@@ -1,0 +1,112 @@
+# Auto-merges Dependabot's own PRs — patch/minor only, major stays manual.
+#
+# Requires a GitHub App to mint the actual merge token — see below for why,
+# and docs/github-standard.md § Dependabot for the exact setup steps
+# (create the App, install it, add two Dependabot secrets). Without that
+# App configured, this workflow degrades gracefully: it reports "not
+# configured" and leaves the PR for a manual merge, rather than failing.
+#
+# Adopt: cp to .github/workflows/dependabot-automerge.yml. Fully generic,
+# no per-repo edits needed — the App ID/key come from secrets, not this file.
+name: Dependabot auto-merge
+
+on: pull_request
+
+# The merge is performed with the App token below, so this workflow's own GITHUB_TOKEN
+# only needs read access. Dependabot-triggered runs get a read-only one regardless.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    # Surfaced as env rather than read inline so the steps below can branch on whether the
+    # App is configured: the `secrets` context is not available in a step `if`, but `env` is.
+    env:
+      APP_ID: ${{ secrets.AUTOMERGE_APP_ID }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+
+      # A merge made with GITHUB_TOKEN triggers no further workflow runs — GitHub
+      # suppresses that to prevent a workflow from triggering itself in an infinite loop.
+      # On a repo with a deploy pipeline gated on push-to-main, that means an auto-merged
+      # bump silently never deploys: nothing reports a problem, the change just sits merged
+      # but not shipped until an unrelated human push happens to carry it out.
+      #
+      # A short-lived GitHub App installation token is the fix. A PAT also works but is a
+      # long-lived credential with write access; the App token is scoped to this
+      # installation and expires within the hour. Only this step needs it.
+      - name: Mint a GitHub App token
+        id: app-token
+        if: env.APP_ID != ''
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ env.APP_ID }}
+          private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+
+      # `--auto` queues the merge behind the required CI check rather than merging
+      # immediately, so the branch ruleset still decides whether it lands.
+      #
+      # Gated on the mint step's outcome rather than on APP_ID. `outcome == 'success'`
+      # subsumes the APP_ID check (an unset id leaves this 'skipped') and states the real
+      # precondition: a token was actually issued. A plain `if:` is ANDed with the implicit
+      # success(), so a failed mint already skips this step, but naming the dependency means
+      # it no longer rests on that subtlety.
+      - name: Auto-merge patch and minor updates
+        if: |
+          steps.app-token.outcome == 'success' &&
+          (steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+           steps.metadata.outputs.update-type == 'version-update:semver-minor')
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      # Three outcomes, each reported distinctly. "Auto-merge quietly stopped working" is
+      # the exact failure this workflow exists to prevent, so it must not fail that way
+      # itself.
+      #
+      # Not configured is a legitimate state, so the job stays green — bumps wait for a
+      # manual merge, which does deploy. Written to the step summary as well as an
+      # annotation, because annotations are easy to miss on a green run.
+      - name: Report that auto-merge is not configured
+        if: steps.app-token.outcome == 'skipped'
+        run: |
+          echo "::notice title=Dependabot auto-merge not configured::AUTOMERGE_APP_ID is unset, so this PR will not auto-merge. Merge it by hand — that does trigger a deploy."
+          {
+            echo "### Dependabot auto-merge: not configured"
+            echo
+            echo "\`AUTOMERGE_APP_ID\` is unset, so this PR will **not** auto-merge."
+            echo "Merging by hand works and does trigger a deploy."
+            echo
+            echo "To enable automation, add both of these as **Dependabot** secrets"
+            echo "(Settings → Secrets and variables → Dependabot), not Actions secrets —"
+            echo "a Dependabot-triggered workflow cannot read Actions secrets:"
+            echo
+            echo "- \`AUTOMERGE_APP_ID\`"
+            echo "- \`AUTOMERGE_APP_PRIVATE_KEY\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Configured but unusable: the mint step has already failed the job, so the signal is
+      # a red run. This adds only the diagnosis, which a bare "mint failed" does not give.
+      # Needs !cancelled(), since the implicit success() would otherwise skip it on a job
+      # that has already failed.
+      - name: Report that auto-merge is misconfigured
+        if: ${{ !cancelled() && steps.app-token.outcome == 'failure' }}
+        run: |
+          echo "::error title=Dependabot auto-merge misconfigured::AUTOMERGE_APP_ID is set but no installation token could be issued, so this PR was not merged."
+          {
+            echo "### Dependabot auto-merge: misconfigured"
+            echo
+            echo "\`AUTOMERGE_APP_ID\` is set, but minting an installation token failed,"
+            echo "so this PR was not merged. Most likely one of:"
+            echo
+            echo "- \`AUTOMERGE_APP_PRIVATE_KEY\` is missing, or stored as an **Actions**"
+            echo "  secret rather than a **Dependabot** secret"
+            echo "- the key does not match \`AUTOMERGE_APP_ID\`"
+            echo "- the App is no longer installed on this repository"
+          } >> "$GITHUB_STEP_SUMMARY"

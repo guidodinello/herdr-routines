@@ -1,0 +1,63 @@
+# Baseline CI for a small/single-package Python repo — mirrors the pre-commit
+# baseline (templates/pre-commit/python.yaml) as a required gate, since
+# pre-commit itself only runs locally and CI is the only place a required
+# check can actually enforce it. Deliberately just lint + test: no
+# typecheck (add a "Typecheck Python" job with pyright/mypy once the repo
+# has real type-annotation coverage), no path filtering (add
+# dorny/paths-filter once this repo is a monorepo with independent
+# subprojects — not needed for a single package).
+#
+# Adopt: cp to .github/workflows/ci.yml, fill in the two <FIXME> spots,
+# then add "Lint Python" as a required_status_checks context (no test job
+# below yet — see the note under jobs:)
+# contexts for this repo in github-standard.json.
+#
+# Before the first push, check the target repo actually has what this
+# workflow assumes — two gaps found rolling this out the first time:
+#   - `ruff`/`pytest` must be in the project's own dev dependency group.
+#     A repo that only runs ruff through pre-commit's isolated hook env
+#     doesn't have it on `uv sync --dev`'s PATH; CI fails with
+#     "Failed to spawn: `ruff`" even though pre-commit works fine locally.
+#   - ruff >=0.13 formats fenced Python code blocks inside Markdown by
+#     default. `ruff format --check .` at a repo root with a docs/ folder
+#     will try to reformat illustrative code snippets in prose. Add
+#     `extend-exclude = ["docs"]` (or wherever non-source markdown lives)
+#     under `[tool.ruff]` in pyproject.toml — fixes it for local
+#     pre-commit and editors too, not just this workflow.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Default GITHUB_TOKEN scope for every job below — neither lints nor tests
+# writes anything (no comments, no pushes, no packages). Least privilege.
+permissions:
+  contents: read
+
+jobs:
+# No "Tests (Python)" job yet — this repo has no test suite. Add one (pytest
+# as a dev dependency, a tests/ directory) then bring that job back from the
+# template and add its context to required_status_checks in github-standard.json.
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: ruff format check
+        run: uv run ruff format --check .
+
+      - name: ruff lint
+        run: uv run ruff check .
