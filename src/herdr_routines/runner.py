@@ -32,7 +32,7 @@ def default_reports_dir() -> Path:
 
 
 def make_run_id(job_name: str, scheduled_for: datetime) -> str:
-    return f"{job_name}-{scheduled_for.strftime('%Y%m%dT%H%M%SZ')}"
+    return f"{job_name}-{scheduled_for.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}"
 
 
 def build_branch_name(job_name: str, run_id: str) -> str:
@@ -52,7 +52,7 @@ def substitute_prompt(
 
 @dataclass(frozen=True, slots=True)
 class RunOutcome:
-    state: str  # "done" | "failed" | "blocked" (recorded as failed with reason) | "skipped"
+    state: str  # "done" | "failed" | "interrupted_unknown" (see docs/plan-v1.md §4)
     run_id: str
     reason: str | None = None
     error: str | None = None
@@ -89,10 +89,23 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
                 "--base",
                 job.base,
                 "--no-focus",
+                "--label",
+                job.name,
             ]
         )
     else:
-        argv.append(["herdr", "tab", "create", "--cwd", str(job.repo), "--no-focus"])
+        argv.append(
+            [
+                "herdr",
+                "tab",
+                "create",
+                "--cwd",
+                str(job.repo),
+                "--no-focus",
+                "--label",
+                job.name,
+            ]
+        )
 
     argv.append(
         [
@@ -129,13 +142,23 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     write a terminal history record."""
     started_at = datetime.now(UTC)
     report_path = default_reports_dir() / f"{run_id}.md"
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt = substitute_prompt(
-        job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
-    )
-
     branch = (
         build_branch_name(job.name, run_id) if job.workspace == "worktree" else None
+    )
+
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return RunOutcome(
+            state="failed",
+            run_id=run_id,
+            reason="report_dir_creation_failed",
+            error=str(e),
+            branch=branch,
+        )
+
+    prompt = substitute_prompt(
+        job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
     )
 
     try:
@@ -145,7 +168,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             )
         else:
             pane_id = client.tab_create(cwd=str(job.repo), label=job.name)
-    except HerdrCliError as e:
+    except (HerdrCliError, OSError) as e:
         return RunOutcome(
             state="failed",
             run_id=run_id,
@@ -161,7 +184,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             pane_id=pane_id,
             start_timeout_ms=job.start_timeout_ms,
         )
-    except HerdrCliError as e:
+    except (HerdrCliError, OSError) as e:
         return RunOutcome(
             state="failed",
             run_id=run_id,
@@ -175,7 +198,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         settled_status = client.agent_prompt_wait(
             target=job.agent_name, text=prompt, timeout_ms=job.timeout_ms
         )
-    except HerdrCliError as e:
+    except (HerdrCliError, OSError) as e:
         return RunOutcome(
             state="failed",
             run_id=run_id,
@@ -187,9 +210,12 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         )
 
     # Best-effort diagnostic tail — never allowed to fail the run (docs/plan-v1.md §6 layer 2).
-    tail = client.agent_read(job.agent_name, lines=200)
-    if tail:
-        (report_path.parent / f"{run_id}.tail.txt").write_text(tail)
+    try:
+        tail = client.agent_read(job.agent_name, lines=200)
+        if tail:
+            (report_path.parent / f"{run_id}.tail.txt").write_text(tail)
+    except OSError:
+        pass
 
     report_written = report_path.exists()
     report_bytes = report_path.stat().st_size if report_written else 0
@@ -209,17 +235,25 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     if settled_status == "blocked":
         return RunOutcome(state="failed", reason="blocked", **common)
 
+    if settled_status == "unknown":
+        # An unresolvable settle status maps to the same terminal state as a crashed/killed
+        # tick (docs/plan-v1.md §4's state machine), not a plain "failed" — stale-run recovery
+        # already treats interrupted_unknown as the "we don't know what happened" bucket.
+        return RunOutcome(
+            state="interrupted_unknown", reason="unsettled_status_unknown", **common
+        )
+
     if settled_status not in SUCCESS_AGENT_STATUSES:
-        # "working"/"unknown" here means agent_prompt_wait's --wait settled on something that
-        # isn't a completion signal — treat as interrupted/unclear rather than success.
+        # "working" here means agent_prompt_wait's --wait settled on something that isn't a
+        # completion signal — treat as interrupted/unclear rather than success.
         return RunOutcome(
             state="failed", reason=f"unsettled_status_{settled_status}", **common
         )
 
-    if not report_written:
+    if not report_written or report_bytes == 0:
         # Direct response to the research repo's standing pattern that unattended scheduled
-        # runs fail silently and plausibly (docs/plan-v1.md §6): a clean settle with no report
-        # is not "done".
+        # runs fail silently and plausibly (docs/plan-v1.md §6): a clean settle with no report,
+        # or an empty one, is not "done".
         return RunOutcome(state="failed", reason="no_report", **common)
 
     return RunOutcome(state="done", **common)

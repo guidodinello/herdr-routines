@@ -1,7 +1,7 @@
 """Run history: append-only JSONL, plus the read-back queries `schedule.py` needs.
 
 The file is a log of state transitions, not a mutable record set — see docs/plan-v1.md §5.
-States: registered, scheduled, running, done, failed, skipped, missed, interrupted_unknown.
+States actually written: registered, running, done, failed, skipped, missed, interrupted_unknown.
 """
 
 from __future__ import annotations
@@ -12,6 +12,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from logger import get_logger
+
+log = get_logger(__name__)
 
 TERMINAL_STATES = frozenset(
     {"done", "failed", "skipped", "missed", "interrupted_unknown"}
@@ -75,16 +79,23 @@ def append(path: Path, record: HistoryRecord) -> None:
 
 
 def read_all(path: Path) -> list[HistoryRecord]:
-    """Read every record in file order (oldest first). Empty list if the file doesn't exist."""
+    """Read every record in file order (oldest first). Empty list if the file doesn't exist.
+
+    A line that fails to parse (e.g. truncated by a power cut or SIGKILL mid-append, since
+    `append` is not atomic) is skipped rather than raised — one bad line must not take down
+    every future tick."""
     if not path.exists():
         return []
     records = []
     with path.open() as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            records.append(HistoryRecord.from_dict(json.loads(line)))
+            try:
+                records.append(HistoryRecord.from_dict(json.loads(line)))
+            except (json.JSONDecodeError, KeyError, ValueError):
+                log.warning("skipping unparseable history line %s:%d", path, lineno)
     return records
 
 

@@ -50,11 +50,13 @@ class ScriptedClient:
         pane_id: str = "w1:p1",
         agent_status: str = "idle",
         write_report_at: Path | None = None,
+        report_content: str = "# Report\n\nFindings.\n",
         raise_on: str | None = None,
     ) -> None:
         self.pane_id = pane_id
         self.agent_status = agent_status
         self.write_report_at = write_report_at
+        self.report_content = report_content
         self.raise_on = raise_on
         self.calls: list[str] = []
 
@@ -79,7 +81,7 @@ class ScriptedClient:
             raise HerdrCliError("boom", exit_code=1)
         if self.write_report_at is not None:
             self.write_report_at.parent.mkdir(parents=True, exist_ok=True)
-            self.write_report_at.write_text("# Report\n\nFindings.\n")
+            self.write_report_at.write_text(self.report_content)
         return self.agent_status
 
     def agent_read(self, target, *, lines=200):
@@ -125,6 +127,7 @@ def test_build_dry_run_argv_worktree_mode(tmp_path: Path) -> None:
     commands = build_dry_run_argv(job, run_id="a-1")
     assert commands[0][:3] == ["herdr", "worktree", "create"]
     assert "--branch" in commands[0]
+    assert "--label" in commands[0] and job.name in commands[0]
     assert commands[1][:3] == ["herdr", "agent", "start"]
     assert commands[2][:3] == ["herdr", "agent", "prompt"]
 
@@ -133,6 +136,7 @@ def test_build_dry_run_argv_root_mode(tmp_path: Path) -> None:
     job = make_job(tmp_path, workspace="root")
     commands = build_dry_run_argv(job, run_id="a-1")
     assert commands[0][:3] == ["herdr", "tab", "create"]
+    assert "--label" in commands[0] and job.name in commands[0]
 
 
 def test_execute_run_success_writes_report(
@@ -188,16 +192,35 @@ def test_execute_run_blocked_status_is_failed_with_reason(
     assert outcome.reason == "blocked"
 
 
-def test_execute_run_unknown_status_is_failed(
+def test_execute_run_unknown_status_is_interrupted_unknown(
     tmp_path: Path, _isolated_reports_dir: Path
 ) -> None:
+    """An unresolvable settle status maps to the same terminal state stale-run recovery uses
+    for a crashed/killed run (docs/plan-v1.md §4), not a plain "failed"."""
     job = make_job(tmp_path)
     run_id = "a-run5"
     report_path = _isolated_reports_dir / f"{run_id}.md"
     client = ScriptedClient(agent_status="unknown", write_report_at=report_path)
     outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
-    assert outcome.state == "failed"
+    assert outcome.state == "interrupted_unknown"
     assert outcome.reason == "unsettled_status_unknown"
+
+
+def test_execute_run_empty_report_is_failed_not_done(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """A report file that exists but is empty must not be recorded as done."""
+    job = make_job(tmp_path)
+    run_id = "a-run5b"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(
+        agent_status="idle", write_report_at=report_path, report_content=""
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "no_report"
+    assert outcome.report_written is True
+    assert outcome.report_bytes == 0
 
 
 def test_execute_run_worktree_creation_failure_short_circuits(tmp_path: Path) -> None:

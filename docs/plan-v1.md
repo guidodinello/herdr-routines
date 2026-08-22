@@ -111,9 +111,12 @@ Three figures, referenced from the sections below. Source SVGs are in
 
 ![Layered architecture: an imperative shell of cli.py, tick.py, and runner.py above a pure core of config.py, schedule.py, and history.py, with runner.py calling the herdr.py adapter, which forks to either a real subprocess or a FakeRunner used in tests.](diagrams/architecture-layers.svg)
 
-**Fig. A — layers and the adapter seam.** The split discussed in §1: a pure core with no I/O,
-an imperative shell around it, and `herdr.py` as the one adapter that shells out — with two
-implementations, real and faked, behind the same `HerdrClient` interface.
+**Fig. A — layers and the adapter seam.** The split discussed in §1: a core with no
+subprocess/network I/O (`config.py`/`schedule.py` read no files themselves beyond `config.py`
+parsing the one YAML config; `history.py` reads/writes the JSONL history file — none of the
+three shells out or talks to Herdr), an imperative shell around it, and `herdr.py` as the one
+adapter that shells out — with two implementations, real and faked, behind the same
+`HerdrClient` interface.
 
 ![Sequence of one scheduled run: timer fires, lock acquired and job found due, pane created, agent started, prompt sent and awaited, result verified against report file and settle status, then recorded to history and a notification sent.](diagrams/tick-sequence.svg)
 
@@ -304,8 +307,8 @@ concurrency cap), but it means a long job delays other jobs' start times by up t
 personal tool with a handful of nightly jobs this is acceptable; if it stops being acceptable,
 the fix is per-job units, not a daemon.
 
-**Prerequisite:** Herdr is not yet installed on the Pi (it is an open item in
-`~/projects/raspberrypi/roadmap.md` §3). Until it is, v1 runs and is smoke-tested on the laptop.
+**Prerequisite:** Herdr is not yet installed on the Pi (tracked separately in this operator's own
+deployment notes, outside this repo). Until it is, v1 runs and is smoke-tested on the laptop.
 This is a real dependency, not a footnote.
 
 ---
@@ -372,14 +375,14 @@ transition, so the file is a log, not a mutable record set.
  "duration_seconds":1868,"final_agent_status":"idle","report":"/home/guido/.local/state/herdr-routines/reports/....md"}
 ```
 
-States: `registered`, `scheduled`, `running`, `done`, `failed`, `skipped`, `missed`,
-`interrupted_unknown`. `failed` carries `error` and `stderr_tail`; `skipped`/`missed` carry
-`reason`.
+States: `registered`, `running`, `done`, `failed`, `skipped`, `missed`, `interrupted_unknown`.
+`failed` carries `error` (and a diagnostic pane tail, written to `reports/<run_id>.tail.txt`,
+not into the JSONL record itself); `skipped`/`missed` carry `reason`.
 
 CLI:
 
-- `herdr-routines status` — one line per job: last run, its state, next scheduled occurrence,
-  whether currently running. This is the morning check-in.
+- `herdr-routines status` — one line per job: last run, its state, and whether it's due — not
+  the next scheduled occurrence, since `status` only looks backward over `(since, now]`.
 - `herdr-routines history <job> [-n N] [--json]` — recent runs for one job.
 - `herdr-routines validate` — config check, exits non-zero on error. Also used in CI.
 - `herdr-routines run <job> [--dry-run]` — force one run now, ignoring the schedule.
@@ -615,7 +618,8 @@ kept for anyone picking this up later.
    closed, no `auto/*` branch left since the test used `workspace: root`).
 
 **Pi deployment is separate, out of scope here, and was not attempted.** It's gated on installing
-Herdr on the Pi (`raspberrypi/roadmap.md` §3) plus `enable-linger`. Nothing above depended on it —
+Herdr on the Pi (tracked separately in this operator's own deployment notes, outside this repo)
+plus `enable-linger`. Nothing above depended on it —
 the tool is host-agnostic and step 9 already proved the loop works against a real Herdr instance.
 
 ## Out of scope for v1 (named so they don't creep in)

@@ -5,6 +5,10 @@ Two systemd **user** units drive this tool — no daemon of our own, no root req
 
 ## Install
 
+`herdr-routines.service`'s `WorkingDirectory` and `ExecStart` hardcode this checkout's path and
+this host's `uv` location (`%h/projects/herdr-routines`, `%h/.local/bin/uv`) — edit both before
+copying the unit to a host with a different checkout path or `uv` install location.
+
 ```sh
 mkdir -p ~/.config/systemd/user
 cp systemd/herdr-server.service systemd/herdr-routines.timer systemd/herdr-routines.service \
@@ -59,6 +63,6 @@ docs/plan-v1.md §7 tier 3) on any new host before trusting the timer:
 Step 5 was performed live against `herdr 0.8.2` on this laptop while building this tool: a
 `root`-mode job with a trivial "write PONG to `$ROUTINE_REPORT`" prompt produced
 `registered → missed → running → done`, a real report file, and a live `rt-<job>` agent —
-confirming the whole loop end to end. Repeat it on the Pi once Herdr is installed there
-(`~/projects/raspberrypi/roadmap.md` §3) — that step is separate from, and not required for,
-this tool's own correctness.
+confirming the whole loop end to end. Repeat it on the Pi once Herdr is installed there (tracked
+separately in this operator's own deployment notes, outside this repo) — that step is separate
+from, and not required for, this tool's own correctness.

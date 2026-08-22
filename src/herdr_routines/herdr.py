@@ -1,8 +1,9 @@
 """Thin typed wrapper over the `herdr` CLI. The only module in this package that shells out.
 
-Every call goes through `HerdrClient.run`, which is the seam `runner.py` tests against via a
-fake (see tests/test_herdr.py and docs/plan-v1.md §7 tier 2). Nothing here parses stdout beyond
-JSON — IDs are always read from the response, never predicted, per Herdr's own SKILL.md guidance.
+Every call goes through the injected `CommandRunner`, which is the seam `test_herdr.py` fakes
+(see docs/plan-v1.md §7 tier 2); `runner.py` in turn tests against a faked `HerdrClient`. Nothing
+here parses stdout beyond JSON — IDs are always read from the response, never predicted, per
+Herdr's own SKILL.md guidance.
 """
 
 from __future__ import annotations

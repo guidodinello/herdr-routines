@@ -16,7 +16,9 @@ run history format, and test strategy.
 
 ![Layered architecture: an imperative shell of cli.py, tick.py, and runner.py above a pure core of config.py, schedule.py, and history.py, with runner.py calling the herdr.py adapter, which forks to either a real subprocess or a FakeRunner used in tests.](docs/diagrams/architecture-layers.svg)
 
-A pure core (`config.py` / `schedule.py` / `history.py`, no I/O) sits under an imperative shell
+A core with no subprocess/network I/O (`config.py` / `schedule.py` / `history.py` — the latter
+two do read/write the YAML config and the JSONL history file, but neither shells out or talks to
+Herdr) sits under an imperative shell
 (`cli.py` / `tick.py` / `runner.py`); `herdr.py` is the one adapter that shells out to `herdr`,
 behind a seam that's faked in tests. See
 [`docs/plan-v1.md#diagrams`](docs/plan-v1.md#diagrams) for the full-run sequence diagram and a
@@ -26,7 +28,7 @@ breakdown of exactly what a Herdr API change vs. an agent-CLI change would touch
 
 v1 implemented and verified end to end against a real Herdr session on the laptop (see
 `docs/plan-v1.md` build-order record). Not yet deployed to the Pi — that's gated on installing
-Herdr there (`~/projects/raspberrypi/roadmap.md` §3).
+Herdr there, tracked separately in this operator's own deployment notes (outside this repo).
 
 ## Usage
 

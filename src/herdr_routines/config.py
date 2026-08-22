@@ -10,6 +10,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from croniter import croniter
@@ -248,6 +249,13 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
     model = merged["model"]
     if model is not None and not isinstance(model, str):
         raise ConfigError(f"{label}: 'model' must be a string or null")
+    if model is not None:
+        # `agent_start` doesn't pass this through yet — the native flag for selecting a model
+        # differs per agent_kind and hasn't been pinned down against any of them (see
+        # docs/plan-v1.md). Reject rather than silently ignore a configured value.
+        raise ConfigError(
+            f"{label}: 'model' is not yet implemented — leave it null (see docs/plan-v1.md)"
+        )
 
     prompt = merged["prompt"]
     if not isinstance(prompt, str):
@@ -256,6 +264,12 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
     timezone = merged["timezone"]
     if not isinstance(timezone, str):
         raise ConfigError(f"{label}: 'timezone' must be a string")
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as e:
+        raise ConfigError(
+            f"{label}: 'timezone' is not a valid IANA zone: {timezone!r}"
+        ) from e
 
     base = merged["base"]
     if not isinstance(base, str):

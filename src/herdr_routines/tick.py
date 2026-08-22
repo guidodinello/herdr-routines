@@ -11,8 +11,10 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
+from logger import get_logger
+
 from herdr_routines.config import Job, RoutinesConfig
-from herdr_routines.herdr import HerdrClient
+from herdr_routines.herdr import HerdrClient, HerdrCliError
 from herdr_routines.history import (
     HistoryRecord,
     append,
@@ -24,6 +26,8 @@ from herdr_routines.history import (
 )
 from herdr_routines.runner import execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
+
+log = get_logger(__name__)
 
 
 def default_lock_path() -> Path:
@@ -98,6 +102,18 @@ def _process_job(
     if is_currently_running(history_path, job.name, timeout_ms=job.timeout_ms, now=now):
         return f"{job.name}: skipped (already running)"
 
+    if _live_agent_exists(client, job):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                extra={"reason": "agent_name_live"},
+            ),
+        )
+        return f"{job.name}: skipped (agent already live)"
+
     last = last_terminal_run(history_path, job.name)
     # job_registered_at only matters when `last` is None (seen but never finished a run yet) —
     # it must be the job's actual first-seen time, not `now`, or the search window (since, now]
@@ -127,7 +143,8 @@ def _process_job(
             HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
         )
         if job.on_missed == "notify":
-            client.notification_show(
+            _notify(
+                client,
                 f"herdr-routines: {job.name} missed",
                 body="outside catch-up window",
                 sound="request",
@@ -200,12 +217,36 @@ def _process_job(
     )
 
     if outcome.state == "done":
-        client.notification_show(f"herdr-routines: {job.name} done", sound="done")
+        _notify(client, f"herdr-routines: {job.name} done", sound="done")
         return f"{job.name}: done"
 
-    client.notification_show(
+    _notify(
+        client,
         f"herdr-routines: {job.name} failed",
         body=outcome.reason or "unknown",
         sound="request",
     )
     return f"{job.name}: failed ({outcome.reason})"
+
+
+def _notify(
+    client: HerdrClient, title: str, *, body: str | None = None, sound: str = "none"
+) -> None:
+    """Best-effort: a notification failure (e.g. Herdr server unreachable) must not abort the
+    tick — see run_tick's isolation contract above."""
+    try:
+        client.notification_show(title, body=body, sound=sound)
+    except HerdrCliError as e:
+        log.warning("%s: notification failed: %s", title, e)
+
+
+def _live_agent_exists(client: HerdrClient, job: Job) -> bool:
+    """Cross-process safety net (docs/plan-v1.md §4): catches a live `rt-<name>` agent that
+    survived a lost/rotated history.jsonl, which `is_currently_running` can't see since it
+    reads only history. Fails open on a HerdrCliError (e.g. server unreachable) since the
+    history/flock check above remains the primary guard."""
+    try:
+        return job.agent_name in client.agent_list_names()
+    except HerdrCliError as e:
+        log.warning("%s: could not query live agents, proceeding: %s", job.name, e)
+        return False

@@ -19,7 +19,12 @@ from herdr_routines.config import (
     load_config,
 )
 from herdr_routines.herdr import HerdrClient
-from herdr_routines.history import default_history_path, last_terminal_run, read_job
+from herdr_routines.history import (
+    default_history_path,
+    first_seen_at,
+    last_terminal_run,
+    read_job,
+)
 from herdr_routines.runner import build_dry_run_argv, execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.tick import default_lock_path, run_tick, tick_lock
@@ -59,7 +64,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tick.set_defaults(handler=_cmd_tick)
 
     p_status = sub.add_parser(
-        "status", help="one line per job: last run, next occurrence"
+        "status", help="one line per job: last run, and whether it's due"
     )
     p_status.set_defaults(handler=_cmd_status)
 
@@ -127,7 +132,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             catch_up_minutes=job.catch_up_minutes,
             now=now,
             last_terminal=last,
-            job_registered_at=now,
+            job_registered_at=first_seen_at(history_path, job.name) or now,
         )
         due_desc = {
             Decision.NOT_DUE: "not due",
@@ -155,7 +160,65 @@ def _cmd_history(args: argparse.Namespace) -> int:
 # TimeoutStartSec — see docs/plan-v1.md §3 on why TimeoutStartSec must never be `infinity`.
 SYSTEMD_TIMEOUT_MARGIN_SECONDS = 300
 
-_TIMEOUT_START_SEC_RE = re.compile(r"^TimeoutStartSec=(\d+)\s*$", re.MULTILINE)
+_TIMEOUT_START_SEC_RE = re.compile(
+    r"^TimeoutStartSec=(?P<value>\S.*?)\s*$", re.MULTILINE
+)
+
+# systemd.time(7) unit suffixes, in seconds. A bare number with no suffix means seconds.
+_SYSTEMD_TIME_UNIT_SECONDS = {
+    "us": 0.000001,
+    "usec": 0.000001,
+    "ms": 0.001,
+    "msec": 0.001,
+    "s": 1.0,
+    "sec": 1.0,
+    "secs": 1.0,
+    "second": 1.0,
+    "seconds": 1.0,
+    "m": 60.0,
+    "min": 60.0,
+    "mins": 60.0,
+    "minute": 60.0,
+    "minutes": 60.0,
+    "h": 3600.0,
+    "hr": 3600.0,
+    "hrs": 3600.0,
+    "hour": 3600.0,
+    "hours": 3600.0,
+    "d": 86400.0,
+    "day": 86400.0,
+    "days": 86400.0,
+    "w": 604800.0,
+    "week": 604800.0,
+    "weeks": 604800.0,
+}
+
+_TIME_SPAN_TOKEN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]*)")
+
+
+def _parse_systemd_seconds(value: str) -> float | None:
+    """Parse a systemd.time(7) span (e.g. "3000", "50min", "1h 30min") into seconds, or None
+    if it doesn't match the grammar we support."""
+    value = value.strip()
+    if re.fullmatch(r"\d+", value):
+        return float(value)
+
+    total = 0.0
+    pos = 0
+    matched_any = False
+    for m in _TIME_SPAN_TOKEN_RE.finditer(value):
+        if m.start() != pos:
+            return None
+        number, unit = m.groups()
+        unit = unit.lower()
+        if unit not in _SYSTEMD_TIME_UNIT_SECONDS:
+            return None
+        total += float(number) * _SYSTEMD_TIME_UNIT_SECONDS[unit]
+        matched_any = True
+        pos = m.end()
+    if not matched_any or pos != len(value):
+        return None
+    return total
 
 
 def _cmd_validate(args: argparse.Namespace) -> int:
@@ -170,7 +233,9 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     for job in config.jobs:
         if not job.repo.exists():
             problems.append(f"{job.name}: repo path does not exist: {job.repo}")
-        elif job.workspace == "worktree" and not (job.repo / ".git").exists():
+        elif job.workspace == "worktree" and not (job.repo / ".git").is_file():
+            # A worktree root's `.git` is a file (pointer to the real gitdir); a normal repo's
+            # `.git` is a directory. `.exists()` alone can't tell them apart.
             problems.append(f"{job.name}: repo is not a git worktree root: {job.repo}")
 
     problems += _check_systemd_timeout(config, args.systemd_unit)
@@ -185,11 +250,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
 
 def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]:
-    """If the systemd service unit exists, make sure its TimeoutStartSec covers the largest
-    job timeout — a unit with too small a value (or the tempting `infinity`) can leave a wedged
-    tick blocking every future run forever. Silently skipped if the unit file isn't found, since
-    `validate` is also usable before deployment exists."""
-    if not config.jobs or not unit_path.exists():
+    """If the systemd service unit exists, make sure its TimeoutStartSec covers a tick running
+    every enabled job sequentially in the worst case — a unit with too small a value (or the
+    tempting `infinity`) can leave a wedged tick blocking every future run forever. Silently
+    skipped if the unit file isn't found, since `validate` is also usable before deployment
+    exists."""
+    enabled_jobs = [job for job in config.jobs if job.enabled]
+    if not enabled_jobs or not unit_path.exists():
         return []
 
     directive_lines = [
@@ -208,14 +275,23 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
     if match is None:
         return [f"{unit_path}: no TimeoutStartSec= line found"]
 
-    unit_timeout_s = int(match.group(1))
-    max_job_timeout_s = max(job.timeout_ms for job in config.jobs) / 1000
-    required_s = max_job_timeout_s + SYSTEMD_TIMEOUT_MARGIN_SECONDS
+    unit_timeout_s = _parse_systemd_seconds(match.group("value"))
+    if unit_timeout_s is None:
+        return [
+            f"{unit_path}: could not parse TimeoutStartSec={match.group('value')!r}"
+        ]
+
+    # A tick runs every due job sequentially in one service invocation, so the worst case is
+    # every enabled job being due at once.
+    total_job_seconds = sum(
+        (job.start_timeout_ms + job.timeout_ms) / 1000 for job in enabled_jobs
+    )
+    required_s = total_job_seconds + SYSTEMD_TIMEOUT_MARGIN_SECONDS
     if unit_timeout_s < required_s:
         message = (
-            f"{unit_path}: TimeoutStartSec={unit_timeout_s} is less than the largest job "
-            f"timeout ({max_job_timeout_s:.0f}s) plus {SYSTEMD_TIMEOUT_MARGIN_SECONDS}s margin "
-            f"= {required_s:.0f}s — bump it"
+            f"{unit_path}: TimeoutStartSec={unit_timeout_s:.0f} is less than the sum of every "
+            f"enabled job's start+run timeout ({total_job_seconds:.0f}s, worst case for one "
+            f"tick) plus {SYSTEMD_TIMEOUT_MARGIN_SECONDS}s margin = {required_s:.0f}s — bump it"
         )
         return [message]
     return []
