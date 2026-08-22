@@ -15,7 +15,7 @@ from pathlib import Path
 from logger import get_logger
 
 from herdr_routines.config import Job, RoutinesConfig
-from herdr_routines.herdr import HerdrClient, HerdrCliError
+from herdr_routines.herdr import LIVE_AGENT_STATUSES, HerdrClient, HerdrCliError
 from herdr_routines.history import (
     HistoryRecord,
     append,
@@ -65,10 +65,18 @@ def tick_lock(path: Path) -> Generator[bool]:
 @dataclass(frozen=True, slots=True)
 class TickOutcome:
     """What one `run_tick` call did. `any_job_failed` is what `cli._cmd_tick` maps to a
-    non-zero process exit — it is True only when a job this tick *actually executed* settled
-    on something other than "done" (state `failed` or `interrupted_unknown`), never for a
-    routine scheduling outcome like `missed`/`skipped`/`not due`, so systemd only marks the
-    unit "failed" for a genuine operational problem, not a job that simply wasn't due."""
+    non-zero process exit — it is True only when a job this tick *itself* called `execute_run`
+    for and got back a state other than "done" (`failed`, or `interrupted_unknown` from an
+    unsettled agent status). It is never set for a routine scheduling outcome
+    (`missed`/`skipped`/`not due`), so systemd only marks the unit "failed" for a genuine
+    operational problem, not a job that simply wasn't due.
+
+    Note the one case that also writes `interrupted_unknown` but does *not* set this flag: the
+    stale-running recovery path in `_process_job` (a *previous* tick's crashed run, discovered
+    by `find_stale_running`). That record describes a past tick's failure, not this one's own
+    execution — this tick didn't run anything for it, so it has nothing of its own to report as
+    failed. That past tick, whenever it ran, already exited non-zero on its own account (or was
+    killed outright, which systemd/monitoring sees independently)."""
 
     summaries: tuple[str, ...]
     any_job_failed: bool
@@ -258,10 +266,14 @@ def _notify(
 def _live_agent_exists(client: HerdrClient, job: Job) -> bool:
     """Cross-process safety net (docs/plan-v1.md §4): catches a live `rt-<name>` agent that
     survived a lost/rotated history.jsonl, which `is_currently_running` can't see since it
-    reads only history. Fails open on a HerdrCliError (e.g. server unreachable) since the
-    history/flock check above remains the primary guard."""
+    reads only history. "Live" means actually still mid-run (agent_status in
+    LIVE_AGENT_STATUSES), not merely registered — a finished agent stays registered under
+    `herdr agent list` until its tab is closed, so name presence alone would make a recurring
+    job's agent name "live" forever after its first run. Fails open on a HerdrCliError (e.g.
+    server unreachable) since the history/flock check above remains the primary guard."""
     try:
-        return job.agent_name in client.agent_list_names()
+        status = client.agent_statuses().get(job.agent_name)
     except HerdrCliError as e:
         log.warning("%s: could not query live agents, proceeding: %s", job.name, e)
         return False
+    return status in LIVE_AGENT_STATUSES
