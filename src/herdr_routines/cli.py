@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+
+from logger import get_logger, init_logging
 
 from herdr_routines.config import (
     ConfigError,
@@ -21,8 +24,25 @@ from herdr_routines.runner import build_dry_run_argv, execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.tick import default_lock_path, run_tick, tick_lock
 
+log = get_logger(__name__)
+
+
+def default_log_path() -> Path:
+    """$HERDR_PLUGIN_STATE_DIR/herdr-routines.log if set, else ~/.local/state/herdr-routines/.
+
+    Same convention as history.default_history_path and tick.default_lock_path.
+    """
+    plugin_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    base = (
+        Path(plugin_dir)
+        if plugin_dir
+        else Path.home() / ".local" / "state" / "herdr-routines"
+    )
+    return base / "herdr-routines.log"
+
 
 def main(argv: list[str] | None = None) -> int:
+    init_logging(log_file=default_log_path())
     parser = _build_parser()
     args = parser.parse_args(argv)
     return args.handler(args)
@@ -75,7 +95,7 @@ def _load_config_or_exit(args: argparse.Namespace) -> RoutinesConfig:
     try:
         return load_config(path)
     except ConfigError as e:
-        print(f"error: {e}", file=sys.stderr)
+        log.error("failed to load config %s: %s", path, e)
         raise SystemExit(1) from e
 
 
@@ -90,7 +110,7 @@ def _cmd_tick(args: argparse.Namespace) -> int:
         now = datetime.now(UTC)
         client = HerdrClient()
         for line in run_tick(config, history_path, client=client, now=now):
-            print(line)
+            log.info(line)
     return 0
 
 
@@ -205,7 +225,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     config = _load_config_or_exit(args)
     job = config.job(args.job)
     if job is None:
-        print(f"error: no such job: {args.job}", file=sys.stderr)
+        log.error("no such job: %s", args.job)
         return 1
 
     now = datetime.now(UTC)
@@ -216,9 +236,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(" ".join(command))
         return 0
 
+    log.info("%s: starting run %s", job.name, run_id)
     client = HerdrClient()
     outcome = execute_run(job, client, run_id=run_id)
-    print(f"{job.name}: {outcome.state} ({outcome.reason or 'ok'})")
+    if outcome.state == "done":
+        log.info("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
+    else:
+        log.error("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
     return 0 if outcome.state == "done" else 1
 
 

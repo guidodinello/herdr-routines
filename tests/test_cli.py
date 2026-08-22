@@ -8,7 +8,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from herdr_routines.cli import _check_systemd_timeout
+import pytest
+
+from herdr_routines import cli
+from herdr_routines.cli import _check_systemd_timeout, default_log_path
 from herdr_routines.config import Job, RoutinesConfig
 
 
@@ -102,3 +105,37 @@ def test_missing_directive_is_flagged(tmp_path: Path) -> None:
     problems = _check_systemd_timeout(config, unit)
     assert len(problems) == 1
     assert "no TimeoutStartSec" in problems[0]
+
+
+def test_default_log_path_honors_state_dir_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    assert default_log_path() == tmp_path / "state" / "herdr-routines.log"
+
+
+def test_default_log_path_falls_back_to_local_state_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HERDR_PLUGIN_STATE_DIR", raising=False)
+    assert default_log_path() == (
+        Path.home() / ".local" / "state" / "herdr-routines" / "herdr-routines.log"
+    )
+
+
+def test_main_configures_logging_before_parsing_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[Path | None] = []
+    monkeypatch.setattr(
+        cli, "init_logging", lambda log_file=None, **_: calls.append(log_file)
+    )
+    monkeypatch.setattr(
+        cli, "default_log_path", lambda: tmp_path / "herdr-routines.log"
+    )
+    monkeypatch.setattr(cli, "default_config_path", lambda: tmp_path / "jobs.yaml")
+    (tmp_path / "jobs.yaml").write_text("version: 1\njobs: []\n")
+
+    cli.main(["status"])
+
+    assert calls == [tmp_path / "herdr-routines.log"]
