@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local git worktree checkouts (per-agent isolation, not repo content)
+.claude/worktrees/
