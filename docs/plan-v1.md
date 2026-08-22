@@ -123,12 +123,13 @@ adapter that shells out — with two implementations, real and faked, behind the
 **Fig. B — one tick, traced.** The control flow described across §3–§6, start to finish, for a
 single due job.
 
-![Side-by-side comparison: a Herdr API change touches herdr.py directly and conditionally touches config.py's kind list and runner.py's status policy, leaving the scheduler and pure core untouched. An agent CLI change touches nothing in this codebase except one dormant, unwired model field, because Herdr absorbs the provider surface first.](diagrams/blast-radius.svg)
+![Side-by-side comparison: a Herdr API change touches herdr.py directly and conditionally touches config.py's kind list and runner.py's status policy, leaving the scheduler and pure core untouched. An agent CLI change only touches the small AGENT_MODEL_FLAGS map shared by config.py and herdr.py, because Herdr absorbs the rest of the provider surface first.](diagrams/blast-radius.svg)
 
 **Fig. C — blast radius of a Herdr change vs. an agent-CLI change.** The practical payoff of the
 adapter seam: a Herdr API change is a small, localized edit; a provider (OpenCode / Claude Code)
-CLI change reaches this codebase not at all today, since nothing provider-specific is passed
-through yet (see `Job.model`, parsed but not wired into `agent_start`).
+CLI change reaches this codebase only at the single `AGENT_MODEL_FLAGS` mapping (`config.py`,
+consumed by `herdr.build_agent_start_args`) that names each kind's native model flag — see
+`Job.model`, wired into `agent_start` below.
 
 ---
 
@@ -219,6 +220,9 @@ Notes on the schema:
   not `--dangerously-skip-permissions`.
 - `validate` subcommand checks the whole file: unknown keys rejected, cron parseable, `repo` is
   an existing git worktree root, `agent_kind` is in the kind list, names unique.
+- `model` is passed as a native arg after `--`, using the flag pinned down per `agent_kind` in
+  `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `-m` for `opencode`. Config load
+  rejects a non-null `model` for any other `agent_kind` rather than guessing its flag.
 
 ---
 

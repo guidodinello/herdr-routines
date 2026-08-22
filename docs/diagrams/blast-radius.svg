@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" color="#16303f" viewBox="0 0 900 560" role="img" aria-label="Side-by-side comparison: a Herdr API change touches herdr.py directly and conditionally touches config.py's kind list and runner.py's status policy, leaving the scheduler and pure core untouched. An agent CLI change touches nothing in this codebase except one dormant, unwired model field, because Herdr absorbs the provider surface first.">
+<svg xmlns="http://www.w3.org/2000/svg" color="#16303f" viewBox="0 0 900 560" role="img" aria-label="Side-by-side comparison: a Herdr API change touches herdr.py directly and conditionally touches config.py's kind list and runner.py's status policy, leaving the scheduler and pure core untouched. An agent CLI change only touches the small AGENT_MODEL_FLAGS map shared by config.py and herdr.py, because Herdr absorbs the rest of the provider surface first.">
           <defs>
             <marker id="c-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
               <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
@@ -54,8 +54,8 @@
           <text x="230" y="336" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">herdr.py — the whole seam</text>
           <text x="230" y="351" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#ffffff">argv built here, responses parsed here</text>
           <rect x="500" y="316" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
-          <text x="670" y="336" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">herdr.py — absorbed by Herdr</text>
-          <text x="670" y="351" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#ffffff">never sees a provider-specific flag</text>
+          <text x="670" y="336" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">herdr.py — mostly absorbed by Herdr</text>
+          <text x="670" y="351" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#ffffff">sees a flag only via AGENT_MODEL_FLAGS</text>
 
           <!-- row 6: runner status policy -->
           <rect x="60" y="368" width="340" height="44" fill="none" stroke="#b97a1e" stroke-width="1.6"></rect>
@@ -68,9 +68,9 @@
           <rect x="60" y="420" width="340" height="44" fill="#dcd6c8" stroke="#8a8378" stroke-width="1"></rect>
           <text x="230" y="440" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11" fill="#16303f">Job.model — not applicable here</text>
           <rect x="500" y="420" width="340" height="44" fill="#dcd6c8" stroke="#8a8378" stroke-width="1"></rect>
-          <text x="670" y="438" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11" fill="#16303f">Job.model — parsed, never wired</text>
-          <text x="670" y="453" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#4c6472">dormant regardless of provider changes</text>
+          <text x="670" y="438" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11" fill="#16303f">Job.model — wired via AGENT_MODEL_FLAGS</text>
+          <text x="670" y="453" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#4c6472">new kind needs one map entry, else rejected</text>
 
           <text x="230" y="500" text-anchor="middle" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="12" fill="#4c6472">→ one seam, one adapter, a two-line blast radius</text>
-          <text x="670" y="500" text-anchor="middle" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="12" fill="#4c6472">→ absorbed upstream; nothing to update</text>
+          <text x="670" y="500" text-anchor="middle" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="12" fill="#4c6472">→ absorbed upstream; one map entry for model support</text>
         </svg>

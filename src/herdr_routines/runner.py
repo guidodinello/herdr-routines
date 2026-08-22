@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from herdr_routines.config import Job
-from herdr_routines.herdr import HerdrClient, HerdrCliError
+from herdr_routines.herdr import HerdrClient, HerdrCliError, build_agent_start_args
 
 # Settle states that count as success for a scheduled (never-focused) run. Both are included
 # because "idle" is what was empirically observed on herdr 0.8.2 for a never-focused pane, and
@@ -110,15 +110,13 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
     argv.append(
         [
             "herdr",
-            "agent",
-            "start",
-            job.agent_name,
-            "--kind",
-            job.agent_kind,
-            "--pane",
-            "<pane_id>",
-            "--timeout",
-            str(job.start_timeout_ms),
+            *build_agent_start_args(
+                name=job.agent_name,
+                kind=job.agent_kind,
+                pane_id="<pane_id>",
+                start_timeout_ms=job.start_timeout_ms,
+                model=job.model,
+            ),
         ]
     )
     argv.append(
@@ -139,7 +137,9 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
 def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     """Runs one job to completion (or failure) against a real or faked HerdrClient. Never
     raises — every failure mode is captured in the returned RunOutcome so `tick.py` can always
-    write a terminal history record."""
+    write a terminal history record. (A `job.model` unsupported for `job.agent_kind` would raise
+    `ValueError` from `agent_start`, but `config.py` already rejects that combination at load
+    time, so it can't reach here.)"""
     started_at = datetime.now(UTC)
     report_path = default_reports_dir() / f"{run_id}.md"
     branch = (
@@ -183,6 +183,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             kind=job.agent_kind,
             pane_id=pane_id,
             start_timeout_ms=job.start_timeout_ms,
+            model=job.model,
         )
     except (HerdrCliError, OSError) as e:
         return RunOutcome(

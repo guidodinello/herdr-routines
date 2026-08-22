@@ -43,6 +43,15 @@ VALID_AGENT_KINDS = frozenset(
     }
 )
 
+# Native model-selection flag per agent kind, passed as a native arg after `--`. Confirmed
+# empirically against herdr 0.8.2 (see docs/plan-v1.md): only these two kinds have a pinned-down
+# flag — a job's 'model' is rejected for any other agent_kind rather than guessing. Also consumed
+# by herdr.py's `build_agent_start_args`, which is where the flag is actually applied.
+AGENT_MODEL_FLAGS: dict[str, str] = {
+    "claude": "--model",
+    "opencode": "-m",
+}
+
 VALID_WORKSPACE_MODES = frozenset({"worktree", "root"})
 VALID_ON_MISSED = frozenset({"log", "notify"})
 
@@ -249,12 +258,10 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
     model = merged["model"]
     if model is not None and not isinstance(model, str):
         raise ConfigError(f"{label}: 'model' must be a string or null")
-    if model is not None:
-        # `agent_start` doesn't pass this through yet — the native flag for selecting a model
-        # differs per agent_kind and hasn't been pinned down against any of them (see
-        # docs/plan-v1.md). Reject rather than silently ignore a configured value.
+    if model is not None and agent_kind not in AGENT_MODEL_FLAGS:
         raise ConfigError(
-            f"{label}: 'model' is not yet implemented — leave it null (see docs/plan-v1.md)"
+            f"{label}: 'model' is not supported for agent_kind {agent_kind!r} "
+            f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
         )
 
     prompt = merged["prompt"]
