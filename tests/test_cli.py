@@ -1,17 +1,19 @@
 """Tests for the CLI's own validation logic (not the full argparse plumbing — see
 docs/plan-v1.md §7). Covers _check_systemd_timeout (the TimeoutStartSec trap described in
-docs/plan-v1.md §3) and _cmd_tick's exit code (must go non-zero when a job's run genuinely
-fails, so systemd marks the unit "failed" rather than always reporting success).
+docs/plan-v1.md §3), _cmd_validate's repo/.git check for workspace:worktree jobs, and
+_cmd_tick's exit code (must go non-zero when a job's run genuinely fails, so systemd marks the
+unit "failed" rather than always reporting success).
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
 
 from herdr_routines import cli
-from herdr_routines.cli import _check_systemd_timeout, default_log_path
+from herdr_routines.cli import _check_systemd_timeout, _cmd_validate, default_log_path
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.tick import TickOutcome
 
@@ -124,6 +126,61 @@ def test_default_log_path_falls_back_to_local_state_home(
     assert default_log_path() == (
         Path.home() / ".local" / "state" / "herdr-routines" / "herdr-routines.log"
     )
+
+
+def _validate_args(config_path: Path, tmp_path: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        config=config_path, systemd_unit=tmp_path / "does-not-exist.service"
+    )
+
+
+def _write_worktree_job_config(tmp_path: Path, repo: Path) -> Path:
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: a\n"
+        f"    cron: '0 3 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    workspace: worktree\n"
+    )
+    return config_path
+
+
+def test_validate_accepts_a_plain_clone_as_worktree_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Regression: `herdr worktree create --cwd <repo>` creates a *new* linked worktree
+    elsewhere from `repo` — confirmed empirically against a live herdr server — so `repo` does
+    not need to already be one itself. A plain clone's `.git` is a directory, not a file."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = _write_worktree_job_config(tmp_path, repo)
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    assert "not a git repository" not in capsys.readouterr().err
+
+
+def test_validate_accepts_an_already_linked_worktree_as_worktree_repo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The previously-only-accepted shape must keep working: a linked worktree's `.git` is a
+    file (a pointer to the real gitdir), not a directory."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/repo\n")
+    config_path = _write_worktree_job_config(tmp_path, repo)
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    assert "not a git repository" not in capsys.readouterr().err
+
+
+def test_validate_rejects_a_worktree_repo_with_no_git_at_all(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    config_path = _write_worktree_job_config(tmp_path, repo)
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 1
+    assert "not a git repository" in capsys.readouterr().err
 
 
 def _prepare_tick_cli(

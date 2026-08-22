@@ -219,7 +219,10 @@ Notes on the schema:
   without granting a scheduled agent blanket permissions. That is the v2 direction for `blocked`,
   not `--dangerously-skip-permissions`.
 - `validate` subcommand checks the whole file: unknown keys rejected, cron parseable, `repo` is
-  an existing git worktree root, `agent_kind` is in the kind list, names unique.
+  a git repository (for `workspace: worktree` jobs — `herdr worktree create --cwd <repo>`
+  creates a *new* linked worktree elsewhere from it, so `repo` itself does not need to already
+  be one; a plain clone works exactly like an already-linked worktree here), `agent_kind` is in
+  the kind list, names unique.
 - `model` is passed as a native arg after `--`, using the flag pinned down per `agent_kind` in
   `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `-m` for `opencode`. Config load
   rejects a non-null `model` for any other `agent_kind` rather than guessing its flag.
