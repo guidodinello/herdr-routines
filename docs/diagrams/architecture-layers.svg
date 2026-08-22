@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" color="#16303f" viewBox="0 0 900 440" role="img" aria-label="Layered architecture diagram: an imperative shell of cli.py, tick.py, and runner.py sits above a pure core of config.py, schedule.py, and history.py. runner.py calls the herdr.py adapter, which forks to either a real subprocess calling the herdr CLI and Herdr server, or a FakeRunner used in tests.">
+          <defs>
+            <marker id="a-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
+            </marker>
+          </defs><rect x="0" y="0" width="100%" height="100%" fill="#eceff1"></rect>
+
+          <rect x="20" y="28" width="630" height="132" fill="none" stroke="#7c8f97" stroke-width="1" stroke-dasharray="4 3" rx="3"></rect>
+          <text x="36" y="46" font-family="IBM Plex Mono, Consolas, monospace" font-size="11" letter-spacing="1" fill="#4c6472">IMPERATIVE SHELL</text>
+
+          <rect x="40" y="66" width="170" height="54" fill="#e2e7e9" stroke="currentColor" stroke-width="1.3"></rect>
+          <text x="125" y="98" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="13" fill="currentColor">cli.py</text>
+
+          <rect x="240" y="66" width="170" height="54" fill="#e2e7e9" stroke="currentColor" stroke-width="1.3"></rect>
+          <text x="325" y="98" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="13" fill="currentColor">tick.py</text>
+
+          <rect x="440" y="66" width="170" height="54" fill="#e2e7e9" stroke="currentColor" stroke-width="1.3"></rect>
+          <text x="525" y="98" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="13" fill="currentColor">runner.py</text>
+
+          <line x1="210" y1="93" x2="240" y2="93" stroke="currentColor" stroke-width="1.3" marker-end="url(#a-arrow)"></line>
+          <text x="225" y="82" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="10.5" fill="#4c6472">tick</text>
+
+          <line x1="410" y1="93" x2="440" y2="93" stroke="currentColor" stroke-width="1.3" marker-end="url(#a-arrow)"></line>
+          <text x="425" y="82" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="10.5" fill="#4c6472">execute_run(job)</text>
+
+          <!-- adapter -->
+          <rect x="440" y="176" width="170" height="58" fill="#e2e7e9" stroke="#b97a1e" stroke-width="1.6"></rect>
+          <text x="525" y="200" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="13" fill="#b97a1e">herdr.py</text>
+          <text x="525" y="216" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#4c6472">adapter — shells out</text>
+
+          <line x1="525" y1="120" x2="525" y2="176" stroke="currentColor" stroke-width="1.3" marker-end="url(#a-arrow)"></line>
+          <text x="515" y="152" text-anchor="end" font-family="IBM Plex Mono, Consolas, monospace" font-size="10.5" fill="#4c6472">HerdrClient.*</text>
+
+          <!-- outside our code -->
+          <rect x="670" y="118" width="210" height="76" fill="none" stroke="#7c8f97" stroke-width="1" stroke-dasharray="4 3" rx="3"></rect>
+          <text x="684" y="134" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" letter-spacing="0.5" fill="#7c8f97">OUTSIDE OUR CODE</text>
+          <text x="684" y="156" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="currentColor">herdr CLI + Herdr server</text>
+          <text x="684" y="174" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="currentColor">→ agent pane (CC / OC)</text>
+
+          <path d="M610,197 H645 V156 H670" fill="none" stroke="currentColor" stroke-width="1.3" marker-end="url(#a-arrow)"></path>
+          <text x="650" y="146" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="10.5" fill="#4c6472">subprocess argv</text>
+
+          <!-- fakerunner -->
+          <rect x="670" y="222" width="210" height="58" fill="#e2e7e9" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3"></rect>
+          <text x="775" y="246" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="12.5" fill="currentColor">FakeRunner</text>
+          <text x="775" y="262" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#4c6472">pytest, tier 2</text>
+
+          <path d="M610,214 H645 V251 H670" fill="none" stroke="currentColor" stroke-width="1.3" stroke-dasharray="5 3" marker-end="url(#a-arrow)"></path>
+          <text x="600" y="265" text-anchor="end" font-family="IBM Plex Mono, Consolas, monospace" font-size="10.5" fill="#4c6472">canned response</text>
+
+          <!-- pure core -->
+          <rect x="20" y="320" width="630" height="100" fill="none" stroke="#7c8f97" stroke-width="1" stroke-dasharray="4 3" rx="3"></rect>
+          <text x="36" y="338" font-family="IBM Plex Mono, Consolas, monospace" font-size="11" letter-spacing="1" fill="#4c6472">PURE CORE — FUNCTIONAL CORE</text>
+
+          <rect x="40" y="352" width="170" height="48" fill="#e2e7e9" stroke="currentColor" stroke-width="1.3"></rect>
+          <text x="125" y="381" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="13" fill="currentColor">config.py</text>
+
+          <rect x="240" y="352" width="170" height="48" fill="#e2e7e9" stroke="currentColor" stroke-width="1.3"></rect>
+          <text x="325" y="381" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="13" fill="currentColor">schedule.py</text>
+
+          <rect x="440" y="352" width="170" height="48" fill="#e2e7e9" stroke="currentColor" stroke-width="1.3"></rect>
+          <text x="525" y="381" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="13" fill="currentColor">history.py</text>
+
+          <line x1="325" y1="160" x2="325" y2="320" stroke="#4c6472" stroke-width="1.3" marker-end="url(#a-arrow)"></line>
+          <text x="345" y="248" font-family="IBM Plex Mono, Consolas, monospace" font-size="10.5" fill="#4c6472">load_config ·</text>
+          <text x="345" y="262" font-family="IBM Plex Mono, Consolas, monospace" font-size="10.5" fill="#4c6472">decide · append/read</text>
+        </svg>

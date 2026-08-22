@@ -1,0 +1,34 @@
+# Example herdr-routines job list. Copy to the path resolved by
+# `herdr_routines.config.default_config_path()` (--config, then
+# $HERDR_PLUGIN_CONFIG_DIR/jobs.yaml, then ~/.config/herdr-routines/jobs.yaml) and edit for
+# your own jobs. See docs/plan-v1.md §2 for the full schema.
+#
+# jobs.yaml itself is host-specific (repo: paths are local to whichever machine's Herdr server
+# runs the jobs — see docs/plan-v1.md §3) and is deliberately NOT committed; only this example
+# is.
+
+version: 1
+
+defaults:
+  agent_kind: claude
+  workspace: worktree
+  timeout_ms: 1800000 # 30 min
+  catch_up_minutes: 120
+  timezone: America/Montevideo
+
+jobs:
+  - name: nightly-dep-audit
+    enabled: true
+    cron: "0 3 * * *"
+    repo: /home/guido/projects/fitted
+    workspace: worktree
+    base: main
+    agent_kind: opencode
+    model: null
+    prompt: |
+      Review the dependency tree for known CVEs and unpinned versions.
+      Write your findings to $ROUTINE_REPORT as Markdown. Do not commit or push.
+    timeout_ms: 2700000
+    start_timeout_ms: 120000
+    catch_up_minutes: 120
+    on_missed: log

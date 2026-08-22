@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" color="#16303f" viewBox="0 0 900 560" role="img" aria-label="Side-by-side comparison: a Herdr API change touches herdr.py directly and conditionally touches config.py's kind list and runner.py's status policy, leaving the scheduler and pure core untouched. An agent CLI change touches nothing in this codebase except one dormant, unwired model field, because Herdr absorbs the provider surface first.">
+          <defs>
+            <marker id="c-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="currentColor"></path>
+            </marker>
+          </defs><rect x="0" y="0" width="100%" height="100%" fill="#eceff1"></rect>
+
+          <text x="230" y="24" text-anchor="middle" font-family="IBM Plex Sans Condensed, Arial Narrow, sans-serif" font-weight="600" font-size="15" fill="currentColor">Herdr CLI / API changes</text>
+          <line x1="60" y1="34" x2="400" y2="34" stroke="#b9c4c6" stroke-width="1"></line>
+
+          <text x="670" y="24" text-anchor="middle" font-family="IBM Plex Sans Condensed, Arial Narrow, sans-serif" font-weight="600" font-size="15" fill="currentColor">Agent CLI changes (OpenCode / Claude Code)</text>
+          <line x1="500" y1="34" x2="840" y2="34" stroke="#b9c4c6" stroke-width="1"></line>
+
+          <!-- cause row -->
+          <rect x="60" y="48" width="340" height="34" fill="#b97a1e"></rect>
+          <text x="230" y="70" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">herdr CLI / socket API (the change)</text>
+
+          <rect x="500" y="48" width="340" height="34" fill="#b97a1e"></rect>
+          <text x="670" y="70" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">OpenCode / Claude Code CLI (the change)</text>
+
+          <line x1="230" y1="82" x2="230" y2="104" stroke="currentColor" stroke-width="1.3" marker-end="url(#c-arrow)"></line>
+          <line x1="670" y1="82" x2="670" y2="104" stroke="currentColor" stroke-width="1.3" marker-end="url(#c-arrow)"></line>
+
+          <!-- row helper via manual boxes -->
+          <!-- row 1: systemd units -->
+          <rect x="60" y="108" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
+          <text x="230" y="132" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">systemd timer / service — unaffected</text>
+          <rect x="500" y="108" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
+          <text x="670" y="132" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">systemd timer / service — unaffected</text>
+
+          <!-- row 2: cli/tick -->
+          <rect x="60" y="160" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
+          <text x="230" y="184" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">cli.py / tick.py — unaffected</text>
+          <rect x="500" y="160" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
+          <text x="670" y="184" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">cli.py / tick.py — unaffected</text>
+
+          <!-- row 3: schedule/history -->
+          <rect x="60" y="212" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
+          <text x="230" y="236" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">schedule.py / history.py — unaffected</text>
+          <rect x="500" y="212" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
+          <text x="670" y="236" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">schedule.py / history.py — unaffected</text>
+
+          <!-- row 4: config.py kinds -->
+          <rect x="60" y="264" width="340" height="44" fill="none" stroke="#b97a1e" stroke-width="1.6"></rect>
+          <text x="230" y="284" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#b97a1e">config.py — VALID_AGENT_KINDS</text>
+          <text x="230" y="299" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#4c6472">only if the kind list itself changes</text>
+          <rect x="500" y="264" width="340" height="44" fill="none" stroke="#b97a1e" stroke-width="1.6"></rect>
+          <text x="670" y="284" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#b97a1e">config.py — VALID_AGENT_KINDS</text>
+          <text x="670" y="299" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#4c6472">only if a provider is renamed in herdr</text>
+
+          <!-- row 5: herdr.py -->
+          <rect x="60" y="316" width="340" height="44" fill="#b97a1e"></rect>
+          <text x="230" y="336" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">herdr.py — the whole seam</text>
+          <text x="230" y="351" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#ffffff">argv built here, responses parsed here</text>
+          <rect x="500" y="316" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
+          <text x="670" y="336" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">herdr.py — absorbed by Herdr</text>
+          <text x="670" y="351" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#ffffff">never sees a provider-specific flag</text>
+
+          <!-- row 6: runner status policy -->
+          <rect x="60" y="368" width="340" height="44" fill="none" stroke="#b97a1e" stroke-width="1.6"></rect>
+          <text x="230" y="388" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#b97a1e">runner.py — SUCCESS_AGENT_STATUSES</text>
+          <text x="230" y="403" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#4c6472">only if the status enum itself changes</text>
+          <rect x="500" y="368" width="340" height="44" fill="#3f7d6f" opacity="0.85"></rect>
+          <text x="670" y="388" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11.5" fill="#ffffff">runner.py — unaffected</text>
+
+          <!-- row 7: model field -->
+          <rect x="60" y="420" width="340" height="44" fill="#dcd6c8" stroke="#8a8378" stroke-width="1"></rect>
+          <text x="230" y="440" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11" fill="#16303f">Job.model — not applicable here</text>
+          <rect x="500" y="420" width="340" height="44" fill="#dcd6c8" stroke="#8a8378" stroke-width="1"></rect>
+          <text x="670" y="438" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="11" fill="#16303f">Job.model — parsed, never wired</text>
+          <text x="670" y="453" text-anchor="middle" font-family="IBM Plex Mono, Consolas, monospace" font-size="9.5" fill="#4c6472">dormant regardless of provider changes</text>
+
+          <text x="230" y="500" text-anchor="middle" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="12" fill="#4c6472">→ one seam, one adapter, a two-line blast radius</text>
+          <text x="670" y="500" text-anchor="middle" font-family="IBM Plex Sans, Segoe UI, sans-serif" font-size="12" fill="#4c6472">→ absorbed upstream; nothing to update</text>
+        </svg>
