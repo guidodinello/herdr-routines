@@ -24,7 +24,8 @@ jobs:
     workspace: worktree
     base: main
     agent_kind: opencode
-    model: null
+    model: null # native model flag, e.g. "opencode/big-pickle"; null = agent default.
+                # Only supported for agent_kind claude/opencode (see docs/plan-v1.md §2).
     prompt: |
       Review the dependency tree for known CVEs and unpinned versions.
       Write your findings to $ROUTINE_REPORT as Markdown. Do not commit or push.

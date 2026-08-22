@@ -71,6 +71,48 @@ def test_agent_start_passes_timeout_and_raises_seam() -> None:
     assert "--timeout" in argv and "120000" in argv
 
 
+def test_agent_start_passes_claude_model_via_native_flag() -> None:
+    runner = FakeRunner([ok({"result": {"agent": {"agent_status": "idle"}}})])
+    client = HerdrClient(runner=runner)
+    client.agent_start(
+        name="rt-a",
+        kind="claude",
+        pane_id="w1:p1",
+        start_timeout_ms=120_000,
+        model="opus",
+    )
+    argv = runner.calls[0]
+    assert argv[-3:] == ["--", "--model", "opus"]
+
+
+def test_agent_start_passes_opencode_model_via_native_flag() -> None:
+    runner = FakeRunner([ok({"result": {"agent": {"agent_status": "idle"}}})])
+    client = HerdrClient(runner=runner)
+    client.agent_start(
+        name="rt-a",
+        kind="opencode",
+        pane_id="w1:p1",
+        start_timeout_ms=120_000,
+        model="opencode/big-pickle",
+    )
+    argv = runner.calls[0]
+    assert argv[-3:] == ["--", "-m", "opencode/big-pickle"]
+
+
+def test_agent_start_rejects_model_for_unsupported_kind() -> None:
+    runner = FakeRunner([])
+    client = HerdrClient(runner=runner)
+    with pytest.raises(ValueError, match="codex"):
+        client.agent_start(
+            name="rt-a",
+            kind="codex",
+            pane_id="w1:p1",
+            start_timeout_ms=120_000,
+            model="something",
+        )
+    assert runner.calls == []
+
+
 @pytest.mark.parametrize("status", ["idle", "done"])
 def test_agent_prompt_wait_returns_settled_status_for_success_states(
     status: str,

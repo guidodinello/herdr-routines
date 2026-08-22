@@ -26,8 +26,10 @@ actually using it, rather than trying to design it all up front.
   2026-08-21/22): capture the full transcript to the run-history log as soon as a run finishes,
   then close the pane — but the actual cleanup timing/policy (immediate vs. keep-for-a-week vs.
   manual) still needs a few real runs to get a feel for before locking in.
-- **Model selection per job** — v1 passes whatever native model flag the job config specifies
-  straight through; no validation, catalog, or per-harness default handling yet.
+- **Model selection per job, beyond claude/opencode** — `model` is now wired through to
+  `agent_start` for `agent_kind: claude`/`opencode` (the only two kinds with a pinned-down native
+  flag, see `AGENT_MODEL_FLAGS` in `config.py`). Extending it to the other agent kinds, or adding
+  a model-catalog/existence check, is still open.
 
 ## Explicitly out of scope for now
 

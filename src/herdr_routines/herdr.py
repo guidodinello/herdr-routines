@@ -13,6 +13,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from herdr_routines.config import AGENT_MODEL_FLAGS
+
 HERDR_BIN = "herdr"
 
 # Settle states `agent get`/`agent prompt --wait` can report. Confirmed empirically against
@@ -137,19 +139,21 @@ class HerdrClient:
     # -- agent lifecycle -----------------------------------------------------------------------
 
     def agent_start(
-        self, *, name: str, kind: str, pane_id: str, start_timeout_ms: int
+        self,
+        *,
+        name: str,
+        kind: str,
+        pane_id: str,
+        start_timeout_ms: int,
+        model: str | None = None,
     ) -> None:
-        args = [
-            "agent",
-            "start",
-            name,
-            "--kind",
-            kind,
-            "--pane",
-            pane_id,
-            "--timeout",
-            str(start_timeout_ms),
-        ]
+        args = build_agent_start_args(
+            name=name,
+            kind=kind,
+            pane_id=pane_id,
+            start_timeout_ms=start_timeout_ms,
+            model=model,
+        )
         self._call(args, timeout_s=start_timeout_ms / 1000 + 10)
 
     def agent_prompt_wait(self, *, target: str, text: str, timeout_ms: int) -> str:
@@ -189,6 +193,38 @@ class HerdrClient:
         if body:
             args += ["--body", body]
         self._call(args)
+
+
+def build_agent_start_args(
+    *,
+    name: str,
+    kind: str,
+    pane_id: str,
+    start_timeout_ms: int,
+    model: str | None = None,
+) -> list[str]:
+    """Builds the `agent start` argv (without the leading `herdr` binary). Shared by
+    `HerdrClient.agent_start` and `runner.build_dry_run_argv` so the two can't drift."""
+    args = [
+        "agent",
+        "start",
+        name,
+        "--kind",
+        kind,
+        "--pane",
+        pane_id,
+        "--timeout",
+        str(start_timeout_ms),
+    ]
+    if model is not None:
+        flag = AGENT_MODEL_FLAGS.get(kind)
+        if flag is None:
+            raise ValueError(
+                f"agent kind {kind!r} has no known native model flag "
+                f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
+            )
+        args += ["--", flag, model]
+    return args
 
 
 def _try_parse_json(text: str) -> dict[str, Any] | None:

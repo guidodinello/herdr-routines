@@ -228,6 +228,55 @@ def test_empty_jobs_list_is_valid(tmp_config_path: Path) -> None:
     assert cfg.jobs == ()
 
 
+@pytest.mark.parametrize(
+    "agent_kind,model",
+    [("claude", "opus"), ("opencode", "opencode/big-pickle")],
+)
+def test_model_is_accepted_for_supported_agent_kinds(
+    tmp_config_path: Path, agent_kind: str, model: str
+) -> None:
+    text = f"""
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: {agent_kind}
+    model: {model}
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.model == model
+
+
+def test_model_raises_for_unsupported_agent_kind(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: codex
+    model: some-model
+"""
+    with pytest.raises(ConfigError, match="model"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_non_string_model_raises(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    model: 123
+"""
+    with pytest.raises(ConfigError, match="model"):
+        load_config(write(tmp_config_path, text))
+
+
 def test_no_permission_mode_key_exists_in_schema(tmp_config_path: Path) -> None:
     """Deliberate: v1 has no escape hatch for unattended auto-approve (see docs/plan-v1.md §2)."""
     text = """

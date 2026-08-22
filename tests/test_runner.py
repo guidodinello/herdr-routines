@@ -59,6 +59,7 @@ class ScriptedClient:
         self.report_content = report_content
         self.raise_on = raise_on
         self.calls: list[str] = []
+        self.started_with_model: str | None = None
 
     def worktree_create(self, *, cwd, branch, base, label=None):
         self.calls.append("worktree_create")
@@ -70,8 +71,9 @@ class ScriptedClient:
         self.calls.append("tab_create")
         return self.pane_id
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms):
+    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
         self.calls.append("agent_start")
+        self.started_with_model = model
         if self.raise_on == "agent_start":
             raise HerdrCliError("boom", exit_code=1)
 
@@ -137,6 +139,27 @@ def test_build_dry_run_argv_root_mode(tmp_path: Path) -> None:
     commands = build_dry_run_argv(job, run_id="a-1")
     assert commands[0][:3] == ["herdr", "tab", "create"]
     assert "--label" in commands[0] and job.name in commands[0]
+
+
+def test_build_dry_run_argv_passes_claude_model_flag(tmp_path: Path) -> None:
+    job = make_job(tmp_path, agent_kind="claude", model="opus")
+    commands = build_dry_run_argv(job, run_id="a-1")
+    agent_start_argv = commands[1]
+    assert agent_start_argv[-3:] == ["--", "--model", "opus"]
+
+
+def test_build_dry_run_argv_passes_opencode_model_flag(tmp_path: Path) -> None:
+    job = make_job(tmp_path, agent_kind="opencode", model="opencode/big-pickle")
+    commands = build_dry_run_argv(job, run_id="a-1")
+    agent_start_argv = commands[1]
+    assert agent_start_argv[-3:] == ["--", "-m", "opencode/big-pickle"]
+
+
+def test_execute_run_passes_model_through_to_agent_start(tmp_path: Path) -> None:
+    job = make_job(tmp_path, agent_kind="opencode", model="opencode/big-pickle")
+    client = ScriptedClient()
+    execute_run(job, client, run_id="a-1")  # type: ignore[arg-type]
+    assert client.started_with_model == "opencode/big-pickle"
 
 
 def test_execute_run_success_writes_report(
