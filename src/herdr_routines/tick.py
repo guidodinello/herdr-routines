@@ -8,6 +8,7 @@ import fcntl
 import os
 from collections.abc import Generator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -61,27 +62,41 @@ def tick_lock(path: Path) -> Generator[bool]:
         os.close(fd)
 
 
+@dataclass(frozen=True, slots=True)
+class TickOutcome:
+    """What one `run_tick` call did. `any_job_failed` is what `cli._cmd_tick` maps to a
+    non-zero process exit — it is True only when a job this tick *actually executed* settled
+    on something other than "done" (state `failed` or `interrupted_unknown`), never for a
+    routine scheduling outcome like `missed`/`skipped`/`not due`, so systemd only marks the
+    unit "failed" for a genuine operational problem, not a job that simply wasn't due."""
+
+    summaries: tuple[str, ...]
+    any_job_failed: bool
+
+
 def run_tick(
     config: RoutinesConfig, history_path: Path, *, client: HerdrClient, now: datetime
-) -> list[str]:
-    """Process every enabled job once. Returns a list of human-readable summary lines, one per
-    job that did something (registered/ran/skipped/missed) — used by `tick`'s stdout and by
-    tests. Does not raise for individual job failures; each is captured in its own history
-    record so one bad job cannot prevent the rest from being evaluated."""
+) -> TickOutcome:
+    """Process every enabled job once. Does not raise for individual job failures; each is
+    captured in its own history record so one bad job cannot prevent the rest from being
+    evaluated."""
     summaries: list[str] = []
+    any_job_failed = False
     for job in config.jobs:
         if not job.enabled:
             continue
-        summaries.append(_process_job(job, history_path, client=client, now=now))
-    return summaries
+        summary, failed = _process_job(job, history_path, client=client, now=now)
+        summaries.append(summary)
+        any_job_failed = any_job_failed or failed
+    return TickOutcome(summaries=tuple(summaries), any_job_failed=any_job_failed)
 
 
 def _process_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
-) -> str:
+) -> tuple[str, bool]:
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
-        return f"{job.name}: registered"
+        return f"{job.name}: registered", False
 
     stale = find_stale_running(
         history_path, job.name, timeout_ms=job.timeout_ms, now=now
@@ -100,7 +115,7 @@ def _process_job(
         # Fall through: the stale run no longer blocks this tick from evaluating the schedule.
 
     if is_currently_running(history_path, job.name, timeout_ms=job.timeout_ms, now=now):
-        return f"{job.name}: skipped (already running)"
+        return f"{job.name}: skipped (already running)", False
 
     if _live_agent_exists(client, job):
         append(
@@ -112,7 +127,7 @@ def _process_job(
                 extra={"reason": "agent_name_live"},
             ),
         )
-        return f"{job.name}: skipped (agent already live)"
+        return f"{job.name}: skipped (agent already live)", False
 
     last = last_terminal_run(history_path, job.name)
     # job_registered_at only matters when `last` is None (seen but never finished a run yet) —
@@ -129,7 +144,7 @@ def _process_job(
     )
 
     if result.decision == Decision.NOT_DUE:
-        return f"{job.name}: not due"
+        return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
         extra = {
@@ -149,7 +164,7 @@ def _process_job(
                 body="outside catch-up window",
                 sound="request",
             )
-        return f"{job.name}: missed"
+        return f"{job.name}: missed", False
 
     # Decision.RUN
     assert result.occurrence is not None
@@ -218,7 +233,7 @@ def _process_job(
 
     if outcome.state == "done":
         _notify(client, f"herdr-routines: {job.name} done", sound="done")
-        return f"{job.name}: done"
+        return f"{job.name}: done", False
 
     _notify(
         client,
@@ -226,7 +241,7 @@ def _process_job(
         body=outcome.reason or "unknown",
         sound="request",
     )
-    return f"{job.name}: failed ({outcome.reason})"
+    return f"{job.name}: failed ({outcome.reason})", True
 
 
 def _notify(
