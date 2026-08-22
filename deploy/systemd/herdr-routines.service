@@ -6,6 +6,13 @@ Wants=herdr-server.service
 [Service]
 Type=oneshot
 WorkingDirectory=%h/projects/herdr-routines
+# A systemd --user unit does not inherit your login shell's PATH — only a minimal default
+# (usually /usr/local/bin:/usr/bin:/bin). herdr.py invokes the bare command name "herdr" (not
+# a full path) via subprocess, so without this, every `herdr` call raises FileNotFoundError as
+# soon as `uv run` hands off to herdr-routines, even though `ExecStart`'s own `uv` (given as a
+# full path below) starts fine. %h/.local/bin covers the common `uv tool install`/pipx location
+# for `herdr`; adjust if yours lives elsewhere (check with `command -v herdr` in your login shell).
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=%h/.local/bin/uv run herdr-routines tick
 
 # NOT infinity. A tick blocks for the length of whatever job it runs (agent prompt --wait), so
