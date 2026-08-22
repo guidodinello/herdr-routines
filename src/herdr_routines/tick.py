@@ -14,7 +14,7 @@ from pathlib import Path
 from logger import get_logger
 
 from herdr_routines.config import Job, RoutinesConfig
-from herdr_routines.herdr import HerdrClient, HerdrCliError
+from herdr_routines.herdr import LIVE_AGENT_STATUSES, HerdrClient, HerdrCliError
 from herdr_routines.history import (
     HistoryRecord,
     append,
@@ -243,10 +243,14 @@ def _notify(
 def _live_agent_exists(client: HerdrClient, job: Job) -> bool:
     """Cross-process safety net (docs/plan-v1.md §4): catches a live `rt-<name>` agent that
     survived a lost/rotated history.jsonl, which `is_currently_running` can't see since it
-    reads only history. Fails open on a HerdrCliError (e.g. server unreachable) since the
-    history/flock check above remains the primary guard."""
+    reads only history. "Live" means actually still mid-run (agent_status in
+    LIVE_AGENT_STATUSES), not merely registered — a finished agent stays registered under
+    `herdr agent list` until its tab is closed, so name presence alone would make a recurring
+    job's agent name "live" forever after its first run. Fails open on a HerdrCliError (e.g.
+    server unreachable) since the history/flock check above remains the primary guard."""
     try:
-        return job.agent_name in client.agent_list_names()
+        status = client.agent_statuses().get(job.agent_name)
     except HerdrCliError as e:
         log.warning("%s: could not query live agents, proceeding: %s", job.name, e)
         return False
+    return status in LIVE_AGENT_STATUSES

@@ -26,6 +26,14 @@ AGENT_STATUS_WORKING = "working"
 AGENT_STATUS_BLOCKED = "blocked"
 AGENT_STATUS_UNKNOWN = "unknown"
 
+# The only status that self-clears without outside intervention: an actively-working agent
+# will transition on its own once it settles. idle/done are already settled. "blocked" and
+# "unknown" are sticky under an unattended cron job — nothing in herdr-routines answers a
+# blocked agent's prompt or resolves an unknown state — so treating them as "live" would just
+# move the skip-forever bug (permanently registered, never re-evaluated) rather than fix it.
+# See tick.py's _live_agent_exists.
+LIVE_AGENT_STATUSES = frozenset({AGENT_STATUS_WORKING})
+
 
 class HerdrCliError(Exception):
     """A `herdr` invocation exited non-zero. Carries the parsed JSON error body when there was
@@ -179,10 +187,18 @@ class HerdrClient:
         exit_code, stdout, _stderr = self.runner([self.bin_path, *args], timeout_s=30)
         return stdout if exit_code == 0 else ""
 
-    def agent_list_names(self) -> frozenset[str]:
+    def agent_statuses(self) -> dict[str, str]:
+        """Maps every currently-registered agent name to its `agent_status`. A name stays
+        registered (and shows up here) long after its run has settled to idle/done, until the
+        tab is closed — callers that want "still actively running" must filter by status
+        against LIVE_AGENT_STATUSES, not just check for name presence."""
         body = self._call(["agent", "list"])
         agents = body.get("result", {}).get("agents", [])
-        return frozenset(a.get("name") for a in agents if a.get("name"))
+        return {
+            a["name"]: a["agent_status"]
+            for a in agents
+            if a.get("name") and a.get("agent_status")
+        }
 
     # -- misc -----------------------------------------------------------------------------------
 
