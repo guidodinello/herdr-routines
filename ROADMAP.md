@@ -30,7 +30,7 @@ actually using it, rather than trying to design it all up front.
   `agent_start` for `agent_kind: claude`/`opencode` (the only two kinds with a pinned-down native
   flag, see `AGENT_MODEL_FLAGS` in `config.py`). Extending it to the other agent kinds, or adding
   a model-catalog/existence check, is still open.
-- **A `repository: <git-url>` job field, as an alternative to `repo: <local-path>`** —
+- **`repository: <git-url>` job field** —
   herdr-routines would own the clone lifecycle: idempotent clone-if-missing (likely under
   `~/.local/state/herdr-routines/repos/<name>`), pulled/kept up to date on each run, rather than
   requiring `repo:` to already exist as a checkout on the host. Mainly useful for standing the
