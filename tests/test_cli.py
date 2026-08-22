@@ -1,7 +1,8 @@
 """Tests for the CLI's own validation logic (not the full argparse plumbing — see
-docs/plan-v1.md §7). Covers _check_systemd_timeout, which is the one piece of validate logic
-non-trivial enough to deserve dedicated tests: it guards the TimeoutStartSec trap described in
-docs/plan-v1.md §3.
+docs/plan-v1.md §7). Covers _check_systemd_timeout (the TimeoutStartSec trap described in
+docs/plan-v1.md §3), _cmd_validate's repo/.git check for workspace:worktree jobs, and
+_cmd_tick's exit code (must go non-zero when a job's run genuinely fails, so systemd marks the
+unit "failed" rather than always reporting success).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import pytest
 from herdr_routines import cli
 from herdr_routines.cli import _check_systemd_timeout, _cmd_validate, default_log_path
 from herdr_routines.config import Job, RoutinesConfig
+from herdr_routines.tick import TickOutcome
 
 
 def make_job(tmp_path: Path, timeout_ms: int, name: str = "a") -> Job:
@@ -179,6 +181,39 @@ def test_validate_rejects_a_worktree_repo_with_no_git_at_all(
     config_path = _write_worktree_job_config(tmp_path, repo)
     assert _cmd_validate(_validate_args(config_path, tmp_path)) == 1
     assert "not a git repository" in capsys.readouterr().err
+
+
+def _prepare_tick_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: TickOutcome
+) -> None:
+    monkeypatch.setattr(cli, "default_config_path", lambda: tmp_path / "jobs.yaml")
+    (tmp_path / "jobs.yaml").write_text("version: 1\njobs: []\n")
+    monkeypatch.setattr(cli, "default_history_path", lambda: tmp_path / "history.jsonl")
+    monkeypatch.setattr(cli, "default_lock_path", lambda: tmp_path / "tick.lock")
+    monkeypatch.setattr(cli, "run_tick", lambda *args, **kwargs: outcome)
+
+
+def test_cmd_tick_exits_zero_when_no_job_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _prepare_tick_cli(
+        tmp_path, monkeypatch, TickOutcome(summaries=("a: done",), any_job_failed=False)
+    )
+    assert cli.main(["tick"]) == 0
+
+
+def test_cmd_tick_exits_nonzero_when_a_job_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: `_cmd_tick` used to always `return 0`, even when a job's run genuinely
+    failed (verified 3x on the Pi with the herdr server killed mid-run) — contradicting
+    deploy/README.md's claim that the systemd unit goes "failed" in that case."""
+    _prepare_tick_cli(
+        tmp_path,
+        monkeypatch,
+        TickOutcome(summaries=("a: failed (agent_start_failed)",), any_job_failed=True),
+    )
+    assert cli.main(["tick"]) != 0
 
 
 def test_main_configures_logging_before_parsing_args(
