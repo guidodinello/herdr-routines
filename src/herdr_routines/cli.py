@@ -114,9 +114,10 @@ def _cmd_tick(args: argparse.Namespace) -> int:
             return 0
         now = datetime.now(UTC)
         client = HerdrClient()
-        for line in run_tick(config, history_path, client=client, now=now):
+        outcome = run_tick(config, history_path, client=client, now=now)
+        for line in outcome.summaries:
             log.info(line)
-    return 0
+        return 1 if outcome.any_job_failed else 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
