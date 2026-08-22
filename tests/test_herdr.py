@@ -184,15 +184,19 @@ def test_missing_expected_field_raises() -> None:
         client.agent_get("rt-a")
 
 
-def test_agent_list_names_extracts_names() -> None:
+def test_agent_statuses_maps_names_to_status() -> None:
     body = {
         "result": {
-            "agents": [{"name": "rt-a"}, {"name": "rt-b"}, {"pane_id": "no-name"}]
+            "agents": [
+                {"name": "rt-a", "agent_status": "working"},
+                {"name": "rt-b", "agent_status": "idle"},
+                {"pane_id": "no-name", "agent_status": "idle"},
+            ]
         }
     }
     runner = FakeRunner([ok(body)])
     client = HerdrClient(runner=runner)
-    assert client.agent_list_names() == frozenset({"rt-a", "rt-b"})
+    assert client.agent_statuses() == {"rt-a": "working", "rt-b": "idle"}
 
 
 def test_notification_show_includes_sound_and_optional_body() -> None:
