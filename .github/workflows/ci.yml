@@ -39,9 +39,6 @@ permissions:
   contents: read
 
 jobs:
-# No "Tests (Python)" job yet — this repo has no test suite. Add one (pytest
-# as a dev dependency, a tests/ directory) then bring that job back from the
-# template and add its context to required_status_checks in github-standard.json.
   lint-python:
     name: Lint Python
     runs-on: ubuntu-latest
@@ -61,3 +58,20 @@ jobs:
 
       - name: ruff lint
         run: uv run ruff check .
+
+  test-python:
+    name: Tests (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: pytest
+        run: uv run pytest

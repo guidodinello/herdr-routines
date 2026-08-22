@@ -1,0 +1,10 @@
+[Unit]
+Description=Herdr headless server
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/herdr server
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
