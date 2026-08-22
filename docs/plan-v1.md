@@ -104,6 +104,31 @@ Checked directly against `herdr 0.8.2` on this machine, not from memory:
 
 ---
 
+## Diagrams
+
+Three figures, referenced from the sections below. Source SVGs are in
+[`docs/diagrams/`](diagrams/); each embeds a text alternative for non-visual readers.
+
+![Layered architecture: an imperative shell of cli.py, tick.py, and runner.py above a pure core of config.py, schedule.py, and history.py, with runner.py calling the herdr.py adapter, which forks to either a real subprocess or a FakeRunner used in tests.](diagrams/architecture-layers.svg)
+
+**Fig. A — layers and the adapter seam.** The split discussed in §1: a pure core with no I/O,
+an imperative shell around it, and `herdr.py` as the one adapter that shells out — with two
+implementations, real and faked, behind the same `HerdrClient` interface.
+
+![Sequence of one scheduled run: timer fires, lock acquired and job found due, pane created, agent started, prompt sent and awaited, result verified against report file and settle status, then recorded to history and a notification sent.](diagrams/tick-sequence.svg)
+
+**Fig. B — one tick, traced.** The control flow described across §3–§6, start to finish, for a
+single due job.
+
+![Side-by-side comparison: a Herdr API change touches herdr.py directly and conditionally touches config.py's kind list and runner.py's status policy, leaving the scheduler and pure core untouched. An agent CLI change touches nothing in this codebase except one dormant, unwired model field, because Herdr absorbs the provider surface first.](diagrams/blast-radius.svg)
+
+**Fig. C — blast radius of a Herdr change vs. an agent-CLI change.** The practical payoff of the
+adapter seam: a Herdr API change is a small, localized edit; a provider (OpenCode / Claude Code)
+CLI change reaches this codebase not at all today, since nothing provider-specific is passed
+through yet (see `Job.model`, parsed but not wired into `agent_start`).
+
+---
+
 ## 1. Language & module layout
 
 Python 3.13, this repo's uv setup. Convert the virtual project to a packaged one: add
