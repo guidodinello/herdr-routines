@@ -20,7 +20,8 @@ jobs:
   - name: nightly-dep-audit
     enabled: true
     cron: "0 3 * * *"
-    repo: /home/guido/projects/fitted
+    repo: /home/guido/projects/fitted # a normal clone is fine; `herdr worktree create` makes a
+                                       # new linked worktree elsewhere from it each run
     workspace: worktree
     base: main
     agent_kind: opencode

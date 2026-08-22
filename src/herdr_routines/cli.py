@@ -233,10 +233,15 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     for job in config.jobs:
         if not job.repo.exists():
             problems.append(f"{job.name}: repo path does not exist: {job.repo}")
-        elif job.workspace == "worktree" and not (job.repo / ".git").is_file():
-            # A worktree root's `.git` is a file (pointer to the real gitdir); a normal repo's
-            # `.git` is a directory. `.exists()` alone can't tell them apart.
-            problems.append(f"{job.name}: repo is not a git worktree root: {job.repo}")
+        elif job.workspace == "worktree" and not (job.repo / ".git").exists():
+            # `workspace: worktree` calls `herdr worktree create --cwd <repo>`, which creates a
+            # *new* linked worktree elsewhere (under ~/.herdr/worktrees/) from whatever `repo`
+            # is — confirmed empirically against a live herdr server: a plain clone (`.git` a
+            # directory) works exactly like an already-linked worktree (`.git` a file) here.
+            # `repo` just needs to be a git repo at all, either shape.
+            problems.append(
+                f"{job.name}: repo is not a git repository (no .git): {job.repo}"
+            )
 
     problems += _check_systemd_timeout(config, args.systemd_unit)
 
