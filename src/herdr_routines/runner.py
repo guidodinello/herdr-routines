@@ -185,7 +185,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             start_timeout_ms=job.start_timeout_ms,
             model=job.model,
         )
-    except (HerdrCliError, OSError) as e:
+    except (HerdrCliError, OSError, ValueError) as e:
         return RunOutcome(
             state="failed",
             run_id=run_id,
