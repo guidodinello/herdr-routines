@@ -19,7 +19,8 @@ ExecStart=%h/.local/bin/uv run herdr-routines tick
 # the naive choice is TimeoutStartSec=infinity — but that's a trap: if the herdr server dies or
 # the socket goes away mid-run, an infinity unit never gets reclaimed, and because systemd won't
 # start a second instance of a oneshot service while one is running, one wedged tick would
-# silently disable every job forever. Set this to (largest job timeout_ms + 5 min margin);
-# `herdr-routines validate` checks this file against jobs.yaml and tells you to bump it if it's
-# too low. See docs/plan-v1.md §3.
-TimeoutStartSec=4500
+# silently disable every job forever. Set this to (sum of every enabled job's start+run timeout
+# — jobs can share a tick, so worst case is all of them — plus 5 min margin); `herdr-routines
+# validate` checks this file against jobs.yaml and tells you to bump it if it's too low.
+# See docs/plan-v1.md §3.
+TimeoutStartSec=9600
