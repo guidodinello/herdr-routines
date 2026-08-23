@@ -180,8 +180,11 @@ class RunOutcome:
 
 
 def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
-    """The exact `herdr` command sequence `run --dry-run` prints, without executing anything.
-    Kept in lockstep with `execute_run` below by sharing branch/prompt construction helpers."""
+    """The `herdr` command sequence `run --dry-run` prints for pane creation and agent
+    start/prompt, without executing anything. Kept in lockstep with `execute_run` below
+    by sharing branch/prompt construction helpers. The pre-start reap probe (`agent list`
+    + `pane close`) is intentionally omitted from dry-run output — it is a best-effort
+    cleanup of our own previous settled pane and not part of the run's core argv."""
     report_path = default_reports_dir() / f"{run_id}.md"
     prompt = substitute_prompt(
         job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
@@ -274,21 +277,25 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
     )
 
-    # A recurring job reuses one agent name, and runs intentionally leave their workspace
-    # behind (plan-v1 §6) — so by tomorrow the settled pane from today would make agent start
-    # fail on the duplicate name. Reap our own previous pane first: only when its agent is
-    # settled (never working), and never touching branches (cleanup there stays manual).
-    try:
-        stale_workspace = client.settled_agent_workspace(job.agent_name)
-        if stale_workspace is not None:
-            client.workspace_close(stale_workspace)
-            log.info(
-                "%s: closed stale workspace %s from previous run",
-                job.name,
-                stale_workspace,
-            )
-    except (HerdrCliError, OSError) as e:
-        log.warning("%s: could not reap previous workspace: %s", job.name, e)
+    # A recurring job reuses one agent name, and runs otherwise leave their workspace
+    # behind for inspection (plan-v1 §6 and ROADMAP pane-retention notes defer automatic
+    # branch/workspace GC). By tomorrow the settled pane from today would still make
+    # agent start fail on the duplicate name, so we reap our own previous pane first:
+    # only when its agent is settled to idle/done (never working/blocked/unknown), never
+    # for workspace:root jobs (their tab lives in the shared ambient workspace), and
+    # closing only the single pane (not the whole workspace) to preserve sibling tabs.
+    if job.workspace != "root":
+        try:
+            stale_pane = client.settled_agent_pane(job.agent_name)
+            if stale_pane is not None:
+                client.pane_close(stale_pane)
+                log.info(
+                    "%s: closed stale pane %s from previous run",
+                    job.name,
+                    stale_pane,
+                )
+        except Exception as e:  # noqa: BLE001 — best-effort reap must never break execute_run's never-raises contract
+            log.warning("%s: could not reap previous pane: %s", job.name, e)
 
     try:
         if job.workspace == "worktree":

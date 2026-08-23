@@ -34,6 +34,11 @@ AGENT_STATUS_UNKNOWN = "unknown"
 # See tick.py's _live_agent_exists.
 LIVE_AGENT_STATUSES = frozenset({AGENT_STATUS_WORKING})
 
+# Statuses safe to reap when reusing a recurring job's agent name. Only idle/done are
+# provably settled and will never need human follow-up; blocked (waiting on approval,
+# answerable from bed via herdr-push per plan-v1 §2) and unknown must never be reaped.
+SETTLED_AGENT_STATUSES = frozenset({AGENT_STATUS_IDLE, AGENT_STATUS_DONE})
+
 
 class HerdrCliError(Exception):
     """A `herdr` invocation exited non-zero. Carries the parsed JSON error body when there was
@@ -209,30 +214,93 @@ class HerdrClient:
         registered (and shows up here) long after its run has settled to idle/done, until the
         tab is closed — callers that want "still actively running" must filter by status
         against LIVE_AGENT_STATUSES, not just check for name presence."""
-        body = self._call(["agent", "list"])
-        agents = body.get("result", {}).get("agents", [])
+        body = self._call(["agent", "list"], timeout_s=10)
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        agents = result.get("agents")
+        if not isinstance(agents, list):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
         return {
             a["name"]: a["agent_status"]
             for a in agents
-            if a.get("name") and a.get("agent_status")
+            if isinstance(a, dict) and a.get("name") and a.get("agent_status")
         }
 
     def settled_agent_workspace(self, name: str) -> str | None:
-        """The workspace_id hosting registered agent `name`, if its status is settled. None
-        when the agent is absent or still working — callers use this to reap our own previous
-        run's pane before reusing the name, and must never close a working one."""
-        body = self._call(["agent", "list"])
-        for agent in body.get("result", {}).get("agents", []):
-            if agent.get("name") != name:
+        """The workspace_id hosting registered agent `name`, if its status is settled
+        (idle/done). None when absent, still working, blocked, unknown, or status
+        unreadable — callers must never close a busy or human-blocked pane. Only
+        idle/done are considered settled (see SETTLED_AGENT_STATUSES); blocked/unknown
+        are sticky under cron and must not be reaped."""
+        body = self._call(["agent", "list"], timeout_s=10)
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        agents = result.get("agents")
+        if not isinstance(agents, list):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        # Names are unique only among live agents (plan-v1 empirical notes), so scan
+        # all entries: if any matching agent is live, blocked, unknown, or has an
+        # unreadable status, treat the whole name as not-settled and return None.
+        matched: list[dict[str, object]] = []
+        for agent in agents:
+            if not isinstance(agent, dict) or agent.get("name") != name:
                 continue
-            if agent.get("agent_status") in LIVE_AGENT_STATUSES:
+            matched.append(agent)
+        if not matched:
+            return None
+        for agent in matched:
+            status = agent.get("agent_status")
+            if not isinstance(status, str) or status not in SETTLED_AGENT_STATUSES:
                 return None
-            workspace_id = agent.get("workspace_id")
-            return workspace_id if isinstance(workspace_id, str) else None
-        return None
+        # All matched entries are settled — return the first one's workspace.
+        workspace_id = matched[0].get("workspace_id")
+        return workspace_id if isinstance(workspace_id, str) and workspace_id else None
+
+    def settled_agent_pane(self, name: str) -> str | None:
+        """The pane_id hosting registered agent `name`, if its status is settled
+        (idle/done). None when absent, still working, blocked, unknown, or status
+        unreadable. Narrower than settled_agent_workspace — reaping a single pane
+        preserves sibling tabs/panes the user may have opened to inspect the last run."""
+        body = self._call(["agent", "list"], timeout_s=10)
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        agents = result.get("agents")
+        if not isinstance(agents, list):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        matched: list[dict[str, object]] = []
+        for agent in agents:
+            if not isinstance(agent, dict) or agent.get("name") != name:
+                continue
+            matched.append(agent)
+        if not matched:
+            return None
+        for agent in matched:
+            status = agent.get("agent_status")
+            if not isinstance(status, str) or status not in SETTLED_AGENT_STATUSES:
+                return None
+        pane_id = matched[0].get("pane_id")
+        return pane_id if isinstance(pane_id, str) and pane_id else None
 
     def workspace_close(self, workspace_id: str) -> None:
-        self._call(["workspace", "close", workspace_id])
+        self._call(["workspace", "close", workspace_id], timeout_s=10)
+
+    def pane_close(self, pane_id: str) -> None:
+        self._call(["pane", "close", pane_id], timeout_s=10)
 
     # -- misc -----------------------------------------------------------------------------------
 
