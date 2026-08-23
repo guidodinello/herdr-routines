@@ -199,6 +199,11 @@ jobs:
                               # cold Claude Code/OpenCode boot, esp. on a Pi
     catch_up_minutes: 120
     on_missed: log             # log | notify
+    failure_markers: null      # post-v1 (docs/failure-reaping.md §3.4): list[str] of screen
+                               # markers scanned after a failed prompt wait; null = built-in
+                               # defaults ("Free usage exceeded"). Never put a marker phrase
+                               # in your prompt — the scan skips those to avoid matching the
+                               # prompt echo.
 ```
 
 Notes on the schema:

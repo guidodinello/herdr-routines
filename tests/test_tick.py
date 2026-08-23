@@ -143,6 +143,9 @@ class FakeFullClient:
     def agent_read(self, target, *, lines=200):
         return ""
 
+    def agent_read_visible(self, target, *, lines=200):
+        return ""
+
     def agent_statuses(self) -> dict[str, str]:
         return dict(self._registered)
 
@@ -230,6 +233,9 @@ class FakeClient:
         return self.settle_status
 
     def agent_read(self, target, *, lines=200):
+        return ""
+
+    def agent_read_visible(self, target, *, lines=200):
         return ""
 
     def agent_statuses(self) -> dict[str, str]:

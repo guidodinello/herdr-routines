@@ -265,6 +265,25 @@ def test_agent_read_returns_empty_string_on_failure_rather_than_raising() -> Non
     assert client.agent_read("rt-a") == ""
 
 
+def test_agent_read_visible_builds_expected_argv() -> None:
+    """Failure-path screen capture reads the live viewport (--source visible): herdr rejects
+    recent-unwrapped while an agent is unsettled (agent_not_idle, observed 2026-08-23)."""
+    runner = FakeRunner([(0, "Free usage exceeded", "")])
+    client = HerdrClient(runner=runner)
+    assert client.agent_read_visible("rt-a") == "Free usage exceeded"
+    argv = runner.calls[0]
+    assert argv[1:3] == ["agent", "read"]
+    assert "--source" in argv and "visible" in argv
+    assert "--lines" in argv and "200" in argv
+
+
+def test_agent_read_visible_returns_empty_string_on_failure() -> None:
+    """Same best-effort contract as agent_read: "" on any failure, never a raise."""
+    runner = FakeRunner([(1, "", "some error")])
+    client = HerdrClient(runner=runner)
+    assert client.agent_read_visible("rt-a") == ""
+
+
 # -- settled_agent_* / pane_close tier-2 tests -----------------------------------------------
 
 

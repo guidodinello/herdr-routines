@@ -15,6 +15,9 @@ defaults:
   timeout_ms: 1800000 # 30 min
   catch_up_minutes: 120
   timezone: America/Montevideo
+  # failure_markers: ["Free usage exceeded"] # optional (docs/failure-reaping.md §3.4):
+  #                                          # screen markers scanned after a failed prompt
+  #                                          # wait; omit for the built-in defaults.
 
 jobs:
   - name: nightly-dep-audit

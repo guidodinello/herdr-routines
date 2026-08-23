@@ -35,6 +35,13 @@ READY_POLL_INTERVAL_S = 1.0
 # adjust or zero it out.
 PROMPT_RETRY_DELAYS_S = (5.0, 15.0)
 
+# Screen markers scanned once after a failed prompt wait (docs/failure-reaping.md §3.2). The
+# first observed wedge cause: OpenCode's free-tier limit renders a "Free usage exceeded" modal
+# and retries forever instead of settling. A job's `failure_markers` config overrides this
+# tuple wholesale (config.py); markers appearing verbatim in the job's own prompt are skipped —
+# the visible screen contains the prompt echo, so scanning would self-match.
+DEFAULT_FAILURE_MARKERS: tuple[str, ...] = ("Free usage exceeded",)
+
 
 def _error_body_code(e: HerdrCliError) -> str | None:
     """The parsed error body's error.code when it is a string, else None. Never raises: both
@@ -130,6 +137,51 @@ def _wait_for_agent_ready(
         if time.monotonic() >= deadline:
             return False, last_error
         time.sleep(READY_POLL_INTERVAL_S)
+
+
+def _matched_failure_marker(
+    screen_text: str, markers: tuple[str, ...], prompt_text: str
+) -> str | None:
+    """The first marker visible on screen and not verbatim in the job's own prompt (the
+    visible screen contains the prompt echo — docs/failure-reaping.md §3.2's false-positive
+    guard). Empty screens match nothing."""
+    if not screen_text:
+        return None
+    for marker in markers:
+        if marker and marker in screen_text and marker not in prompt_text:
+            return marker
+    return None
+
+
+def _capture_visible_tail(
+    client: HerdrClient, target: str, *, reports_dir: Path, run_id: str
+) -> str:
+    """Best-effort failure-path diagnostic: read the working agent's visible screen via
+    agent_read_visible (--source visible; recent-unwrapped is rejected while unsettled), write
+    it to {run_id}.tail.txt when non-empty, and return whatever was read so callers can scan
+    it for failure markers without a second read. Never raises."""
+    try:
+        tail = client.agent_read_visible(target, lines=200)
+    except OSError:
+        return ""
+    if tail:
+        try:
+            (reports_dir / f"{run_id}.tail.txt").write_text(tail)
+        except OSError:
+            pass
+    return tail
+
+
+def _reap_failed_run_pane(client: HerdrClient, *, job_name: str, pane_id: str) -> None:
+    """Best-effort close of THIS run's pane after a post-start failure. The pane was created
+    by this very execute_run call, so closing it is ours to do; leaving it behind wedges every
+    future tick on agent_name_live, because a never-settled agent stays "working" and the
+    stale-run reap only touches settled agents (docs/failure-reaping.md §1/§3.1). Never
+    raises — mirrors execute_run's contract."""
+    try:
+        client.pane_close(pane_id)
+    except Exception as e:  # noqa: BLE001 — best-effort reap must never break execute_run's never-raises contract
+        log.warning("%s: could not reap failed run pane %s: %s", job_name, pane_id, e)
 
 
 def default_reports_dir() -> Path:
@@ -322,6 +374,12 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             model=job.model,
         )
     except (HerdrCliError, OSError, ValueError) as e:
+        # Our pane, dead run: leave nothing behind to wedge later ticks on agent_name_live
+        # (docs/failure-reaping.md §3.1).
+        _capture_visible_tail(
+            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
+        _reap_failed_run_pane(client, job_name=job.name, pane_id=pane_id)
         return RunOutcome(
             state="failed",
             run_id=run_id,
@@ -344,6 +402,10 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         )
         if last_poll_error:
             error = f"{error}; last poll error: {last_poll_error}"
+        _capture_visible_tail(
+            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
+        _reap_failed_run_pane(client, job_name=job.name, pane_id=pane_id)
         return RunOutcome(
             state="failed",
             run_id=run_id,
@@ -363,11 +425,29 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             timeout_ms=job.timeout_ms,
         )
     except (HerdrCliError, OSError) as e:
+        # The wedge case: the prompt was delivered but the agent never settled (e.g. an
+        # OpenCode quota modal retry-looping forever). Capture what's on screen, classify
+        # quota exhaustion from it, then close our pane — otherwise every future tick skips
+        # this job forever (docs/failure-reaping.md §1).
+        screen_tail = _capture_visible_tail(
+            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
+        # `is not None`, not truthiness: an explicit empty failure_markers list is valid config
+        # meaning "scan nothing" — `or` would silently fall back to the defaults (PR #25 review).
+        markers = (
+            job.failure_markers
+            if job.failure_markers is not None
+            else DEFAULT_FAILURE_MARKERS
+        )
+        marker = _matched_failure_marker(screen_tail, markers, prompt)
+        reason = "quota_exhausted" if marker else "agent_prompt_failed"
+        error = f"failure marker matched: {marker!r}" if marker else str(e)
+        _reap_failed_run_pane(client, job_name=job.name, pane_id=pane_id)
         return RunOutcome(
             state="failed",
             run_id=run_id,
-            reason="agent_prompt_failed",
-            error=str(e),
+            reason=reason,
+            error=error,
             agent_name=job.agent_name,
             pane_id=pane_id,
             branch=branch,
@@ -409,7 +489,13 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
 
     if settled_status not in SUCCESS_AGENT_STATUSES:
         # "working" here means agent_prompt_wait's --wait settled on something that isn't a
-        # completion signal — treat as interrupted/unclear rather than success.
+        # completion signal — treat as interrupted/unclear rather than success, and close our
+        # pane: herdr still classifies the agent as live, so leaving it behind wedges the job
+        # exactly like the prompt-failed path (docs/failure-reaping.md §3.1).
+        _capture_visible_tail(
+            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
+        _reap_failed_run_pane(client, job_name=job.name, pane_id=pane_id)
         return RunOutcome(
             state="failed", reason=f"unsettled_status_{settled_status}", **common
         )

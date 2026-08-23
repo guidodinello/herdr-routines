@@ -57,6 +57,7 @@ class ScriptedClient:
         write_report_at: Path | None = None,
         report_content: str = "# Report\n\nFindings.\n",
         raise_on: str | None = None,
+        visible_screen: str = "",
     ) -> None:
         self.pane_id = pane_id
         self.agent_status = agent_status
@@ -69,6 +70,7 @@ class ScriptedClient:
         self.write_report_at = write_report_at
         self.report_content = report_content
         self.raise_on = raise_on
+        self.visible_screen = visible_screen
         self.calls: list[str] = []
         self.closed_workspaces: list[str] = []
         self.closed_panes: list[str] = []
@@ -130,6 +132,10 @@ class ScriptedClient:
     def agent_read(self, target, *, lines=200):
         self.calls.append("agent_read")
         return "some tail output"
+
+    def agent_read_visible(self, target, *, lines=200):
+        self.calls.append("agent_read_visible")
+        return self.visible_screen
 
 
 @pytest.fixture(autouse=True)
@@ -308,7 +314,11 @@ def test_execute_run_agent_start_failure_short_circuits(tmp_path: Path) -> None:
         "settled_agent_pane",
         "worktree_create",
         "agent_start",
+        "agent_read_visible",
+        "pane_close",
     ]
+    # The failed run's own pane is reaped so no later tick can wedge on agent_name_live.
+    assert client.closed_panes == ["w1:p1"]
 
 
 def test_execute_run_prompt_failure_short_circuits(
@@ -326,6 +336,8 @@ def test_execute_run_prompt_failure_short_circuits(
         "agent_start",
         "agent_interactive_ready",
         "agent_prompt_wait",
+        "agent_read_visible",
+        "pane_close",
     ]
 
 
@@ -602,6 +614,7 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
         "agent_interactive_ready",
         "agent_prompt_wait",
         "agent_read",
+        "agent_read_visible",
     ):
         assert hasattr(HerdrClient, name)
 
@@ -681,3 +694,162 @@ def test_execute_run_survives_unexpected_reap_exception(
     client = ExplodingClient(write_report_at=report_path)
     outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
     assert outcome.state == "done"
+
+
+# -- failure reaping & quota classification (docs/failure-reaping.md) -------------------------
+
+
+class QuotaWedgeClient(ScriptedClient):
+    """The 2026-08-23 Pi wedge, replayed: the prompt was delivered but the agent never
+    settled — OpenCode rendered its free-quota modal and retries forever — so the settle-wait
+    raises the non-retryable timeout signature while the modal sits on screen."""
+
+    def agent_prompt_wait(self, *, target, text, timeout_ms):
+        self.calls.append("agent_prompt_wait")
+        raise HerdrCliError(
+            "timed out waiting for agent status",
+            exit_code=1,
+            error_body={"error": {"code": "timeout", "message": "timed out"}},
+        )
+
+
+def test_settle_timeout_with_quota_marker_is_quota_exhausted(
+    tmp_path: Path,
+    _isolated_reports_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the overnight wedge: a settle timeout with the quota modal on screen
+    classifies as quota_exhausted, leaves the screen tail as evidence, and reaps the pane."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ())
+    job = make_job(tmp_path)
+    run_id = "a-quota"
+    client = QuotaWedgeClient(
+        visible_screen="Free usage exceeded, subscribe to Go [retrying in 3h 35m attempt #1]"
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert "'Free usage exceeded'" in (outcome.error or "")
+    # Evidence lands before the reap; nothing touches the agent after the close.
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.exists() and "Free usage exceeded" in tail_path.read_text()
+    assert client.calls.index("agent_read_visible") < client.calls.index("pane_close")
+    assert client.calls[-1] == "pane_close"
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_settle_timeout_without_marker_stays_agent_prompt_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty/irrelevant screen keeps the plain agent_prompt_failed classification."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ())
+    job = make_job(tmp_path)
+    client = QuotaWedgeClient(visible_screen="")
+    outcome = execute_run(job, client, run_id="a-plain")  # type: ignore[arg-type]
+    assert outcome.reason == "agent_prompt_failed"
+    assert "timed out waiting for agent status" in (outcome.error or "")
+
+
+def test_marker_in_own_prompt_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The visible screen contains our own prompt echo, so a marker appearing verbatim in the
+    prompt must not classify the run as quota exhaustion (§3.2's false-positive guard)."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ())
+    job = make_job(
+        tmp_path,
+        prompt="Never print the phrase Free usage exceeded. Write $ROUTINE_REPORT.",
+    )
+    client = QuotaWedgeClient(visible_screen="Free usage exceeded is forbidden here")
+    outcome = execute_run(job, client, run_id="a-guard")  # type: ignore[arg-type]
+    assert outcome.reason == "agent_prompt_failed"
+
+
+def test_custom_failure_markers_override_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ())
+    job = make_job(tmp_path, failure_markers=("Out of credits",))
+    client = QuotaWedgeClient(
+        visible_screen="Free usage exceeded\nOut of credits — retrying"
+    )
+    outcome = execute_run(job, client, run_id="a-custom")  # type: ignore[arg-type]
+    assert outcome.reason == "quota_exhausted"
+    assert "'Out of credits'" in (outcome.error or "")
+
+
+def test_explicit_empty_failure_markers_disable_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit empty list is valid config meaning 'scan nothing' — it must NOT fall back
+    to the defaults via falsy-`or` (found by the muse review on this very PR)."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ())
+    job = make_job(tmp_path, failure_markers=())
+    client = QuotaWedgeClient(visible_screen="Free usage exceeded")
+    outcome = execute_run(job, client, run_id="a-empty")  # type: ignore[arg-type]
+    assert outcome.reason == "agent_prompt_failed"
+
+
+def test_agent_not_interactive_reaps_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    job = make_job(tmp_path, start_timeout_ms=50)
+    client = ScriptedClient(interactive_ready=False, visible_screen="partial boot")
+    outcome = execute_run(job, client, run_id="a-unready")  # type: ignore[arg-type]
+    assert outcome.reason == "agent_not_interactive"
+    assert "pane_close" in client.calls
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_blocked_status_keeps_pane_alive(tmp_path: Path) -> None:
+    """blocked is answerable from bed via herdr-push (ROADMAP Next) — never reaped, and it is
+    a settled state so the recent-unwrapped success-path tail still works."""
+    job = make_job(tmp_path)
+    client = ScriptedClient(agent_status="blocked")
+    outcome = execute_run(job, client, run_id="a-blocked")  # type: ignore[arg-type]
+    assert outcome.reason == "blocked"
+    assert "pane_close" not in client.calls
+    assert "agent_read_visible" not in client.calls
+
+
+def test_unknown_status_keeps_pane_alive(tmp_path: Path) -> None:
+    """interrupted_unknown is the evidence-preservation bucket (plan-v1 §4) — no reaping."""
+    job = make_job(tmp_path)
+    client = ScriptedClient(agent_status="unknown")
+    outcome = execute_run(job, client, run_id="a-unknown")  # type: ignore[arg-type]
+    assert outcome.state == "interrupted_unknown"
+    assert "pane_close" not in client.calls
+    assert "agent_read_visible" not in client.calls
+
+
+def test_defensive_unsettled_status_reaps_pane(tmp_path: Path) -> None:
+    """A post-wait 'working' status means herdr still classifies the agent as live — leaving
+    it behind wedges the job exactly like the prompt-failed path (§3.1's defensive row)."""
+    job = make_job(tmp_path)
+    client = ScriptedClient(agent_status="working", visible_screen="still going")
+    outcome = execute_run(job, client, run_id="a-working")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "unsettled_status_working"
+    assert client.calls.index("agent_read_visible") < client.calls.index("pane_close")
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_failed_pane_close_never_breaks_execute_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pane_close failure at reap time degrades to today's behavior (warning + leftover
+    pane), never to a crash — execute_run's never-raises contract (§5)."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ())
+
+    class UnreapableWedge(QuotaWedgeClient):
+        def pane_close(self, pane_id):
+            self.calls.append("pane_close")
+            raise HerdrCliError("server went away", exit_code=1)
+
+    job = make_job(tmp_path)
+    client = UnreapableWedge(visible_screen="Free usage exceeded")
+    outcome = execute_run(job, client, run_id="a-noreap")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert "pane_close" in client.calls

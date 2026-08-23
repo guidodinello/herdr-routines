@@ -192,6 +192,25 @@ class HerdrClient:
         exit_code, stdout, _stderr = self.runner([self.bin_path, *args], timeout_s=30)
         return stdout if exit_code == 0 else ""
 
+    def agent_read_visible(self, target: str, *, lines: int = 200) -> str:
+        """agent_read against the currently-rendered viewport (`--source visible`). While an
+        agent is unsettled herdr rejects recent-unwrapped reads with agent_not_idle — observed
+        live 2026-08-23 ("alternate-screen history can only be captured by scrolling while
+        idle") — and failure-path agents are definitionally unsettled, so post-mortem screen
+        capture needs this variant. Same best-effort contract as agent_read: "" on any
+        failure."""
+        args = [
+            "agent",
+            "read",
+            target,
+            "--source",
+            "visible",
+            "--lines",
+            str(lines),
+        ]
+        exit_code, stdout, _stderr = self.runner([self.bin_path, *args], timeout_s=30)
+        return stdout if exit_code == 0 else ""
+
     def agent_interactive_ready(self, target: str) -> bool:
         """True when the target agent's TUI reports itself ready to accept typed input.
         Prompting before readiness fails server-side (~5s in, EmptyResponse) — observed live
