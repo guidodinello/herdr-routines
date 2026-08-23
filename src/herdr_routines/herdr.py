@@ -187,6 +187,15 @@ class HerdrClient:
         exit_code, stdout, _stderr = self.runner([self.bin_path, *args], timeout_s=30)
         return stdout if exit_code == 0 else ""
 
+    def agent_interactive_ready(self, target: str) -> bool:
+        """True when the target agent's TUI reports itself ready to accept typed input.
+        Prompting before readiness fails server-side (~5s in, EmptyResponse) — observed live
+        against OpenCode and Claude TUIs seconds after start (Pi deploy 2026-08-22). A response
+        without the flag is treated as ready (fail-open) so older herdr builds keep working."""
+        body = self._call(["agent", "get", target])
+        ready = body.get("result", {}).get("agent", {}).get("interactive_ready")
+        return ready if isinstance(ready, bool) else True
+
     def agent_statuses(self) -> dict[str, str]:
         """Maps every currently-registered agent name to its `agent_status`. A name stays
         registered (and shows up here) long after its run has settled to idle/done, until the

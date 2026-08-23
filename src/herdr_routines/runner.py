@@ -5,6 +5,7 @@ contract and the post-run verification rationale.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,30 @@ from herdr_routines.herdr import HerdrClient, HerdrCliError, build_agent_start_a
 # "done" is kept in case SKILL.md's seen/unseen distinction applies under some other condition
 # not exercised by the step-5 probe. See docs/plan-v1.md.
 SUCCESS_AGENT_STATUSES = frozenset({"idle", "done"})
+
+# How often _wait_for_agent_ready re-checks `agent get` while waiting for the agent's TUI to
+# accept typed input. Module-level so tests can zero it out.
+READY_POLL_INTERVAL_S = 1.0
+
+
+def _wait_for_agent_ready(
+    client: HerdrClient, target: str, *, timeout_s: float
+) -> bool:
+    """Blocks until the agent reports interactive_ready, or False once timeout_s elapses.
+    `agent start` returns as soon as the process is detected, but the TUI needs another few
+    seconds before typed input is delivered; prompting earlier makes the server-side
+    agent.prompt fail (EmptyResponse) and the run dies as agent_prompt_failed. Polling errors
+    are swallowed — a transiently unreachable server must not abort the wait."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            if client.agent_interactive_ready(target):
+                return True
+        except HerdrCliError:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(READY_POLL_INTERVAL_S)
 
 
 def default_reports_dir() -> Path:
@@ -191,6 +216,25 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             run_id=run_id,
             reason="agent_start_failed",
             error=str(e),
+            pane_id=pane_id,
+            branch=branch,
+        )
+
+    # The prompt must not race the TUI's own startup (see _wait_for_agent_ready): reuse
+    # start_timeout_ms as the readiness bound since both describe "how long agent startup
+    # may take".
+    if not _wait_for_agent_ready(
+        client, job.agent_name, timeout_s=job.start_timeout_ms / 1000
+    ):
+        return RunOutcome(
+            state="failed",
+            run_id=run_id,
+            reason="agent_not_interactive",
+            error=(
+                f"agent {job.agent_name} did not report interactive_ready within "
+                f"{job.start_timeout_ms}ms of start"
+            ),
+            agent_name=job.agent_name,
             pane_id=pane_id,
             branch=branch,
         )
