@@ -273,3 +273,88 @@ def test_validate_stays_silent_when_prompt_targets_the_report(
     )
     assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
     assert "$ROUTINE_REPORT" not in capsys.readouterr().err
+
+
+def test_validate_does_not_warn_for_disabled_job_missing_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Blocking review finding on PR #18: the $ROUTINE_REPORT warning must not fire for
+    disabled jobs — disabling is the natural mitigation for a known-broken prompt."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: a\n"
+        f"    cron: '0 3 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    workspace: worktree\n"
+        f"    enabled: false\n"
+        f"    prompt: Review the oldest PR and stop.\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    assert "$ROUTINE_REPORT" not in capsys.readouterr().err
+
+
+def test_validate_empty_prompt_gets_distinct_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Non-blocking finding on PR #18: an omitted/empty prompt defaults to "" (config.py:87)
+    and fails earlier as agent_prompt_failed, so the misdiagnosis as no_report is fixed."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = tmp_path / "jobs.yaml"
+    # Omit prompt entirely -> defaults to "" via config.py:_JOB_DEFAULTS.
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: a\n"
+        f"    cron: '0 3 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    workspace: worktree\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    err = capsys.readouterr().err
+    assert "$ROUTINE_REPORT" in err
+    assert "prompt is empty" in err
+    assert "no_report" not in err
+
+
+def test_validate_whitespace_prompt_gets_empty_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: a\n"
+        f"    cron: '0 3 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    workspace: worktree\n"
+        f'    prompt: "   "\n'
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    err = capsys.readouterr().err
+    assert "prompt is empty" in err
+
+
+def test_validate_disabled_empty_prompt_stays_silent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: a\n"
+        f"    cron: '0 3 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    workspace: worktree\n"
+        f"    enabled: false\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    assert "$ROUTINE_REPORT" not in capsys.readouterr().err

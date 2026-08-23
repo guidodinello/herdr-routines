@@ -253,7 +253,7 @@ def test_no_failure_for_a_successful_run(
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
-    t1 = t0.replace(minute=(t0.minute + 1) % 60)
+    t1 = t0 + timedelta(minutes=1)
     outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
 
     assert outcome.summaries == ("a: done",)
@@ -274,7 +274,7 @@ def test_failure_flagged_when_a_due_job_actually_fails(
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
-    t1 = t0.replace(minute=(t0.minute + 1) % 60)
+    t1 = t0 + timedelta(minutes=1)
     outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
 
     assert outcome.summaries == ("a: failed (agent_start_failed)",)

@@ -222,7 +222,10 @@ Notes on the schema:
   a git repository (for `workspace: worktree` jobs — `herdr worktree create --cwd <repo>`
   creates a *new* linked worktree elsewhere from it, so `repo` itself does not need to already
   be one; a plain clone works exactly like an already-linked worktree here), `agent_kind` is in
-  the kind list, names unique.
+  the kind list, names unique. It also emits soft warnings (exit code unchanged) when an
+  *enabled* job's prompt never mentions `$ROUTINE_REPORT` — empty prompts get a distinct
+  message since they fail earlier as `agent_prompt_failed` rather than `no_report` — and
+  checks the systemd unit's `TimeoutStartSec` covers the worst-case tick duration.
 - `model` is passed as a native arg after `--`, using the flag pinned down per `agent_kind` in
   `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `-m` for `opencode`. Config load
   rejects a non-null `model` for any other `agent_kind` rather than guessing its flag.
@@ -391,7 +394,10 @@ CLI:
 - `herdr-routines status` — one line per job: last run, its state, and whether it's due — not
   the next scheduled occurrence, since `status` only looks backward over `(since, now]`.
 - `herdr-routines history <job> [-n N] [--json]` — recent runs for one job.
-- `herdr-routines validate` — config check, exits non-zero on error. Also used in CI.
+- `herdr-routines validate` — config check, exits non-zero only on errors; soft warnings
+  (e.g. an enabled job's prompt never mentioning `$ROUTINE_REPORT`, or empty) are printed to
+  stderr as `warning:` without changing the exit code, and the systemd unit's
+  `TimeoutStartSec` is checked when the unit file exists. Also used in CI.
 - `herdr-routines run <job> [--dry-run]` — force one run now, ignoring the schedule.
   `--dry-run` prints the exact `herdr` argv it would execute and exits. This is the debugging
   tool that makes §7 tier-3 verification tractable.
