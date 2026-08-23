@@ -63,10 +63,18 @@ Hardcoded stages (mirrors spec §3, stages mirror
 
 Stage rules copied from spec §3: tests before code (stage 3 done = every
 acceptance test exists and passes), comment-addressal capped at 2 iterations +
-**wait-for-comments 60 min** (audit gap 13: previously unspecified `spec:51`),
-human gate stays at merge. Stage 5 code-review skill is multi-agent (5
-reviewers) — for v1 run as single worker session; full 5-reviewer fan-out is v2
-if needed (audit gap 13).
+**wait-for-comments 60 min** (audit gap 13: previously unspecified `spec:51`) —
+poll `gh pr view --json comments` (or `reviews` per G-3) every **5 min** for
+60 min after stage 5 settles; gate stage 6 on the review's `blocking` findings,
+not on arbitrary human comments arriving later; after 60 min with no review,
+abort with partial report (G-12). Human gate stays at merge. Stage 5 code-review
+skill is multi-agent (5 reviewers) — for v1 run as single worker session; full
+5-reviewer fan-out is v2 if needed (audit gap 13).
+
+**Spec leakage (G-13):** stage 1's `spec.md` commit(s) on `auto/pipeline-<run_id>`
+ride the PR opened in stage 4. Document as intentional — prefix spec commits
+`spec:` so reviewers can trivially filter them. Stripping `spec.md` before PR is
+not needed for dogfood.
 
 ## Handoff contract (single shared branch — audit gap 1)
 
@@ -78,7 +86,7 @@ herdr worktree create --cwd <parent-clone> --base main --branch auto/pipeline-<r
 # → shared path: ~/.herdr/worktrees/<branch> (recorded in state.json: shared_worktree, branch)
 ```
 
-* Every worker attaches to that same path (either `herdr tab create --workspace <shared_ws>` or `herdr worktree create --cwd <shared_worktree>` reuse — no fresh `--base main` per stage). Fresh **sessions** give independence, not fresh worktrees.
+* Every worker attaches to that same path via `herdr tab create --workspace "$SHARED_WS" --cwd "$WT"` (new tab in the shared workspace, cwd pinned to the shared worktree — verified `herdr tab create` syntax `herdr tab:12`). **Do not** use `herdr worktree create --cwd <shared_worktree>` to "reuse" — that form is invalid per `herdr worktree:3` (expects `--cwd` of an existing repo to link *from* plus `--branch` for a *new* worktree; pointing it at an already-linked worktree errors or duplicates branch) — G-6. Fresh **sessions** give independence, not fresh worktrees.
 * Stage 1 must `git add spec.md && git commit -m "spec: v1 for <feature>"` before settling — untracked files do not cross worktree boundaries (git shares object store, not untracked files). Stage 2 then sees the committed spec.
 * Stage 3 continues on the same branch (commits implementation + tests); stage 4 PRs that same branch. Artifacts: `spec.md`, `state.json`, `$PIPELINE_REPORT` (all on the shared worktree; `$PIPELINE_REPORT` also mirrored to `~/.local/state/herdr-routines/reports/<run_id>.md` for the notification layer). Every worker prompt names input files explicitly — workers never rely on prior-session context, only on disk.
 
@@ -103,13 +111,23 @@ fresh worktree does not show another worktree's untracked files.
   full overnight command surface, or the first un-allowlisted call wedges as
   `blocked` at 03:00 (same class as `docs/failure-reaping.md:1`, `roadmap:54-61`):
   - `herdr` (spawn/poll/close), `git` (commit/add/log/rev-parse), `gh` (pr
-    create/view/api + thread resolve), `uv`/`pytest`/`ruff`, `rg`/`jq`/`column`
+    create/view/api/graphql + thread resolve), `uv`/`pytest`/`ruff`, `rg`/`jq`/`column`,
+    `herdr notification show` (deadline path)
   - `permission.external_directory` for `~/.config/herdr/herdr.sock`,
-    `~/.local/state/herdr-routines/`, `~/.local/state/herdr/` and the
-    on-demand clone cache dir (if stage 5 ever clones cross-repo — same fix as
+    `~/.local/state/herdr-routines/`, `~/.local/state/herdr/`, the shared
+    worktree `~/.herdr/worktrees/auto/pipeline-*`, the report dir
+    `~/.local/state/herdr-routines/reports/` and the on-demand clone cache
+    dir (if stage 5 ever clones cross-repo — same fix as
     `raspberrypi/troubleshooting-log.md` external-directory `blocked`).
-  Replicate the allowlist to the Pi's `~/.config/opencode/opencode.json` before
-  the first overnight run and verify with a manual blocked-prompt dry-run.
+  - `GH_TOKEN` / `gh auth status` must be valid on the Pi — `gh pr create` and
+    `gh api graphql` fail differently when unauthenticated and surface at 03:00
+    as gate-4/6 failures, not permission wedges (G-5).
+  **Transcription note (G-5 verification):** current `~/.config/opencode/opencode.json:3`
+  only shows `permission.external_directory`; opencode's per-command `permissions` are
+  pattern-based (e.g. `bash:herdr *` vs `bash:gh api *` are distinct) — the bullet
+  list is an inventory checklist, not copy-paste JSON. Translate to actual
+  `permissions` patterns and run one manual pipeline stage on the Pi under the
+  real allowlist to confirm no `blocked` wedge before the overnight run.
 - **Polling hygiene (audit gap 6):** do not hot-poll `herdr agent get` every
   30–60s (≈50–80 tool calls per 39-min review, burning orchestrator context).
   Instead: `nohup herdr agent prompt <worker> --wait --timeout <ms> > <stage>.result.json 2>&1 &`
@@ -118,21 +136,17 @@ fresh worktree does not show another worktree's untracked files.
   tens of minutes, the detached form is required — verify at build time (audit
   open question 3). One `agent prompt --wait` per stage is the cheap primitive
   (`docs/plan-v1.md:65`), not dozens of `agent get`.
-- **Checkpointing & resume (audit gap 7):** `state.json`
-  (`{current_stage, pr_number, artifact_paths, shared_worktree, branch, run_id}`)
-  updated after every stage transition. `$PIPELINE_REPORT` written at end
-  regardless of outcome (stage-by-stage status, artifacts, where it stopped and
-  why) — same pattern as `$ROUTINE_REPORT` in `docs/plan-v1.md:386`. **Resume
-  recipe:** on relaunch read `state.json` → `herdr agent list | rg "pl-"` to
-  reconcile live `pl-<stage>-<run_id>` agents → adopt still-working worker or
-  reap stragglers before re-spawning. Crash between spawn and state-write:
-  handle duplicate-name collision via reap-before-spawn.
-- **Pipeline deadline (audit gap 5):** hard wall-clock budget, e.g. launch + 7 h
-  (tune to overnight window; audit open question 4). When exceeded, finish the
-  current stage, write a **partial** `$PIPELINE_REPORT` and fire
-  `herdr notification show --sound request` — since the report is "at end
-  regardless" (`design:93`), an overrunning night with no deadline yields no
-  report at all. Worst case 6×90 min + 2 loops >10 h without a deadline.
+- **Checkpointing & resume (audit gap 7 + G-9):** `state.json`
+  (`{current_stage, pr_number, artifact_paths, shared_worktree, branch, run_id, deadline_epoch}`)
+  updated **atomically** (write to temp + rename) after every stage transition.
+  `$PIPELINE_REPORT` written at end regardless of outcome (stage-by-stage
+  status, artifacts, where it stopped and why) — same pattern as
+  `$ROUTINE_REPORT` in `docs/plan-v1.md:386`. **Resume recipe:** on relaunch
+  read `state.json` → `herdr agent list | jq -r '.result.agents[] | select(.name | startswith("pl-")) | "\(.name) \(.agent_status)"'` (not `rg "pl-"` on JSON — G-9) to reconcile live `pl-<stage>-<run_id>` agents. Derive orphan stage from agent name suffix when `state.json:current_stage` lags spawn (crash between `herdr agent prompt` and state write). Adopt still-`working` worker if stage matches, otherwise `herdr pane close <pane_id>` (pane_close, not settled-agent reap — reaping `working` requires `pane_close` per `src/herdr_routines/herdr.py:34`). Atomic write prevents corrupt resume on crash mid-write.
+- **Pipeline deadline (audit gap 5 + G-7):** hard wall-clock budget **launch + 7 h**
+  (pinned default, written to `state.json:deadline_epoch` at orchestrator start;
+  tune via open question 4). Orchestrator checks `date +%s` vs `deadline_epoch`
+  between stages; when exceeded, **wait for the in-flight `herdr agent prompt --wait` to return** (do not kill mid-implementation), then skip remaining stages and write a **partial** `$PIPELINE_REPORT` + `herdr notification show --sound request` — since the report is "at end regardless" (`design:93`), an overrunning night with no deadline yields no report at all. Worst case 6×90 min + 2 loops >10 h without a deadline. `systemd-run --timeout 25200000` is a per-worker prompt timeout, not the pipeline deadline — wire `deadline_epoch` separately.
 - **Quota handling (audit gap 4):** worker quota death already has timeout
   backstop (`design:109-112`); add reaping's visible-screen scan on settle-timeout:
   `herdr agent read <worker> --source visible --lines 200 | rg "Free usage exceeded"`
@@ -143,12 +157,16 @@ fresh worktree does not show another worktree's untracked files.
   report). Accept for v1 but add morning checklist: "no report file ⇒ check
   `systemctl --user status` + `herdr agent list`" and keep v2 provider/model
   failover in Parking Lot (`roadmap:126-129`).
-- **Cleanup (audit gap 12):** after `$PIPELINE_REPORT` is written and artifacts
-  are committed/copied out, close worker panes/workspaces (`herdr workspace close`
-  / `herdr worktree remove`); **keep the PR branch** `auto/pipeline-<run_id>`
-  (aligns with manual GC stance `roadmap:77-79`). Order matters: artifacts out
-  before workspace close. Leaked live `pl-*` agents were the central incident
-  of reaping §1.
+- **Cleanup (audit gap 12 + G-10):** after `$PIPELINE_REPORT` is mirrored to
+  `~/.local/state/herdr-routines/reports/<run_id>.md` and commits are on
+  `auto/pipeline-<run_id>`, **close each worker's tab/pane** (`herdr tab close` /
+  `herdr pane` close) — **do not** `herdr workspace close` the shared workspace
+  nor `herdr worktree remove` the shared worktree (that would destroy the branch
+  to keep). Order: (1) mirror report + ensure `auto/pipeline-<run_id>` has all
+  commits, (2) close worker tabs/panes, (3) leave shared worktree+branch for
+  manual GC per `roadmap:77-79`. Leaked live `pl-*` agents were the central
+  incident of reaping §1. Future `herdr-routines gc` must exclude `auto/pipeline-*`
+  (G-14).
 
 ## Worker spawning (what must be ported, not rediscovered)
 
@@ -171,7 +189,11 @@ Mechanically solved — same `herdr` CLI calls `src/herdr_routines/herdr.py` +
    §5, not SKILL.md's `done`/`idle` claim).
 
 Each worker gets a unique agent name `pl-<stage>-<run_id>` (Herdr cap
-`[a-z][a-z0-9_-]{0,31}`, unique among live agents — `docs/plan-v1.md:71`).
+`[a-z][a-z0-9_-]{0,31}`, unique among live agents — `docs/plan-v1.md:71`),
+**except stage 6 which reuses `pl-3-<run_id>`** via `herdr agent prompt pl-3-<run_id> …`
+(no new `agent start`; preserves code context per G-11 — alternative is fresh
+`pl-6-<run_id>` seeded with `git diff main...HEAD` + `gh pr view --comments`,
+switch if context burn becomes an issue).
 
 ## Gates in v1 (orchestrator-supervised, machine-checkable forms — audit gap 2)
 
@@ -182,12 +204,12 @@ no address off failed review — `spec:57-59`).
 
 | # | Gate (must all pass) | Check command (orchestrator runs it) |
 |---|----------------------|--------------------------------------|
-| 1 | `spec.md` exists, non-empty, committed | `test -f "$WT/spec.md" && wc -l "$WT/spec.md" && git -C "$WT" log --oneline -1 -- spec.md` |
-| 2 | Spec v2 contains `## Acceptance criteria` with numbered items, each `Test: <name>`; change notes inside spec as `## Changelog v1→v2`; blocking tiers present | `rg -c "^[0-9]+\\. .*Test:" "$WT/spec.md"` ≥ N (N from count), `rg -q "^## Acceptance criteria" && rg -q "^## Changelog" && rg -q "blocking|non-blocking" "$WT/spec.md"` |
-| 3 | Every named test from acceptance section exists (file/symbol) **and** suite passes | Extract `Test: <name>` → `rg -q "<name>" "$WT"` for existence; then `uv run pytest -q` (or repo's test cmd). Existence first, green second — audit gap 2: green alone proves nothing. |
-| 4 | PR exists on the shared branch | `gh pr view <n> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-<run_id>"'` |
-| 5 | Review posted with structured confidence+blocking tiers (code-review skill) | `gh pr view <n> --json comments | jq -e '.comments[].body | test("blocking|non-blocking") and test("confidence")'` |
-| 6 | No unresolved blocking findings (or replies exist on every blocking finding — pick one) | **Option A (preferred, checkable):** worker via `gh api` resolves threads it addressed; gate is `gh api repos/{owner}/{repo}/pulls/<n>/threads | jq -e '[.[] | select(.isResolved==false and .isBlocking==true)] | length==0'`. **Option B (fallback):** gate is "a reply exists on every blocking finding" via `gh pr view --json comments` count match. Chosen option must be written in orchestrator prompt; default is Option A when `gh api` thread access is confirmed at build. |
+| 1 | `spec.md` exists, non-empty, committed on pipeline branch | `test -s "$WT/spec.md" && test $(wc -l < "$WT/spec.md") -gt 2 && git -C "$WT" rev-parse --abbrev-ref HEAD | grep -q "^auto/pipeline-" && git -C "$WT" log --oneline -1 -- spec.md | grep -q .` |
+| 2 | Spec v2 contains `## Acceptance criteria` with numbered items, each `Test: <name>`; change notes inside spec as `## Changelog v1→v2`; blocking tiers present | Count `Test:` via `rg -c "Test:" "$WT/spec.md"` (≥ N, N derived by orchestrator counting `Test:` lines); headings via `rg -q "^## Acceptance criteria" "$WT/spec.md" && rg -q "^## Changelog" "$WT/spec.md"`; tiers via `rg -qw "blocking" "$WT/spec.md" && rg -qw "non-blocking" "$WT/spec.md" && rg -q "confidence:" "$WT/spec.md"` (fixed: `-w` avoids substring tautology; see G-2 verification) |
+| 3 | Every named test from acceptance section exists (file/symbol) **and** suite passes | Extract `Test: <name>` → `rg -F -q -- "<name>" "$WT/tests"` (fixed-string `-F`, scoped to `tests/` not `$WT` which contains `spec.md` itself — G-2); then `uv run pytest -q` (or repo's test cmd). Existence first, green second — audit gap 2: green alone proves nothing. |
+| 4 | PR exists on the shared branch | `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-<run_id>"'` |
+| 5 | Review posted with structured confidence+blocking tiers (code-review skill) | `gh pr view <n> --json comments,reviews | jq -e 'all(.comments[].body // empty; test("confidence:\\s*(high|medium|low)")) and all(.reviews[].body // empty; test("confidence:\\s*(high|medium|low)"))'` — use `all(...)` not per-element stream (G-3: last-value bug) and tight `confidence:` regex (not substring); verify at build whether skill writes to `comments` or `reviews` and gate on that field (currently checks both) |
+| 6 | No unresolved blocking findings | **Verified fix for G-1:** `gh api repos/{owner}/{repo}/pulls/<n>/threads` 404s (confirmed `gh: Not Found`). **Option A (GraphQL, preferred):** `gh api graphql -f query='query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$pr){reviewThreads(first:50){nodes{isResolved comments(first:1){nodes{body}}}}}}}' -f owner=<o> -f repo=<r> -F pr=<n> | jq -e '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false and (.comments.nodes[0].body | test("blocking")))] | length==0'` — filter `isResolved==false` + body contains `blocking` (skill convention, not an API field). **Option B (fallback, no GraphQL):** `gh pr view <n> --json comments | jq -e 'all(.comments[].body; test("blocking")) | not or all(...replies...)` count-match. Delete the old REST `threads` line; pin one option in `orchestrator-prompt.md` after one real PR run. |
 
 Stage rules: tests before code (stage 3 done = every acceptance test exists and
 passes), comment-addressal capped at 2 iterations + 60-min wait-for-comments
