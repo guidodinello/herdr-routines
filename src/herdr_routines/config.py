@@ -68,6 +68,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
         "catch_up_minutes",
         "timezone",
         "on_missed",
+        "failure_markers",
     }
 )
 
@@ -90,6 +91,7 @@ _JOB_DEFAULTS = {
     "catch_up_minutes": 120,
     "timezone": "UTC",
     "on_missed": "log",
+    "failure_markers": None,
 }
 
 
@@ -113,6 +115,9 @@ class Job:
     catch_up_minutes: int
     timezone: str
     on_missed: str  # "log" | "notify"
+    # Screen markers scanned after a failed prompt wait (docs/failure-reaping.md §3.2).
+    # None = runner.DEFAULT_FAILURE_MARKERS.
+    failure_markers: tuple[str, ...] | None = None
 
     @property
     def agent_name(self) -> str:
@@ -282,6 +287,17 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
     if not isinstance(base, str):
         raise ConfigError(f"{label}: 'base' must be a string")
 
+    failure_markers_raw = merged["failure_markers"]
+    failure_markers: tuple[str, ...] | None = None
+    if failure_markers_raw is not None:
+        if not isinstance(failure_markers_raw, list) or not all(
+            isinstance(m, str) and m for m in failure_markers_raw
+        ):
+            raise ConfigError(
+                f"{label}: 'failure_markers' must be null or a list of non-empty strings"
+            )
+        failure_markers = tuple(failure_markers_raw)
+
     return Job(
         name=name,
         enabled=enabled,
@@ -297,4 +313,5 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
         catch_up_minutes=merged["catch_up_minutes"],
         timezone=timezone,
         on_missed=on_missed,
+        failure_markers=failure_markers,
     )

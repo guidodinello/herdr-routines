@@ -289,3 +289,63 @@ jobs:
 """
     with pytest.raises(ConfigError, match="unknown key"):
         load_config(write(tmp_config_path, text))
+
+
+# -- failure_markers (docs/failure-reaping.md §3.4) -------------------------------------------
+
+
+def test_failure_markers_absent_means_none(tmp_config_path: Path) -> None:
+    cfg = load_config(write(tmp_config_path, VALID_MINIMAL))
+    job = cfg.job("nightly-audit")
+    assert job is not None
+    assert job.failure_markers is None
+
+
+def test_failure_markers_from_defaults_are_inherited(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+defaults:
+  failure_markers: ["Free usage exceeded"]
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.failure_markers == ("Free usage exceeded",)
+
+
+def test_failure_markers_job_level_overrides_defaults(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+defaults:
+  failure_markers: ["Free usage exceeded"]
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    failure_markers: ["Out of credits", "quota blown"]
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.failure_markers == ("Out of credits", "quota blown")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["just-a-string", "[1, 2]", '["ok", ""]', '["ok", null]', "{}"],
+)
+def test_invalid_failure_markers_raise(tmp_config_path: Path, raw: str) -> None:
+    text = f"""
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    failure_markers: {raw}
+"""
+    with pytest.raises(ConfigError, match="failure_markers"):
+        load_config(write(tmp_config_path, text))
