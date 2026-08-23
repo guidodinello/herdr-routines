@@ -118,6 +118,9 @@ class FakeFullClient:
     def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
         self._registered[name] = "working"
 
+    def agent_interactive_ready(self, target):
+        return True
+
     def agent_prompt_wait(self, *, target, text, timeout_ms):
         self._registered[target] = self._settle_status
         # `text` is the prompt with $ROUTINE_REPORT already substituted to a real path (see
@@ -191,6 +194,10 @@ class FakeClient:
 
     def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
         self._maybe_raise("agent_start")
+
+    def agent_interactive_ready(self, target):
+        self._maybe_raise("agent_interactive_ready")
+        return True
 
     def agent_prompt_wait(self, *, target, text, timeout_ms):
         self._maybe_raise("agent_prompt_wait")

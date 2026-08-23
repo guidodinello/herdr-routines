@@ -199,6 +199,30 @@ def test_agent_statuses_maps_names_to_status() -> None:
     assert client.agent_statuses() == {"rt-a": "working", "rt-b": "idle"}
 
 
+def test_agent_interactive_ready_parses_flag_and_argv() -> None:
+    body = {"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.agent_interactive_ready("rt-a") is True
+    assert runner.calls[0][1:4] == ["agent", "get", "rt-a"]
+
+
+def test_agent_interactive_ready_false_is_respected() -> None:
+    body = {"result": {"agent": {"agent_status": "idle", "interactive_ready": False}}}
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.agent_interactive_ready("rt-a") is False
+
+
+def test_agent_interactive_ready_fails_open_when_flag_absent() -> None:
+    """Older herdr builds may not report the flag; absence must not wedge every run into
+    agent_not_interactive — treat unknown as ready."""
+    body = {"result": {"agent": {"agent_status": "idle"}}}
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.agent_interactive_ready("rt-a") is True
+
+
 def test_notification_show_includes_sound_and_optional_body() -> None:
     runner = FakeRunner([ok({"result": {}})])
     client = HerdrClient(runner=runner)

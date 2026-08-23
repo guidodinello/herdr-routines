@@ -49,12 +49,14 @@ class ScriptedClient:
         *,
         pane_id: str = "w1:p1",
         agent_status: str = "idle",
+        interactive_ready: bool = True,
         write_report_at: Path | None = None,
         report_content: str = "# Report\n\nFindings.\n",
         raise_on: str | None = None,
     ) -> None:
         self.pane_id = pane_id
         self.agent_status = agent_status
+        self.interactive_ready = interactive_ready
         self.write_report_at = write_report_at
         self.report_content = report_content
         self.raise_on = raise_on
@@ -76,6 +78,12 @@ class ScriptedClient:
         self.started_with_model = model
         if self.raise_on == "agent_start":
             raise HerdrCliError("boom", exit_code=1)
+
+    def agent_interactive_ready(self, target):
+        self.calls.append("agent_interactive_ready")
+        if self.raise_on == "agent_interactive_ready":
+            raise HerdrCliError("boom", exit_code=1)
+        return self.interactive_ready
 
     def agent_prompt_wait(self, *, target, text, timeout_ms):
         self.calls.append("agent_prompt_wait")
@@ -177,6 +185,7 @@ def test_execute_run_success_writes_report(
     assert client.calls == [
         "worktree_create",
         "agent_start",
+        "agent_interactive_ready",
         "agent_prompt_wait",
         "agent_read",
     ]
@@ -270,7 +279,49 @@ def test_execute_run_prompt_failure_short_circuits(tmp_path: Path) -> None:
     outcome = execute_run(job, client, run_id="a-run8")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "agent_prompt_failed"
-    assert client.calls == ["worktree_create", "agent_start", "agent_prompt_wait"]
+    assert client.calls == [
+        "worktree_create",
+        "agent_start",
+        "agent_interactive_ready",
+        "agent_prompt_wait",
+    ]
+
+
+def test_execute_run_prompts_only_after_readiness(tmp_path: Path) -> None:
+    """The prompt must not race the agent TUI's startup: live on the Pi (2026-08-22), prompting
+    ~3s after `agent start` failed server-side while a prompt after settle succeeded."""
+    job = make_job(tmp_path)
+    client = ScriptedClient()
+    execute_run(job, client, run_id="a-run9")  # type: ignore[arg-type]
+    assert client.calls.index("agent_interactive_ready") < client.calls.index(
+        "agent_prompt_wait"
+    )
+
+
+def test_execute_run_unready_agent_fails_without_prompting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    job = make_job(tmp_path, start_timeout_ms=50)
+    client = ScriptedClient(interactive_ready=False)
+    outcome = execute_run(job, client, run_id="a-run10")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_not_interactive"
+    assert "agent_prompt_wait" not in client.calls
+    assert outcome.agent_name == "rt-a"
+
+
+def test_execute_run_ready_polling_survives_cli_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transiently unreachable server during the readiness wait must not crash the run —
+    it keeps polling until the deadline, then maps to agent_not_interactive."""
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    job = make_job(tmp_path, start_timeout_ms=50)
+    client = ScriptedClient(raise_on="agent_interactive_ready")
+    outcome = execute_run(job, client, run_id="a-run11")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_not_interactive"
 
 
 def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
@@ -280,6 +331,7 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
         "worktree_create",
         "tab_create",
         "agent_start",
+        "agent_interactive_ready",
         "agent_prompt_wait",
         "agent_read",
     ):
