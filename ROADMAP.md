@@ -28,6 +28,17 @@ Ready to build whenever; no real-run evidence required.
 - **Worktree GC, dry-run half** — `herdr-routines gc --dry-run`: list `auto/<name>-<ts>`
   branches that are merged or whose worktree is gone. Read-only and mechanical; useful as soon
   as the first real worktree jobs run. The deletion half is gated separately (see Next).
+- **Overnight feature-pipeline orchestrator (POC)** — one orchestrator agent session drives an
+  entire feature lifecycle by spawning per-stage worker sessions via herdr: plan/spec →
+  independent spec review (adds acceptance criteria + test plan) → implement-until-spec-tests-pass
+  → PR → code review → capped comment-addressal loop. Files-as-handoff, machine-checkable gates
+  between stages, stop-on-failure semantics, checkpoint/resume. Full POC spec already written:
+  `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md` (lands in `docs/` here via PR
+  when picked up). Under Now because it needs no real-run evidence to attempt: every piece it
+  composes (programmatic spawn/settle via runner.py's patterns, worktree jobs, gh-driven code
+  review) already works in isolation — the missing thing is the integration, which is learned
+  only by running it. Generalizes the auto-fix-PR idea (Later) into a full chain. Gate for
+  promoting beyond POC: a few real overnight runs finishing end-to-end without human rescue.
 
 ## Next
 
