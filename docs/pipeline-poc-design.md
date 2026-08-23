@@ -25,14 +25,14 @@ enforcement in code for v1 — define the workflow, let the orchestrator supervi
  human idea (one paragraph)
        │
        ▼
- orchestrator herdr session (opencode/big-pickle, lean)
-       │  spawns via herdr CLI, polls coarse, writes state.json + $PIPELINE_REPORT
-       ├─→ stage 1 plan/spec  (claude)
-       ├─→ stage 2 spec review (opencode, different model — independence)
-       ├─→ stage 3 implement+tests (opencode)
+ orchestrator herdr session (opencode/muse-spark-1.2-contributor-free, lean)
+       │  spawns via herdr CLI, detached --wait, writes state.json + $PIPELINE_REPORT
+       ├─→ stage 1 plan/spec  (muse-spark)
+       ├─→ stage 2 spec review (muse-spark fresh session — independence via sessions, not model family)
+       ├─→ stage 3 implement+tests (ox-alpha-free)
        ├─→ stage 4 open PR (same session as 3)
-       ├─→ stage 5 code review (separate session, code-review skill)
-       └─→ stage 6 address comments (capped 2 iterations)
+       ├─→ stage 5 code review (separate session, big-pickle primary — fan-out hy3+x-preview is v2)
+       └─→ stage 6 address comments (ox fixes + muse GH ops, capped 2 iterations)
 ```
 
 Why agentic orchestrator over a Python driver (`src/herdr_routines/runner.py`
@@ -54,11 +54,11 @@ Hardcoded stages (mirrors spec §3, stages mirror
 
 | # | Stage | Worker harness | Input | Output | Gate hint (orchestrator judges) |
 |---|-------|----------------|-------|--------|---------------------------------|
-| 1 | Plan + draft spec | `claude` | idea paragraph | `spec.md` v1 | file exists, non-empty |
-| 2 | Spec review + update | `opencode` (≠ stage 1) | spec v1 | spec v2 + Acceptance criteria & test plan (numbered, each → ≥1 named test) | reviewer posted updated spec + change notes |
-| 3 | Implement | `opencode` | spec v2 | branch commits + tests from acceptance section | all spec-derived tests pass locally |
+| 1 | Plan + draft spec | `opencode/muse-spark-1.2-contributor-free` | idea paragraph | `spec.md` v1 | file exists, non-empty |
+| 2 | Spec review + update | `opencode/muse-spark-1.2-contributor-free` (fresh session, ≠ stage 1) | spec v1 | spec v2 + Acceptance criteria & test plan (numbered, each → ≥1 named test) | reviewer posted updated spec + change notes |
+| 3 | Implement | `opencode/x-preview-f-free` (= `ox-alpha-free`, alias per `opencode-e2e:17`) | spec v2 | branch commits + tests from acceptance section | all spec-derived tests pass locally |
 | 4 | Open PR | same session as 3 | branch | PR | `gh pr view` exists |
-| 5 | Code review | separate session (code-review skill, confidence + blocking tiers) | PR number | posted review | review posted (blocking allowed) |
+| 5 | Code review | separate session (code-review skill) — **v1 single `opencode/big-pickle` primary** (measured 1/7, 5 high-sev uniques `pr4:106`); **v2 fan-out `hy3-free` + `x-preview-f-free` 2-tie** (`opencode-e2e:19`) | PR number | posted review | review posted (blocking allowed) |
 | 6 | Address comments | same agent as stages 3–4, prompted with review digest + `gh pr view --comments` (preserves code context; audit gap 8) | review findings | fixes + `gh api` thread-resolve + replies | gate 6: no unresolved blocking threads (or replies on every blocking finding per Gates) |
 
 Stage rules copied from spec §3: tests before code (stage 3 done = every
@@ -100,9 +100,9 @@ fresh worktree does not show another worktree's untracked files.
 ## Orchestrator session
 
 - **Kind:** lean `herdr` session (`herdr workspace create --cwd <repo-parent>`,
-  `herdr agent start --kind opencode --model big-pickle --pane <id>`), so it is
+  `herdr agent start --kind opencode --model muse-spark-1.2-contributor-free --pane <id>`), so it is
   watchable in the TUI. Bare `opencode` is the fallback, but herdr session is
-  preferred for visibility.
+  preferred for visibility. Orchestrator model pinned to `muse-spark` per pi-2 e2e (`opencode-e2e:15` — muse excels at spec/arch reasoning; was `big-pickle` — keep as fallback if truncation/quota).
 - **Env & unattended allowlist (audit gap 3):** `HERDR_ENV=1` must be set or
   the orchestrator cannot drive `herdr` at all — inject via
   `herdr workspace create --cwd <parent> --label pipeline-orchestrator --env HERDR_ENV=1`
@@ -242,11 +242,11 @@ WS=$(herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> \
   --label pipeline-poc-20260824 --env HERDR_ENV=1 | jq -r '.result.root_pane.pane_id')
 systemd-run --user --on-calendar="2026-08-24 02:00:00" --timer-property=AccuracySec=30s \
   --unit=pipeline-poc-20260824 \
-  bash -c "herdr agent start pipeline-orchestrator --kind opencode --pane $WS --timeout 120000 -- -m opencode/big-pickle && herdr agent prompt pipeline-orchestrator \"\$(cat orchestrator-prompt.md)\" --wait --until idle --timeout 25200000"
+  bash -c "herdr agent start pipeline-orchestrator --kind opencode --pane \$WS --timeout 120000 -- -m opencode/muse-spark-1.2-contributor-free && herdr agent prompt pipeline-orchestrator \"\$(cat orchestrator-prompt.md)\" --wait --until idle --timeout 25200000"
 
 # B — manual one-liner from an existing herdr pane (simplest for first run)
 WS=$(herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> --label pipeline-poc --env HERDR_ENV=1 | jq -r '.result.root_pane.pane_id')
-herdr agent start pipeline-orchestrator --kind opencode --model big-pickle --pane "$WS" --timeout 120000 -- -m opencode/big-pickle
+herdr agent start pipeline-orchestrator --kind opencode --pane "$WS" --timeout 120000 -- -m opencode/muse-spark-1.2-contributor-free
 herdr agent prompt pipeline-orchestrator "$(cat orchestrator-prompt.md)" --wait --until idle --timeout 25200000
 ```
 
@@ -265,9 +265,13 @@ prompt is green.
 
 - **Repo:** `herdr-routines` itself (dogfood, cheapest to verify). `fitted` is
   the stress test after the dogfood run succeeds — open question 1 in spec §5.
-- **Models:** `stage 1 ≠ stage 2` harness for genuine independence
-  (spec §5 Q4). POC: `1 claude` / `2 opencode/big-pickle` / `3 opencode` /
-  `5 opencode/code-review` (or `claude` if review quality needs it).
+- **Models (pi-2 e2e `opencode-e2e-workflow-recommendations.md:13`, interim until measured):**
+  `1 muse-spark` plan/spec (`muse excels at spec, terrible at code-gen` `opencode-e2e:15`) /
+  `2 muse-spark` fresh session spec review (independence via sessions, not model family — `1≠2` is `spec §5 Q4` via fresh session, not model family; `ox planning bad` `opencode-e2e:17` makes ox a poor spec reviewer) /
+  `3 ox-alpha-free` (`opencode/x-preview-f-free` on Zen = `opencode-go/ox-alpha-free` `opencode-e2e:17`, 1M ctx, coding best) /
+  `5 big-pickle` primary single reviewer v1 (measured 1/7 `pr4:106`), fan-out `hy3-free` + `x-preview-f-free` 2-tie is v2 (`opencode-e2e:19`, dedup `pr4:45` not yet built) /
+  `6 ox` fixes + `muse` GH ops (`commit/push/reply` pattern #1040 `opencode-e2e:20`).
+  Orchestrator itself: `muse-spark` (spec-like reasoning, not coding; was `big-pickle` — pi-2 suggests muse for planning) or `big-pickle` fallback if muse quota/truncation (`opencode-e2e:15` chunk prompts) — pin `muse` for first manual run.
 - **Workspace:** orchestrator owns the parent clone
   (`~/.local/state/herdr-routines/repos/<name>`) and creates the single shared
   worktree+branch `auto/pipeline-<run_id>` before stage 1 (see Handoff contract).

@@ -108,9 +108,13 @@ boundaries).
 3. Does the orchestrator run as a herdr session itself (so it's watchable in
    the TUI) or bare opencode? **Lean herdr session** (design:77).
 4. Model assignments per stage for the POC (only constraint: stage 1 ≠
-   stage 2 harness, for genuine independence) — **design picks**
-   `1 claude / 2 opencode/big-pickle / 3 opencode / 5 opencode/code-review`
-   (`docs/pipeline-poc-design.md:168`).
+   stage 2 harness, for genuine independence — independence is via fresh
+   sessions, not model family) — **design picks per pi-2 e2e interim**
+   (`opencode-e2e-workflow-recommendations.md:13`): `1 muse-spark` plan/spec /
+   `2 muse-spark` fresh session spec review / `3 ox-alpha-free`
+   (`x-preview-f-free`) implement / `5 big-pickle` primary single reviewer v1
+   (fan-out `hy3-free` + `x-preview-f-free` is v2 `opencode-e2e:19`) /
+   `6 ox` fixes + `muse` GH ops (`docs/pipeline-poc-design.md:268`).
 5. Where does the pipeline launcher live — manual SSH one-liner (transient
    systemd timer, see roadmap §3 one-shot options) or a `herdr-routines run`
    job with the orchestrator prompt? **Design picks one-shot `systemd-run`
