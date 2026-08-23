@@ -121,6 +121,12 @@ class FakeFullClient:
     def agent_interactive_ready(self, target):
         return True
 
+    def settled_agent_workspace(self, name):
+        return None
+
+    def workspace_close(self, workspace_id):
+        pass
+
     def agent_prompt_wait(self, *, target, text, timeout_ms):
         self._registered[target] = self._settle_status
         # `text` is the prompt with $ROUTINE_REPORT already substituted to a real path (see
@@ -198,6 +204,12 @@ class FakeClient:
     def agent_interactive_ready(self, target):
         self._maybe_raise("agent_interactive_ready")
         return True
+
+    def settled_agent_workspace(self, name):
+        self._maybe_raise("settled_agent_workspace")
+
+    def workspace_close(self, workspace_id):
+        pass
 
     def agent_prompt_wait(self, *, target, text, timeout_ms):
         self._maybe_raise("agent_prompt_wait")

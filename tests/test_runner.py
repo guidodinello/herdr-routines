@@ -50,6 +50,7 @@ class ScriptedClient:
         pane_id: str = "w1:p1",
         agent_status: str = "idle",
         interactive_ready: bool = True,
+        stale_workspace: str | None = None,
         write_report_at: Path | None = None,
         report_content: str = "# Report\n\nFindings.\n",
         raise_on: str | None = None,
@@ -57,10 +58,12 @@ class ScriptedClient:
         self.pane_id = pane_id
         self.agent_status = agent_status
         self.interactive_ready = interactive_ready
+        self.stale_workspace = stale_workspace
         self.write_report_at = write_report_at
         self.report_content = report_content
         self.raise_on = raise_on
         self.calls: list[str] = []
+        self.closed_workspaces: list[str] = []
         self.started_with_model: str | None = None
 
     def worktree_create(self, *, cwd, branch, base, label=None):
@@ -68,6 +71,16 @@ class ScriptedClient:
         if self.raise_on == "worktree_create":
             raise HerdrCliError("boom", exit_code=1)
         return self.pane_id
+
+    def settled_agent_workspace(self, name):
+        self.calls.append("settled_agent_workspace")
+        if self.raise_on == "settled_agent_workspace":
+            raise HerdrCliError("boom", exit_code=1)
+        return self.stale_workspace
+
+    def workspace_close(self, workspace_id):
+        self.calls.append("workspace_close")
+        self.closed_workspaces.append(workspace_id)
 
     def tab_create(self, *, cwd, label=None):
         self.calls.append("tab_create")
@@ -183,6 +196,7 @@ def test_execute_run_success_writes_report(
     assert outcome.report_bytes > 0
     assert outcome.final_agent_status == "idle"
     assert client.calls == [
+        "settled_agent_workspace",
         "worktree_create",
         "agent_start",
         "agent_interactive_ready",
@@ -261,7 +275,7 @@ def test_execute_run_worktree_creation_failure_short_circuits(tmp_path: Path) ->
     outcome = execute_run(job, client, run_id="a-run6")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "pane_creation_failed"
-    assert client.calls == ["worktree_create"]
+    assert client.calls == ["settled_agent_workspace", "worktree_create"]
 
 
 def test_execute_run_agent_start_failure_short_circuits(tmp_path: Path) -> None:
@@ -270,7 +284,11 @@ def test_execute_run_agent_start_failure_short_circuits(tmp_path: Path) -> None:
     outcome = execute_run(job, client, run_id="a-run7")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "agent_start_failed"
-    assert client.calls == ["worktree_create", "agent_start"]
+    assert client.calls == [
+        "settled_agent_workspace",
+        "worktree_create",
+        "agent_start",
+    ]
 
 
 def test_execute_run_prompt_failure_short_circuits(
@@ -283,6 +301,7 @@ def test_execute_run_prompt_failure_short_circuits(
     assert outcome.state == "failed"
     assert outcome.reason == "agent_prompt_failed"
     assert client.calls == [
+        "settled_agent_workspace",
         "worktree_create",
         "agent_start",
         "agent_interactive_ready",
@@ -400,6 +419,8 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
     """Ensures ScriptedClient's protocol above doesn't silently drift from HerdrClient's real
     method signatures."""
     for name in (
+        "settled_agent_workspace",
+        "workspace_close",
         "worktree_create",
         "tab_create",
         "agent_start",
@@ -408,3 +429,46 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
         "agent_read",
     ):
         assert hasattr(HerdrClient, name)
+
+
+def test_execute_run_reaps_previous_run_workspace_before_starting(
+    tmp_path: Path,
+    _isolated_reports_dir: Path,
+) -> None:
+    """Recurring jobs reuse one agent name while runs deliberately leave their workspace
+    behind (plan-v1 §6) — the settled pane from yesterday must be closed before today's
+    agent start, or herdr rejects the duplicate name."""
+    job = make_job(tmp_path)
+    run_id = "a-run15"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(stale_workspace="w9", write_report_at=report_path)
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert client.closed_workspaces == ["w9"]
+    assert client.calls.index("workspace_close") < client.calls.index("worktree_create")
+
+
+def test_execute_run_leaves_panes_alone_when_no_stale_workspace(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    job = make_job(tmp_path)
+    run_id = "a-run16"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(stale_workspace=None, write_report_at=report_path)
+    execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert "workspace_close" not in client.calls
+
+
+def test_execute_run_survives_stale_workspace_reap_errors(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Failing to reap (e.g. server blip) must not abort the run — the worst case is the old
+    duplicate-name failure at agent start, which is captured like any other failure."""
+    job = make_job(tmp_path)
+    run_id = "a-run17"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(
+        raise_on="settled_agent_workspace", write_report_at=report_path
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"

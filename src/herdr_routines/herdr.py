@@ -209,6 +209,23 @@ class HerdrClient:
             if a.get("name") and a.get("agent_status")
         }
 
+    def settled_agent_workspace(self, name: str) -> str | None:
+        """The workspace_id hosting registered agent `name`, if its status is settled. None
+        when the agent is absent or still working — callers use this to reap our own previous
+        run's pane before reusing the name, and must never close a working one."""
+        body = self._call(["agent", "list"])
+        for agent in body.get("result", {}).get("agents", []):
+            if agent.get("name") != name:
+                continue
+            if agent.get("agent_status") in LIVE_AGENT_STATUSES:
+                return None
+            workspace_id = agent.get("workspace_id")
+            return workspace_id if isinstance(workspace_id, str) else None
+        return None
+
+    def workspace_close(self, workspace_id: str) -> None:
+        self._call(["workspace", "close", workspace_id])
+
     # -- misc -----------------------------------------------------------------------------------
 
     def notification_show(
