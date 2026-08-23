@@ -59,20 +59,35 @@ Hardcoded stages (mirrors spec §3, stages mirror
 | 3 | Implement | `opencode` | spec v2 | branch commits + tests from acceptance section | all spec-derived tests pass locally |
 | 4 | Open PR | same session as 3 | branch | PR | `gh pr view` exists |
 | 5 | Code review | separate session (code-review skill, confidence + blocking tiers) | PR number | posted review | review posted (blocking allowed) |
-| 6 | Address comments | implementer-context session | review findings | fixes + replies | no unresolved blocking findings |
+| 6 | Address comments | same agent as stages 3–4, prompted with review digest + `gh pr view --comments` (preserves code context; audit gap 8) | review findings | fixes + `gh api` thread-resolve + replies | gate 6: no unresolved blocking threads (or replies on every blocking finding per Gates) |
 
 Stage rules copied from spec §3: tests before code (stage 3 done = every
 acceptance test exists and passes), comment-addressal capped at 2 iterations +
-wait-for-comments timeout, human gate stays at merge.
+**wait-for-comments 60 min** (audit gap 13: previously unspecified `spec:51`),
+human gate stays at merge. Stage 5 code-review skill is multi-agent (5
+reviewers) — for v1 run as single worker session; full 5-reviewer fan-out is v2
+if needed (audit gap 13).
 
-## Handoff contract
+## Handoff contract (single shared branch — audit gap 1)
 
-All inter-stage artifacts live in the repo worktree (committed or not):
-`spec.md`, `state.json`, `$PIPELINE_REPORT`. Every worker prompt names input
-files explicitly — workers never rely on prior-session context, only on disk.
+All inter-stage artifacts live on **one shared worktree+branch**, not per-stage
+worktrees. Orchestrator creates it before stage 1:
+
+```sh
+herdr worktree create --cwd <parent-clone> --base main --branch auto/pipeline-<run_id>
+# → shared path: ~/.herdr/worktrees/<branch> (recorded in state.json: shared_worktree, branch)
+```
+
+* Every worker attaches to that same path (either `herdr tab create --workspace <shared_ws>` or `herdr worktree create --cwd <shared_worktree>` reuse — no fresh `--base main` per stage). Fresh **sessions** give independence, not fresh worktrees.
+* Stage 1 must `git add spec.md && git commit -m "spec: v1 for <feature>"` before settling — untracked files do not cross worktree boundaries (git shares object store, not untracked files). Stage 2 then sees the committed spec.
+* Stage 3 continues on the same branch (commits implementation + tests); stage 4 PRs that same branch. Artifacts: `spec.md`, `state.json`, `$PIPELINE_REPORT` (all on the shared worktree; `$PIPELINE_REPORT` also mirrored to `~/.local/state/herdr-routines/reports/<run_id>.md` for the notification layer). Every worker prompt names input files explicitly — workers never rely on prior-session context, only on disk.
+
 Same inversion as `docs/plan-v1.md:414` (`$ROUTINE_REPORT`): file is the only
 reliable extraction channel because agents render on the alternate screen and
 `herdr agent read` cannot recover scrolled output.
+
+Empirical check at build time (2 min): confirm `git status --porcelain` in a
+fresh worktree does not show another worktree's untracked files.
 
 ## Orchestrator session
 
@@ -80,19 +95,60 @@ reliable extraction channel because agents render on the alternate screen and
   `herdr agent start --kind opencode --model big-pickle --pane <id>`), so it is
   watchable in the TUI. Bare `opencode` is the fallback, but herdr session is
   preferred for visibility.
-- **Env:** `HERDR_ENV=1` must be set or the orchestrator cannot drive `herdr`
-  at all. `~/.config/opencode/opencode.json` needs
-  `permission.external_directory` allowlist for the herdr socket/state dirs and
-  for the on-demand clone cache if stage 5 clones cross-repo (same fix as
-  `raspberrypi/troubleshooting-log.md` external-directory `blocked`).
-- **Polling hygiene:** coarse `sleep 30–60s` between `herdr agent get <worker>`
-  checks. Never per-minute tool-call polling — a 40-min review would otherwise
-  eat the orchestrator's own context/quota. This is a load-bearing detail from
-  spec §5 / open question 2.
-- **Checkpointing:** `state.json` (`{current_stage, pr_number, artifact_paths}`)
+- **Env & unattended allowlist (audit gap 3):** `HERDR_ENV=1` must be set or
+  the orchestrator cannot drive `herdr` at all — inject via
+  `herdr workspace create --cwd <parent> --label pipeline-orchestrator --env HERDR_ENV=1`
+  (plan:63 `herdr workspace create [--env K=V]`), not via shell export.
+  `~/.config/opencode/opencode.json` on **both laptop and Pi** must allowlist the
+  full overnight command surface, or the first un-allowlisted call wedges as
+  `blocked` at 03:00 (same class as `docs/failure-reaping.md:1`, `roadmap:54-61`):
+  - `herdr` (spawn/poll/close), `git` (commit/add/log/rev-parse), `gh` (pr
+    create/view/api + thread resolve), `uv`/`pytest`/`ruff`, `rg`/`jq`/`column`
+  - `permission.external_directory` for `~/.config/herdr/herdr.sock`,
+    `~/.local/state/herdr-routines/`, `~/.local/state/herdr/` and the
+    on-demand clone cache dir (if stage 5 ever clones cross-repo — same fix as
+    `raspberrypi/troubleshooting-log.md` external-directory `blocked`).
+  Replicate the allowlist to the Pi's `~/.config/opencode/opencode.json` before
+  the first overnight run and verify with a manual blocked-prompt dry-run.
+- **Polling hygiene (audit gap 6):** do not hot-poll `herdr agent get` every
+  30–60s (≈50–80 tool calls per 39-min review, burning orchestrator context).
+  Instead: `nohup herdr agent prompt <worker> --wait --timeout <ms> > <stage>.result.json 2>&1 &`
+  and sleep in 3–5 min chunks checking for the result file; fall back to
+  `herdr agent get` only near timeout. If opencode's bash tool cannot block
+  tens of minutes, the detached form is required — verify at build time (audit
+  open question 3). One `agent prompt --wait` per stage is the cheap primitive
+  (`docs/plan-v1.md:65`), not dozens of `agent get`.
+- **Checkpointing & resume (audit gap 7):** `state.json`
+  (`{current_stage, pr_number, artifact_paths, shared_worktree, branch, run_id}`)
   updated after every stage transition. `$PIPELINE_REPORT` written at end
   regardless of outcome (stage-by-stage status, artifacts, where it stopped and
-  why) — same pattern as `$ROUTINE_REPORT` in `docs/plan-v1.md:386`.
+  why) — same pattern as `$ROUTINE_REPORT` in `docs/plan-v1.md:386`. **Resume
+  recipe:** on relaunch read `state.json` → `herdr agent list | rg "pl-"` to
+  reconcile live `pl-<stage>-<run_id>` agents → adopt still-working worker or
+  reap stragglers before re-spawning. Crash between spawn and state-write:
+  handle duplicate-name collision via reap-before-spawn.
+- **Pipeline deadline (audit gap 5):** hard wall-clock budget, e.g. launch + 7 h
+  (tune to overnight window; audit open question 4). When exceeded, finish the
+  current stage, write a **partial** `$PIPELINE_REPORT` and fire
+  `herdr notification show --sound request` — since the report is "at end
+  regardless" (`design:93`), an overrunning night with no deadline yields no
+  report at all. Worst case 6×90 min + 2 loops >10 h without a deadline.
+- **Quota handling (audit gap 4):** worker quota death already has timeout
+  backstop (`design:109-112`); add reaping's visible-screen scan on settle-timeout:
+  `herdr agent read <worker> --source visible --lines 200 | rg "Free usage exceeded"`
+  (or `DEFAULT_FAILURE_MARKERS` from `docs/failure-reaping.md:88`) → report
+  `quota_exhausted` not bare `timeout`. Orchestrator itself runs `big-pickle`,
+  the model that died twice (`docs/failure-reaping.md:8-9`), in the longest
+  role while owning `$PIPELINE_REPORT` — its own quota death is silent (no
+  report). Accept for v1 but add morning checklist: "no report file ⇒ check
+  `systemctl --user status` + `herdr agent list`" and keep v2 provider/model
+  failover in Parking Lot (`roadmap:126-129`).
+- **Cleanup (audit gap 12):** after `$PIPELINE_REPORT` is written and artifacts
+  are committed/copied out, close worker panes/workspaces (`herdr workspace close`
+  / `herdr worktree remove`); **keep the PR branch** `auto/pipeline-<run_id>`
+  (aligns with manual GC stance `roadmap:77-79`). Order matters: artifacts out
+  before workspace close. Leaked live `pl-*` agents were the central incident
+  of reaping §1.
 
 ## Worker spawning (what must be ported, not rediscovered)
 
@@ -117,49 +173,71 @@ Mechanically solved — same `herdr` CLI calls `src/herdr_routines/herdr.py` +
 Each worker gets a unique agent name `pl-<stage>-<run_id>` (Herdr cap
 `[a-z][a-z0-9_-]{0,31}`, unique among live agents — `docs/plan-v1.md:71`).
 
-## Gates in v1 (orchestrator-supervised)
+## Gates in v1 (orchestrator-supervised, machine-checkable forms — audit gap 2)
 
-**Chosen: Option A — orchestrator judges, no code gate.**
+**Chosen: Option A — orchestrator judges, but against grep/rg/gh checkable
+forms, not vibes.** `proceed | retry_stage | abort` is allowed only as
+below; every gate-content failure is `abort` (no PR off failed upstream,
+no address off failed review — `spec:57-59`).
 
-Orchestrator verifies by reading disk / running the command itself, then
-decides `proceed | retry_stage | abort`:
+| # | Gate (must all pass) | Check command (orchestrator runs it) |
+|---|----------------------|--------------------------------------|
+| 1 | `spec.md` exists, non-empty, committed | `test -f "$WT/spec.md" && wc -l "$WT/spec.md" && git -C "$WT" log --oneline -1 -- spec.md` |
+| 2 | Spec v2 contains `## Acceptance criteria` with numbered items, each `Test: <name>`; change notes inside spec as `## Changelog v1→v2`; blocking tiers present | `rg -c "^[0-9]+\\. .*Test:" "$WT/spec.md"` ≥ N (N from count), `rg -q "^## Acceptance criteria" && rg -q "^## Changelog" && rg -q "blocking|non-blocking" "$WT/spec.md"` |
+| 3 | Every named test from acceptance section exists (file/symbol) **and** suite passes | Extract `Test: <name>` → `rg -q "<name>" "$WT"` for existence; then `uv run pytest -q` (or repo's test cmd). Existence first, green second — audit gap 2: green alone proves nothing. |
+| 4 | PR exists on the shared branch | `gh pr view <n> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-<run_id>"'` |
+| 5 | Review posted with structured confidence+blocking tiers (code-review skill) | `gh pr view <n> --json comments | jq -e '.comments[].body | test("blocking|non-blocking") and test("confidence")'` |
+| 6 | No unresolved blocking findings (or replies exist on every blocking finding — pick one) | **Option A (preferred, checkable):** worker via `gh api` resolves threads it addressed; gate is `gh api repos/{owner}/{repo}/pulls/<n>/threads | jq -e '[.[] | select(.isResolved==false and .isBlocking==true)] | length==0'`. **Option B (fallback):** gate is "a reply exists on every blocking finding" via `gh pr view --json comments` count match. Chosen option must be written in orchestrator prompt; default is Option A when `gh api` thread access is confirmed at build. |
 
-- `test -f spec.md && wc -l spec.md` / `cat spec.md`
-- `gh pr view <n> --json state,url` for PR existence
-- `pytest -q` / `npm test` for stage 3 (run them, don't trust agent report)
-- `gh pr view <n> --comments` + review thread state for stage 6
+Stage rules: tests before code (stage 3 done = every acceptance test exists and
+passes), comment-addressal capped at 2 iterations + 60-min wait-for-comments
+timeout (audit gap 13: value now pinned), human gate stays at merge.
 
-Failure semantics (spec §4): any gate not met → pipeline stops, never open a
-PR off a failed upstream stage, never address comments off a failed review.
-Orchestrator writes `$PIPELINE_REPORT` with where it stopped and why.
+Retry policy (resolves `design:125` vs `spec:57` contradiction): `retry_stage`
+allowed **only** for `EmptyResponse` start-race (once) and infra-flavored
+transient test failures (once, e.g. network). Every gate-content failure (missing
+criterion, missing test, unresolved blocking) is `abort` and writes
+`$PIPELINE_REPORT` with where it stopped and why.
 
 **Deferred to v2 (opt-in): Option B — `scripts/verify-gate.sh <stage>`**
 deterministic oracle (`0/1`) that orchestrator can call before judging. One
 bash call per transition; add only if first runs show orchestrator misses
-checks. **Option C — `src/herdr_routines/pipeline.py` typed `Gate` objects**
-only if we want `tick` to own the pipeline as a scheduled job — explicitly out
-of scope for POC.
+checks — recommendation 2 above preempts most of its value. **Option C —
+`src/herdr_routines/pipeline.py` typed `Gate` objects** only if we want `tick`
+to own the pipeline as a scheduled job — explicitly out of scope for POC.
 
-## Launcher (one-shot, not cron)
+## Launcher (one-shot, not cron — audit gap 11)
 
 `herdr-routines` cron is not used for the pipeline (`roadmap.md:32`). Two
 equivalent one-shot options on the Pi (pick one for the POC, both are
-`systemd-run` transient, no lingering unit):
+`systemd-run` transient, no lingering unit). **Prerequisite:** `herdr agent
+start` never creates layout (`docs/plan-v1.md:70-71`) — a pane must exist first;
+parse `.result.root_pane.pane_id` from `herdr workspace create` output:
 
 ```sh
 # A — pinned-date transient timer (visible in systemctl, survives SSH drop)
+WS=$(herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> \
+  --label pipeline-poc-20260824 --env HERDR_ENV=1 | jq -r '.result.root_pane.pane_id')
 systemd-run --user --on-calendar="2026-08-24 02:00:00" --timer-property=AccuracySec=30s \
   --unit=pipeline-poc-20260824 \
-  herdr agent start orchestrator --kind opencode --model big-pickle --pane <id> -- prompt.md
+  bash -c "herdr agent start pipeline-orchestrator --kind opencode --pane $WS --timeout 120000 -- -m opencode/big-pickle && herdr agent prompt pipeline-orchestrator \"\$(cat orchestrator-prompt.md)\" --wait --until idle --timeout 25200000"
 
 # B — manual one-liner from an existing herdr pane (simplest for first run)
-herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> --label pipeline-poc
-herdr agent start pipeline-orchestrator --kind opencode --model big-pickle --pane <pane_id> -- < orchestrator-prompt.md
+WS=$(herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> --label pipeline-poc --env HERDR_ENV=1 | jq -r '.result.root_pane.pane_id')
+herdr agent start pipeline-orchestrator --kind opencode --model big-pickle --pane "$WS" --timeout 120000 -- -m opencode/big-pickle
+herdr agent prompt pipeline-orchestrator "$(cat orchestrator-prompt.md)" --wait --until idle --timeout 25200000
 ```
 
 For the POC the prompt file is checked out alongside the target repo worktree
 so the orchestrator can reference it on disk. A `herdr-routines run orchestrator`
 job wrapper is the later ergonomic improvement — not v1.
+
+**Blast radius (audit gap 10):** worktree isolation shares the object store and
+can push (`roadmap:58-61`); stage 4 requires push; dogfood target is
+`herdr-routines` itself — the repo containing the scheduler. This is
+consistent with the single-user threat model but must be stated: keep the first
+feature trivial (build-order step 3) to bound blast radius while the orchestrator
+prompt is green.
 
 ## Target repo & models (POC defaults)
 
@@ -169,10 +247,14 @@ job wrapper is the later ergonomic improvement — not v1.
   (spec §5 Q4). POC: `1 claude` / `2 opencode/big-pickle` / `3 opencode` /
   `5 opencode/code-review` (or `claude` if review quality needs it).
 - **Workspace:** orchestrator owns the parent clone
-  (`~/.local/state/herdr-routines/repos/<name>`); workers use
-  `herdr worktree create --cwd <repo> --base main --branch auto/pipeline-<ts>`
-  except stage 5 which may reuse `workspace: root` for review-only idempotence
-  (`src/herdr_routines/config.py:workspace`).
+  (`~/.local/state/herdr-routines/repos/<name>`) and creates the single shared
+  worktree+branch `auto/pipeline-<run_id>` before stage 1 (see Handoff contract).
+  All workers attach to that same worktree — no per-stage `herdr worktree create
+  --base main`. Stage 5 (review) also attaches to the shared worktree (read-only
+  is not needed; review isolation comes from the session, not the worktree).
+  This supersedes the earlier per-stage worktree sketch; the old
+  `src/herdr_routines/config.py:workspace` `worktree` vs `root` distinction does
+  not apply to the pipeline POC.
 
 ## Verification
 
