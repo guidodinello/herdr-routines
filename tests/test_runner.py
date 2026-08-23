@@ -273,7 +273,10 @@ def test_execute_run_agent_start_failure_short_circuits(tmp_path: Path) -> None:
     assert client.calls == ["worktree_create", "agent_start"]
 
 
-def test_execute_run_prompt_failure_short_circuits(tmp_path: Path) -> None:
+def test_execute_run_prompt_failure_short_circuits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ())
     job = make_job(tmp_path)
     client = ScriptedClient(raise_on="agent_prompt_wait")
     outcome = execute_run(job, client, run_id="a-run8")  # type: ignore[arg-type]
@@ -322,6 +325,75 @@ def test_execute_run_ready_polling_survives_cli_errors(
     outcome = execute_run(job, client, run_id="a-run11")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "agent_not_interactive"
+
+
+class FlakyPromptClient(ScriptedClient):
+    """Fails the first N prompt attempts with a non-timeout server error (the early
+    session-not-ready EmptyResponse signature), then succeeds."""
+
+    def __init__(self, *, fail_times: int = 1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._fail_times = fail_times
+
+    def agent_prompt_wait(self, *, target, text, timeout_ms):
+        if self._fail_times > 0:
+            self._fail_times -= 1
+            self.calls.append("agent_prompt_wait[failed]")
+            raise HerdrCliError("EmptyResponse", exit_code=1)
+        return super().agent_prompt_wait(
+            target=target, text=text, timeout_ms=timeout_ms
+        )
+
+
+def test_execute_run_retries_early_prompt_failures(
+    tmp_path: Path,
+    _isolated_reports_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", (0.0,))
+    job = make_job(tmp_path)
+    run_id = "a-run12"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = FlakyPromptClient(fail_times=1, write_report_at=report_path)
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert client.calls.count("agent_prompt_wait[failed]") == 1
+
+
+def test_execute_run_prompt_retries_exhausted_is_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", (0.0, 0.0))
+    job = make_job(tmp_path)
+    client = FlakyPromptClient(fail_times=99)
+    outcome = execute_run(job, client, run_id="a-run13")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_prompt_failed"
+    assert "EmptyResponse" in (outcome.error or "")
+
+
+def test_execute_run_never_resends_after_settle_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A JSON code:"timeout" error proves the prompt was delivered — retrying would make the
+    agent do the work twice."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", (0.0,))
+
+    class SettleTimeoutClient(ScriptedClient):
+        def agent_prompt_wait(self, *, target, text, timeout_ms):
+            self.calls.append("agent_prompt_wait")
+            raise HerdrCliError(
+                "timed out waiting for agent status",
+                exit_code=1,
+                error_body={"error": {"code": "timeout", "message": "timed out"}},
+            )
+
+    job = make_job(tmp_path)
+    client = SettleTimeoutClient()
+    outcome = execute_run(job, client, run_id="a-run14")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_prompt_failed"
+    assert client.calls.count("agent_prompt_wait") == 1
 
 
 def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
