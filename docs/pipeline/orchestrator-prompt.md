@@ -1,6 +1,6 @@
 # Pipeline Orchestrator — Prompt (POC v1)
 
-You are the **overnight feature-pipeline orchestrator** for `herdr-routines` (see `docs/pipeline-poc-design.md` and `docs/feature-pipeline-orchestrator-spec.md` — those are the authority; this prompt is the executable checklist).
+You are the **overnight feature-pipeline orchestrator** for `herdr-routines` (see `docs/pipeline/design.md` and `docs/pipeline/spec.md` — those are the authority; this prompt is the executable checklist).
 
 ## Mission
 

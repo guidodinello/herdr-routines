@@ -1,8 +1,8 @@
 # Pipeline POC — Design Draft (v1)
 
 Status: draft (2026-08-23). POC scope: free models only, quota out of scope.
-Canonical spec: [`docs/feature-pipeline-orchestrator-spec.md`](feature-pipeline-orchestrator-spec.md) (mirrored at `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md`).
-Roadmap tracking: `ROADMAP.md:31` (Now, gate: a few overnight runs end-to-end without human rescue).
+Canonical spec: [`spec.md`](spec.md) (sibling in `docs/pipeline/`; mirrored at `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md`).
+Roadmap tracking: `ROADMAP.md:31` (Now, gate: a few overnight runs end-to-end without human rescue). Orchestrator prompt: [`orchestrator-prompt.md`](orchestrator-prompt.md); audits: `audits/`.
 
 ## Goal
 
@@ -242,12 +242,12 @@ WS=$(herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> \
   --label pipeline-poc-20260824 --env HERDR_ENV=1 | jq -r '.result.root_pane.pane_id')
 systemd-run --user --on-calendar="2026-08-24 02:00:00" --timer-property=AccuracySec=30s \
   --unit=pipeline-poc-20260824 \
-  bash -c "herdr agent start pipeline-orchestrator --kind opencode --pane \$WS --timeout 120000 -- -m opencode/muse-spark-1.2-contributor-free && herdr agent prompt pipeline-orchestrator \"\$(cat orchestrator-prompt.md)\" --wait --until idle --timeout 25200000"
+  bash -c "herdr agent start pipeline-orchestrator --kind opencode --pane \$WS --timeout 120000 -- -m opencode/muse-spark-1.2-contributor-free && herdr agent prompt pipeline-orchestrator \"\$(cat docs/pipeline/orchestrator-prompt.md)\" --wait --until idle --timeout 25200000"
 
 # B — manual one-liner from an existing herdr pane (simplest for first run)
 WS=$(herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> --label pipeline-poc --env HERDR_ENV=1 | jq -r '.result.root_pane.pane_id')
 herdr agent start pipeline-orchestrator --kind opencode --pane "$WS" --timeout 120000 -- -m opencode/muse-spark-1.2-contributor-free
-herdr agent prompt pipeline-orchestrator "$(cat orchestrator-prompt.md)" --wait --until idle --timeout 25200000
+herdr agent prompt pipeline-orchestrator "$(cat docs/pipeline/orchestrator-prompt.md)" --wait --until idle --timeout 25200000
 ```
 
 For the POC the prompt file is checked out alongside the target repo worktree
@@ -304,7 +304,7 @@ prompt is green.
 ## Build order (when picked up)
 
 1. ~~Copy this design + `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md`
-   into `docs/`~~ — done: this doc + [`docs/feature-pipeline-orchestrator-spec.md`](feature-pipeline-orchestrator-spec.md) (canonical) now live in `docs/` on this branch (PR still required per `ROADMAP.md` ruleset).
+   into `docs/pipeline/`~~ — done: this doc + [`docs/pipeline/spec.md`](spec.md) (canonical) now live in `docs/pipeline/` on this branch (PR still required per `ROADMAP.md` ruleset).
 2. Write `orchestrator-prompt.md` (the hardcoded stage list + spawn/poll/checkpoint
    instructions) and a minimal `state.json` schema.
 3. First manual run against `herdr-routines` with a trivial feature idea; fix

@@ -66,14 +66,14 @@ Stage rules:
   current stage, PR number, artifact paths, shared_worktree, branch) updated
   after every stage transition, so a relaunched run can resume instead of
   restarting (resume recipe: `state.json` + `herdr agent list` reconcile;
-  see `docs/pipeline-poc-design.md:92`). POC may fake this with convention
+  see `design.md:92`). POC may fake this with convention
   over code — acceptable.
 
 ## Handoff contract (clarified by design audit 2026-08-23, gap 1)
 
 All inter-stage artifacts live on **one shared worktree+branch**
 `auto/pipeline-<run_id>` created by the orchestrator before stage 1 (see
-`docs/pipeline-poc-design.md:68`). `spec.md` is committed before stage 1
+`design.md:68`). `spec.md` is committed before stage 1
 settles so stage 2 sees it; stage 3 commits on the same branch; stage 4 PRs it.
 Artifacts: `spec.md`, `state.json` (incl. `shared_worktree`, `branch`), and
 `$PIPELINE_REPORT`. Every worker prompt names its input files explicitly —
@@ -94,7 +94,7 @@ boundaries).
 
 1. Which repo hosts the POC feature? (herdr-routines itself is the natural
    dogfood target; fitted is the stress test.) — **Design picks herdr-routines
-   dogfood first** (`docs/pipeline-poc-design.md:164`).
+   dogfood first** (`design.md:164`).
 2. Orchestrator→worker driving: mechanically solved — the same herdr CLI calls
    runner.py uses are available to an agent. What must be *ported* (not
    rediscovered) is runner.py's hard-won failure handling: start-race prompt
@@ -103,7 +103,7 @@ boundaries).
    detached `herdr agent prompt --wait` + result-file + 3–5 min sleep (not
    30–60s `agent get` hot polling), plus `HERDR_ENV=1` via
    `herdr workspace create --env` and full `herdr`/`git`/`gh`/`uv` allowlist
-   on laptop+Pi — **resolved in design** (`docs/pipeline-poc-design.md:77-95`),
+   on laptop+Pi — **resolved in design** (`design.md:77-95`),
    empirical check at build: confirm opencode bash can block / detach.
 3. Does the orchestrator run as a herdr session itself (so it's watchable in
    the TUI) or bare opencode? **Lean herdr session** (design:77).
@@ -114,12 +114,12 @@ boundaries).
    `2 muse-spark` fresh session spec review / `3 ox-alpha-free`
    (`x-preview-f-free`) implement / `5 big-pickle` primary single reviewer v1
    (fan-out `hy3-free` + `x-preview-f-free` is v2 `opencode-e2e:19`) /
-   `6 ox` fixes + `muse` GH ops (`docs/pipeline-poc-design.md:268`).
+   `6 ox` fixes + `muse` GH ops (`design.md:268`).
 5. Where does the pipeline launcher live — manual SSH one-liner (transient
    systemd timer, see roadmap §3 one-shot options) or a `herdr-routines run`
    job with the orchestrator prompt? **Design picks one-shot `systemd-run`
    transient** with correct `herdr workspace create` + pane parsing
-   (`docs/pipeline-poc-design.md:143`), `herdr-routines run` wrapper deferred.
+   (`design.md:143`), `herdr-routines run` wrapper deferred.
 
 ## Non-goals for POC
 

@@ -33,7 +33,7 @@ Ready to build whenever; no real-run evidence required.
    independent spec review (adds acceptance criteria + test plan) → implement-until-spec-tests-pass
    → PR → code review → capped comment-addressal loop. Files-as-handoff, machine-checkable gates
    between stages, stop-on-failure semantics, checkpoint/resume. Full POC spec:
-   [`docs/feature-pipeline-orchestrator-spec.md`](docs/feature-pipeline-orchestrator-spec.md) (canonical; mirrored at `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md` until Pi rollout settles). Design draft: [`docs/pipeline-poc-design.md`](docs/pipeline-poc-design.md) (v1: workflow hardcoded in orchestrator prompt, gates judged by orchestrator). Under Now because it needs no real-run evidence to attempt: every piece it
+   [`docs/pipeline/spec.md`](docs/pipeline/spec.md) (canonical; mirrored at `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md` until Pi rollout settles). Design draft: [`docs/pipeline/design.md`](docs/pipeline/design.md) (v1: workflow hardcoded in orchestrator prompt, gates judged by orchestrator). Audits: `docs/pipeline/audits/` (not top-level). Under Now because it needs no real-run evidence to attempt: every piece it
    composes (programmatic spawn/settle via runner.py's patterns, worktree jobs, gh-driven code
    review) already works in isolation — the missing thing is the integration, which is learned
    only by running it. Generalizes the auto-fix-PR idea (Later) into a full chain. Gate for
