@@ -28,17 +28,50 @@ READY_POLL_INTERVAL_S = 1.0
 
 # Retries for the prompt send itself. `interactive_ready` only means the TUI is drawn — the
 # agent's session backend can still reject the first prompt seconds later (server-side
-# EmptyResponse, observed ~3s and ~10s after start on herdr 0.8.2/0.8.x). A settle timeout is
-# NOT retried: its JSON body (code "timeout") proves delivery succeeded, and resending would
-# double-prompt the agent. Module-level so tests can adjust.
+# EmptyResponse, observed ~3s and ~10s after start on herdr 0.8.2/0.8.x). Only such provably-
+# early server rejections are retried (see _is_retryable_prompt_error); everything else is
+# terminal, because unknown-or-proven delivery plus a resend would double-prompt the agent and
+# duplicate the run's side effects (branch/report written twice). Module-level so tests can
+# adjust or zero it out.
 PROMPT_RETRY_DELAYS_S = (5.0, 15.0)
+
+
+def _error_body_code(e: HerdrCliError) -> str | None:
+    """The parsed error body's error.code when it is a string, else None. Never raises: both
+    callers run inside except blocks, where crashing on a malformed body (e.g. a flat
+    {"error": "timeout"}) would mask the original failure."""
+    body = e.error_body
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    return code if isinstance(code, str) else None
 
 
 def _is_settle_timeout(e: HerdrCliError) -> bool:
     """True when the prompt was delivered but the agent didn't settle within timeout_ms
-    (herdr exits 1 with a JSON body, code "timeout"). Resending in that case would double-prompt."""
-    code = (e.error_body or {}).get("error", {}).get("code")
-    return code == "timeout"
+    (herdr exits 1 with a JSON body, code "timeout"). Resending in that case would double-prompt.
+    Any malformed body conservatively classifies as not-a-settle-timeout rather than raising —
+    see _error_body_code."""
+    return _error_body_code(e) == "timeout"
+
+
+def _is_retryable_prompt_error(e: HerdrCliError) -> bool:
+    """True only for provably-early server rejections: herdr exited 1 with a parsed JSON error
+    body whose error.code is present and is not "timeout" (the session-not-ready EmptyResponse).
+    Everything else raises immediately:
+      - exit 124 (_subprocess_runner wrapper timeout): herdr ran past timeout_ms + grace, so
+        the prompt was almost certainly delivered;
+      - exit 0 shape errors (_extract_status): delivery AND settle already succeeded — only
+        the response JSON was unexpected;
+      - exit 1 without a parseable body or without an error.code: delivery state unknown.
+    Resending in any terminal case risks duplicating the run's side effects."""
+    if e.exit_code != 1 or not isinstance(e.error_body, dict):
+        return False
+    code = _error_body_code(e)
+    return code is not None and code != "timeout"
 
 
 def _prompt_with_retry(
@@ -49,9 +82,11 @@ def _prompt_with_retry(
     text: str,
     timeout_ms: int,
 ) -> str:
-    """agent_prompt_wait with bounded retries over early session-not-ready failures. Raises the
-    last error if every attempt fails (or immediately on settle timeouts — see
-    _is_settle_timeout). `target` is the agent name; `job_name` only labels log lines."""
+    """agent_prompt_wait with bounded retries over provably-early session-not-ready failures
+    (see _is_retryable_prompt_error). Any other error — settle timeouts, wrapper subprocess
+    timeouts, shape errors — raises immediately, because delivery is proven or likely and a
+    resend would double-prompt the agent. Raises the last error if every attempt fails.
+    `target` is the agent name; `job_name` only labels log lines."""
     delays = (None, *PROMPT_RETRY_DELAYS_S)
     for i, delay in enumerate(delays):
         if delay is not None:
@@ -64,7 +99,7 @@ def _prompt_with_retry(
                 target=target, text=text, timeout_ms=timeout_ms
             )
         except HerdrCliError as e:
-            if _is_settle_timeout(e) or i == len(delays) - 1:
+            if not _is_retryable_prompt_error(e) or i == len(delays) - 1:
                 raise
     raise AssertionError(
         "unreachable"
@@ -77,8 +112,9 @@ def _wait_for_agent_ready(
     """Blocks until the agent reports interactive_ready, returning (True, None); once
     timeout_s elapses returns (False, last_error_text). `agent start` returns as soon as the
     process is detected, but the TUI needs another few seconds before typed input is delivered;
-    prompting earlier makes the server-side agent.prompt fail (EmptyResponse) and the run dies
-    as agent_prompt_failed. Polling errors are swallowed and never escape this function — a
+    prompting earlier makes the server-side agent.prompt fail (EmptyResponse), which
+    _prompt_with_retry then retries via _is_retryable_prompt_error (terminal agent_prompt_failed
+    only on exhaustion). Polling errors are swallowed and never escape this function — a
     transiently unreachable server (or a vanished `herdr` binary raising OSError) must not
     abort the wait nor break execute_run's never-raises contract; the last error's text
     accompanies the verdict so an eventual agent_not_interactive failure can be attributed to

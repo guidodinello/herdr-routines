@@ -11,6 +11,8 @@ import pytest
 from herdr_routines.config import Job
 from herdr_routines.herdr import HerdrClient, HerdrCliError
 from herdr_routines.runner import (
+    _is_retryable_prompt_error,
+    _is_settle_timeout,
     build_branch_name,
     build_dry_run_argv,
     execute_run,
@@ -374,8 +376,9 @@ def test_execute_run_readiness_polling_survives_oserror(
 
 
 class FlakyPromptClient(ScriptedClient):
-    """Fails the first N prompt attempts with a non-timeout server error (the early
-    session-not-ready EmptyResponse signature), then succeeds."""
+    """Fails the first N prompt attempts with a provably-early, retryable server rejection —
+    the session-not-ready EmptyResponse signature (exit 1 plus a JSON error body naming its
+    code) — then succeeds."""
 
     def __init__(self, *, fail_times: int = 1, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -385,7 +388,13 @@ class FlakyPromptClient(ScriptedClient):
         if self._fail_times > 0:
             self._fail_times -= 1
             self.calls.append("agent_prompt_wait[failed]")
-            raise HerdrCliError("EmptyResponse", exit_code=1)
+            raise HerdrCliError(
+                "EmptyResponse",
+                exit_code=1,
+                error_body={
+                    "error": {"code": "empty_response", "message": "EmptyResponse"}
+                },
+            )
         return super().agent_prompt_wait(
             target=target, text=text, timeout_ms=timeout_ms
         )
@@ -440,6 +449,125 @@ def test_execute_run_never_resends_after_settle_timeout(
     assert outcome.state == "failed"
     assert outcome.reason == "agent_prompt_failed"
     assert client.calls.count("agent_prompt_wait") == 1
+
+
+class TerminalPromptClient(ScriptedClient):
+    """Always fails the prompt with one terminal error — the retry loop must send exactly once,
+    whatever delays are configured."""
+
+    def __init__(self, *, error: HerdrCliError, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._error = error
+
+    def agent_prompt_wait(self, *, target, text, timeout_ms):
+        self.calls.append("agent_prompt_wait")
+        raise self._error
+
+
+def test_execute_run_wrapper_subprocess_timeout_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_subprocess_runner maps a hang past timeout_ms+grace to exit 124 with no error body.
+    The prompt was almost certainly delivered, so there is exactly one send attempt and the
+    run records a failure."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", (0.0,))
+    job = make_job(tmp_path)
+    client = TerminalPromptClient(
+        error=HerdrCliError(
+            "herdr call timed out: herdr agent prompt rt-a --wait", exit_code=124
+        )
+    )
+    outcome = execute_run(job, client, run_id="a-run18")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_prompt_failed"
+    assert client.calls.count("agent_prompt_wait") == 1
+
+
+def test_execute_run_post_settle_shape_error_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_extract_status raises exit_code=0 only after delivery AND settle already succeeded —
+    only the response JSON was unexpected. Retrying would make the agent do the work twice."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", (0.0,))
+    job = make_job(tmp_path)
+    client = TerminalPromptClient(
+        error=HerdrCliError("unexpected herdr agent response shape: {}", exit_code=0)
+    )
+    outcome = execute_run(job, client, run_id="a-run19")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_prompt_failed"
+    assert client.calls.count("agent_prompt_wait") == 1
+
+
+def test_execute_run_flat_timeout_body_fails_without_crash_or_resend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flat {"error": "timeout"} body used to crash _is_settle_timeout (AttributeError on
+    .get of a str) inside the retry loop's except block. It must classify conservatively —
+    not a settle timeout, and lacking error.code not retryable either: one send, clean failed
+    outcome, nothing raised out of execute_run."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", (0.0,))
+    job = make_job(tmp_path)
+    client = TerminalPromptClient(
+        error=HerdrCliError("timed out", exit_code=1, error_body={"error": "timeout"})
+    )
+    outcome = execute_run(job, client, run_id="a-run20")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_prompt_failed"
+    assert client.calls.count("agent_prompt_wait") == 1
+
+
+def test_is_settle_timeout_survives_malformed_bodies() -> None:
+    """_is_settle_timeout runs inside an except block and must never raise itself; any shape
+    without a nested string code conservatively reads as not a settle timeout."""
+    bodies: list[dict[str, object] | None] = [
+        None,
+        {},
+        {"error": "timeout"},
+        {"error": {}},
+        {"error": {"code": 7}},
+        {"error": ["timeout"]},
+    ]
+    for body in bodies:
+        e = HerdrCliError("x", exit_code=1, error_body=body)
+        assert _is_settle_timeout(e) is False
+
+
+def test_nested_timeout_body_is_still_a_settle_timeout() -> None:
+    """The genuine settle-timeout signature keeps classifying as such."""
+    e = HerdrCliError(
+        "x",
+        exit_code=1,
+        error_body={"error": {"code": "timeout", "message": "timed out"}},
+    )
+    assert _is_settle_timeout(e) is True
+
+
+def test_only_provably_early_rejections_are_retryable() -> None:
+    """The retry whitelist is structural: exit 1 plus a parsed body whose error.code exists and
+    is not "timeout". Exit 124, exit-0 shape errors, missing/malformed bodies and timeouts all
+    stay terminal."""
+
+    def err(**kwargs) -> HerdrCliError:
+        return HerdrCliError("boom", **kwargs)
+
+    assert _is_retryable_prompt_error(
+        err(exit_code=1, error_body={"error": {"code": "empty_response"}})
+    )
+    assert not _is_retryable_prompt_error(err(exit_code=124))
+    assert not _is_retryable_prompt_error(err(exit_code=2))
+    assert not _is_retryable_prompt_error(
+        err(exit_code=0, error_body={"error": {"code": "shape"}})
+    )
+    assert not _is_retryable_prompt_error(err(exit_code=1))
+    assert not _is_retryable_prompt_error(err(exit_code=1, error_body={"other": 1}))
+    assert not _is_retryable_prompt_error(err(exit_code=1, error_body={"error": {}}))
+    assert not _is_retryable_prompt_error(
+        err(exit_code=1, error_body={"error": "timeout"})
+    )
+    assert not _is_retryable_prompt_error(
+        err(exit_code=1, error_body={"error": {"code": "timeout"}})
+    )
 
 
 def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
