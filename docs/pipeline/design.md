@@ -113,12 +113,11 @@ fresh worktree does not show another worktree's untracked files.
   - `herdr` (spawn/poll/close), `git` (commit/add/log/rev-parse), `gh` (pr
     create/view/api/graphql + thread resolve), `uv`/`pytest`/`ruff`, `rg`/`jq`/`column`,
     `herdr notification show` (deadline path)
-  - `permission.external_directory` for `~/.config/herdr/herdr.sock`,
-    `~/.local/state/herdr-routines/`, `~/.local/state/herdr/`, the shared
-    worktree `~/.herdr/worktrees/auto/pipeline-*`, the report dir
-    `~/.local/state/herdr-routines/reports/` and the on-demand clone cache
-    dir (if stage 5 ever clones cross-repo — same fix as
-    `raspberrypi/troubleshooting-log.md` external-directory `blocked`).
+  - `permission.external_directory` for `~/.config/opencode/**`,
+    `~/.config/herdr/**` (`~/.config/herdr/herdr.sock`), `~/.herdr/worktrees/auto/pipeline-*`,
+    `~/.local/state/herdr-routines/**` (incl. `reports/`), `~/.local/state/herdr/**` and the
+    on-demand clone cache dir (if stage 5 ever clones cross-repo — same fix as
+    `raspberrypi/troubleshooting-log.md` external-directory `blocked` — Pi probe hit `~/.config/opencode` `blocked` on first pipeline run, fixed 2026-08-23).
   - `GH_TOKEN` / `gh auth status` must be valid on the Pi — `gh pr create` and
     `gh api graphql` fail differently when unauthenticated and surface at 03:00
     as gate-4/6 failures, not permission wedges (G-5).
