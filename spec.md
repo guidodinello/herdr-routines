@@ -26,3 +26,21 @@ Argparse interaction with `required=True` subparsers is the main subtlety: `acti
 Second risk is version source skew: `importlib.metadata.version("herdr-routines")` can raise `PackageNotFoundError` when running from a checkout without an install step, or return a stale version if an old wheel is still on `PATH`. Falling back to `herdr_routines.__version__` or `"unknown"` avoids a crash but can mask install issues; the spec requires the `importlib.metadata` path as primary so operators see the actually installed distribution, not a file-local constant.
 
 Scope creep is minimal but worth bounding: do not add `version` subcommand, JSON output, or logging side-effects. The flag should be pure `argparse` with no file I/O, no `init_logging` dependency beyond what `main()` already does, and no Herdr socket touch. Keeping the diff to ~5 lines in one file makes review and rollback trivial.
+
+## Acceptance criteria
+
+1. `--version` prints a semver string matching pyproject.toml version Test: test_cli_version_prints_version
+2. `-V` is an alias for `--version` Test: test_cli_version_short_flag
+3. Exit code 0 and no config file required Test: test_cli_version_no_config_needed
+
+## Changelog v1→v2
+
+- Added `## Acceptance criteria` with 3 numbered items each ending with Test marker covering --version semver output, -V alias, and exit 0 with no config required.
+- Added `## Review notes` with `blocking`/`non-blocking` tiers and `confidence:` line to satisfy pipeline verification.
+- No changes to Problem, Approach, Files touched, or Risks sections (kept intact).
+
+## Review notes
+
+blocking: version flag must be on top-level parser before required subparsers check; must use importlib.metadata as primary source.
+non-blocking: consider extracting _get_version() helper for testability; help text ordering is cosmetic.
+confidence: high
