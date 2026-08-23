@@ -231,6 +231,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         return 1
 
     problems = []
+    warnings = []
     for job in config.jobs:
         if not job.repo.exists():
             problems.append(f"{job.name}: repo path does not exist: {job.repo}")
@@ -243,8 +244,19 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             problems.append(
                 f"{job.name}: repo is not a git repository (no .git): {job.repo}"
             )
+        if "$ROUTINE_REPORT" not in job.prompt:
+            # A run only settles as "done" when the report file exists and is non-empty (see
+            # runner.execute_run's no_report check); the agent only writes it if the prompt
+            # asks. A prompt that never mentions the placeholder can never succeed.
+            warnings.append(
+                f"{job.name}: prompt never mentions $ROUTINE_REPORT — the run will always "
+                f"fail with no_report; tell the agent to write its summary there"
+            )
 
     problems += _check_systemd_timeout(config, args.systemd_unit)
+
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
 
     if problems:
         for p in problems:

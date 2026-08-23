@@ -232,3 +232,44 @@ def test_main_configures_logging_before_parsing_args(
     cli.main(["status"])
 
     assert calls == [tmp_path / "herdr-routines.log"]
+
+
+def test_validate_warns_when_prompt_never_writes_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Live on the Pi (2026-08-23): a job whose prompt never mentions $ROUTINE_REPORT ran
+    green through the whole pipeline and still failed with no_report — validate must flag
+    that up front instead."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: a\n"
+        f"    cron: '0 3 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    workspace: worktree\n"
+        f"    prompt: Review the oldest PR and stop.\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    assert "$ROUTINE_REPORT" in capsys.readouterr().err
+
+
+def test_validate_stays_silent_when_prompt_targets_the_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: a\n"
+        f"    cron: '0 3 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    workspace: worktree\n"
+        f"    prompt: Write your findings to $ROUTINE_REPORT.\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    assert "$ROUTINE_REPORT" not in capsys.readouterr().err
