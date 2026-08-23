@@ -334,6 +334,25 @@ jobs:
     assert job.failure_markers == ("Out of credits", "quota blown")
 
 
+def test_explicit_empty_failure_markers_is_valid_and_means_empty_tuple(
+    tmp_config_path: Path,
+) -> None:
+    """[] must survive validation as an empty tuple (scan disabled downstream) — not collapse
+    into 'unset'."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    failure_markers: []
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.failure_markers == ()
+
+
 @pytest.mark.parametrize(
     "raw",
     ["just-a-string", "[1, 2]", '["ok", ""]', '["ok", null]', "{}"],

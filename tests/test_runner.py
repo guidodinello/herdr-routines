@@ -778,6 +778,18 @@ def test_custom_failure_markers_override_defaults(
     assert "'Out of credits'" in (outcome.error or "")
 
 
+def test_explicit_empty_failure_markers_disable_scanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit empty list is valid config meaning 'scan nothing' — it must NOT fall back
+    to the defaults via falsy-`or` (found by the muse review on this very PR)."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ())
+    job = make_job(tmp_path, failure_markers=())
+    client = QuotaWedgeClient(visible_screen="Free usage exceeded")
+    outcome = execute_run(job, client, run_id="a-empty")  # type: ignore[arg-type]
+    assert outcome.reason == "agent_prompt_failed"
+
+
 def test_agent_not_interactive_reaps_pane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -432,7 +432,13 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         screen_tail = _capture_visible_tail(
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
-        markers = job.failure_markers or DEFAULT_FAILURE_MARKERS
+        # `is not None`, not truthiness: an explicit empty failure_markers list is valid config
+        # meaning "scan nothing" — `or` would silently fall back to the defaults (PR #25 review).
+        markers = (
+            job.failure_markers
+            if job.failure_markers is not None
+            else DEFAULT_FAILURE_MARKERS
+        )
         marker = _matched_failure_marker(screen_tail, markers, prompt)
         reason = "quota_exhausted" if marker else "agent_prompt_failed"
         error = f"failure marker matched: {marker!r}" if marker else str(e)
