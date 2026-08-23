@@ -124,7 +124,13 @@ class FakeFullClient:
     def settled_agent_workspace(self, name):
         return None
 
+    def settled_agent_pane(self, name):
+        return None
+
     def workspace_close(self, workspace_id):
+        pass
+
+    def pane_close(self, pane_id):
         pass
 
     def agent_prompt_wait(self, *, target, text, timeout_ms):
@@ -208,7 +214,14 @@ class FakeClient:
     def settled_agent_workspace(self, name):
         self._maybe_raise("settled_agent_workspace")
 
+    def settled_agent_pane(self, name):
+        self._maybe_raise("settled_agent_pane")
+        self._maybe_raise("settled_agent_workspace")
+
     def workspace_close(self, workspace_id):
+        pass
+
+    def pane_close(self, pane_id):
         pass
 
     def agent_prompt_wait(self, *, target, text, timeout_ms):

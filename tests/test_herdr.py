@@ -263,3 +263,198 @@ def test_agent_read_returns_empty_string_on_failure_rather_than_raising() -> Non
     runner = FakeRunner([(1, "", "some error")])
     client = HerdrClient(runner=runner)
     assert client.agent_read("rt-a") == ""
+
+
+# -- settled_agent_* / pane_close tier-2 tests -----------------------------------------------
+
+
+def test_settled_agent_pane_returns_pane_when_settled() -> None:
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": "rt-a",
+                    "agent_status": "idle",
+                    "pane_id": "w9:p1",
+                    "workspace_id": "w9",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_pane("rt-a") == "w9:p1"
+    assert runner.calls[0][1:3] == ["agent", "list"]
+
+
+def test_settled_agent_workspace_returns_workspace_when_settled() -> None:
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": "rt-a",
+                    "agent_status": "done",
+                    "pane_id": "w9:p1",
+                    "workspace_id": "w9",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_workspace("rt-a") == "w9"
+    assert runner.calls[0][1:3] == ["agent", "list"]
+
+
+def test_settled_agent_pane_does_not_return_for_working() -> None:
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": "rt-a",
+                    "agent_status": "working",
+                    "pane_id": "w9:p1",
+                    "workspace_id": "w9",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_pane("rt-a") is None
+
+
+def test_settled_agent_pane_does_not_return_for_blocked() -> None:
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": "rt-a",
+                    "agent_status": "blocked",
+                    "pane_id": "w9:p1",
+                    "workspace_id": "w9",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_pane("rt-a") is None
+
+
+def test_settled_agent_pane_does_not_return_for_unknown() -> None:
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": "rt-a",
+                    "agent_status": "unknown",
+                    "pane_id": "w9:p1",
+                    "workspace_id": "w9",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_pane("rt-a") is None
+
+
+def test_settled_agent_pane_does_not_return_when_status_missing() -> None:
+    body = {
+        "result": {
+            "agents": [{"name": "rt-a", "pane_id": "w9:p1", "workspace_id": "w9"}]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_pane("rt-a") is None
+
+
+def test_settled_agent_pane_first_match_fragility() -> None:
+    """If any matching entry is still live, the name must not be considered settled —
+    names are unique only among live agents, so a settled duplicate listed before a
+    working one must not be reaped."""
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": "rt-a",
+                    "agent_status": "idle",
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                },
+                {
+                    "name": "rt-a",
+                    "agent_status": "working",
+                    "pane_id": "w2:p1",
+                    "workspace_id": "w2",
+                },
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_pane("rt-a") is None
+
+
+def test_settled_agent_pane_missing_pane_id_returns_none() -> None:
+    body = {"result": {"agents": [{"name": "rt-a", "agent_status": "idle"}]}}
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_pane("rt-a") is None
+
+
+def test_settled_agent_pane_absent_name_returns_none() -> None:
+    body = {
+        "result": {
+            "agents": [{"name": "rt-other", "agent_status": "idle", "pane_id": "w1:p1"}]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_pane("rt-a") is None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"result": None},
+        {"result": {"agents": None}},
+        {"result": {"agents": "bad"}},
+        {"result": []},
+    ],
+)
+def test_settled_agent_pane_converts_malformed_shapes_to_cli_error(body: dict) -> None:
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    with pytest.raises(HerdrCliError):
+        client.settled_agent_pane("rt-a")
+
+
+def test_pane_close_builds_expected_argv() -> None:
+    runner = FakeRunner([ok({"result": {}})])
+    client = HerdrClient(runner=runner)
+    client.pane_close("w9:p1")
+    assert runner.calls[0] == ["herdr", "pane", "close", "w9:p1"]
+
+
+def test_workspace_close_builds_expected_argv() -> None:
+    runner = FakeRunner([ok({"result": {}})])
+    client = HerdrClient(runner=runner)
+    client.workspace_close("w9")
+    assert runner.calls[0] == ["herdr", "workspace", "close", "w9"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"result": None},
+        {"result": {"agents": None}},
+    ],
+)
+def test_agent_statuses_converts_malformed_shapes_to_cli_error(body: dict) -> None:
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    with pytest.raises(HerdrCliError):
+        client.agent_statuses()

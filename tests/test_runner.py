@@ -53,6 +53,7 @@ class ScriptedClient:
         agent_status: str = "idle",
         interactive_ready: bool = True,
         stale_workspace: str | None = None,
+        stale_pane: str | None = None,
         write_report_at: Path | None = None,
         report_content: str = "# Report\n\nFindings.\n",
         raise_on: str | None = None,
@@ -60,12 +61,17 @@ class ScriptedClient:
         self.pane_id = pane_id
         self.agent_status = agent_status
         self.interactive_ready = interactive_ready
+        # stale_pane is the new primary; stale_workspace kept for backwards-compat in tests
+        if stale_pane is None and stale_workspace is not None:
+            stale_pane = stale_workspace
+        self.stale_pane = stale_pane
         self.stale_workspace = stale_workspace
         self.write_report_at = write_report_at
         self.report_content = report_content
         self.raise_on = raise_on
         self.calls: list[str] = []
         self.closed_workspaces: list[str] = []
+        self.closed_panes: list[str] = []
         self.started_with_model: str | None = None
 
     def worktree_create(self, *, cwd, branch, base, label=None):
@@ -80,9 +86,21 @@ class ScriptedClient:
             raise HerdrCliError("boom", exit_code=1)
         return self.stale_workspace
 
+    def settled_agent_pane(self, name):
+        self.calls.append("settled_agent_pane")
+        if self.raise_on == "settled_agent_pane":
+            raise HerdrCliError("boom", exit_code=1)
+        if self.raise_on == "settled_agent_workspace":
+            raise HerdrCliError("boom", exit_code=1)
+        return self.stale_pane
+
     def workspace_close(self, workspace_id):
         self.calls.append("workspace_close")
         self.closed_workspaces.append(workspace_id)
+
+    def pane_close(self, pane_id):
+        self.calls.append("pane_close")
+        self.closed_panes.append(pane_id)
 
     def tab_create(self, *, cwd, label=None):
         self.calls.append("tab_create")
@@ -198,7 +216,7 @@ def test_execute_run_success_writes_report(
     assert outcome.report_bytes > 0
     assert outcome.final_agent_status == "idle"
     assert client.calls == [
-        "settled_agent_workspace",
+        "settled_agent_pane",
         "worktree_create",
         "agent_start",
         "agent_interactive_ready",
@@ -277,7 +295,7 @@ def test_execute_run_worktree_creation_failure_short_circuits(tmp_path: Path) ->
     outcome = execute_run(job, client, run_id="a-run6")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "pane_creation_failed"
-    assert client.calls == ["settled_agent_workspace", "worktree_create"]
+    assert client.calls == ["settled_agent_pane", "worktree_create"]
 
 
 def test_execute_run_agent_start_failure_short_circuits(tmp_path: Path) -> None:
@@ -287,7 +305,7 @@ def test_execute_run_agent_start_failure_short_circuits(tmp_path: Path) -> None:
     assert outcome.state == "failed"
     assert outcome.reason == "agent_start_failed"
     assert client.calls == [
-        "settled_agent_workspace",
+        "settled_agent_pane",
         "worktree_create",
         "agent_start",
     ]
@@ -303,7 +321,7 @@ def test_execute_run_prompt_failure_short_circuits(
     assert outcome.state == "failed"
     assert outcome.reason == "agent_prompt_failed"
     assert client.calls == [
-        "settled_agent_workspace",
+        "settled_agent_pane",
         "worktree_create",
         "agent_start",
         "agent_interactive_ready",
@@ -575,7 +593,9 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
     method signatures."""
     for name in (
         "settled_agent_workspace",
+        "settled_agent_pane",
         "workspace_close",
+        "pane_close",
         "worktree_create",
         "tab_create",
         "agent_start",
@@ -596,11 +616,11 @@ def test_execute_run_reaps_previous_run_workspace_before_starting(
     job = make_job(tmp_path)
     run_id = "a-run15"
     report_path = _isolated_reports_dir / f"{run_id}.md"
-    client = ScriptedClient(stale_workspace="w9", write_report_at=report_path)
+    client = ScriptedClient(stale_pane="w9:p1", write_report_at=report_path)
     outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
     assert outcome.state == "done"
-    assert client.closed_workspaces == ["w9"]
-    assert client.calls.index("workspace_close") < client.calls.index("worktree_create")
+    assert client.closed_panes == ["w9:p1"]
+    assert client.calls.index("pane_close") < client.calls.index("worktree_create")
 
 
 def test_execute_run_leaves_panes_alone_when_no_stale_workspace(
@@ -609,8 +629,9 @@ def test_execute_run_leaves_panes_alone_when_no_stale_workspace(
     job = make_job(tmp_path)
     run_id = "a-run16"
     report_path = _isolated_reports_dir / f"{run_id}.md"
-    client = ScriptedClient(stale_workspace=None, write_report_at=report_path)
+    client = ScriptedClient(stale_pane=None, write_report_at=report_path)
     execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert "pane_close" not in client.calls
     assert "workspace_close" not in client.calls
 
 
@@ -622,8 +643,41 @@ def test_execute_run_survives_stale_workspace_reap_errors(
     job = make_job(tmp_path)
     run_id = "a-run17"
     report_path = _isolated_reports_dir / f"{run_id}.md"
-    client = ScriptedClient(
-        raise_on="settled_agent_workspace", write_report_at=report_path
-    )
+    client = ScriptedClient(raise_on="settled_agent_pane", write_report_at=report_path)
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+
+
+def test_execute_run_does_not_reap_in_root_mode(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Root-mode jobs share the ambient workspace — closing it would tear down every other
+    open tab, not just our own previous pane."""
+    job = make_job(tmp_path, workspace="root")
+    run_id = "a-run-root"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(stale_pane="w9:p1", write_report_at=report_path)
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert "settled_agent_pane" not in client.calls
+    assert "pane_close" not in client.calls
+    assert "workspace_close" not in client.calls
+
+
+def test_execute_run_survives_unexpected_reap_exception(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """The reap catch must preserve execute_run's never-raises contract even for
+    unexpected exceptions like AttributeError from a malformed agent list shape."""
+
+    class ExplodingClient(ScriptedClient):
+        def settled_agent_pane(self, name):  # type: ignore[override]
+            self.calls.append("settled_agent_pane")
+            raise AttributeError("'NoneType' object has no attribute 'get'")
+
+    job = make_job(tmp_path)
+    run_id = "a-run-attr"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ExplodingClient(write_report_at=report_path)
     outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
     assert outcome.state == "done"
