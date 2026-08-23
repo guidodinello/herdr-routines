@@ -29,16 +29,23 @@ Ready to build whenever; no real-run evidence required.
   branches that are merged or whose worktree is gone. Read-only and mechanical; useful as soon
   as the first real worktree jobs run. The deletion half is gated separately (see Next).
 - **Overnight feature-pipeline orchestrator (POC)** — one orchestrator agent session drives an
-  entire feature lifecycle by spawning per-stage worker sessions via herdr: plan/spec →
-  independent spec review (adds acceptance criteria + test plan) → implement-until-spec-tests-pass
-  → PR → code review → capped comment-addressal loop. Files-as-handoff, machine-checkable gates
-  between stages, stop-on-failure semantics, checkpoint/resume. Full POC spec already written:
-  `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md` (lands in `docs/` here via PR
-  when picked up). Under Now because it needs no real-run evidence to attempt: every piece it
-  composes (programmatic spawn/settle via runner.py's patterns, worktree jobs, gh-driven code
-  review) already works in isolation — the missing thing is the integration, which is learned
-  only by running it. Generalizes the auto-fix-PR idea (Later) into a full chain. Gate for
-  promoting beyond POC: a few real overnight runs finishing end-to-end without human rescue.
+   entire feature lifecycle by spawning per-stage worker sessions via herdr: plan/spec →
+   independent spec review (adds acceptance criteria + test plan) → implement-until-spec-tests-pass
+   → PR → code review → capped comment-addressal loop. Files-as-handoff, machine-checkable gates
+   between stages, stop-on-failure semantics, checkpoint/resume. Full POC spec:
+   [`docs/feature-pipeline-orchestrator-spec.md`](docs/feature-pipeline-orchestrator-spec.md) (canonical; mirrored at `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md` until Pi rollout settles). Design draft: [`docs/pipeline-poc-design.md`](docs/pipeline-poc-design.md) (v1: workflow hardcoded in orchestrator prompt, gates judged by orchestrator). Under Now because it needs no real-run evidence to attempt: every piece it
+   composes (programmatic spawn/settle via runner.py's patterns, worktree jobs, gh-driven code
+   review) already works in isolation — the missing thing is the integration, which is learned
+   only by running it. Generalizes the auto-fix-PR idea (Later) into a full chain. Gate for
+   promoting beyond POC: a few real overnight runs finishing end-to-end without human rescue.
+
+- **Failure reaping & quota-exhaustion handling** — a failed run whose agent never settles
+  (OpenCode free-quota modal; observed twice on the Pi, 2026-08-22/23) left a live `working`
+  agent behind, so every later tick skipped the job (`agent_name_live`) until manual cleanup.
+  Spec: [`docs/failure-reaping.md`](docs/failure-reaping.md). Phase 1 (reap own pane on
+  failure, post-hoc quota classification, failure-path screen tails) ready to build; phase 2
+  (mid-run fast-fail watchdog) is gated on phase 1 surviving a real overnight cycle and the
+  dead wait mattering once more.
 
 ## Next
 
@@ -115,6 +122,11 @@ Real designs, but untouched until something demands them. Each names its trigger
 
 Anything else noticed while actually running jobs — add a bullet here, promote to
 Now/Next/Later once it's clear it's worth designing properly.
+
+- **Switch provider/model on quota exhaustion** — react to `reason=quota_exhausted`
+  (`docs/failure-reaping.md` §3.2) with a per-job failover model list, or degrade to a
+  smaller tier for the rest of the window. Gate: quota failures recurring after failure-reaping
+  phase 1 ships.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives
