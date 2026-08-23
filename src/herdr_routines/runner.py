@@ -5,6 +5,7 @@ contract and the post-run verification rationale.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,6 +13,8 @@ from pathlib import Path
 
 from herdr_routines.config import Job
 from herdr_routines.herdr import HerdrClient, HerdrCliError, build_agent_start_args
+
+log = logging.getLogger(__name__)
 
 # Settle states that count as success for a scheduled (never-focused) run. Both are included
 # because "idle" is what was empirically observed on herdr 0.8.2 for a never-focused pane, and
@@ -22,6 +25,50 @@ SUCCESS_AGENT_STATUSES = frozenset({"idle", "done"})
 # How often _wait_for_agent_ready re-checks `agent get` while waiting for the agent's TUI to
 # accept typed input. Module-level so tests can zero it out.
 READY_POLL_INTERVAL_S = 1.0
+
+# Retries for the prompt send itself. `interactive_ready` only means the TUI is drawn — the
+# agent's session backend can still reject the first prompt seconds later (server-side
+# EmptyResponse, observed ~3s and ~10s after start on herdr 0.8.2/0.8.x). A settle timeout is
+# NOT retried: its JSON body (code "timeout") proves delivery succeeded, and resending would
+# double-prompt the agent. Module-level so tests can adjust.
+PROMPT_RETRY_DELAYS_S = (5.0, 15.0)
+
+
+def _is_settle_timeout(e: HerdrCliError) -> bool:
+    """True when the prompt was delivered but the agent didn't settle within timeout_ms
+    (herdr exits 1 with a JSON body, code "timeout"). Resending in that case would double-prompt."""
+    code = (e.error_body or {}).get("error", {}).get("code")
+    return code == "timeout"
+
+
+def _prompt_with_retry(
+    client: HerdrClient,
+    *,
+    job_name: str,
+    target: str,
+    text: str,
+    timeout_ms: int,
+) -> str:
+    """agent_prompt_wait with bounded retries over early session-not-ready failures. Raises the
+    last error if every attempt fails (or immediately on settle timeouts — see
+    _is_settle_timeout). `target` is the agent name; `job_name` only labels log lines."""
+    delays = (None, *PROMPT_RETRY_DELAYS_S)
+    for i, delay in enumerate(delays):
+        if delay is not None:
+            time.sleep(delay)
+            log.info(
+                "%s: retrying prompt (attempt %d/%d)", job_name, i + 1, len(delays)
+            )
+        try:
+            return client.agent_prompt_wait(
+                target=target, text=text, timeout_ms=timeout_ms
+            )
+        except HerdrCliError as e:
+            if _is_settle_timeout(e) or i == len(delays) - 1:
+                raise
+    raise AssertionError(
+        "unreachable"
+    )  # for the type checker; loop always returns/raises
 
 
 def _wait_for_agent_ready(
@@ -240,8 +287,12 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         )
 
     try:
-        settled_status = client.agent_prompt_wait(
-            target=job.agent_name, text=prompt, timeout_ms=job.timeout_ms
+        settled_status = _prompt_with_retry(
+            client,
+            job_name=job.name,
+            target=job.agent_name,
+            text=prompt,
+            timeout_ms=job.timeout_ms,
         )
     except (HerdrCliError, OSError) as e:
         return RunOutcome(
