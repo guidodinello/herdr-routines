@@ -233,6 +233,22 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
     )
 
+    # A recurring job reuses one agent name, and runs intentionally leave their workspace
+    # behind (plan-v1 §6) — so by tomorrow the settled pane from today would make agent start
+    # fail on the duplicate name. Reap our own previous pane first: only when its agent is
+    # settled (never working), and never touching branches (cleanup there stays manual).
+    try:
+        stale_workspace = client.settled_agent_workspace(job.agent_name)
+        if stale_workspace is not None:
+            client.workspace_close(stale_workspace)
+            log.info(
+                "%s: closed stale workspace %s from previous run",
+                job.name,
+                stale_workspace,
+            )
+    except (HerdrCliError, OSError) as e:
+        log.warning("%s: could not reap previous workspace: %s", job.name, e)
+
     try:
         if job.workspace == "worktree":
             pane_id = client.worktree_create(
