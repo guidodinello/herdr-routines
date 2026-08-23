@@ -337,13 +337,40 @@ def test_execute_run_ready_polling_survives_cli_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A transiently unreachable server during the readiness wait must not crash the run —
-    it keeps polling until the deadline, then maps to agent_not_interactive."""
+    it keeps polling until the deadline, then maps to agent_not_interactive with the last
+    poll error preserved for attribution."""
     monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
     job = make_job(tmp_path, start_timeout_ms=50)
     client = ScriptedClient(raise_on="agent_interactive_ready")
     outcome = execute_run(job, client, run_id="a-run11")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "agent_not_interactive"
+    assert "HerdrCliError: boom" in (outcome.error or "")
+
+
+class MissingBinaryPollClient(ScriptedClient):
+    """Raises FileNotFoundError from the readiness probe — what spawning `herdr` does when
+    the binary vanishes mid-run, the exact escape flagged by PR#14's blocking finding."""
+
+    def agent_interactive_ready(self, target):
+        self.calls.append("agent_interactive_ready")
+        raise FileNotFoundError(2, "No such file or directory: 'herdr'")
+
+
+def test_execute_run_readiness_polling_survives_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OSError during readiness polling used to escape execute_run — its only unwrapped
+    client call site — leaving tick.py without a terminal history record and skipping the
+    remaining jobs in the tick. It must degrade to a failed RunOutcome instead."""
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    job = make_job(tmp_path, start_timeout_ms=50)
+    client = MissingBinaryPollClient()
+    outcome = execute_run(job, client, run_id="a-run18")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_not_interactive"
+    assert "FileNotFoundError" in (outcome.error or "")
+    assert "agent_prompt_wait" not in client.calls
 
 
 class FlakyPromptClient(ScriptedClient):

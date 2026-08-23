@@ -191,9 +191,17 @@ class HerdrClient:
         """True when the target agent's TUI reports itself ready to accept typed input.
         Prompting before readiness fails server-side (~5s in, EmptyResponse) — observed live
         against OpenCode and Claude TUIs seconds after start (Pi deploy 2026-08-22). A response
-        without the flag is treated as ready (fail-open) so older herdr builds keep working."""
+        without the flag is treated as ready (fail-open) so older herdr builds keep working; a
+        malformed shape raises HerdrCliError like the sibling parsers do, which the readiness
+        poll loop in runner.py swallows and retries."""
         body = self._call(["agent", "get", target])
-        ready = body.get("result", {}).get("agent", {}).get("interactive_ready")
+        result = body.get("result")
+        agent = result.get("agent") if isinstance(result, dict) else None
+        if not isinstance(agent, dict):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        ready = agent.get("interactive_ready")
         return ready if isinstance(ready, bool) else True
 
     def agent_statuses(self) -> dict[str, str]:

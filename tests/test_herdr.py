@@ -223,6 +223,29 @@ def test_agent_interactive_ready_fails_open_when_flag_absent() -> None:
     assert client.agent_interactive_ready("rt-a") is True
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"result": None},
+        {"result": ["unexpected"]},
+        {"result": {}},
+        {"result": {"agent": None}},
+        {"result": {"agent": "w1:p1"}},
+    ],
+)
+def test_agent_interactive_ready_converts_malformed_shapes_to_cli_error(
+    body: dict,
+) -> None:
+    """Chained .get() used to raise AttributeError on null/non-dict nodes (the default only
+    covers absent keys) — an exception type that bypassed both this method's contract and the
+    readiness poll loop's HerdrCliError-only catch. Shape surprises must surface as
+    HerdrCliError like _extract_status/_extract_pane_id; only the flag itself fails open."""
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    with pytest.raises(HerdrCliError):
+        client.agent_interactive_ready("rt-a")
+
+
 def test_notification_show_includes_sound_and_optional_body() -> None:
     runner = FakeRunner([ok({"result": {}})])
     client = HerdrClient(runner=runner)

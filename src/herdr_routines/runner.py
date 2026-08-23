@@ -73,21 +73,26 @@ def _prompt_with_retry(
 
 def _wait_for_agent_ready(
     client: HerdrClient, target: str, *, timeout_s: float
-) -> bool:
-    """Blocks until the agent reports interactive_ready, or False once timeout_s elapses.
-    `agent start` returns as soon as the process is detected, but the TUI needs another few
-    seconds before typed input is delivered; prompting earlier makes the server-side
-    agent.prompt fail (EmptyResponse) and the run dies as agent_prompt_failed. Polling errors
-    are swallowed — a transiently unreachable server must not abort the wait."""
+) -> tuple[bool, str | None]:
+    """Blocks until the agent reports interactive_ready, returning (True, None); once
+    timeout_s elapses returns (False, last_error_text). `agent start` returns as soon as the
+    process is detected, but the TUI needs another few seconds before typed input is delivered;
+    prompting earlier makes the server-side agent.prompt fail (EmptyResponse) and the run dies
+    as agent_prompt_failed. Polling errors are swallowed and never escape this function — a
+    transiently unreachable server (or a vanished `herdr` binary raising OSError) must not
+    abort the wait nor break execute_run's never-raises contract; the last error's text
+    accompanies the verdict so an eventual agent_not_interactive failure can be attributed to
+    infrastructure rather than a slow agent."""
     deadline = time.monotonic() + timeout_s
+    last_error: str | None = None
     while True:
         try:
             if client.agent_interactive_ready(target):
-                return True
-        except HerdrCliError:
-            pass
+                return True, None
+        except (HerdrCliError, OSError) as e:
+            last_error = f"{type(e).__name__}: {e}"
         if time.monotonic() >= deadline:
-            return False
+            return False, last_error
         time.sleep(READY_POLL_INTERVAL_S)
 
 
@@ -285,18 +290,22 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
 
     # The prompt must not race the TUI's own startup (see _wait_for_agent_ready): reuse
     # start_timeout_ms as the readiness bound since both describe "how long agent startup
-    # may take".
-    if not _wait_for_agent_ready(
+    # may take". All poll errors are handled inside the wait, so nothing escapes this call.
+    ready, last_poll_error = _wait_for_agent_ready(
         client, job.agent_name, timeout_s=job.start_timeout_ms / 1000
-    ):
+    )
+    if not ready:
+        error = (
+            f"agent {job.agent_name} did not report interactive_ready within "
+            f"{job.start_timeout_ms}ms of start"
+        )
+        if last_poll_error:
+            error = f"{error}; last poll error: {last_poll_error}"
         return RunOutcome(
             state="failed",
             run_id=run_id,
             reason="agent_not_interactive",
-            error=(
-                f"agent {job.agent_name} did not report interactive_ready within "
-                f"{job.start_timeout_ms}ms of start"
-            ),
+            error=error,
             agent_name=job.agent_name,
             pane_id=pane_id,
             branch=branch,
