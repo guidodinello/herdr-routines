@@ -40,6 +40,10 @@ def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _warn(message: str) -> None:
+    print(f"warning: {message}", file=sys.stderr)
+
+
 def resolve_repo_root(repo: Path) -> Path | None:
     """Working-tree top-level containing ``repo``, or None when not inside a git repo."""
     proc = run_git(repo, "rev-parse", "--show-toplevel")
@@ -53,6 +57,9 @@ def list_auto_branches(repo: Path) -> list[str]:
     """Local ``auto/*`` branches minus ``auto/pipeline-*`` (G-14), sorted by name."""
     proc = run_git(repo, "for-each-ref", "--format=%(refname:short)", BRANCH_PATTERN)
     if proc.returncode != 0:
+        # Keep going with an empty listing, but never let plumbing failure masquerade as
+        # a clean "0 branch(es) listed" inventory.
+        _warn(f"could not list auto/* branches: {proc.stderr.strip()}")
         return []
     names = (line.strip() for line in proc.stdout.splitlines())
     return sorted(n for n in names if n and not n.startswith(PIPELINE_PREFIX))
@@ -73,10 +80,7 @@ def is_merged(branch: str, base: str, repo: Path) -> bool:
     if proc.returncode == 0:
         return True
     if proc.returncode != 1:
-        print(
-            f"warning: merge-check failed for {branch} vs {base}: {proc.stderr.strip()}",
-            file=sys.stderr,
-        )
+        _warn(f"merge-check failed for {branch} vs {base}: {proc.stderr.strip()}")
     return False
 
 
@@ -89,6 +93,9 @@ def branch_worktrees(repo: Path) -> dict[str, Path]:
     proc = run_git(repo, "worktree", "list", "--porcelain")
     mapping: dict[str, Path] = {}
     if proc.returncode != 0:
+        # Same as list_auto_branches: degrade to "no worktrees" but say so on stderr,
+        # so a plumbing failure can't silently mark every branch worktree_exists=no.
+        _warn(f"could not list worktrees: {proc.stderr.strip()}")
         return mapping
     current: Path | None = None
     for line in proc.stdout.splitlines():
@@ -143,10 +150,18 @@ def run_gc(repo: Path, base: str | None = None, out: TextIO | None = None) -> in
     if out is None:
         # Resolved lazily so callers that swap sys.stdout (pytest capsys) are honored.
         out = sys.stdout
-    root = resolve_repo_root(repo)
-    if root is None:
-        print(f"error: not a git repository: {repo}", file=sys.stderr)
+    try:
+        root = resolve_repo_root(repo)
+        if root is None:
+            print(f"error: not a git repository: {repo}", file=sys.stderr)
+            return 1
+        resolved_base = base or detect_base(root)
+        out.write(format_table(collect_rows(root, resolved_base)))
+    except subprocess.TimeoutExpired:
+        # run_git's 30s cap must fail cleanly (stderr + exit), never as a traceback.
+        print(
+            f"error: git timed out after {GIT_TIMEOUT_SECONDS}s in {repo}",
+            file=sys.stderr,
+        )
         return 1
-    resolved_base = base or detect_base(root)
-    out.write(format_table(collect_rows(root, resolved_base)))
     return 0

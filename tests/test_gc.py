@@ -223,3 +223,81 @@ def test_gc_requires_dry_run_flag(repo: Path) -> None:
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["gc", "--repo", str(repo)])
     assert excinfo.value.code != 0
+
+
+def test_gc_warns_when_branch_listing_fails(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Plumbing failure after rev-parse must stay visible on stderr, not silently read
+    as a clean '0 branch(es) listed' inventory (review finding, PR #28)."""
+    real_run_git = gc.run_git
+
+    def failing_for_each_ref(
+        repo_path: Path, *args: str
+    ) -> subprocess.CompletedProcess[str]:
+        if args[:1] == ("for-each-ref",):
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=128, stdout="", stderr="fatal: bad ref"
+            )
+        return real_run_git(repo_path, *args)
+
+    monkeypatch.setattr(gc, "run_git", failing_for_each_ref)
+
+    code = cli.main(["gc", "--dry-run", "--repo", str(repo), "--base", "main"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "0 branch(es) listed" in captured.out
+    assert "warning" in captured.err
+    assert "could not list auto/* branches" in captured.err
+    assert "fatal: bad ref" in captured.err
+
+
+def test_gc_warns_when_worktree_listing_fails(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failing `git worktree list` must not silently mark every row worktree_exists=no
+    (which would count them all as eligible) without saying why on stderr."""
+    real_run_git = gc.run_git
+
+    def failing_worktree_list(
+        repo_path: Path, *args: str
+    ) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ("worktree", "list"):
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=128,
+                stdout="",
+                stderr="fatal: worktree boom",
+            )
+        return real_run_git(repo_path, *args)
+
+    monkeypatch.setattr(gc, "run_git", failing_worktree_list)
+    _git(repo, "branch", "auto/solo-20260819T000000Z", "main")
+
+    code = cli.main(["gc", "--dry-run", "--repo", str(repo), "--base", "main"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert _rows(captured.out)["auto/solo-20260819T000000Z"] == ("no", "yes")
+    assert "warning" in captured.err
+    assert "could not list worktrees" in captured.err
+
+
+def test_gc_times_out_cleanly_without_traceback(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """subprocess.TimeoutExpired from run_git's cap must surface as clean stderr + exit 1,
+    never an unhandled traceback (review finding, PR #28)."""
+
+    def hanging(repo_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=["git"], timeout=gc.GIT_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(gc, "run_git", hanging)
+
+    code = cli.main(["gc", "--dry-run", "--repo", str(repo), "--base", "main"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert "timed out after 30s" in captured.err
+    assert "Traceback" not in captured.err
