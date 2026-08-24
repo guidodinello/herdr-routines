@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from logger import get_logger, init_logging
 
+import herdr_routines
 from herdr_routines.config import (
     ConfigError,
     RoutinesConfig,
@@ -53,9 +55,26 @@ def main(argv: list[str] | None = None) -> int:
     return args.handler(args)
 
 
+def _get_version() -> str:
+    """Installed distribution version (pyproject.toml is authoritative); never raises."""
+    try:
+        return importlib.metadata.version("herdr-routines")
+    except importlib.metadata.PackageNotFoundError:
+        return herdr_routines.__version__
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="herdr-routines")
     parser.add_argument("--config", type=Path, default=None, help="path to jobs.yaml")
+    # On the top-level parser so the version action fires before the required-subcommand
+    # check — --version/-V must work with no jobs.yaml and no Herdr server.
+    parser.add_argument(
+        "--version",
+        "-V",
+        action="version",
+        version=_get_version(),
+        help="show program's version number and exit",
+    )
     sub = parser.add_subparsers(required=True)
 
     p_tick = sub.add_parser(
