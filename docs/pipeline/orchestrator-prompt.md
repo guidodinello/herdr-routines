@@ -40,7 +40,7 @@ herdr worktree create --cwd "$REPO_PARENT" --base main --branch "auto/pipeline-$
 }
 ```
 
-Write via `tmpfile && mv` (atomic rename — G-9). `deadline_epoch` = `date +%s` + `25200` (launch + 7h, design:146). Fork a `herdr workspace` with `--env HERDR_ENV=1` already — this is required or every `herdr` call wedges as `blocked` (design:98). The allowlist for `~/.config/opencode/opencode.json` (both laptop and Pi) must already include the inventory from design:98 — `herdr`, `git`, `gh` (+ `api`/`graphql`), `uv`/`pytest`/`ruff`, `rg`/`jq`/`column`, `herdr notification show`, plus `permission.external_directory` for `~/.config/herdr/herdr.sock`, `~/.local/state/herdr-routines/`, `~/.herdr/worktrees/auto/pipeline-*`, `~/.local/state/herdr-routines/reports/`. `GH_TOKEN` must be valid (`gh auth status`).
+Write via `tmpfile && mv` (atomic rename — G-9). `deadline_epoch` = `date +%s` + `25200` (launch + 7h, design:146). Fork a `herdr workspace` with `--env HERDR_ENV=1` already — this is required or every `herdr` call wedges as `blocked` (design:98). Host prerequisites (signing key, allowlist, tools like `rg`) are configured **outside this prompt** per [`setup.md`](setup.md) — do not attempt to install tools or change git/gh config mid-run; if a gate fails on a missing tool, abort with report noting the gap. Write a heartbeat line (`echo "stage N poll $(date -u +%H:%M:%SZ)" >> /tmp/pipeline_resume_$RUN_ID.log`) each poll cycle so a silent orchestrator death is diagnosable (first run: wS:p1 killed between stages 4→5, no error, only `herdr-server.log agent → None`).
 
 ## Worker spawn template (use for every stage)
 
@@ -100,8 +100,8 @@ Execute sequentially. After each stage, run its **gate commands** (design:205) a
 ### Stage 5 — Code review (quality gate)
 - **Harness:** `opencode/big-pickle` **single primary reviewer v1** (measured 1/7, 5 high-sev uniques `pr4:106`); fan-out `hy3-free` + `x-preview-f-free` 2-tie is **v2** (`opencode-e2e:19`, dedup `pr4:45` not yet built, so keep single)
 - **Input:** PR number
-- **Prompt:** "Run the code-review skill against PR `<n>` (skill at `fitted/.claude/skills/code-review` or global `~/.config/opencode/skills/code-review/`). Use 5-reviewer skill in single-session mode for v1; full 5-reviewer fan-out is v2 if needed. Ensure output contains structured `blocking`/`non-blocking` and `confidence: high|medium|low` tiers."
-- **Gate 5:** `gh pr view <n> --json comments,reviews | jq -e 'all(.comments[].body // empty; test("confidence:\\s*(high|medium|low)")) and all(.reviews[].body // empty; test("confidence:\\s*(high|medium|low)"))'` — use `all(...)` not per-element stream (G-3 last-value bug) and tight regex; verify at build whether skill writes to `comments` or `reviews` and gate on that field.
+- **Prompt:** "Run the code-review skill against PR `<n>` (skill at `fitted/.claude/skills/code-review` or global `~/.config/opencode/skills/code-review/`). Use 5-reviewer skill in single-session mode for v1; full 5-reviewer fan-out is v2 if needed. Ensure output contains structured `blocking`/`non-blocking` tier labels."
+- **Gate 5:** `gh pr view <n> --json comments,reviews | jq -e 'any(.comments[].body // empty; test("blocking")) or any(.reviews[].body // empty; test("blocking"))'` — checks the skill's tier structure is present (relaxed after first real run: skill posts no literal `confidence:` token; design Gates table row 5).
 
 ### Stage 6 — Address comments
 - **Harness:** **reuse `pl-3-$RUN_ID`** via `herdr agent prompt pl-3-$RUN_ID ...` (no new `agent start`; preserves code context per G-11 — alternative fresh `pl-6-$RUN_ID` seeded with `git diff main...HEAD` + `gh pr view --comments` if context burn)

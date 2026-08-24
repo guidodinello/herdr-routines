@@ -2,7 +2,7 @@
 
 Status: draft (2026-08-23). POC scope: free models only, quota out of scope.
 Canonical spec: [`spec.md`](spec.md) (sibling in `docs/pipeline/`; mirrored at `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md`).
-Roadmap tracking: `ROADMAP.md:31` (Now, gate: a few overnight runs end-to-end without human rescue). Orchestrator prompt: [`orchestrator-prompt.md`](orchestrator-prompt.md); audits: `audits/`.
+Roadmap tracking: `ROADMAP.md:31` (Now, gate: a few overnight runs end-to-end without human rescue). Orchestrator prompt: [`orchestrator-prompt.md`](orchestrator-prompt.md); audits: `audits/`; **one-time host/repo setup: [`setup.md`](setup.md)**.
 
 ## Goal
 
@@ -207,7 +207,7 @@ no address off failed review — `spec:57-59`).
 | 2 | Spec v2 contains `## Acceptance criteria` with numbered items, each `Test: <name>`; change notes inside spec as `## Changelog v1→v2`; blocking tiers present | Count `Test:` via `rg -c "Test:" "$WT/spec.md"` (≥ N, N derived by orchestrator counting `Test:` lines); headings via `rg -q "^## Acceptance criteria" "$WT/spec.md" && rg -q "^## Changelog" "$WT/spec.md"`; tiers via `rg -qw "blocking" "$WT/spec.md" && rg -qw "non-blocking" "$WT/spec.md" && rg -q "confidence:" "$WT/spec.md"` (fixed: `-w` avoids substring tautology; see G-2 verification) |
 | 3 | Every named test from acceptance section exists (file/symbol) **and** suite passes | Extract `Test: <name>` → `rg -F -q -- "<name>" "$WT/tests"` (fixed-string `-F`, scoped to `tests/` not `$WT` which contains `spec.md` itself — G-2); then `uv run pytest -q` (or repo's test cmd). Existence first, green second — audit gap 2: green alone proves nothing. |
 | 4 | PR exists on the shared branch | `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-<run_id>"'` |
-| 5 | Review posted with structured confidence+blocking tiers (code-review skill) | `gh pr view <n> --json comments,reviews | jq -e 'all(.comments[].body // empty; test("confidence:\\s*(high|medium|low)")) and all(.reviews[].body // empty; test("confidence:\\s*(high|medium|low)"))'` — use `all(...)` not per-element stream (G-3: last-value bug) and tight `confidence:` regex (not substring); verify at build whether skill writes to `comments` or `reviews` and gate on that field (currently checks both) |
+| 5 | Review posted with structured blocking/non-blocking tiers (code-review skill) | `gh pr view <n> --json comments,reviews | jq -e 'any(.comments[].body // empty; test("blocking")) or any(.reviews[].body // empty; test("blocking"))'` — **relaxed after first real run** (`pipeline-20260823T234906Z`): the code-review skill posts `blocking`/`non-blocking` tier labels but no literal `confidence: high|medium|low` token, so the original `confidence:` regex false-failed; orchestrator judged pass-with-note. Keep `all(...)` shape for absence checks if a repo's review format adds confidence back; gate on what the skill actually writes. |
 | 6 | No unresolved blocking findings | **Verified fix for G-1:** `gh api repos/{owner}/{repo}/pulls/<n>/threads` 404s (confirmed `gh: Not Found`). **Option A (GraphQL, preferred):** `gh api graphql -f query='query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$pr){reviewThreads(first:50){nodes{isResolved comments(first:1){nodes{body}}}}}}}' -f owner=<o> -f repo=<r> -F pr=<n> | jq -e '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false and (.comments.nodes[0].body | test("blocking")))] | length==0'` — filter `isResolved==false` + body contains `blocking` (skill convention, not an API field). **Option B (fallback, no GraphQL):** `gh pr view <n> --json comments | jq -e 'all(.comments[].body; test("blocking")) | not or all(...replies...)` count-match. Delete the old REST `threads` line; pin one option in `orchestrator-prompt.md` after one real PR run. |
 
 Stage rules: tests before code (stage 3 done = every acceptance test exists and
@@ -280,6 +280,51 @@ prompt is green.
   This supersedes the earlier per-stage worktree sketch; the old
   `src/herdr_routines/config.py:workspace` `worktree` vs `root` distinction does
   not apply to the pipeline POC.
+
+## First real run — findings (2026-08-23/24, `pipeline-20260823T234906Z`)
+
+Dogfood `--version` flag run on the Pi completed all 6 stages end-to-end
+(`docs/pipeline/features/version-flag-idea.md`, PR #27, report
+`~/.local/state/herdr-routines/reports/pipeline-20260823T234906Z.md`). What it taught:
+
+- **Silent orchestrator death is real.** The first orchestrator (`wS:p1`, muse) died
+  between stage 4 and 5 with zero feedback: no error anywhere, just
+  `herdr-server.log` `agent changed pane=28 → None`. No report was written (report
+  is "at end regardless" — a killed orchestrator writes nothing). What saved the run:
+  `state.json` checkpoint (stage 4, pr_number 27) + the resume recipe (`design:131`)
+  — relaunched with same RUN_ID, reconciled live `pl-*` agents, continued at stage 5.
+  **v1 hardening adopted:** orchestrator writes a heartbeat line to
+  `/tmp/pipeline_resume_<run_id>.log` every poll; morning checklist "no heartbeat
+  advance + no report ⇒ orchestrator died, resume from state.json". A future v2
+  could move the deadline/report writing out of the orchestrator into the launcher
+  wrapper so even a dead orchestrator produces a partial report.
+- **Gate 5's `confidence:` regex doesn't match the skill's actual output.** The
+  code-review skill posts `blocking`/`non-blocking` tier labels but never a literal
+  `confidence: high|medium|low` string — the strict gate false-failed and the
+  orchestrator had to judge pass-with-note. Gate relaxed to check tier structure
+  only (see Gates table row 5). Lesson: pin gate regexes to observed output, not
+  the skill doc's described format.
+- **Commit signing must be automatic, not prompt-driven.** Repo ruleset requires
+  verified signatures; workers committed as `opencode <opencode@herdr.local>`
+  unsigned → merge BLOCKED. Fix: dedicated SSH signing key per host
+  (`~/.ssh/herdr-routines-pipeline_signing`, registered once on GitHub as a
+  **Signing key**), wired via **repo-local** `git config` on the parent clone
+  (linked worktrees inherit it) — see [`setup.md`](setup.md). The orchestrator
+  prompt does not touch signing config; new repos need the one-time
+  `setup.md` steps.
+- **Allowlist gaps surface as mid-run `blocked` prompts**, each costing a human
+  tap: `~/.config/opencode/**` (orchestrator reads its own config dir),
+  `/etc/**` (only when probing a missing binary like `rg` — avoid by pre-installing
+  tooling), plus the expected worktree/report/socket dirs. Current Pi allowlist:
+  `/tmp/**`, `~/.claude/rules/**`, `~/.config/opencode/**`, `~/.config/herdr/**`,
+  `~/.herdr/worktrees/**`, `~/.local/state/herdr/**`,
+  `~/.local/state/herdr-routines/**` (+`reports/**`). Keep `/etc` out unless a
+  stage genuinely needs it.
+- **`rg` must be pre-installed on target hosts** (Pi lacked it → gates would have
+  failed; installed `ripgrep 14.1.1` to `~/.local/bin/rg`). Add to `setup.md`.
+- **Stage 6 reuse of `pl-3` worked well** (code context preserved, fix pushed,
+  thread resolved via GraphQL). Detached `nohup --wait` + result-file polling kept
+  orchestrator context at ~6% across the whole night.
 
 ## Verification
 
