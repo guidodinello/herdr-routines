@@ -78,3 +78,23 @@ All git invocations use `subprocess.run(["git", ...], capture_output=True, text=
 - **Branch pattern scope.** Any `auto/*` branch that is not `auto/pipeline-*` is listed, even if created manually outside `herdr-routines`. That's intentional for completeness; over-listing is safer than hiding a stale branch behind a strict regex that drifts.
 - **Empty / non-repo invocation.** Running outside a git repo must fail cleanly (stderr + exit 1/2) without a traceback, but running inside a repo with zero `auto/*` branches must succeed with count 0. Don't conflate the two.
 - **Table vs machine parsing.** Text tables are convenient for review but brittle for scripting. Keep column order and `yes/no` tokens stable; if machine use is needed later, add `--json` in a follow-up without changing v1 output.
+
+## Acceptance criteria
+
+1. `gc --dry-run` lists fully-merged `auto/*` branches — Test: test_gc_dry_run_lists_merged_branches
+2. `gc --dry-run` lists branches whose worktree directory is gone — Test: test_gc_dry_run_lists_gone_worktrees
+3. `auto/pipeline-*` branches are excluded from listing — Test: test_gc_dry_run_excludes_pipeline_branches
+4. Dry-run deletes nothing and exits 0 with empty repo state unchanged — Test: test_gc_dry_run_deletes_nothing
+5. No Herdr server/socket required — Test: test_gc_dry_run_needs_no_server
+
+## Review tiers
+
+- blocking: correctness of `gc --dry-run` listing, filtering `auto/pipeline-*`, dry-run safety (no delete), and no Herdr dependency.
+- non-blocking: table column width/alignment, exact summary wording, base-branch auto-detection fallback details.
+- confidence: high — criteria map 1:1 to `tests/test_gc.py` cases using temp git repos and fake subprocess; no Herdr socket required.
+
+## Changelog v1→v2
+
+- Added `## Acceptance criteria` with 5 numbered items each containing `Test: <name>` for Gate 3 extraction.
+- Added `## Review tiers` documenting `blocking` vs `non-blocking` scope and `confidence: high`.
+- Added `## Changelog v1→v2` section per pipeline stage 2 requirements. No functional spec changes; Approach, Files touched, and Risks remain as in v1.
