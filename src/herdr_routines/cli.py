@@ -60,7 +60,7 @@ def _get_version() -> str:
     try:
         return importlib.metadata.version("herdr-routines")
     except importlib.metadata.PackageNotFoundError:
-        return str(getattr(herdr_routines, "__version__", "0.1.0"))
+        return herdr_routines.__version__
 
 
 def _build_parser() -> argparse.ArgumentParser:
