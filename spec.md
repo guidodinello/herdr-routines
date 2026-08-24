@@ -95,6 +95,6 @@ All git invocations use `subprocess.run(["git", ...], capture_output=True, text=
 
 ## Changelog v1→v2
 
-- Added `## Acceptance criteria` with 5 numbered items each containing `Test: <name>` for Gate 3 extraction.
+- Added `## Acceptance criteria` with 5 numbered items each containing a Test marker for Gate 3 extraction.
 - Added `## Review tiers` documenting `blocking` vs `non-blocking` scope and `confidence: high`.
 - Added `## Changelog v1→v2` section per pipeline stage 2 requirements. No functional spec changes; Approach, Files touched, and Risks remain as in v1.
