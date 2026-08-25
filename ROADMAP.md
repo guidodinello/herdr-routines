@@ -156,6 +156,23 @@ Worth designing once their gate clears — usually "a few weeks of real runs on 
 
 Real designs, but untouched until something demands them. Each names its trigger.
 
+- **Autonomous task selection for the pipeline** (2026-08-25 idea) — every dogfood run so far
+  (5, as of tonight) needed a human to hand-author a `FEATURE_IDEA` file before launch. For the
+  pipeline to genuinely run nightly unattended, stage 0 needs to pick its own next feature rather
+  than waiting on a human to name one. **`fitted-implementer`'s pattern doesn't transfer
+  directly:** it picks from `docs/process/issues/`, a directory of already-drafted issues with
+  `status:`/`priority:` frontmatter — that structured layer and the drafting process behind it
+  don't exist for `herdr-routines`, which only has `ROADMAP.md`, one higher-level prose document
+  with no per-item files. Two real options, not yet decided between: (a) build the equivalent
+  structured layer here too (split `ROADMAP.md`'s `Now` bullets into individual drafted files
+  with frontmatter, mirroring `fitted`'s convention) — real prerequisite work, not just "reuse the
+  pattern," since the drafting step is what's actually missing, not the selection logic; or
+  (b) have stage 0 make a judgment call reading `ROADMAP.md`'s `Now` section directly, the same
+  way the orchestrator already exercises judgment at other gates (e.g. gate 5's relaxed
+  pass-with-note) — less mechanically verifiable than frontmatter, but no new structured layer to
+  build or keep in sync with the prose. Trigger: the pipeline is actually promoted out of POC and
+  running on a schedule — before that, a human picking the feature each run is a feature (keeps
+  prioritization judgment in the loop), not a gap to close.
 - **API/webhook trigger** — Claude Routines supports "Call via API" (POST to trigger a run) and
   a GitHub-event trigger. Both assume inbound reachability, which the Pi doesn't have without a
   tunnel (declined earlier for the Telegram relay — see
