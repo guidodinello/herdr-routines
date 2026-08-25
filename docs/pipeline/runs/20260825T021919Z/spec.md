@@ -33,3 +33,27 @@ No `src/herdr_routines/pipeline.py` module, no launcher-script changes (`~/.loca
 - **Cross-model `-s` (open question 3).** Stage 6 reuses `pl-3`'s `x-preview-f-free` session with the same model family, so no cross-model resume is needed for the current stage plan; `pl-5`'s `big-pickle` session is never resumed. If a future stage reuses a different-model session, `-s` semantics would need re-verification; leave noted as still-open if not resolved now.
 - **G-number and spec-path hygiene.** Must add G-16 without renumbering G-1..G-15 and keep spec at `docs/pipeline/runs/<run_id>/spec.md` (G-15 fix); a slip reintroduces the PR #28/#29 merge conflict pattern or confuses future readers.
 
+
+## Acceptance criteria
+
+1. `design.md`'s cleanup section documents per-stage pane close on gate-pass (not only end-of-run) — Test: test_design_doc_documents_per_stage_pane_close
+2. `design.md` documents the close-then-resume-by-session-id mechanism for the one worker a later stage reuses, including the empirically-verified `-s <session_id>` flag — Test: test_design_doc_documents_session_resume_mechanism
+3. `orchestrator-prompt.md`'s worker spawn template includes a "close this worker's pane once its gate passes" step (unless it's the reused worker) — Test: test_orchestrator_prompt_includes_pane_close_step
+4. `orchestrator-prompt.md`'s stage 6 instructions use `herdr agent start ... -s <session_id>` against a fresh pane instead of `herdr agent prompt` against a pane held open since stage 3 — Test: test_orchestrator_prompt_stage6_uses_session_resume
+5. The proposal doc (`pane-lifecycle-v2-proposal.md`) is updated to mark itself Status: implemented (with a pointer to the PR), so a future reader doesn't mistake it for still-unbuilt — Test: test_proposal_doc_marked_implemented
+
+## Changelog v1→v2
+
+- Added `## Acceptance criteria` with 5 numbered items, each ending with a Test marker (doc-contract tests grepping the two authority docs and the proposal).
+- Added `## Review notes` with `blocking`/`non-blocking` and `confidence:` tiers for gate 2.
+- Clarified that design amendment adds G-16 without renumbering G-1..G-15 and that `-s <session_id>` resume was verified 2026-08-25 (open question 1 settled); open questions 2 and 3 remain documented as still-open/grace-window notes.
+- No change to `## Problem`, `## Approach`, `## Files touched`, `## Risks`.
+
+## Review notes
+
+blocking: design.md must document per-stage pane close on gate-pass; design.md must document session resume with -s <session_id>; orchestrator-prompt.md must include close step in spawn template; stage 6 must use herdr agent start -s <session_id> against fresh pane; proposal doc must be Status: implemented with PR pointer
+non-blocking: exact wording of grace-window note for open question 2 may remain as still-open if immediate-close vs short grace not fully resolved; cross-model -s note may remain as still-open
+confidence: high — doc-contract greps are deterministic for criteria 1-5
+confidence: medium — manual 2026-08-25 session-resume verification used bare workspace, not shared multi-pane workspace; stage 1 sanity-check against shared-workspace flow documented in Risks
+confidence: low — live Pi launcher scripts (~/.local/bin/pipeline-launch-*.sh) remain out of scope and are not verified by tests
+
