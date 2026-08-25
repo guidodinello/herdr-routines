@@ -93,6 +93,24 @@ Ready to build whenever; no real-run evidence required.
    (`state.json:stage_sessions`), a principle meant to survive the later move to a declarative
    per-stage `isolation:` field rather than being re-derived per hardcoded stage pair. Landed in
    the same PR as the "implemented" status update above.
+   **Fourth 2026-08-25 finding:** G-16 only ever amended the *pipeline orchestrator's* own
+   prompt/design (`pl-*` panes) — `src/herdr_routines/runner.py` was untouched, so the separate
+   `fitted-pr-review-2..5` routine jobs added the same day (adding a 4th–6th daily job) hit the
+   exact same swap-exhaustion failure mode independently: `execute_run`'s success/no-report
+   paths left a job's pane (and its resident `opencode`/`claude` process) running until *that
+   same job's next scheduled run* reaped it, so up to 6 settled-but-unreaped processes could be
+   resident at once on the Pi's 4GB RAM — confirmed live (swap at 95%, 3 of 4 newly added jobs'
+   first runs failed with `agent_prompt_stalled`/`server_unavailable`/a `blocked` verdict that
+   had actually finished `done` by the time anyone checked). Fixed the same way G-16 reasoned
+   about it, generalized to routine jobs: `execute_run` now closes its own pane immediately on
+   every settled terminal path (`done`, `no_report`), capturing the agent's session id first
+   (`HerdrClient.agent_session_id`, new `RunOutcome.session_id`, now in `history.jsonl`) so a
+   human can still resume-and-inspect via `herdr agent start ... -s <session_id>` — the same
+   close-then-resume mechanism G-16 verified for the pipeline, just applied without waiting for
+   a next run to trigger it. `blocked`/`unknown` are untouched (deliberate human-follow-up
+   states, docs/failure-reaping.md §2 non-goals); root-mode jobs are untouched (shared ambient
+   workspace, same guard as the pre-existing stale-pane reap). The pre-run stale-pane reap
+   itself is kept as a defensive fallback, not the primary mechanism anymore.
 
 - **Failure reaping & quota-exhaustion handling** — a failed run whose agent never settles
   (OpenCode free-quota modal; observed twice on the Pi, 2026-08-22/23) left a live `working`

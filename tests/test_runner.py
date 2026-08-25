@@ -58,6 +58,7 @@ class ScriptedClient:
         report_content: str = "# Report\n\nFindings.\n",
         raise_on: str | None = None,
         visible_screen: str = "",
+        session_id: str | None = "ses_fake123",
     ) -> None:
         self.pane_id = pane_id
         self.agent_status = agent_status
@@ -71,6 +72,7 @@ class ScriptedClient:
         self.report_content = report_content
         self.raise_on = raise_on
         self.visible_screen = visible_screen
+        self.session_id = session_id
         self.calls: list[str] = []
         self.closed_workspaces: list[str] = []
         self.closed_panes: list[str] = []
@@ -136,6 +138,12 @@ class ScriptedClient:
     def agent_read_visible(self, target, *, lines=200):
         self.calls.append("agent_read_visible")
         return self.visible_screen
+
+    def agent_session_id(self, target):
+        self.calls.append("agent_session_id")
+        if self.raise_on == "agent_session_id":
+            raise HerdrCliError("boom", exit_code=1)
+        return self.session_id
 
 
 @pytest.fixture(autouse=True)
@@ -221,6 +229,7 @@ def test_execute_run_success_writes_report(
     assert outcome.report_written is True
     assert outcome.report_bytes > 0
     assert outcome.final_agent_status == "idle"
+    assert outcome.session_id == "ses_fake123"
     assert client.calls == [
         "settled_agent_pane",
         "worktree_create",
@@ -228,7 +237,12 @@ def test_execute_run_success_writes_report(
         "agent_interactive_ready",
         "agent_prompt_wait",
         "agent_read",
+        "agent_session_id",
+        "pane_close",
     ]
+    # pane-lifecycle v2: a successful run closes its own pane immediately rather than leaving
+    # it for the next run's stale-pane reap.
+    assert client.closed_panes == ["w1:p1"]
 
 
 def test_execute_run_done_status_also_succeeds(
@@ -250,6 +264,9 @@ def test_execute_run_missing_report_is_failed_not_done(tmp_path: Path) -> None:
     outcome = execute_run(job, client, run_id="a-run3")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "no_report"
+    # A no-report settle is still an idle/done agent — pane-lifecycle v2 closes it too.
+    assert outcome.session_id == "ses_fake123"
+    assert client.closed_panes == ["w1:p1"]
 
 
 def test_execute_run_blocked_status_is_failed_with_reason(
@@ -291,6 +308,7 @@ def test_execute_run_empty_report_is_failed_not_done(
     outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "no_report"
+    assert client.closed_panes == ["w1:p1"]
     assert outcome.report_written is True
     assert outcome.report_bytes == 0
 
@@ -632,19 +650,23 @@ def test_execute_run_reaps_previous_run_workspace_before_starting(
     client = ScriptedClient(stale_pane="w9:p1", write_report_at=report_path)
     outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
     assert outcome.state == "done"
-    assert client.closed_panes == ["w9:p1"]
+    # w9:p1 is yesterday's stale pane, reaped before start; w1:p1 is this run's own pane,
+    # closed eagerly on success (pane-lifecycle v2) rather than left for tomorrow's reap.
+    assert client.closed_panes == ["w9:p1", "w1:p1"]
     assert client.calls.index("pane_close") < client.calls.index("worktree_create")
 
 
-def test_execute_run_leaves_panes_alone_when_no_stale_workspace(
+def test_execute_run_leaves_other_panes_alone_when_no_stale_workspace(
     tmp_path: Path, _isolated_reports_dir: Path
 ) -> None:
+    """No previous stale pane to reap pre-run, but the run still closes its own pane on
+    success — the "leave panes alone" behavior only ever applied to *other* panes."""
     job = make_job(tmp_path)
     run_id = "a-run16"
     report_path = _isolated_reports_dir / f"{run_id}.md"
     client = ScriptedClient(stale_pane=None, write_report_at=report_path)
     execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
-    assert "pane_close" not in client.calls
+    assert client.closed_panes == ["w1:p1"]
     assert "workspace_close" not in client.calls
 
 
@@ -675,6 +697,25 @@ def test_execute_run_does_not_reap_in_root_mode(
     assert "settled_agent_pane" not in client.calls
     assert "pane_close" not in client.calls
     assert "workspace_close" not in client.calls
+    # Nothing is ever closed for a root-mode job, so there's nothing to resume-and-inspect —
+    # capturing a session id would just be a wasted call.
+    assert "agent_session_id" not in client.calls
+    assert outcome.session_id is None
+
+
+def test_execute_run_survives_session_id_capture_errors(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """A session-id lookup failure (e.g. server blip) must still close the pane and record the
+    run as done — losing the resume handle is not worth losing the eager close for."""
+    job = make_job(tmp_path)
+    run_id = "a-run-sid-err"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(raise_on="agent_session_id", write_report_at=report_path)
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert outcome.session_id is None
+    assert client.closed_panes == ["w1:p1"]
 
 
 def test_execute_run_survives_unexpected_reap_exception(

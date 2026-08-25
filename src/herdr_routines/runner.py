@@ -172,16 +172,33 @@ def _capture_visible_tail(
     return tail
 
 
-def _reap_failed_run_pane(client: HerdrClient, *, job_name: str, pane_id: str) -> None:
-    """Best-effort close of THIS run's pane after a post-start failure. The pane was created
-    by this very execute_run call, so closing it is ours to do; leaving it behind wedges every
-    future tick on agent_name_live, because a never-settled agent stays "working" and the
-    stale-run reap only touches settled agents (docs/failure-reaping.md §1/§3.1). Never
+def _close_run_pane(client: HerdrClient, *, job_name: str, pane_id: str) -> None:
+    """Best-effort close of THIS run's pane. The pane was created by this very execute_run
+    call, so closing it is ours to do — on a post-start failure, leaving it behind would wedge
+    every future tick on agent_name_live, because a never-settled agent stays "working" and the
+    stale-run reap only touches settled agents (docs/failure-reaping.md §1/§3.1); on a
+    successful or no-report settle, closing it eagerly (rather than deferring to the next run's
+    stale-pane reap) is what pane-lifecycle v2 for routine jobs relies on — see
+    _capture_session_id for how inspection still works without the pane staying open. Never
     raises — mirrors execute_run's contract."""
     try:
         client.pane_close(pane_id)
-    except Exception as e:  # noqa: BLE001 — best-effort reap must never break execute_run's never-raises contract
-        log.warning("%s: could not reap failed run pane %s: %s", job_name, pane_id, e)
+    except Exception as e:  # noqa: BLE001 — best-effort close must never break execute_run's never-raises contract
+        log.warning("%s: could not close run pane %s: %s", job_name, pane_id, e)
+
+
+def _capture_session_id(client: HerdrClient, target: str) -> str | None:
+    """Best-effort: the agent's underlying session id, captured before _close_run_pane closes
+    its pane. A human can later resume and inspect the conversation via
+    `herdr agent start <name> --kind <kind> --pane <fresh_pane> -- <model_flag> <model> -s
+    <session_id>` (same mechanism the pipeline orchestrator uses for its own pl-3->pl-6 reuse,
+    docs/pipeline/design.md) — this is what makes "keep the pane open for inspection" no longer
+    necessary. Never raises."""
+    try:
+        return client.agent_session_id(target)
+    except Exception as e:  # noqa: BLE001 — best-effort capture must never break execute_run's never-raises contract
+        log.warning("could not capture session id for %s: %s", target, e)
+        return None
 
 
 def default_reports_dir() -> Path:
@@ -229,6 +246,7 @@ class RunOutcome:
     report_bytes: int = 0
     report_path: str | None = None
     duration_seconds: float | None = None
+    session_id: str | None = None
 
 
 def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
@@ -329,10 +347,11 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
     )
 
-    # A recurring job reuses one agent name, and runs otherwise leave their workspace
-    # behind for inspection (plan-v1 §6 and ROADMAP pane-retention notes defer automatic
-    # branch/workspace GC). By tomorrow the settled pane from today would still make
-    # agent start fail on the duplicate name, so we reap our own previous pane first:
+    # A recurring job reuses one agent name, and every settled terminal path below now closes
+    # its own pane eagerly (pane-lifecycle v2 for routine jobs — a human can resume-and-inspect
+    # via the captured session_id instead of the pane needing to stay open, see
+    # _capture_session_id). This pre-run check is now just a defensive fallback for panes that
+    # outlived that eager close (a close that itself failed, or a pane from before this fix):
     # only when its agent is settled to idle/done (never working/blocked/unknown), never
     # for workspace:root jobs (their tab lives in the shared ambient workspace), and
     # closing only the single pane (not the whole workspace) to preserve sibling tabs.
@@ -379,7 +398,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         _capture_visible_tail(
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
-        _reap_failed_run_pane(client, job_name=job.name, pane_id=pane_id)
+        _close_run_pane(client, job_name=job.name, pane_id=pane_id)
         return RunOutcome(
             state="failed",
             run_id=run_id,
@@ -405,7 +424,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         _capture_visible_tail(
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
-        _reap_failed_run_pane(client, job_name=job.name, pane_id=pane_id)
+        _close_run_pane(client, job_name=job.name, pane_id=pane_id)
         return RunOutcome(
             state="failed",
             run_id=run_id,
@@ -442,7 +461,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         marker = _matched_failure_marker(screen_tail, markers, prompt)
         reason = "quota_exhausted" if marker else "agent_prompt_failed"
         error = f"failure marker matched: {marker!r}" if marker else str(e)
-        _reap_failed_run_pane(client, job_name=job.name, pane_id=pane_id)
+        _close_run_pane(client, job_name=job.name, pane_id=pane_id)
         return RunOutcome(
             state="failed",
             run_id=run_id,
@@ -495,15 +514,28 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         _capture_visible_tail(
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
-        _reap_failed_run_pane(client, job_name=job.name, pane_id=pane_id)
+        _close_run_pane(client, job_name=job.name, pane_id=pane_id)
         return RunOutcome(
             state="failed", reason=f"unsettled_status_{settled_status}", **common
         )
+
+    # Both remaining outcomes are a settled idle/done agent — pane-lifecycle v2: close our own
+    # pane now instead of leaving it for the next run's stale-pane reap (root-mode jobs share
+    # the ambient workspace and are never auto-closed, same guard as the pre-run reap above;
+    # skip capturing a session id too, since there's nothing to resume-and-inspect for a pane
+    # that's never closed). Session id is captured before closing since a closed pane's agent
+    # record won't answer `agent get` afterwards.
+    session_id: str | None = None
+    if job.workspace != "root":
+        session_id = _capture_session_id(client, job.agent_name)
+        _close_run_pane(client, job_name=job.name, pane_id=pane_id)
 
     if not report_written or report_bytes == 0:
         # Direct response to the research repo's standing pattern that unattended scheduled
         # runs fail silently and plausibly (docs/plan-v1.md §6): a clean settle with no report,
         # or an empty one, is not "done".
-        return RunOutcome(state="failed", reason="no_report", **common)
+        return RunOutcome(
+            state="failed", reason="no_report", session_id=session_id, **common
+        )
 
-    return RunOutcome(state="done", **common)
+    return RunOutcome(state="done", session_id=session_id, **common)

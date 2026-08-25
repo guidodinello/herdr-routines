@@ -179,6 +179,27 @@ class HerdrClient:
         body = self._call(["agent", "get", target])
         return _extract_status(body)
 
+    def agent_session_id(self, target: str) -> str | None:
+        """Best-effort: the agent's underlying CLI session id (e.g. an opencode `ses_...`
+        id) from `agent get`'s `agent_session.value`, or None on any failure or shape
+        mismatch. Callers capture this before closing a settled run's pane so a human can
+        later resume and inspect the conversation (`herdr agent start ... -s <session_id>`)
+        without the pane/process needing to stay resident just for that purpose (pane-
+        lifecycle v2 for routine jobs). Never raises."""
+        exit_code, stdout, _stderr = self.runner(
+            [self.bin_path, "agent", "get", target], timeout_s=10
+        )
+        if exit_code != 0:
+            return None
+        body = _try_parse_json(stdout)
+        if not isinstance(body, dict):
+            return None
+        try:
+            value = body["result"]["agent"]["agent_session"]["value"]
+        except (KeyError, TypeError):
+            return None
+        return value if isinstance(value, str) and value else None
+
     def agent_read(self, target: str, *, lines: int = 200) -> str:
         args = [
             "agent",
