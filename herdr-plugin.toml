@@ -1,0 +1,42 @@
+# herdr-plugin.toml — front-door manifest for herdr-routines (docs/plan-v1.md §8.4).
+#
+# Actions only: the Herdr plugin system cannot own the clock, so systemd user
+# timers (deploy/systemd/) stay the sole scheduler and `herdr-routines tick`
+# stays the only tick.lock writer. This manifest deliberately declares no
+# [[startup]] hook, no daemon, no background process of any kind — see spec.md.
+#
+# Shape follows herdr.dev/docs/plugins/ (0.8.2): id/name/version/
+# min_herdr_version plus [[actions]] whose `command` values are plain argv
+# arrays (Herdr runs them without a shell).
+
+id = "herdr-routines"
+name = "herdr-routines"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Trigger herdr-routines jobs and status from inside Herdr"
+platforms = ["linux", "macos"]
+
+# herdr plugin action invoke --plugin herdr-routines --action run
+#
+# The job name (a `jobs.yaml` job name key, [a-z][a-z0-9_-]{0,23} per
+# src/herdr_routines/config.py) goes in the HERDR_PLUGIN_RUN_JOB env var;
+# scripts/herdr-plugin-run.sh forwards it to `herdr-routines run <job>` and
+# preserves the CLI's exit code. Action commands are fixed argv with no
+# parameter interpolation in plugin v1, hence the shim.
+
+[[actions]]
+id = "run"
+title = "Run routine"
+command = ["sh", "scripts/herdr-plugin-run.sh"]
+
+# herdr plugin action invoke --plugin herdr-routines --action status
+#
+# Same thin-wrapper pattern as `run`: Herdr may start plugin commands with a
+# minimal environment, so resolving the herdr-routines console script cannot
+# assume a full login PATH — scripts/herdr-plugin-status.sh falls back to
+# HERDR_ROUTINES_BIN and well-known console-script locations before execing.
+
+[[actions]]
+id = "status"
+title = "Routine status"
+command = ["sh", "scripts/herdr-plugin-status.sh"]
