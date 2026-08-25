@@ -30,8 +30,13 @@ title = "Run routine"
 command = ["sh", "scripts/herdr-plugin-run.sh"]
 
 # herdr plugin action invoke --plugin herdr-routines --action status
+#
+# Same thin-wrapper pattern as `run`: Herdr may start plugin commands with a
+# minimal environment, so resolving the herdr-routines console script cannot
+# assume a full login PATH — scripts/herdr-plugin-status.sh falls back to
+# HERDR_ROUTINES_BIN and well-known console-script locations before execing.
 
 [[actions]]
 id = "status"
 title = "Routine status"
-command = ["herdr-routines", "status"]
+command = ["sh", "scripts/herdr-plugin-status.sh"]
