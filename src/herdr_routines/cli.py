@@ -1,4 +1,7 @@
-"""herdr-routines CLI: tick | status | history | validate | run | gc. See docs/plan-v1.md §5."""
+"""herdr-routines CLI: tick | status | ps | scheduled | history | validate | run | gc.
+
+See docs/plan-v1.md §5 and docs/pipeline/runs/20260825T070012Z/spec.md for the two
+read-only visibility commands."""
 
 from __future__ import annotations
 
@@ -28,8 +31,10 @@ from herdr_routines.history import (
     last_terminal_run,
     read_job,
 )
+from herdr_routines.ps import collect_ps_rows, render_ps
 from herdr_routines.runner import build_dry_run_argv, execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
+from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
 from herdr_routines.tick import default_lock_path, run_tick, tick_lock
 
 log = get_logger(__name__)
@@ -87,6 +92,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "status", help="one line per job: last run, and whether it's due"
     )
     p_status.set_defaults(handler=_cmd_status)
+
+    p_ps = sub.add_parser(
+        "ps",
+        help="read-only: what's currently running (live agents + in-progress pipeline runs)",
+    )
+    p_ps.add_argument("--json", action="store_true")
+    p_ps.set_defaults(handler=_cmd_ps)
+
+    p_scheduled = sub.add_parser(
+        "scheduled",
+        help="read-only: every configured job with its next-fire time (disabled included)",
+    )
+    p_scheduled.add_argument("--json", action="store_true")
+    p_scheduled.set_defaults(handler=_cmd_scheduled)
 
     p_history = sub.add_parser("history", help="recent runs for one job")
     p_history.add_argument("job")
@@ -186,6 +205,56 @@ def _cmd_status(args: argparse.Namespace) -> int:
         }[result.decision]
         enabled_desc = "" if job.enabled else " [disabled]"
         print(f"{job.name}{enabled_desc}: last={last_desc}; {due_desc}")
+    return 0
+
+
+def _cmd_ps(args: argparse.Namespace) -> int:
+    # Read-only by construction: no history.append, no config write, no state.json touch
+    # (spec 20260825T070012Z criterion 5). Unreachable Herdr degrades to a warning + empty
+    # table with exit 0 rather than a crash.
+    rows, warnings = collect_ps_rows(HerdrClient())
+    for w in warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {"agent": r.agent, "status": r.status, "detail": r.detail}
+                    for r in rows
+                ]
+            )
+        )
+    else:
+        print(render_ps(rows))
+        # One warning is enough: when collect_ps_rows already explained why the table
+        # is empty (e.g. Herdr unreachable), don't also print the generic one.
+        if not rows and not warnings:
+            print("warning: nothing currently running", file=sys.stderr)
+    return 0
+
+
+def _cmd_scheduled(args: argparse.Namespace) -> int:
+    # Read-only: loads jobs.yaml, reads history.jsonl, writes neither.
+    config = _load_config_or_exit(args)
+    rows = build_scheduled_rows(config, default_history_path(), now=datetime.now(UTC))
+    if args.json:
+        print(
+            json.dumps(
+                [
+                    {
+                        "name": r.name,
+                        "enabled": r.enabled,
+                        "cron": r.cron,
+                        "timezone": r.timezone,
+                        "next_fire": r.next_fire.isoformat() if r.next_fire else None,
+                        "last_state": r.last_state,
+                    }
+                    for r in rows
+                ]
+            )
+        )
+    else:
+        print(render_scheduled(rows))
     return 0
 
 
