@@ -1,9 +1,6 @@
 # Pipeline pane lifecycle — v2 proposal (close-and-resume)
 
-Status: proposal (2026-08-24 night), not yet built or reviewed. Written after two real
-dogfood runs (`20260823T234906Z` → PR #27, `20260824T232136Z` → PR #28, and the in-progress
-`20260825T000735Z`) exposed a real memory ceiling on the Pi. Read-only relative to
-`design.md`/`spec.md` — this proposes an amendment, it does not change them.
+Status: implemented (2026-08-25, `auto/pipeline-20260825T021919Z` — see PR for this branch; original proposal 2026-08-24 night). Implemented in `docs/pipeline/design.md` (G-16) and `docs/pipeline/orchestrator-prompt.md` (spawn template close step + stage 6 `-s <session_id>` resume). Original context: two real dogfood runs (`20260823T234906Z` → PR #27, `20260824T232136Z` → PR #28, and `20260825T000735Z`) exposed a real memory ceiling on the Pi. Read-only relative to `design.md`/`spec.md` prior to this implementation — this proposal is now the implemented record.
 
 ## The problem, with evidence
 
@@ -69,19 +66,19 @@ individual stage actually does.
   live, but its session ID is in state.json/history — reopen by `-s <id>` if this stage still needs
   it" is now a normal, expected case instead of only a crash-recovery edge case.
 
-## Open questions before building this
+## Open questions before building this (updated 2026-08-25)
 
-1. Does `herdr agent start ... -- -m <model> -s <session_id>` actually attach opencode's TUI to
+1. ~~Does `herdr agent start ... -- -m <model> -s <session_id>` actually attach opencode's TUI to
    that session cleanly (vs. starting a fresh one and silently ignoring `-s`)? Untested — verify
    empirically before relying on it, same caution the original design applied to the detached
-   `--wait` form (`design.md:118-119`).
+   `--wait` form (`design.md:118-119`).~~ **Resolved 2026-08-25 (G-16):** manually verified — throwaway opencode session given a fact, pane closed, new pane in new workspace opened with `-s <original_session_id>`, resumed session correctly recalled the fact and `agent_session.value` matched original (true resume, not fork). Treat as settled; stage 1 sanity-check against shared-workspace pattern remains as noted in `design.md: risks`.
 2. Exact trigger for "close this worker's pane" — immediately on gate-pass, or with a short grace
    window in case the orchestrator itself needs to re-read its output? Immediate is simpler and
    matches "the files are the handoff," but worth confirming there's no reliance on reading pane
-   scrollback (`agent read --source visible`) after the gate check.
+   scrollback (`agent read --source visible`) after the gate check. **Still open (G-16):** immediate close is the default in `design.md`/`orchestrator-prompt.md`; a short grace window remains permissible and is documented as not yet needing scrollback.
 3. Whether `-s`/`--fork` interacts correctly with a *different* model than the one that created the
    session (stage 6 might reuse `pl-3`'s `x-preview-f-free` session, which is fine since it's the
-   same worker; this wouldn't apply to `pl-5`'s `big-pickle` session since nothing reuses it).
+   same worker; this wouldn't apply to `pl-5`'s `big-pickle` session since nothing reuses it). **Still open (G-16):** current `pl-3` → `pl-6` reuses same `x-preview-f-free` model family, so same-model resume covers this run; cross-model interaction remains open for future different-model reuse and is noted as such in `design.md`.
 
 ## Rationale for filing this now rather than later
 

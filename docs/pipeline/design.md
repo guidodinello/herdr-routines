@@ -147,13 +147,13 @@ fresh worktree does not show another worktree's untracked files.
   tens of minutes, the detached form is required — verify at build time (audit
   open question 3). One `agent prompt --wait` per stage is the cheap primitive
   (`docs/plan-v1.md:65`), not dozens of `agent get`.
-- **Checkpointing & resume (audit gap 7 + G-9):** `state.json`
+- **Checkpointing & resume (audit gap 7 + G-9, updated G-16):** `state.json`
   (`{current_stage, pr_number, artifact_paths, shared_worktree, branch, run_id, deadline_epoch}`)
   updated **atomically** (write to temp + rename) after every stage transition.
   `$PIPELINE_REPORT` written at end regardless of outcome (stage-by-stage
   status, artifacts, where it stopped and why) — same pattern as
   `$ROUTINE_REPORT` in `docs/plan-v1.md:386`. **Resume recipe:** on relaunch
-  read `state.json` → `herdr agent list | jq -r '.result.agents[] | select(.name | startswith("pl-")) | "\(.name) \(.agent_status)"'` (not `rg "pl-"` on JSON — G-9) to reconcile live `pl-<stage>-<run_id>` agents. Derive orphan stage from agent name suffix when `state.json:current_stage` lags spawn (crash between `herdr agent prompt` and state write). Adopt still-`working` worker if stage matches, otherwise `herdr pane close <pane_id>` (pane_close, not settled-agent reap — reaping `working` requires `pane_close` per `src/herdr_routines/herdr.py:34`). Atomic write prevents corrupt resume on crash mid-write.
+  read `state.json` → `herdr agent list | jq -r '.result.agents[] | select(.name | startswith("pl-")) | "\(.name) \(.agent_status)"'` (not `rg "pl-"` on JSON — G-9) to reconcile live `pl-<stage>-<run_id>` agents. Derive orphan stage from agent name suffix when `state.json:current_stage` lags spawn (crash between `herdr agent prompt` and state write). Adopt still-`working` worker if stage matches, otherwise `herdr pane close <pane_id>` (pane_close, not settled-agent reap — reaping `working` requires `pane_close` per `src/herdr_routines/herdr.py:34`). Atomic write prevents corrupt resume on crash mid-write. **Pane-lifecycle v2 (G-16):** a closed-but-resumable worker ("not found live, but its session ID is in `state.json`/history — reopen by `-s <session_id>` if this stage still needs it") is now a normal, expected case (per-stage close), not only a crash-recovery edge case; resume captures `agent_session.value` for `pl-3` so stage 6 can `herdr agent start pl-6-… -s <session_id>`.
 - **Pipeline deadline (audit gap 5 + G-7):** hard wall-clock budget **launch + 7 h**
   (pinned default, written to `state.json:deadline_epoch` at orchestrator start;
   tune via open question 4). Orchestrator checks `date +%s` vs `deadline_epoch`
@@ -168,13 +168,13 @@ fresh worktree does not show another worktree's untracked files.
   report). Accept for v1 but add morning checklist: "no report file ⇒ check
   `systemctl --user status` + `herdr agent list`" and keep v2 provider/model
   failover in Parking Lot (`roadmap:126-129`).
-- **Cleanup (audit gap 12 + G-10):** after `$PIPELINE_REPORT` is mirrored to
+- **Cleanup (audit gap 12 + G-10, pane-lifecycle v2 G-16):** after `$PIPELINE_REPORT` is mirrored to
   `~/.local/state/herdr-routines/reports/<run_id>.md` and commits are on
   `auto/pipeline-<run_id>`, **close each worker's tab/pane** (`herdr tab close` /
   `herdr pane` close) — **do not** `herdr workspace close` the shared workspace
   nor `herdr worktree remove` the shared worktree (that would destroy the branch
-  to keep). Order: (1) mirror report + ensure `auto/pipeline-<run_id>` has all
-  commits, (2) close worker tabs/panes, (3) leave shared worktree+branch for
+  to keep). **Per-stage pane close on gate-pass (not only end-of-run) (G-16):** close a worker's pane as soon as its stage's gate has passed and the handoff (commit + `state.json` update) is confirmed on disk — close this worker's pane once its gate passes — for every worker except whichever one a later stage reuses for context. For the reused worker (`pl-3`, reused by stage 6 per G-11), close its pane too after stage 4, but when stage 6 needs it, reopen by resuming its session: `herdr agent start pl-6-<run_id> --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` — where `<session_id>` is `agent_session.value` already captured in `state.json`/history for that worker — instead of keeping the pane open idle from stage 3 through stage 6. This close-then-resume-by-session-id mechanism was empirically verified 2026-08-25 (`-s <session_id>` true resume, `agent_session.value` matched exact session; proposal open question 1 settled). At most 2 opencode processes resident at any point (orchestrator + active stage) instead of one per stage. Open questions 2 (grace window before closing) and 3 (cross-model `-s` interaction) remain open — immediate close is the default; a short grace window is still permissible if scrollback reliance is later found, and cross-model `-s` is out of scope for current `pl-3`/`pl-6` same-model reuse. Order: (1) mirror report + ensure `auto/pipeline-<run_id>` has all
+  commits, (2) close worker tabs/panes (per-stage as gates pass, plus final sweep for any still-open), (3) leave shared worktree+branch for
   manual GC per `roadmap:77-79`. Leaked live `pl-*` agents were the central
   incident of reaping §1. Future `herdr-routines gc` must exclude `auto/pipeline-*`
   (G-14).
@@ -201,10 +201,7 @@ Mechanically solved — same `herdr` CLI calls `src/herdr_routines/herdr.py` +
 
 Each worker gets a unique agent name `pl-<stage>-<run_id>` (Herdr cap
 `[a-z][a-z0-9_-]{0,31}`, unique among live agents — `docs/plan-v1.md:71`),
-**except stage 6 which reuses `pl-3-<run_id>`** via `herdr agent prompt pl-3-<run_id> …`
-(no new `agent start`; preserves code context per G-11 — alternative is fresh
-`pl-6-<run_id>` seeded with `git diff main...HEAD` + `gh pr view --comments`,
-switch if context burn becomes an issue).
+**except stage 6 which reuses the stage-3 session via close-then-resume-by-session-id (G-16)** via `herdr agent start pl-6-<run_id> --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` where `<session_id>` is `pl-3`'s `agent_session.value` (`-s <session_id>` empirically verified 2026-08-25, true resume not fork; `agent_session.value` on resumed agent matched original). This preserves code context per G-11 without keeping the `pl-3` pane open idle from stage 3 through stage 6 — close a worker's pane as soon as its stage's gate passes (G-16), and reopen the one needed later by `-s <session_id>` against a fresh pane. Alternative fresh `pl-6-<run_id>` seeded with `git diff main...HEAD` + `gh pr view --comments` remains the fallback if context burn or cross-model `-s` becomes an issue (open question 3).
 
 ## Gates in v1 (orchestrator-supervised, machine-checkable forms — audit gap 2)
 
