@@ -44,3 +44,26 @@ Output: plain text table by default (fixed-width columns, fits `herdr notificati
 - **Table vs JSON trade-off.** Fixed-width tables can truncate long branch/pane IDs; adding deps (`rich`/`tabulate`) adds weight for a single-user CLI. Mitigation: stdlib formatting, truncate with `…`, offer `--json` for scripting; keep no new runtime deps.
 - **Stale/incomplete `state.json`.** A crashed pipeline may leave `state.json` with stale `current_stage` and no `pipeline-*.md`. Mitigation: treat absent report as "in progress" only when `state.json` `current_stage` not terminal and `history.jsonl` has no terminal record for that `run_id`; otherwise show as orphaned with warning.
 - **Spec-path hygiene (G-15).** Must stay at `docs/pipeline/runs/<run_id>/spec.md`; writing to root `spec.md` or `docs/pipeline/spec.md` reintroduces PR #28/#29 full-file merge conflict. Verified `mkdir -p` per-run path on purpose.
+
+## Acceptance criteria
+
+1. A new subcommand (`herdr-routines ps`) prints a table of currently-running panes/agents from `herdr pane list`/`herdr agent list` via `HerdrClient` (same seam as `tick.py:266`) with no crash when herdr reports zero live agents — empty table with warning, exit 0 — Test: test_status_running_table_handles_empty
+2. The running-table command cross-references in-progress pipeline runs (`state.json` files under `~/.local/state/herdr-routines/reports/` or `$HERDR_PLUGIN_STATE_DIR/reports/` whose stage isn't complete) and shows a stage indicator (e.g. "pipeline run 20260825T… stage 4/6"), not just a bare agent name — Test: test_status_running_table_shows_pipeline_stage
+3. A new subcommand (`herdr-routines scheduled`) prints a table of scheduled jobs from `jobs.yaml` via `config.py:138` `load_config()`/`default_config_path()` with each job's next-fire time (reusing `schedule.py:72` croniter + ZoneInfo logic) and enabled/disabled state — Test: test_status_scheduled_table_shows_next_fire
+4. The scheduled-jobs table correctly shows a disabled job (e.g. `enabled: false` in `jobs.yaml`) as disabled (dimmed/marked), not silently omitted — Test: test_status_scheduled_table_shows_disabled_jobs
+5. Both commands are read-only: no test asserts any write to `jobs.yaml`, `history.jsonl`, or any `state.json` — Test: test_status_commands_are_read_only
+
+## Changelog v1→v2
+
+- Added `## Acceptance criteria` with 5 numbered items, each ending `Test: <name>` to make verification deterministic and CI-enforceable (covers empty running table, pipeline stage cross-reference, scheduled next-fire, disabled-job visibility, and read-only guarantee).
+- Added `## Review notes` with explicit `blocking`/`non-blocking` labels and `confidence:` tiers for review gating.
+- Clarified that `ps` reuses `HerdrClient`/`CommandRunner` fake seam and handles missing Herdr server / absent files gracefully (`HerdrCliError` → empty table with warning, exit 0); `scheduled` reuses `schedule.py` cron logic (DST dedup, `catch_up_minutes`, `ZoneInfo`) rather than reimplementing.
+- No change to `## Problem`, `## Approach`, `## Files touched`, `## Risks` — still two additive read-only subcommands (`ps` + `scheduled`) with no web server/daemon/new state.
+
+## Review notes
+
+blocking: ps must table herdr pane/agent list via HerdrClient and handle zero live agents without crash (criterion 1); ps must cross-reference state.json in-progress runs and show stage indicator not bare name (criterion 2); scheduled must table jobs.yaml with next-fire and enabled/disabled per job (criterion 3); disabled jobs must be shown as disabled not omitted (criterion 4); both commands must be read-only with no writes to jobs.yaml/history.jsonl/state.json (criterion 5)
+non-blocking: exact table column widths/truncation and optional --json flag shape are formatting choices; module split (ps.py+scheduled.py vs visibility.py) is at implementer's discretion if reuse of config.py/schedule.py/history.py/herdr.py is preserved
+confidence: high — empty-table, stage cross-reference, next-fire, disabled-visible, and read-only criteria are deterministic via fake CommandRunner/filesystem tests (criteria 1-5)
+confidence: medium — next-fire recomputation reuses schedule.py/croniter + ZoneInfo DST dedup; edge on catch-up/history interaction may need live history.jsonl shape check
+confidence: low — live Herdr CLI JSON shape drift (herdr pane list / herdr agent list) and reports/state.json path divergence require fixture update and fail-open warning, covered outside isolated unit tests
