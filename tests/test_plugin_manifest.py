@@ -104,7 +104,11 @@ def test_plugin_manifest_run_action_shape(tmp_path: Path) -> None:
     def run_shim(**env_extra: str) -> subprocess.CompletedProcess[str]:
         env = {"PATH": str(fake_bin), "HOME": str(tmp_path)} | env_extra
         return subprocess.run(
-            ["/bin/sh", str(RUN_SHIM)], capture_output=True, text=True, check=False, env=env
+            ["/bin/sh", str(RUN_SHIM)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
         )
 
     # The job param reaches the CLI via the documented env var…
