@@ -97,10 +97,10 @@ Ready to build whenever; no real-run evidence required.
 - **Failure reaping & quota-exhaustion handling** — a failed run whose agent never settles
   (OpenCode free-quota modal; observed twice on the Pi, 2026-08-22/23) left a live `working`
   agent behind, so every later tick skipped the job (`agent_name_live`) until manual cleanup.
-  Spec: [`docs/failure-reaping.md`](docs/failure-reaping.md). Phase 1 (reap own pane on
-  failure, post-hoc quota classification, failure-path screen tails) ready to build; phase 2
+  Spec: [`docs/failure-reaping.md`](docs/failure-reaping.md). **Phase 1 shipped** (reap own pane
+  on failure, post-hoc quota classification, failure-path screen tails — PR #25); phase 2
   (mid-run fast-fail watchdog) is gated on phase 1 surviving a real overnight cycle and the
-  dead wait mattering once more.
+  dead wait mattering once more, and hasn't cleared that gate yet.
 
 ## Next
 
