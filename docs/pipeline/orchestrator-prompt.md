@@ -36,13 +36,25 @@ herdr worktree create --cwd "$REPO_PARENT" --base main --branch "auto/pipeline-$
   "branch": "auto/pipeline-<RUN_ID>",
   "shared_workspace": "<SHARED_WS>",
   "deadline_epoch": <now + 25200>,
-  "artifact_paths": {"spec": "$WT/docs/pipeline/runs/$RUN_ID/spec.md", "report": "$PIPELINE_REPORT"}
+  "artifact_paths": {"spec": "$WT/docs/pipeline/runs/$RUN_ID/spec.md", "report": "$PIPELINE_REPORT"},
+  "stage_sessions": {}
 }
 ```
 
+`stage_sessions` (G-17): record `agent_session.value` for **every** stage's worker as it spawns — `"1": "<session_id>"`, `"2": "<session_id>"`, etc. — not just the reused `pl-3` worker (G-16 already does that one). This is what Gate 2i (and any future stage-independence gate) compares against to confirm a stage actually ran in its own session rather than reusing a prior stage's.
+
 Write via `tmpfile && mv` (atomic rename — G-9). `deadline_epoch` = `date +%s` + `25200` (launch + 7h, design:146). Fork a `herdr workspace` with `--env HERDR_ENV=1` already — this is required or every `herdr` call wedges as `blocked` (design:98). Host prerequisites (signing key, allowlist, tools like `rg`) are configured **outside this prompt** per [`setup.md`](setup.md) — do not attempt to install tools or change git/gh config mid-run; if a gate fails on a missing tool, abort with report noting the gap. Write a heartbeat line (`echo "stage N poll $(date -u +%H:%M:%SZ)" >> /tmp/pipeline_resume_$RUN_ID.log`) each poll cycle so a silent orchestrator death is diagnosable (first run: wS:p1 killed between stages 4→5, no error, only `herdr-server.log agent → None`).
 
-## Worker spawn template (use for every stage)
+## Worker spawn template (use for every stage — no exceptions, G-17)
+
+**You are the orchestrator, not a worker.** Every stage below must run as its own
+`pl-<N>-<run_id>` agent via this template — never author a stage's content
+yourself in your own session, even when it feels faster (it isn't a real
+shortcut: stages exist as separate sessions specifically so e.g. stage 2's
+review is independent of stage 1's authoring — collapsing them defeats that
+even if the resulting file looks identical). Each stage's gate now includes an
+explicit check that the right agent/session actually ran it (G-17 below) —
+skipping spawn is a gate-content failure, not a style choice.
 
 For stage `N` with harness `MODEL`:
 
@@ -87,12 +99,14 @@ Execute sequentially. After each stage, run its **gate commands** (design:205) a
 - **Input:** `FEATURE_IDEA` paragraph
 - **Prompt:** "Read `docs/plan-v1.md` for context. Produce `spec.md` v1 at `$WT/docs/pipeline/runs/$RUN_ID/spec.md` (create the directory first: `mkdir -p \"$WT/docs/pipeline/runs/$RUN_ID\"` — this path is per-run **on purpose**, not `$WT/spec.md`: every run writing to the same root-level path is what caused PR #29's merge conflict against PR #28, both full-file rewrites of one shared path — G-15) with: problem, approach, files touched, risks. Keep it concise but complete. Commit before settling: `git -C \"$WT\" add docs/pipeline/runs/$RUN_ID/spec.md && git commit -m \"spec: v1 for $RUN_ID\"`."
 - **Gate 1:** `test -s "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && test $(wc -l < "$WT/docs/pipeline/runs/$RUN_ID/spec.md") -gt 2 && git -C "$WT" rev-parse --abbrev-ref HEAD | grep -q "^auto/pipeline-" && git -C "$WT" log --oneline -1 -- "docs/pipeline/runs/$RUN_ID/spec.md" | grep -q .` (design:207, G-4 fix)
+- **Gate 1i (process fidelity, G-17):** `herdr agent list | jq -e --arg n "pl-1-$RUN_ID" '[.result.agents[] | select(.name==$n)] | length==1'` — a distinct `pl-1-$RUN_ID` agent must have run this stage; if you (the orchestrator) wrote `spec.md` yourself instead of spawning it, this fails and the stage is not done — go back and spawn it for real, do not paper over with a passing content gate.
 
 ### Stage 2 — Spec review + update (adds acceptance criteria)
 - **Harness:** `opencode/muse-spark-1.2-contributor-free` **fresh session** (same model family, different session — independence via sessions not model family; `ox planning bad` `opencode-e2e:17` makes ox a poor spec reviewer; was `big-pickle`)
 - **Input:** `spec.md` v1 (committed)
 - **Prompt:** "Review `$WT/docs/pipeline/runs/$RUN_ID/spec.md` v1. Produce spec v2 with an added `## Acceptance criteria` section: numbered items, each ends `Test: <name>` (exact test name). Also add `## Changelog v1→v2` inside the same file describing changes, and ensure `blocking`/`non-blocking` and `confidence:` tiers are present. Commit: `git -C \"$WT\" add docs/pipeline/runs/$RUN_ID/spec.md && git commit -m \"spec: v2 acceptance for $RUN_ID\"`."
 - **Gate 2:** `rg -c "Test:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` counts `N` (orchestrator counts); `rg -q "^## Acceptance criteria" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "^## Changelog" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -qw "blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -qw "non-blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "confidence:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` (design:208, G-2 fix: `-w` avoids tautology)
+- **Gate 2i (process fidelity, G-17):** `herdr agent list | jq -e --arg n "pl-2-$RUN_ID" '[.result.agents[] | select(.name==$n)] | length==1'` **and** its `agent_session.value` differs from `pl-1-$RUN_ID`'s recorded session id in `state.json` — stage 2's whole purpose is an independent reviewer, not the stage-1 author re-reading its own work in the same session. Same failure handling as Gate 1i.
 
 ### Stage 3 — Implement (tests before code)
 - **Harness:** `opencode/x-preview-f-free` (= `ox-alpha-free`, alias `opencode-e2e:17`, 1M ctx, coding best — was generic `opencode`)

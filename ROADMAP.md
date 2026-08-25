@@ -83,6 +83,16 @@ Ready to build whenever; no real-run evidence required.
    Pi launcher scripts (`~/.local/bin/pipeline-launch-*.sh`, outside this repo) still need a
    manual update to match G-16's per-stage close-and-resume — the design doc changed, the actual
    launch mechanics on the Pi haven't yet.
+   **Third 2026-08-25 finding (same run):** the pane-lifecycle-v2 run itself surfaced a deeper
+   gap — the orchestrator skipped spawning stages 1/2 as separate workers and authored `spec.md`
+   v1 and v2 itself in one session, and every gate passed anyway, because gates only check
+   *content shape*, never *which process produced it*. Stage 2 exists specifically to be an
+   independent reviewer of stage 1's spec; collapsing them silently defeats that. Fixed generally
+   (not as a one-off "check `pl-1` exists" patch) as **G-17**: any stage a workflow declares
+   independent must be gate-verified by agent name + session id
+   (`state.json:stage_sessions`), a principle meant to survive the later move to a declarative
+   per-stage `isolation:` field rather than being re-derived per hardcoded stage pair. Landed in
+   the same PR as the "implemented" status update above.
 
 - **Failure reaping & quota-exhaustion handling** — a failed run whose agent never settles
   (OpenCode free-quota modal; observed twice on the Pi, 2026-08-22/23) left a live `working`

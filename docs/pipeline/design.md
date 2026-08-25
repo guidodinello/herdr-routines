@@ -214,10 +214,33 @@ no address off failed review — `spec:57-59`).
 |---|----------------------|--------------------------------------|
 | 1 | `spec.md` exists, non-empty, committed on pipeline branch | `test -s "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && test $(wc -l < "$WT/docs/pipeline/runs/$RUN_ID/spec.md") -gt 2 && git -C "$WT" rev-parse --abbrev-ref HEAD | grep -q "^auto/pipeline-" && git -C "$WT" log --oneline -1 -- "docs/pipeline/runs/$RUN_ID/spec.md" | grep -q .` |
 | 2 | Spec v2 contains `## Acceptance criteria` with numbered items, each `Test: <name>`; change notes inside spec as `## Changelog v1→v2`; blocking tiers present | Count `Test:` via `rg -c "Test:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` (≥ N, N derived by orchestrator counting `Test:` lines); headings via `rg -q "^## Acceptance criteria" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "^## Changelog" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"`; tiers via `rg -qw "blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -qw "non-blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "confidence:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` (fixed: `-w` avoids substring tautology; see G-2 verification) |
+| 1i/2i | **Stage isolation (G-17):** every stage marked independent in the workflow definition actually ran as a distinct worker — not the orchestrator authoring the content itself | `herdr agent list | jq -e --arg n "pl-<N>-<run_id>" '[.result.agents[] | select(.name==$n)] | length==1'` — a named `pl-<N>-<run_id>` agent must exist for stage `N`, and (for a stage the workflow does **not** declare as reusing an earlier stage's session) its `agent_session.value` must differ from every prior stage's recorded session id in `state.json`. Missing agent or a reused session where none was declared ⇒ gate-content failure, `abort` (same severity as 1/2), not a warning. |
 | 3 | Every named test from acceptance section exists (file/symbol) **and** suite passes | Extract `Test: <name>` → `rg -F -q -- "<name>" "$WT/tests"` (fixed-string `-F`, scoped to `tests/` not `$WT` which contains `spec.md` itself — G-2); then `uv run pytest -q` (or repo's test cmd). Existence first, green second — audit gap 2: green alone proves nothing. |
 | 4 | PR exists on the shared branch | `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-<run_id>"'` |
 | 5 | Review posted with structured blocking/non-blocking tiers (code-review skill) | `gh pr view <n> --json comments,reviews | jq -e 'any(.comments[].body // empty; test("blocking")) or any(.reviews[].body // empty; test("blocking"))'` — **relaxed after first real run** (`pipeline-20260823T234906Z`): the code-review skill posts `blocking`/`non-blocking` tier labels but no literal `confidence: high|medium|low` token, so the original `confidence:` regex false-failed; orchestrator judged pass-with-note. Keep `all(...)` shape for absence checks if a repo's review format adds confidence back; gate on what the skill actually writes. |
 | 6 | No unresolved blocking findings | **Verified fix for G-1:** `gh api repos/{owner}/{repo}/pulls/<n>/threads` 404s (confirmed `gh: Not Found`). **Option A (GraphQL, preferred):** `gh api graphql -f query='query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$pr){reviewThreads(first:50){nodes{isResolved comments(first:1){nodes{body}}}}}}}' -f owner=<o> -f repo=<r> -F pr=<n> | jq -e '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false and (.comments.nodes[0].body | test("blocking")))] | length==0'` — filter `isResolved==false` + body contains `blocking` (skill convention, not an API field). **Option B (fallback, no GraphQL):** `gh pr view <n> --json comments | jq -e 'all(.comments[].body; test("blocking")) | not or all(...replies...)` count-match. Delete the old REST `threads` line; pin one option in `orchestrator-prompt.md` after one real PR run. |
+
+**Process fidelity, not just content shape (G-17):** every gate above (1-6)
+checks the *shape of the output* — does `spec.md` have the right headings, do
+named tests exist, is there a PR. None of them check *how* the output was
+produced. On the pane-lifecycle-v2 dogfood run (`20260825T021919Z`, PR #31)
+the orchestrator (`muse-spark-1.2-contributor-free`, free tier) skipped
+spawning `pl-1`/`pl-2` entirely and wrote both spec versions itself in its own
+session — Gates 1 and 2 both passed anyway, because a content-shape check
+cannot distinguish "an independent reviewer wrote this" from "the same author
+reviewed its own work." Stage 2 exists specifically for the latter
+independence (`orchestrator-prompt.md` stage 2 harness note: "fresh session
+... independence via sessions not model family"); collapsing it into stage 1
+quietly defeats that, with no
+prompt change required to trigger it — plain model non-determinism against an
+unenforced instruction is enough. The general lesson, meant to generalize past
+this one hardcoded 6-stage prompt: **any stage a workflow declares as needing
+independent execution must be gate-verifiable by process identity (a distinct
+agent name + session id), not merely trusted from the prompt.** Gate 1i/2i
+above is the concrete instance for this v1's stage 1/2; a future declarative
+workflow schema should carry this as a per-stage `isolation: independent |
+reused:<stage>` field with one generic gate function reading it, rather than
+re-deriving a bespoke check per hardcoded stage pair each time.
 
 Stage rules: tests before code (stage 3 done = every acceptance test exists and
 passes), comment-addressal capped at 2 iterations + 60-min wait-for-comments
