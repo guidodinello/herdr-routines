@@ -45,12 +45,24 @@ Verification: `herdr plugin install guidodinello/herdr-routines` succeeds from a
 
 ## Acceptance criteria
 
-1. `herdr-plugin.toml` exists at repo root, declares `name`/`version` and exactly two actions `run` (with `job` param) and `status`, and contains no `startup`/daemon key Test: test_plugin_manifest_actions_only
-2. `herdr plugin install guidodinello/herdr-routines` succeeds and both actions invoke the CLI with identical exit codes to shell Test: test_plugin_action_invoke_run_and_status
-3. Config/state resolution still prefers `HERDR_PLUGIN_CONFIG_DIR`/`HERDR_PLUGIN_STATE_DIR` with XDG fallback Test: test_plugin_env_var_fallback
+1. `herdr-plugin.toml` exists at repo root and parses as valid TOML — Test: test_plugin_manifest_is_valid_toml
+2. Manifest declares no `startup`/daemon/background-hook field — Test: test_plugin_manifest_has_no_startup_hook
+3. Manifest declares a `run` action that invokes `herdr-routines run <job>` — Test: test_plugin_manifest_run_action_shape
+4. Manifest declares a `status` action that invokes `herdr-routines status` — Test: test_plugin_manifest_status_action_shape
+5. Config/state path resolution still honors `HERDR_PLUGIN_CONFIG_DIR`/`HERDR_PLUGIN_STATE_DIR` when set, with existing `~/.config/herdr-routines/`/`~/.local/state/herdr-routines/` as fallback — Test: test_plugin_env_var_paths_fallback
+
+## Changelog v1→v2
+
+- Promoted `## Acceptance criteria` from 3 broad items to 5 test-anchored criteria, each ending `Test: <name>` to make verification deterministic and CI-enforceable.
+- Split former criterion 1 (`actions_only`) into three explicit checks: valid TOML parse, no `startup`/daemon field, and precise `run`/`status` action shapes invoking `herdr-routines run <job>` / `herdr-routines status`.
+- Renamed/refined env-var fallback criterion to `test_plugin_env_var_paths_fallback` and clarified it honors `HERDR_PLUGIN_CONFIG_DIR`/`HERDR_PLUGIN_STATE_DIR` with `~/.config/herdr-routines/`/`~/.local/state/herdr-routines/` fallback (verifying `src/herdr_routines/config.py:138-147`, `src/herdr_routines/history.py:31-40`, `src/herdr_routines/tick.py:34-41`, `src/herdr_routines/cli.py:37-48`, `src/herdr_routines/runner.py:187-196`).
+- No change to `## Problem`, `## Approach`, `## Files touched`, `## Risks` — still actions-only manifest, systemd owns schedule.
+- Added explicit `blocking`/`non-blocking` labels and `confidence:` tiers in `## Review notes` for review gating.
 
 ## Review notes
 
-blocking: manifest must be actions-only (no startup hook/daemon); run action must forward job param; env-var fallback at config.py:138-147 / history.py:31-40 must still hold
-non-blocking: shim is optional if manifest can interpolate param directly; version string sync with pyproject.toml is cosmetic but should match
-confidence: high
+blocking: manifest must be actions-only (no startup hook/daemon); run action must forward job param with `herdr-routines run <job>`; status action must invoke `herdr-routines status`; manifest must parse as valid TOML
+non-blocking: shim is optional if manifest can interpolate param directly; version string sync with pyproject.toml:3 is cosmetic but should match
+confidence: high — manifest parses and actions shapes are deterministic (criteria 1-4)
+confidence: medium — env-var fallback honors HERDR_PLUGIN_CONFIG_DIR/HERDR_PLUGIN_STATE_DIR with existing XDG fallback, verified via existing path helpers (criterion 5)
+confidence: low — Herdr platform install/invoke round-trip requires live Herdr binary and is covered outside isolated unit tests
