@@ -79,7 +79,7 @@ def test_status_scheduled_table_shows_next_fire(
 
 
 def test_next_fire_at_matches_schedule_enumeration() -> None:
-    """next_fire_at reuses schedule._occurrences_since: same timezone handling as tick's
+    """next_fire_at reuses schedule.occurrences_since: same timezone handling as tick's
     decide() — '0 3 * * *' in America/Montevideo (UTC-3) is 06:00 UTC, never 03:00."""
     now = datetime(2026, 8, 25, 7, 0, 0, tzinfo=UTC)
     nxt = next_fire_at("0 3 * * *", "America/Montevideo", now=now)

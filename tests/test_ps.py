@@ -119,7 +119,11 @@ def test_status_running_table_survives_unreachable_herdr(
 
     captured = capsys.readouterr()
     assert "AGENT" in captured.out
-    assert "unavailable" in captured.err
+    err_lines = [line for line in captured.err.splitlines() if line.strip()]
+    # Exactly one warning: the "herdr unavailable" line must not be doubled by the
+    # generic "nothing currently running" fallback (PR #41 review note).
+    assert len(err_lines) == 1
+    assert "unavailable" in err_lines[0]
 
 
 # --- criterion 2 ---------------------------------------------------------------------------

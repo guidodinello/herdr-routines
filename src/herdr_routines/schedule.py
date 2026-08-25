@@ -36,7 +36,7 @@ class ScheduleResult:
     skipped_last: datetime | None = None
 
 
-def _occurrences_since(
+def occurrences_since(
     cron: str, tz_name: str, since: datetime, now: datetime
 ) -> list[datetime]:
     """All cron occurrences in the half-open interval (since, now], in tz_name, returned as
@@ -87,7 +87,7 @@ def decide(
     step 1).
     """
     since = last_terminal.ts if last_terminal is not None else job_registered_at
-    occurrences = _occurrences_since(cron, timezone, since, now)
+    occurrences = occurrences_since(cron, timezone, since, now)
 
     if not occurrences:
         return ScheduleResult(decision=Decision.NOT_DUE)

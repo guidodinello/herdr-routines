@@ -226,7 +226,9 @@ def _cmd_ps(args: argparse.Namespace) -> int:
         )
     else:
         print(render_ps(rows))
-        if not rows:
+        # One warning is enough: when collect_ps_rows already explained why the table
+        # is empty (e.g. Herdr unreachable), don't also print the generic one.
+        if not rows and not warnings:
             print("warning: nothing currently running", file=sys.stderr)
     return 0
 

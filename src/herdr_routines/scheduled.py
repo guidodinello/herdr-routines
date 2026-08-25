@@ -1,7 +1,7 @@
 """`herdr-routines scheduled`: what's scheduled, per jobs.yaml.
 
 Read-only view over `config.load_config()` output: for every job (disabled ones
-included and marked), the next cron fire reuses `schedule._occurrences_since`
+included and marked), the next cron fire reuses `schedule.occurrences_since`
 (the exact croniter + ZoneInfo enumeration `tick.decide()` uses, including its DST
 fall-back dedup) so the table can never disagree with what tick would do. Last-run
 state comes from `history.last_terminal_run`.
@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from herdr_routines.config import RoutinesConfig
 from herdr_routines.history import last_terminal_run
-from herdr_routines.schedule import _occurrences_since
+from herdr_routines.schedule import occurrences_since
 from herdr_routines.table import render_table
 
 # Upper bound for next-fire search; a valid crontab fires at least once a year except
@@ -28,7 +28,7 @@ def next_fire_at(cron: str, timezone: str, *, now: datetime) -> datetime | None:
     """First occurrence strictly after `now`, in the job's timezone, using the same
     occurrence enumeration (and DST dedup) as schedule.decide()."""
     horizon = now.astimezone(UTC) + NEXT_FIRE_HORIZON
-    occurrences = _occurrences_since(cron, timezone, now, horizon)
+    occurrences = occurrences_since(cron, timezone, now, horizon)
     return occurrences[0] if occurrences else None
 
 
