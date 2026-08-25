@@ -477,3 +477,47 @@ def test_agent_statuses_converts_malformed_shapes_to_cli_error(body: dict) -> No
     client = HerdrClient(runner=runner)
     with pytest.raises(HerdrCliError):
         client.agent_statuses()
+
+
+# -- agent_session_id (pane-lifecycle v2 for routine jobs) ----------------------------------
+
+
+def test_agent_session_id_parses_value_and_builds_expected_argv() -> None:
+    body = {
+        "result": {
+            "agent": {
+                "agent_status": "done",
+                "agent_session": {
+                    "agent": "opencode",
+                    "kind": "id",
+                    "source": "herdr:opencode",
+                    "value": "ses_fc9c01dabffeMGspFeeB9flH7y",
+                },
+            }
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.agent_session_id("rt-a") == "ses_fc9c01dabffeMGspFeeB9flH7y"
+    assert runner.calls[0] == ["herdr", "agent", "get", "rt-a"]
+
+
+def test_agent_session_id_returns_none_on_failure_rather_than_raising() -> None:
+    """Best-effort, same contract as agent_read/agent_read_visible — a failure here must not
+    block the run or the pane close that follows it."""
+    runner = FakeRunner([(1, "", "some error")])
+    client = HerdrClient(runner=runner)
+    assert client.agent_session_id("rt-a") is None
+
+
+def test_agent_session_id_returns_none_on_non_json_stdout() -> None:
+    runner = FakeRunner([(0, "not json at all", "")])
+    client = HerdrClient(runner=runner)
+    assert client.agent_session_id("rt-a") is None
+
+
+def test_agent_session_id_returns_none_when_session_absent() -> None:
+    """Not every agent kind necessarily reports a session id — absence is not an error."""
+    runner = FakeRunner([ok({"result": {"agent": {"agent_status": "done"}}})])
+    client = HerdrClient(runner=runner)
+    assert client.agent_session_id("rt-a") is None

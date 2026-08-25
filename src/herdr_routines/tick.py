@@ -222,6 +222,7 @@ def _process_job(
         "report_bytes": outcome.report_bytes,
         "report": outcome.report_path,
         "duration_seconds": outcome.duration_seconds,
+        "session_id": outcome.session_id,
     }
     if outcome.reason:
         extra["reason"] = outcome.reason
