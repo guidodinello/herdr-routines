@@ -83,7 +83,13 @@ Worth designing once their gate clears — usually "a few weeks of real runs on 
 - **Notification policy per job** — decide what "worth telling you" means per job (only on
   failure, or only on a non-trivial finding) instead of a ping on every run; Claude Routines
   frames its notification toggle the same way. Gate: enough real runs to know what noise looks
-  like.
+  like. **2026-08-25 note:** gate is closer to clearing than it looks — the overnight pipeline
+  POC's own manual-monitoring loop tonight (repeated 2-5 min check-ins across three dogfood runs)
+  is exactly the noisy-ping experience this item is meant to fix; an unattended overnight run
+  should push exactly one notification (the final report/PR link, or a failure), not a stream of
+  progress pings. Bundle with the Parking Lot's Telegram-bot item below — the notification
+  *policy* (what to send) and the *transport* (how it reaches the phone) are separate decisions
+  but land in the same place.
 - **Daily digest** — aggregate terminal states + report links into one morning summary instead
   of (or alongside) per-run notifications. Natural home is the herdr-push/Telegram relay.
   Gate: enough nightly jobs that per-run pings are noise.
@@ -144,6 +150,23 @@ Now/Next/Later once it's clear it's worth designing properly.
   (`docs/failure-reaping.md` §3.2) with a per-job failover model list, or degrade to a
   smaller tier for the rest of the window. Gate: quota failures recurring after failure-reaping
   phase 1 ships.
+- **Re-investigate or replace the herdr-push Telegram plugin** (2026-08-25 idea) — herdr-push
+  currently does one-way notification relay (verified working for the approval-path Next item
+  above). Two open questions before committing effort either way: (1) is the existing plugin
+  worth extending, or is a small bot we own outright (using Telegram's Bot API directly) less
+  fragile long-term; (2) either way, a **bidirectional** bot only needs Telegram long-polling
+  (the bot process makes outbound `getUpdates` calls), not an inbound webhook — this sidesteps
+  the "Pi has no inbound reachability without a tunnel" constraint noted under Later's
+  API/webhook trigger, since that constraint is specific to *webhook*-style inbound triggers, not
+  polling. Needs a real investigation pass before promoting to Next.
+- **Spawn a session on the fly from Telegram** (2026-08-25 idea) — message the bot from
+  anywhere ("implement X in herdr-routines") to start a fresh `herdr` agent session against a
+  named repo, and keep iterating with it through the Telegram thread rather than only receiving
+  a one-way notification. Depends on the Telegram-bot item above (needs the bidirectional/
+  long-polling piece) plus a mapping from "which repo/job" to a `herdr workspace create` +
+  `agent start`, roughly the same mechanics the pipeline launcher already uses. Bigger scope than
+  a notification-policy tweak — treat as its own design once the bot-transport question above is
+  settled.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives
