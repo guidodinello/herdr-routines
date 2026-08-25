@@ -633,6 +633,7 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
         "agent_prompt_wait",
         "agent_read",
         "agent_read_visible",
+        "agent_session_id",
     ):
         assert hasattr(HerdrClient, name)
 

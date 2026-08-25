@@ -181,11 +181,12 @@ class HerdrClient:
 
     def agent_session_id(self, target: str) -> str | None:
         """Best-effort: the agent's underlying CLI session id (e.g. an opencode `ses_...`
-        id) from `agent get`'s `agent_session.value`, or None on any failure or shape
-        mismatch. Callers capture this before closing a settled run's pane so a human can
-        later resume and inspect the conversation (`herdr agent start ... -s <session_id>`)
-        without the pane/process needing to stay resident just for that purpose (pane-
-        lifecycle v2 for routine jobs). Never raises."""
+        id) from `agent get`'s `agent_session.value`, or None on any CLI/shape failure —
+        same best-effort contract as agent_read/agent_read_visible. Callers capture this
+        before closing a settled run's pane so a human can later resume and inspect the
+        conversation (`herdr agent start ... -s <session_id>`) without the pane/process
+        needing to stay resident just for that purpose (pane-lifecycle v2 for routine
+        jobs)."""
         exit_code, stdout, _stderr = self.runner(
             [self.bin_path, "agent", "get", target], timeout_s=10
         )
