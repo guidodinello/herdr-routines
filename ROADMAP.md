@@ -190,6 +190,21 @@ Real designs, but untouched until something demands them. Each names its trigger
   host. Mainly for standing the tool up on a new host (or pointing a job at a repo not yet
   cloned there) without a manual `git clone` step; also makes jobs.yaml describe a job fully
   portably. Trigger: a second host, or such a job.
+- **Docker image for trivial setup** (2026-08-25 idea) — bundle `herdr-routines` so standing it
+  up on a new machine is "run the image," not `uv sync` + copy/edit `jobs.yaml` + install the
+  systemd units + separately install and configure Herdr itself. Real open question before
+  committing to this, not just packaging effort: **does Herdr itself run cleanly inside a
+  container?** This tool doesn't run agents directly — it drives Herdr, which manages real
+  terminal panes/PTYs for the `opencode`/`claude` processes it spawns (`herdr pane`/`agent`
+  commands throughout this codebase). If Herdr needs host-level TTY/session semantics that don't
+  survive containerization cleanly, a Docker image would only wrap the thin Python
+  scheduler half of the stack and leave the actually-fiddly half (Herdr install + its own auth,
+  `gh`/git SSH auth, model-provider auth) still manual — worth checking against Herdr's own docs
+  before assuming this is a straightforward `Dockerfile`. Related to the `repository: <git-url>`
+  item above (same "new host" trigger, same underlying motivation) but distinct in scope — that
+  one is about the clone lifecycle, this one is about the whole runtime environment. Trigger: a
+  second host, same as the repository-field item, once the Herdr-containerization question above
+  is actually answered.
 - **Model selection per job, beyond claude/opencode** — `model` is wired through to
   `agent_start` for `agent_kind: claude`/`opencode` (the only two kinds with a pinned-down
   native flag, see `AGENT_MODEL_FLAGS` in `config.py`). Extending to other agent kinds, or
