@@ -76,6 +76,18 @@ ride the PR opened in stage 4. Document as intentional — prefix spec commits
 `spec:` so reviewers can trivially filter them. Stripping `spec.md` before PR is
 not needed for dogfood.
 
+**Spec path is per-run, not repo-root (G-15, added 2026-08-24 after PR #29's merge
+conflict):** `spec.md` lives at `docs/pipeline/runs/<run_id>/spec.md`, never at the
+repo root. Two real dogfood runs (`20260824T232136Z` → PR #28, `20260825T000735Z` →
+PR #29) both wrote a full-file rewrite of a single root-level `spec.md`; since
+PR #28 merged into `main` while PR #29's branch was still open (having branched
+before that merge), PR #29 hit an unresolvable "both sides rewrote the whole file"
+conflict on merge — not a content disagreement, a path collision. Any two pipeline
+runs whose branches have overlapping history will hit this every time the design
+uses one fixed path for a per-run scratch file. The per-run path removes the
+collision entirely: each run's spec lives at its own path, so `main` only ever
+gains new files, never edits to one a concurrent branch also touched.
+
 ## Handoff contract (single shared branch — audit gap 1)
 
 All inter-stage artifacts live on **one shared worktree+branch**, not per-stage
@@ -87,8 +99,8 @@ herdr worktree create --cwd <parent-clone> --base main --branch auto/pipeline-<r
 ```
 
 * Every worker attaches to that same path via `herdr tab create --workspace "$SHARED_WS" --cwd "$WT"` (new tab in the shared workspace, cwd pinned to the shared worktree — verified `herdr tab create` syntax `herdr tab:12`). **Do not** use `herdr worktree create --cwd <shared_worktree>` to "reuse" — that form is invalid per `herdr worktree:3` (expects `--cwd` of an existing repo to link *from* plus `--branch` for a *new* worktree; pointing it at an already-linked worktree errors or duplicates branch) — G-6. Fresh **sessions** give independence, not fresh worktrees.
-* Stage 1 must `git add spec.md && git commit -m "spec: v1 for <feature>"` before settling — untracked files do not cross worktree boundaries (git shares object store, not untracked files). Stage 2 then sees the committed spec.
-* Stage 3 continues on the same branch (commits implementation + tests); stage 4 PRs that same branch. Artifacts: `spec.md`, `state.json`, `$PIPELINE_REPORT` (all on the shared worktree; `$PIPELINE_REPORT` also mirrored to `~/.local/state/herdr-routines/reports/<run_id>.md` for the notification layer). Every worker prompt names input files explicitly — workers never rely on prior-session context, only on disk.
+* Stage 1 must `git add docs/pipeline/runs/<run_id>/spec.md && git commit -m "spec: v1 for <feature>"` before settling — untracked files do not cross worktree boundaries (git shares object store, not untracked files). Stage 2 then sees the committed spec. **Per-run path, not repo root** — see G-15.
+* Stage 3 continues on the same branch (commits implementation + tests); stage 4 PRs that same branch. Artifacts: `docs/pipeline/runs/<run_id>/spec.md`, `state.json`, `$PIPELINE_REPORT` (all on the shared worktree; `$PIPELINE_REPORT` also mirrored to `~/.local/state/herdr-routines/reports/<run_id>.md` for the notification layer). Every worker prompt names input files explicitly — workers never rely on prior-session context, only on disk.
 
 Same inversion as `docs/plan-v1.md:414` (`$ROUTINE_REPORT`): file is the only
 reliable extraction channel because agents render on the alternate screen and
@@ -203,8 +215,8 @@ no address off failed review — `spec:57-59`).
 
 | # | Gate (must all pass) | Check command (orchestrator runs it) |
 |---|----------------------|--------------------------------------|
-| 1 | `spec.md` exists, non-empty, committed on pipeline branch | `test -s "$WT/spec.md" && test $(wc -l < "$WT/spec.md") -gt 2 && git -C "$WT" rev-parse --abbrev-ref HEAD | grep -q "^auto/pipeline-" && git -C "$WT" log --oneline -1 -- spec.md | grep -q .` |
-| 2 | Spec v2 contains `## Acceptance criteria` with numbered items, each `Test: <name>`; change notes inside spec as `## Changelog v1→v2`; blocking tiers present | Count `Test:` via `rg -c "Test:" "$WT/spec.md"` (≥ N, N derived by orchestrator counting `Test:` lines); headings via `rg -q "^## Acceptance criteria" "$WT/spec.md" && rg -q "^## Changelog" "$WT/spec.md"`; tiers via `rg -qw "blocking" "$WT/spec.md" && rg -qw "non-blocking" "$WT/spec.md" && rg -q "confidence:" "$WT/spec.md"` (fixed: `-w` avoids substring tautology; see G-2 verification) |
+| 1 | `spec.md` exists, non-empty, committed on pipeline branch | `test -s "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && test $(wc -l < "$WT/docs/pipeline/runs/$RUN_ID/spec.md") -gt 2 && git -C "$WT" rev-parse --abbrev-ref HEAD | grep -q "^auto/pipeline-" && git -C "$WT" log --oneline -1 -- "docs/pipeline/runs/$RUN_ID/spec.md" | grep -q .` |
+| 2 | Spec v2 contains `## Acceptance criteria` with numbered items, each `Test: <name>`; change notes inside spec as `## Changelog v1→v2`; blocking tiers present | Count `Test:` via `rg -c "Test:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` (≥ N, N derived by orchestrator counting `Test:` lines); headings via `rg -q "^## Acceptance criteria" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "^## Changelog" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"`; tiers via `rg -qw "blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -qw "non-blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "confidence:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` (fixed: `-w` avoids substring tautology; see G-2 verification) |
 | 3 | Every named test from acceptance section exists (file/symbol) **and** suite passes | Extract `Test: <name>` → `rg -F -q -- "<name>" "$WT/tests"` (fixed-string `-F`, scoped to `tests/` not `$WT` which contains `spec.md` itself — G-2); then `uv run pytest -q` (or repo's test cmd). Existence first, green second — audit gap 2: green alone proves nothing. |
 | 4 | PR exists on the shared branch | `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-<run_id>"'` |
 | 5 | Review posted with structured blocking/non-blocking tiers (code-review skill) | `gh pr view <n> --json comments,reviews | jq -e 'any(.comments[].body // empty; test("blocking")) or any(.reviews[].body // empty; test("blocking"))'` — **relaxed after first real run** (`pipeline-20260823T234906Z`): the code-review skill posts `blocking`/`non-blocking` tier labels but no literal `confidence: high|medium|low` token, so the original `confidence:` regex false-failed; orchestrator judged pass-with-note. Keep `all(...)` shape for absence checks if a repo's review format adds confidence back; gate on what the skill actually writes. |

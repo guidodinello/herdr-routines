@@ -36,7 +36,7 @@ herdr worktree create --cwd "$REPO_PARENT" --base main --branch "auto/pipeline-$
   "branch": "auto/pipeline-<RUN_ID>",
   "shared_workspace": "<SHARED_WS>",
   "deadline_epoch": <now + 25200>,
-  "artifact_paths": {"spec": "$WT/spec.md", "report": "$PIPELINE_REPORT"}
+  "artifact_paths": {"spec": "$WT/docs/pipeline/runs/$RUN_ID/spec.md", "report": "$PIPELINE_REPORT"}
 }
 ```
 
@@ -77,24 +77,24 @@ Execute sequentially. After each stage, run its **gate commands** (design:205) a
 ### Stage 1 — Plan + draft spec
 - **Harness:** `opencode/muse-spark-1.2-contributor-free` (pi-2 e2e: muse excels at spec `opencode-e2e:15`, was `claude`)
 - **Input:** `FEATURE_IDEA` paragraph
-- **Prompt:** "Read `docs/plan-v1.md` for context. Produce `spec.md` v1 at `$WT/spec.md` with: problem, approach, files touched, risks. Keep it concise but complete. Commit before settling: `git -C \"$WT\" add spec.md && git commit -m \"spec: v1 for $RUN_ID\"`."
-- **Gate 1:** `test -s "$WT/spec.md" && test $(wc -l < "$WT/spec.md") -gt 2 && git -C "$WT" rev-parse --abbrev-ref HEAD | grep -q "^auto/pipeline-" && git -C "$WT" log --oneline -1 -- spec.md | grep -q .` (design:207, G-4 fix)
+- **Prompt:** "Read `docs/plan-v1.md` for context. Produce `spec.md` v1 at `$WT/docs/pipeline/runs/$RUN_ID/spec.md` (create the directory first: `mkdir -p \"$WT/docs/pipeline/runs/$RUN_ID\"` — this path is per-run **on purpose**, not `$WT/spec.md`: every run writing to the same root-level path is what caused PR #29's merge conflict against PR #28, both full-file rewrites of one shared path — G-15) with: problem, approach, files touched, risks. Keep it concise but complete. Commit before settling: `git -C \"$WT\" add docs/pipeline/runs/$RUN_ID/spec.md && git commit -m \"spec: v1 for $RUN_ID\"`."
+- **Gate 1:** `test -s "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && test $(wc -l < "$WT/docs/pipeline/runs/$RUN_ID/spec.md") -gt 2 && git -C "$WT" rev-parse --abbrev-ref HEAD | grep -q "^auto/pipeline-" && git -C "$WT" log --oneline -1 -- "docs/pipeline/runs/$RUN_ID/spec.md" | grep -q .` (design:207, G-4 fix)
 
 ### Stage 2 — Spec review + update (adds acceptance criteria)
 - **Harness:** `opencode/muse-spark-1.2-contributor-free` **fresh session** (same model family, different session — independence via sessions not model family; `ox planning bad` `opencode-e2e:17` makes ox a poor spec reviewer; was `big-pickle`)
 - **Input:** `spec.md` v1 (committed)
-- **Prompt:** "Review `$WT/spec.md` v1. Produce spec v2 with an added `## Acceptance criteria` section: numbered items, each ends `Test: <name>` (exact test name). Also add `## Changelog v1→v2` inside the same file describing changes, and ensure `blocking`/`non-blocking` and `confidence:` tiers are present. Commit: `git -C \"$WT\" add spec.md && git commit -m \"spec: v2 acceptance for $RUN_ID\"`."
-- **Gate 2:** `rg -c "Test:" "$WT/spec.md"` counts `N` (orchestrator counts); `rg -q "^## Acceptance criteria" "$WT/spec.md" && rg -q "^## Changelog" "$WT/spec.md" && rg -qw "blocking" "$WT/spec.md" && rg -qw "non-blocking" "$WT/spec.md" && rg -q "confidence:" "$WT/spec.md"` (design:208, G-2 fix: `-w` avoids tautology)
+- **Prompt:** "Review `$WT/docs/pipeline/runs/$RUN_ID/spec.md` v1. Produce spec v2 with an added `## Acceptance criteria` section: numbered items, each ends `Test: <name>` (exact test name). Also add `## Changelog v1→v2` inside the same file describing changes, and ensure `blocking`/`non-blocking` and `confidence:` tiers are present. Commit: `git -C \"$WT\" add docs/pipeline/runs/$RUN_ID/spec.md && git commit -m \"spec: v2 acceptance for $RUN_ID\"`."
+- **Gate 2:** `rg -c "Test:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` counts `N` (orchestrator counts); `rg -q "^## Acceptance criteria" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "^## Changelog" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -qw "blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -qw "non-blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "confidence:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` (design:208, G-2 fix: `-w` avoids tautology)
 
 ### Stage 3 — Implement (tests before code)
 - **Harness:** `opencode/x-preview-f-free` (= `ox-alpha-free`, alias `opencode-e2e:17`, 1M ctx, coding best — was generic `opencode`)
 - **Input:** `spec.md` v2
-- **Prompt:** "Implement the feature described in `$WT/spec.md` spec v2 on branch `auto/pipeline-$RUN_ID` (already checked out at `$WT`). Author **every test** named in `## Acceptance criteria` (each `Test: <name>`) before considering done. Run the suite locally: `uv run pytest -q`. Commit incrementally with conventional messages. Do not push yet."
-- **Gate 3:** extract `Test: <name>` lines → for each `<name>`: `rg -F -q -- "<name>" "$WT/tests"` (fixed-string `-F`, scoped to `tests/` not `$WT` which contains `spec.md` — G-2) then `uv run pytest -q` passes. Existence first, green second.
+- **Prompt:** "Implement the feature described in `$WT/docs/pipeline/runs/$RUN_ID/spec.md` spec v2 on branch `auto/pipeline-$RUN_ID` (already checked out at `$WT`). Author **every test** named in `## Acceptance criteria` (each `Test: <name>`) before considering done. Run the suite locally: `uv run pytest -q`. Commit incrementally with conventional messages. Do not push yet."
+- **Gate 3:** extract `Test: <name>` lines → for each `<name>`: `rg -F -q -- "<name>" "$WT/tests"` (fixed-string `-F`, scoped to `tests/` not the spec directory — G-2) then `uv run pytest -q` passes. Existence first, green second.
 
 ### Stage 4 — Open PR
 - **Harness:** same agent as stage 3 (preserve context)
-- **Prompt:** "Push branch and open PR: `git -C \"$WT\" push -u origin auto/pipeline-$RUN_ID && gh pr create --repo <owner>/<repo> --base main --head auto/pipeline-$RUN_ID --title \"feat: <feature> ($RUN_ID)\" --body \"Implements $WT/spec.md spec v2; acceptance tests: <list>\"` . Record PR number to `state.json:pr_number`."
+- **Prompt:** "Push branch and open PR: `git -C \"$WT\" push -u origin auto/pipeline-$RUN_ID && gh pr create --repo <owner>/<repo> --base main --head auto/pipeline-$RUN_ID --title \"feat: <feature> ($RUN_ID)\" --body \"Implements $WT/docs/pipeline/runs/$RUN_ID/spec.md spec v2; acceptance tests: <list>\"` . Record PR number to `state.json:pr_number`."
 - **Gate 4:** `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-'$RUN_ID'"'`
 
 ### Stage 5 — Code review (quality gate)
@@ -108,7 +108,7 @@ Execute sequentially. After each stage, run its **gate commands** (design:205) a
 - **Input:** review findings (`gh pr view <n> --json comments,reviews`)
 - **Prompt:** "Address review findings for PR `<n>`: fix `ox`/`big-pickle` code issues, then reply to each thread and `gh api` resolve threads you addressed. Keep commits on the same branch and push. Cap 2 iterations, plus 60-min wait-for-comments polling (see below)."
 - **Gate 6:** GraphQL (preferred, verified): `gh api graphql -f query='query($owner:String!,$repo:String!,$pr:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$pr){reviewThreads(first:50){nodes{isResolved comments(first:1){nodes{body}}}}}}}' -f owner=<o> -f repo=<r> -F pr=<n> | jq -e '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false and (.comments.nodes[0].body | test("blocking")))] | length==0'` — `gh api repos/.../threads` 404s (G-1 verified). Fallback (no GraphQL): comment-count match via `gh pr view --json comments`. Pin one option after one real PR run. Until then, gate on "reply exists on every blocking finding" via comments JSON.
-- **Wait-for-comments:** poll `gh pr view --json comments` (or `reviews`) every **5 min** for 60 min after stage 5 settles; gate on review's `blocking` findings, not arbitrary human comments later; after 60 min with no review, abort with partial report (G-12). Spec leakage: `spec.md` commits ride the PR — prefix spec commits `spec:` so reviewers can filter.
+- **Wait-for-comments:** poll `gh pr view --json comments` (or `reviews`) every **5 min** for 60 min after stage 5 settles; gate on review's `blocking` findings, not arbitrary human comments later; after 60 min with no review, abort with partial report (G-12). Spec leakage: `docs/pipeline/runs/$RUN_ID/spec.md` commits ride the PR — prefix spec commits `spec:` so reviewers can filter.
 
 ## Pipeline deadline, quota, resume, cleanup
 
