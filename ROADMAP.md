@@ -28,6 +28,20 @@ Ready to build whenever; no real-run evidence required.
 - **Worktree GC, dry-run half** — `herdr-routines gc --dry-run`: list `auto/<name>-<ts>`
   branches that are merged or whose worktree is gone. Read-only and mechanical; useful as soon
   as the first real worktree jobs run. The deletion half is gated separately (see Next).
+- **Status CLI, table view** (2026-08-25 idea) — `herdr-routines` already has `status`/`history`
+  for its own scheduled jobs, but there's no single place to see everything running or scheduled
+  across the whole Herdr+pipeline stack: workspaces/panes/agents (`herdr pane list` / `herdr agent
+  list`), pipeline runs in progress (`~/.local/state/herdr-routines/reports/pipeline-*.md` +
+  `state.json`), and scheduled jobs (`jobs.yaml` + `history.jsonl`) each need a separate manual
+  query today — this whole session was hours of hand-written `jq`/`ssh` one-liners stitching
+  those together. Two simple commands, no web server, no daemon: one prints a table of what's
+  *currently running* (panes/agents/in-progress pipeline runs), another prints what's *scheduled*
+  (cron jobs + their next-fire time, any pending `systemd-run` one-shots). Purely additive read
+  path over data that already exists in these three places — no new state to own. Ready under Now
+  because, like the plugin manifest and gc dry-run items, every piece already works in isolation;
+  this is presentation, not new capability. Narrower and cheaper than the Later "Web/TUI
+  dashboard" item below — a natural first step there, not a replacement for it if that's still
+  wanted once this exists.
 - **Overnight feature-pipeline orchestrator (POC)** — one orchestrator agent session drives an
    entire feature lifecycle by spawning per-stage worker sessions via herdr: plan/spec →
    independent spec review (adds acceptance criteria + test plan) → implement-until-spec-tests-pass
@@ -130,8 +144,10 @@ Real designs, but untouched until something demands them. Each names its trigger
   other jobs' start times by up to one run; acceptable at a handful of nightly jobs. If it
   stops being acceptable, the fix is per-job units, not a daemon (plan-v1.md §3). Trigger: a
   job regularly starving others.
-- **Web/TUI dashboard** — the status/history CLI covers inspection at current scale. Trigger:
-  reaching for `status` feels like friction, not ritual.
+- **Web/TUI dashboard** — the status/history CLI covers inspection at current scale. See the Now
+  item "Status CLI, table view" for a cheaper first step (plain tables, no web/TUI framework).
+  Trigger: reaching for `status` feels like friction, not ritual, even after that table view
+  exists.
 - **Log rotation** — a handful of jobs writing a few JSONL lines a day won't matter for years
   (plan-v1.md §5). Trigger: history.jsonl size becoming noticeable.
 
