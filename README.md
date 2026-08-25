@@ -41,6 +41,8 @@ uv run herdr-routines status
 ```
 
 See [`deploy/README.md`](deploy/README.md) for the systemd units and deployment smoke checklist.
+See [`troubleshooting-log.md`](troubleshooting-log.md) for real incidents hit running this on the
+Pi and their root causes/fixes.
 
 ## Development
 
