@@ -26,7 +26,9 @@ def test_design_doc_documents_per_stage_pane_close() -> None:
     assert "not only end-of-run" in text.lower()
     # Must describe closing once gate passes, not only final sweep
     assert "close this worker's pane once its gate passes" in text.lower()
-    assert "close a worker's pane as soon as its stage's gate has passed" in text.lower()
+    assert (
+        "close a worker's pane as soon as its stage's gate has passed" in text.lower()
+    )
 
 
 def test_design_doc_documents_session_resume_mechanism() -> None:
@@ -63,11 +65,13 @@ def test_orchestrator_prompt_stage6_uses_session_resume() -> None:
     assert "-s <session_id>" in text
     assert "fresh pane" in text
     # Must explicitly forbid the old hold-open form
-    assert "herdr agent prompt pl-3-" not in text or "Do not" in text  # allow mention only if negated
+    assert (
+        "herdr agent prompt pl-3-" not in text or "Do not" in text
+    )  # allow mention only if negated
     # Strong check: stage 6 section should contain -s and fresh pane together
     # Find stage 6 slice
     idx = text.index("Stage 6")
-    slice6 = text[idx: idx + 3000]
+    slice6 = text[idx : idx + 3000]
     assert "-s <session_id>" in slice6
     assert "fresh pane" in slice6
 
@@ -79,5 +83,3 @@ def test_proposal_doc_marked_implemented() -> None:
     assert "auto/pipeline-20260825T021919Z" in text
     # Should still reference the evidence but not be marked as proposal
     assert "PR" in text
-
-
