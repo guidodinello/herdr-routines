@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from logger import get_logger
 
@@ -155,7 +156,14 @@ def _process_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        extra = {
+        # decide() always sets `occurrence` for MISSED (it is the occurrence being reported
+        # as missed); the type stays optional only because NOT_DUE has none. Same invariant
+        # and same assertion as the RUN branch below.
+        assert result.occurrence is not None
+        # Free-form JSONL payload (HistoryRecord.extra is dict[str, Any]). Annotated because
+        # this is the first `extra` binding in the function and mypy would otherwise pin the
+        # value type to `str` from this literal, rejecting the heterogeneous post-run one.
+        extra: dict[str, Any] = {
             "reason": "outside_catch_up_window",
             "occurrence": result.occurrence.isoformat(),
         }

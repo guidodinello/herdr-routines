@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
@@ -22,6 +23,16 @@ class Decision(Enum):
     NOT_DUE = "not_due"
     RUN = "run"
     MISSED = "missed"  # too late to catch up; nothing to run
+
+
+class _SkippedFields(TypedDict, total=False):
+    """The collapsed-earlier-occurrences fields, absent entirely when nothing was skipped —
+    hence total=False. Same reason as runner._CommonOutcomeFields: an untyped dict widens to
+    its join type and mypy rejects the `**` splat. Erased at runtime."""
+
+    skipped_occurrences: int
+    skipped_first: datetime
+    skipped_last: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +108,7 @@ def decide(
     late = now - latest
     grace = timedelta(minutes=catch_up_minutes)
 
-    skipped_kwargs = {}
+    skipped_kwargs: _SkippedFields = {}
     if earlier:
         skipped_kwargs = {
             "skipped_occurrences": len(earlier),

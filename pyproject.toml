@@ -25,12 +25,27 @@ allow-direct-references = true
 
 [dependency-groups]
 dev = [
+    "mypy>=2.3.0",
     "pytest>=9.1.1",
     "ruff>=0.16.4",
+    "types-croniter>=6.0.0",
+    "types-PyYAML>=6.0.0",
 ]
 
 [tool.ruff]
 extend-exclude = ["docs"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src", "tests"]
+mypy_path = "src"
+
+# `logger` is a direct git dependency (see [project].dependencies) that ships no py.typed
+# marker, so mypy can't see into it. Nothing to install — types-* stubs don't exist for a
+# private package — so silence the import rather than leave 4 permanent errors in the gate.
+[[tool.mypy.overrides]]
+module = ["logger", "logger.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

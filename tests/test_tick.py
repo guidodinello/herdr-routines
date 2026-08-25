@@ -3,8 +3,10 @@ TickOutcome.any_job_failed — what `_cmd_tick` (cli.py) maps to the process exi
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,25 +16,26 @@ from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import _live_agent_exists, run_tick
 
 
-def make_job(tmp_path: Path, **overrides) -> Job:
-    defaults = {
-        "name": "a",
-        "enabled": True,
-        "cron": "* * * * *",
-        "repo": tmp_path,
-        "workspace": "root",
-        "base": "main",
-        "agent_kind": "claude",
-        "model": None,
-        "prompt": "report to $ROUTINE_REPORT",
-        "timeout_ms": 5_000,
-        "start_timeout_ms": 30_000,
-        "catch_up_minutes": 120,
-        "timezone": "UTC",
-        "on_missed": "log",
-    }
-    defaults.update(overrides)
-    return Job(**defaults)
+def make_job(tmp_path: Path, **overrides: Any) -> Job:
+    # Built directly, then `replace`d: a defaults dict splatted into Job() widens to
+    # dict[str, object] and fails the typecheck gate on every field.
+    job = Job(
+        name="a",
+        enabled=True,
+        cron="* * * * *",
+        repo=tmp_path,
+        workspace="root",
+        base="main",
+        agent_kind="claude",
+        model=None,
+        prompt="report to $ROUTINE_REPORT",
+        timeout_ms=5_000,
+        start_timeout_ms=30_000,
+        catch_up_minutes=120,
+        timezone="UTC",
+        on_missed="log",
+    )
+    return replace(job, **overrides)
 
 
 class FakeStatusClient:

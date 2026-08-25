@@ -59,6 +59,25 @@ jobs:
       - name: ruff lint
         run: uv run ruff check .
 
+  typecheck-python:
+    name: Typecheck Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # Paths, strictness and the `logger` override live in [tool.mypy] in
+      # pyproject.toml, so this matches what `uv run mypy` does locally.
+      - name: mypy
+        run: uv run mypy
+
   test-python:
     name: Tests (Python)
     runs-on: ubuntu-latest

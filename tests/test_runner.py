@@ -3,8 +3,10 @@ involved). See docs/plan-v1.md §7."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,25 +23,26 @@ from herdr_routines.runner import (
 )
 
 
-def make_job(tmp_path: Path, **overrides) -> Job:
-    defaults = {
-        "name": "a",
-        "enabled": True,
-        "cron": "0 3 * * *",
-        "repo": tmp_path,
-        "workspace": "worktree",
-        "base": "main",
-        "agent_kind": "claude",
-        "model": None,
-        "prompt": "Write a report to $ROUTINE_REPORT for job $ROUTINE_JOB run $ROUTINE_RUN_ID.",
-        "timeout_ms": 60_000,
-        "start_timeout_ms": 30_000,
-        "catch_up_minutes": 120,
-        "timezone": "UTC",
-        "on_missed": "log",
-    }
-    defaults.update(overrides)
-    return Job(**defaults)
+def make_job(tmp_path: Path, **overrides: Any) -> Job:
+    # Built directly, then `replace`d: a defaults dict splatted into Job() widens to
+    # dict[str, object] and fails the typecheck gate on every field.
+    job = Job(
+        name="a",
+        enabled=True,
+        cron="0 3 * * *",
+        repo=tmp_path,
+        workspace="worktree",
+        base="main",
+        agent_kind="claude",
+        model=None,
+        prompt="Write a report to $ROUTINE_REPORT for job $ROUTINE_JOB run $ROUTINE_RUN_ID.",
+        timeout_ms=60_000,
+        start_timeout_ms=30_000,
+        catch_up_minutes=120,
+        timezone="UTC",
+        on_missed="log",
+    )
+    return replace(job, **overrides)
 
 
 class ScriptedClient:

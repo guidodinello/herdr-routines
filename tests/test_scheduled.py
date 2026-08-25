@@ -84,7 +84,11 @@ def test_next_fire_at_matches_schedule_enumeration() -> None:
     now = datetime(2026, 8, 25, 7, 0, 0, tzinfo=UTC)
     nxt = next_fire_at("0 3 * * *", "America/Montevideo", now=now)
     assert nxt is not None
-    assert nxt.utcoffset().total_seconds() == -3 * 3600
+    offset = (
+        nxt.utcoffset()
+    )  # Optional on the tzinfo API; never None for a ZoneInfo result
+    assert offset is not None
+    assert offset.total_seconds() == -3 * 3600
     assert (nxt.hour, nxt.minute) == (3, 0)
 
 
