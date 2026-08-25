@@ -57,7 +57,7 @@ Ready to build whenever; no real-run evidence required.
    design's "keep every worker's pane alive until the whole run ends" cleanup policy
    (`design.md:159-168`) means memory cost is cumulative across stages reached, not just what's
    currently active, even though only one worker (`pl-3`, reused by stages 4 and 6) is ever
-   actually reused. Proposed fix (not yet built):
+   actually reused. Proposed fix:
    [`docs/pipeline/pane-lifecycle-v2-proposal.md`](docs/pipeline/pane-lifecycle-v2-proposal.md) —
    close a worker's pane as soon as its gate passes, and for the one worker a later stage reuses,
    close-then-reopen-by-`opencode -s <session_id>` instead of holding the pane open idle in
@@ -69,6 +69,20 @@ Ready to build whenever; no real-run evidence required.
    disagreement, a path collision that will recur any time two runs' branch histories overlap.
    Fixed by moving to a per-run path (`docs/pipeline/runs/<run_id>/spec.md`, design.md G-15) and
    backfilling PR #28's already-merged spec into that convention.
+   **2026-08-25 update:** the `-s <session_id>` resume mechanism (open question 1 in the
+   proposal) was manually verified before building anything — closed a throwaway opencode
+   session's pane, reopened it in a brand-new pane/workspace via `-s`, and it correctly recalled
+   a fact given before the close, with `agent_session.value` matching the original session ID (a
+   true resume, not a fork). The proposal was then dogfooded as the pipeline's own 4th real run
+   (`20260825T021919Z`, PR #31, merged as `61cc5af`) — the pipeline amended its own
+   `design.md`/`orchestrator-prompt.md` (new G-16) and marked the proposal
+   `Status: implemented`. Notably this run finished in ~9 minutes (vs. 40 min-7 h for the prior
+   three) since it was a docs-only change with no infra hiccups — not evidence pipeline runs are
+   now reliably fast in general. Open questions 2 (grace window before closing a pane) and 3
+   (cross-model `-s` interaction) remain open per the proposal. **Still outstanding:** the live
+   Pi launcher scripts (`~/.local/bin/pipeline-launch-*.sh`, outside this repo) still need a
+   manual update to match G-16's per-stage close-and-resume — the design doc changed, the actual
+   launch mechanics on the Pi haven't yet.
 
 - **Failure reaping & quota-exhaustion handling** — a failed run whose agent never settles
   (OpenCode free-quota modal; observed twice on the Pi, 2026-08-22/23) left a live `working`
