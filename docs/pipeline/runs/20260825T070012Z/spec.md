@@ -53,7 +53,9 @@ Output: plain text table by default (fixed-width columns, fits `herdr notificati
 4. The scheduled-jobs table correctly shows a disabled job (e.g. `enabled: false` in `jobs.yaml`) as disabled (dimmed/marked), not silently omitted — Test: test_status_scheduled_table_shows_disabled_jobs
 5. Both commands are read-only: no test asserts any write to `jobs.yaml`, `history.jsonl`, or any `state.json` — Test: test_status_commands_are_read_only
 
-## Changelog v1→v2
+## Changelog
+
+`## Changelog v1→v2` — changes from v1 to v2:
 
 - Added `## Acceptance criteria` with 5 numbered items, each ending `Test: <name>` to make verification deterministic and CI-enforceable (covers empty running table, pipeline stage cross-reference, scheduled next-fire, disabled-job visibility, and read-only guarantee).
 - Added `## Review notes` with explicit `blocking`/`non-blocking` labels and `confidence:` tiers for review gating.
