@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypedDict
 
 from herdr_routines.config import Job
 from herdr_routines.herdr import HerdrClient, HerdrCliError, build_agent_start_args
@@ -230,6 +231,23 @@ def substitute_prompt(
         .replace("$ROUTINE_JOB", job_name)
         .replace("$ROUTINE_RUN_ID", run_id)
     )
+
+
+class _CommonOutcomeFields(TypedDict):
+    """The fields `execute_run` fills in identically for every terminal outcome, so they can
+    be splatted into RunOutcome without restating nine keyword arguments at six call sites.
+    A plain dict widens to its join type (`float | int | str | None`) and mypy then rejects
+    every `**common`; a TypedDict keeps each key's own type. Erased at runtime."""
+
+    run_id: str
+    agent_name: str | None
+    pane_id: str | None
+    branch: str | None
+    final_agent_status: str | None
+    report_written: bool
+    report_bytes: int
+    report_path: str | None
+    duration_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,7 +501,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     report_written = report_path.exists()
     report_bytes = report_path.stat().st_size if report_written else 0
 
-    common = {
+    common: _CommonOutcomeFields = {
         "run_id": run_id,
         "agent_name": job.agent_name,
         "pane_id": pane_id,
