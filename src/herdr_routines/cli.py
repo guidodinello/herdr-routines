@@ -1,4 +1,4 @@
-"""herdr-routines CLI: tick | status | history | validate | run. See docs/plan-v1.md §5."""
+"""herdr-routines CLI: tick | status | history | validate | run | gc. See docs/plan-v1.md §5."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from herdr_routines.config import (
     default_config_path,
     load_config,
 )
+from herdr_routines.gc import run_gc
 from herdr_routines.herdr import HerdrClient
 from herdr_routines.history import (
     default_history_path,
@@ -110,6 +111,30 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="print the herdr argv, run nothing"
     )
     p_run.set_defaults(handler=_cmd_run)
+
+    p_gc = sub.add_parser(
+        "gc", help="read-only inventory of stale auto/* branches (pure git)"
+    )
+    # Required in v1: the only mode is the read-only one, and making it explicit on
+    # every invocation reserves --no-dry-run/delete for a later Next item (spec.md).
+    p_gc.add_argument(
+        "--dry-run",
+        action="store_true",
+        required=True,
+        help="required in v1: list only; writes and deletes nothing",
+    )
+    p_gc.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        help="target repository (default: current directory)",
+    )
+    p_gc.add_argument(
+        "--base",
+        default=None,
+        help="merge target for the merged-check (default: origin/HEAD, else main)",
+    )
+    p_gc.set_defaults(handler=_cmd_gc)
 
     return parser
 
@@ -366,6 +391,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.error("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
     return 0 if outcome.state == "done" else 1
+
+
+def _cmd_gc(args: argparse.Namespace) -> int:
+    # No HerdrClient, no config load — pure git + filesystem (spec.md §No Herdr server).
+    return run_gc(args.repo or Path.cwd(), base=args.base)
 
 
 if __name__ == "__main__":
