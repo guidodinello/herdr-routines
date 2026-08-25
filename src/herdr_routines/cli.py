@@ -248,6 +248,9 @@ def _cmd_scheduled(args: argparse.Namespace) -> int:
                         "timezone": r.timezone,
                         "next_fire": r.next_fire.isoformat() if r.next_fire else None,
                         "last_state": r.last_state,
+                        "last_run_at": (
+                            r.last_run_at.isoformat() if r.last_run_at else None
+                        ),
                     }
                     for r in rows
                 ]

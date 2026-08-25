@@ -160,7 +160,14 @@ def collect_ps_rows(client: HerdrClient) -> tuple[list[PsRow], list[str]]:
 
 
 def render_ps(rows: list[PsRow]) -> str:
-    return render_table(
-        ["AGENT", "STATUS", "DETAIL"],
-        [[r.agent, r.status, r.detail] for r in rows],
-    )
+    """DETAIL is dropped when no row has one. Only pipeline agents (`pl-<N>-<run_id>`) can
+    be enriched; routine agents (`rt-<job>`) have no detail to show, because
+    `HerdrClient.agent_statuses()` reads only name/agent_status out of `herdr agent list`.
+    On a host running routines but no pipeline that left an always-empty column. `--json`
+    keeps the field unconditionally, so scripting sees a stable shape."""
+    if any(r.detail for r in rows):
+        return render_table(
+            ["AGENT", "STATUS", "DETAIL"],
+            [[r.agent, r.status, r.detail] for r in rows],
+        )
+    return render_table(["AGENT", "STATUS"], [[r.agent, r.status] for r in rows])

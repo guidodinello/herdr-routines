@@ -232,3 +232,45 @@ def test_status_commands_are_read_only(
         capsys.readouterr()  # keep test output clean either way
 
     assert snapshot() == before
+
+
+# --- table legibility (PR: visibility-table-legibility) --------------------------------------
+
+
+def test_detail_column_dropped_when_no_row_has_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only pl-<N>-<run_id> agents can be enriched, so on a host running routines but no
+    pipeline the DETAIL column was always blank. Drop it rather than print dead width."""
+    setup_state_dir(tmp_path, monkeypatch)
+    install_fake_client(monkeypatch, FakeStatusClient({"rt-nightly": "working"}))
+
+    assert cli.main(["ps"]) == 0
+
+    out = capsys.readouterr().out
+    assert "AGENT" in out and "STATUS" in out
+    assert "DETAIL" not in out
+    assert "rt-nightly" in out
+
+
+def test_detail_column_kept_when_a_row_has_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A mixed table keeps DETAIL: the un-enrichable routine agent just leaves it blank."""
+    state_dir = setup_state_dir(tmp_path, monkeypatch)
+    write_pipeline_state(state_dir / "reports", current_stage=4)
+    install_fake_client(
+        monkeypatch,
+        FakeStatusClient({f"pl-4-{RUN_ID}": "working", "rt-nightly": "working"}),
+    )
+
+    assert cli.main(["ps"]) == 0
+
+    out = capsys.readouterr().out
+    assert "DETAIL" in out
+    assert "stage 4/6" in out
+    assert "rt-nightly" in out

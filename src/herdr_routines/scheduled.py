@@ -4,7 +4,8 @@ Read-only view over `config.load_config()` output: for every job (disabled ones
 included and marked), the next cron fire reuses `schedule.occurrences_since`
 (the exact croniter + ZoneInfo enumeration `tick.decide()` uses, including its DST
 fall-back dedup) so the table can never disagree with what tick would do. Last-run
-state comes from `history.last_terminal_run`.
+state (and the time that terminal record was written) comes from
+`history.last_terminal_run`.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ class ScheduledRow:
     timezone: str
     next_fire: datetime | None
     last_state: str | None
+    last_run_at: datetime | None
 
 
 def build_scheduled_rows(
@@ -58,16 +60,34 @@ def build_scheduled_rows(
                 # a disabled job's schedule must stay inspectable (spec criterion 4).
                 next_fire=next_fire_at(job.cron, job.timezone, now=now),
                 last_state=last.state if last else None,
+                last_run_at=last.ts if last else None,
             )
         )
     return rows
 
 
+def _local(when: datetime, timezone: str) -> str:
+    return when.astimezone(ZoneInfo(timezone)).strftime("%Y-%m-%d %H:%M %Z")
+
+
 def _format_next_fire(row: ScheduledRow) -> str:
+    """A disabled job keeps its would-be schedule visible (spec 20260825T070012Z §Risks:
+    "still computes next-fire but marks it inactive") but parenthesised, so a time that
+    will never actually arrive can't be misread as a live schedule."""
     if row.next_fire is None:
         return "never (within 1y)"
-    local = row.next_fire.astimezone(ZoneInfo(row.timezone))
-    return local.strftime("%Y-%m-%d %H:%M %Z")
+    rendered = _local(row.next_fire, row.timezone)
+    return rendered if row.enabled else f"({rendered})"
+
+
+def _format_last_run(row: ScheduledRow) -> str:
+    """Outcome plus when that outcome was recorded. The state alone can't distinguish a
+    job that failed an hour ago from one that failed a month ago."""
+    if row.last_state is None:
+        return "never run"
+    if row.last_run_at is None:
+        return row.last_state
+    return f"{row.last_state} {_local(row.last_run_at, row.timezone)}"
 
 
 def render_scheduled(rows: list[ScheduledRow]) -> str:
@@ -76,11 +96,11 @@ def render_scheduled(rows: list[ScheduledRow]) -> str:
         [
             [
                 row.name,
-                "yes" if row.enabled else "DISABLED",
+                "ENABLED" if row.enabled else "DISABLED",
                 row.cron,
                 row.timezone,
                 _format_next_fire(row),
-                row.last_state or "never run",
+                _format_last_run(row),
             ]
             for row in rows
         ],

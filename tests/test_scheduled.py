@@ -157,3 +157,101 @@ def test_last_run_column_uses_history_terminal_state(
     config = load_config(config_path)
     rows = build_scheduled_rows(config, history_file, now=datetime.now(UTC))
     assert rows[0].last_state == "done"
+
+
+# --- table legibility (PR: visibility-table-legibility) --------------------------------------
+
+
+def test_last_run_cell_shows_outcome_and_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """LAST RUN must say *when*, not just the outcome: a row reading `failed` alone can't
+    distinguish an hour-old failure from a month-old one."""
+    from herdr_routines import cli
+
+    state_dir = make_state_dir(tmp_path, monkeypatch)
+    config_path = write_config(tmp_path, include_disabled=False)
+    append(
+        state_dir / "history.jsonl",
+        HistoryRecord(
+            ts=datetime(2026, 8, 24, 3, 5, tzinfo=UTC), job="nightly", state="failed"
+        ),
+    )
+
+    assert cli.main(["--config", str(config_path), "scheduled"]) == 0
+
+    line = _job_line(capsys.readouterr().out, "nightly")
+    assert "failed" in line
+    assert "2026-08-24 03:05 UTC" in line
+
+
+def test_last_run_at_is_exposed_on_rows_and_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """last_run_at rides alongside last_state (not replacing it) so --json consumers get
+    the timestamp too."""
+    state_dir = make_state_dir(tmp_path, monkeypatch)
+    config_path = write_config(tmp_path, include_disabled=False)
+    history_file = state_dir / "history.jsonl"
+    ts = datetime(2026, 8, 24, 3, 5, tzinfo=UTC)
+    append(history_file, HistoryRecord(ts=ts, job="nightly", state="done"))
+
+    rows = build_scheduled_rows(
+        load_config(config_path), history_file, now=datetime.now(UTC)
+    )
+    assert rows[0].last_state == "done"
+    assert rows[0].last_run_at == ts
+
+
+def test_never_run_job_has_no_last_run_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_dir = make_state_dir(tmp_path, monkeypatch)
+    config_path = write_config(tmp_path, include_disabled=False)
+    rows = build_scheduled_rows(
+        load_config(config_path), state_dir / "history.jsonl", now=datetime.now(UTC)
+    )
+    assert rows[0].last_state is None
+    assert rows[0].last_run_at is None
+
+
+def test_disabled_next_fire_is_marked_inactive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The spec keeps a disabled job's schedule inspectable (§Risks: "still computes
+    next-fire but marks it inactive"), so the time stays — parenthesised, so it can't be
+    misread as something that will actually fire. The enabled row stays bare."""
+    from herdr_routines import cli
+
+    make_state_dir(tmp_path, monkeypatch)
+    config_path = write_config(tmp_path, include_disabled=True)
+
+    assert cli.main(["--config", str(config_path), "scheduled"]) == 0
+
+    out = capsys.readouterr().out
+    disabled_line = _job_line(out, "herdr-pr-review")
+    enabled_line = _job_line(out, "nightly")
+    assert "(" in disabled_line and "14:30 UTC)" in disabled_line
+    assert "(" not in enabled_line
+
+
+def test_enabled_column_uses_one_register(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ENABLED/DISABLED, not `yes`/DISABLED — one register per column."""
+    from herdr_routines import cli
+
+    make_state_dir(tmp_path, monkeypatch)
+    config_path = write_config(tmp_path, include_disabled=True)
+
+    assert cli.main(["--config", str(config_path), "scheduled"]) == 0
+
+    out = capsys.readouterr().out
+    assert "ENABLED" in _job_line(out, "nightly")
+    assert "yes" not in out
