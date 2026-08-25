@@ -38,6 +38,23 @@ Ready to build whenever; no real-run evidence required.
    review) already works in isolation — the missing thing is the integration, which is learned
    only by running it. Generalizes the auto-fix-PR idea (Later) into a full chain. Gate for
    promoting beyond POC: a few real overnight runs finishing end-to-end without human rescue.
+   **2026-08-24 update:** two real dogfood runs completed (PR #27, PR #28), but the second pushed
+   the Pi's swap to functionally zero mid-run with nothing else scheduled concurrently — the
+   design's "keep every worker's pane alive until the whole run ends" cleanup policy
+   (`design.md:159-168`) means memory cost is cumulative across stages reached, not just what's
+   currently active, even though only one worker (`pl-3`, reused by stages 4 and 6) is ever
+   actually reused. Proposed fix (not yet built):
+   [`docs/pipeline/pane-lifecycle-v2-proposal.md`](docs/pipeline/pane-lifecycle-v2-proposal.md) —
+   close a worker's pane as soon as its gate passes, and for the one worker a later stage reuses,
+   close-then-reopen-by-`opencode -s <session_id>` instead of holding the pane open idle in
+   between. Treat this as part of the promotion gate, not a separate nice-to-have — "survives one
+   dogfood run" is weaker evidence than "doesn't need everything else on the Pi to stay quiet."
+   **Second 2026-08-24 fix (same night):** a third dogfood run (`20260825T000735Z`, PR #29) hit a
+   *second* bug: `spec.md` at the repo root is a single shared path every run rewrites in full, so
+   PR #29 conflicted merging against PR #28's already-merged `spec.md` — not a content
+   disagreement, a path collision that will recur any time two runs' branch histories overlap.
+   Fixed by moving to a per-run path (`docs/pipeline/runs/<run_id>/spec.md`, design.md G-15) and
+   backfilling PR #28's already-merged spec into that convention.
 
 - **Failure reaping & quota-exhaustion handling** — a failed run whose agent never settles
   (OpenCode free-quota modal; observed twice on the Pi, 2026-08-22/23) left a live `working`
