@@ -106,6 +106,19 @@ Ready to build whenever; no real-run evidence required.
 
 Worth designing once their gate clears — usually "a few weeks of real runs on the Pi".
 
+- **Split `jobs.yaml` into one file per job** (2026-08-25 idea) — `jobs.d/<name>.yaml` discovered
+  by directory listing, filename doubling as (or validated against) the job's `name`, instead of
+  one monolithic `jobs.yaml` list. Editing a single job today means hand-editing a block inside a
+  bigger file (fragile for scripted edits — flipping `herdr-pr-review`'s `enabled` flag tonight
+  needed a regex substitution rather than a plain file write); disable-by-rename or `git mv` is
+  more legible, and a syntax error in one job's file can't break parsing of the others, unlike one
+  shared YAML document today. Shared fields (`agent_kind`, `workspace`, `timezone`, etc., today's
+  top-level `defaults:` block) become a sibling `defaults.yaml` that the loader merges under each
+  job file's own fields, rather than duplicating those fields into every job file. Real work, not
+  a config reshuffle: `src/herdr_routines/config.py` needs the directory-discovery + merge logic,
+  filename/`name` consistency validation, and `validate`/`status`/`history` need to stop assuming
+  a single file path. Gate: job count growing enough that the monolithic file is real friction —
+  at today's 3 jobs it's mildly annoying, not painful.
 - **Approval path for `blocked` runs** — a job blocked on an agent permission prompt ends as
   `blocked` and waits. Preferred direction (plan-v1.md §2): surface an actionable herdr-push
   notification so it can be approved from the phone (herdr-push's headline feature, already
