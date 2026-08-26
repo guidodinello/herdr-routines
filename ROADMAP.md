@@ -16,109 +16,24 @@ decisions need.
 
 ## Now
 
-Ready to build whenever; no real-run evidence required.
+Ready to build whenever; no real-run evidence required. Curated into
+per-item files as of 2026-08-25 — see
+[`docs/process/issues/`](docs/process/issues/) for full description, update
+log, and acceptance criteria; this section is a one-liner index only
+(pattern matches `~/projects/PENDING.md`).
 
-- **Plugin manifest (`herdr-plugin.toml`)** — actions-only (no startup hook, no daemon):
-  invoke `herdr-routines run <job>` / `status` from inside the Herdr UI via keybinding or
-  `herdr plugin action invoke`, and make the tool installable with
-  `herdr plugin install guidodinello/herdr-routines`. Design already done in `plan-v1.md`
-  §8.4; v1 made config/state paths env-var-aware (`HERDR_PLUGIN_CONFIG_DIR` /
-  `HERDR_PLUGIN_STATE_DIR`) precisely so this needs no file moves later. Stays within the
-  documented plugin model — systemd keeps owning the schedule.
-- **Worktree GC, dry-run half** — `herdr-routines gc --dry-run`: list `auto/<name>-<ts>`
-  branches that are merged or whose worktree is gone. Read-only and mechanical; useful as soon
-  as the first real worktree jobs run. The deletion half is gated separately (see Next).
-- **Status CLI, table view** (2026-08-25 idea) — `herdr-routines` already has `status`/`history`
-  for its own scheduled jobs, but there's no single place to see everything running or scheduled
-  across the whole Herdr+pipeline stack: workspaces/panes/agents (`herdr pane list` / `herdr agent
-  list`), pipeline runs in progress (`~/.local/state/herdr-routines/reports/pipeline-*.md` +
-  `state.json`), and scheduled jobs (`jobs.yaml` + `history.jsonl`) each need a separate manual
-  query today — this whole session was hours of hand-written `jq`/`ssh` one-liners stitching
-  those together. Two simple commands, no web server, no daemon: one prints a table of what's
-  *currently running* (panes/agents/in-progress pipeline runs), another prints what's *scheduled*
-  (cron jobs + their next-fire time, any pending `systemd-run` one-shots). Purely additive read
-  path over data that already exists in these three places — no new state to own. Ready under Now
-  because, like the plugin manifest and gc dry-run items, every piece already works in isolation;
-  this is presentation, not new capability. Narrower and cheaper than the Later "Web/TUI
-  dashboard" item below — a natural first step there, not a replacement for it if that's still
-  wanted once this exists.
-- **Overnight feature-pipeline orchestrator (POC)** — one orchestrator agent session drives an
-   entire feature lifecycle by spawning per-stage worker sessions via herdr: plan/spec →
-   independent spec review (adds acceptance criteria + test plan) → implement-until-spec-tests-pass
-   → PR → code review → capped comment-addressal loop. Files-as-handoff, machine-checkable gates
-   between stages, stop-on-failure semantics, checkpoint/resume. Full POC spec:
-   [`docs/pipeline/spec.md`](docs/pipeline/spec.md) (canonical; mirrored at `~/projects/raspberrypi/feature-pipeline-orchestrator-spec.md` until Pi rollout settles). Design draft: [`docs/pipeline/design.md`](docs/pipeline/design.md) (v1: workflow hardcoded in orchestrator prompt, gates judged by orchestrator). Audits: `docs/pipeline/audits/` (not top-level). Under Now because it needs no real-run evidence to attempt: every piece it
-   composes (programmatic spawn/settle via runner.py's patterns, worktree jobs, gh-driven code
-   review) already works in isolation — the missing thing is the integration, which is learned
-   only by running it. Generalizes the auto-fix-PR idea (Later) into a full chain. Gate for
-   promoting beyond POC: a few real overnight runs finishing end-to-end without human rescue.
-   **2026-08-24 update:** two real dogfood runs completed (PR #27, PR #28), but the second pushed
-   the Pi's swap to functionally zero mid-run with nothing else scheduled concurrently — the
-   design's "keep every worker's pane alive until the whole run ends" cleanup policy
-   (`design.md:159-168`) means memory cost is cumulative across stages reached, not just what's
-   currently active, even though only one worker (`pl-3`, reused by stages 4 and 6) is ever
-   actually reused. Proposed fix:
-   [`docs/pipeline/pane-lifecycle-v2-proposal.md`](docs/pipeline/pane-lifecycle-v2-proposal.md) —
-   close a worker's pane as soon as its gate passes, and for the one worker a later stage reuses,
-   close-then-reopen-by-`opencode -s <session_id>` instead of holding the pane open idle in
-   between. Treat this as part of the promotion gate, not a separate nice-to-have — "survives one
-   dogfood run" is weaker evidence than "doesn't need everything else on the Pi to stay quiet."
-   **Second 2026-08-24 fix (same night):** a third dogfood run (`20260825T000735Z`, PR #29) hit a
-   *second* bug: `spec.md` at the repo root is a single shared path every run rewrites in full, so
-   PR #29 conflicted merging against PR #28's already-merged `spec.md` — not a content
-   disagreement, a path collision that will recur any time two runs' branch histories overlap.
-   Fixed by moving to a per-run path (`docs/pipeline/runs/<run_id>/spec.md`, design.md G-15) and
-   backfilling PR #28's already-merged spec into that convention.
-   **2026-08-25 update:** the `-s <session_id>` resume mechanism (open question 1 in the
-   proposal) was manually verified before building anything — closed a throwaway opencode
-   session's pane, reopened it in a brand-new pane/workspace via `-s`, and it correctly recalled
-   a fact given before the close, with `agent_session.value` matching the original session ID (a
-   true resume, not a fork). The proposal was then dogfooded as the pipeline's own 4th real run
-   (`20260825T021919Z`, PR #31, merged as `61cc5af`) — the pipeline amended its own
-   `design.md`/`orchestrator-prompt.md` (new G-16) and marked the proposal
-   `Status: implemented`. Notably this run finished in ~9 minutes (vs. 40 min-7 h for the prior
-   three) since it was a docs-only change with no infra hiccups — not evidence pipeline runs are
-   now reliably fast in general. Open questions 2 (grace window before closing a pane) and 3
-   (cross-model `-s` interaction) remain open per the proposal. **Still outstanding:** the live
-   Pi launcher scripts (`~/.local/bin/pipeline-launch-*.sh`, outside this repo) still need a
-   manual update to match G-16's per-stage close-and-resume — the design doc changed, the actual
-   launch mechanics on the Pi haven't yet.
-   **Third 2026-08-25 finding (same run):** the pane-lifecycle-v2 run itself surfaced a deeper
-   gap — the orchestrator skipped spawning stages 1/2 as separate workers and authored `spec.md`
-   v1 and v2 itself in one session, and every gate passed anyway, because gates only check
-   *content shape*, never *which process produced it*. Stage 2 exists specifically to be an
-   independent reviewer of stage 1's spec; collapsing them silently defeats that. Fixed generally
-   (not as a one-off "check `pl-1` exists" patch) as **G-17**: any stage a workflow declares
-   independent must be gate-verified by agent name + session id
-   (`state.json:stage_sessions`), a principle meant to survive the later move to a declarative
-   per-stage `isolation:` field rather than being re-derived per hardcoded stage pair. Landed in
-   the same PR as the "implemented" status update above.
-   **Fourth 2026-08-25 finding:** G-16 only ever amended the *pipeline orchestrator's* own
-   prompt/design (`pl-*` panes) — `src/herdr_routines/runner.py` was untouched, so the separate
-   `fitted-pr-review-2..5` routine jobs added the same day (adding a 4th–6th daily job) hit the
-   exact same swap-exhaustion failure mode independently: `execute_run`'s success/no-report
-   paths left a job's pane (and its resident `opencode`/`claude` process) running until *that
-   same job's next scheduled run* reaped it, so up to 6 settled-but-unreaped processes could be
-   resident at once on the Pi's 4GB RAM — confirmed live (swap at 95%, 3 of 4 newly added jobs'
-   first runs failed with `agent_prompt_stalled`/`server_unavailable`/a `blocked` verdict that
-   had actually finished `done` by the time anyone checked). Fixed the same way G-16 reasoned
-   about it, generalized to routine jobs: `execute_run` now closes its own pane immediately on
-   every settled terminal path (`done`, `no_report`), capturing the agent's session id first
-   (`HerdrClient.agent_session_id`, new `RunOutcome.session_id`, now in `history.jsonl`) so a
-   human can still resume-and-inspect via `herdr agent start ... -s <session_id>` — the same
-   close-then-resume mechanism G-16 verified for the pipeline, just applied without waiting for
-   a next run to trigger it. `blocked`/`unknown` are untouched (deliberate human-follow-up
-   states, docs/failure-reaping.md §2 non-goals); root-mode jobs are untouched (shared ambient
-   workspace, same guard as the pre-existing stale-pane reap). The pre-run stale-pane reap
-   itself is kept as a defensive fallback, not the primary mechanism anymore.
+- **Overnight feature-pipeline orchestrator (POC)** — in progress, 4 real
+  dogfood runs so far. → [`docs/process/issues/004-overnight-feature-pipeline-poc.md`](docs/process/issues/004-overnight-feature-pipeline-poc.md)
+- **Failure reaping & quota-exhaustion handling** — phase 1 shipped, phase 2
+  (watchdog) gated on phase 1 surviving a real overnight cycle. → [`docs/process/issues/005-failure-reaping-phase-2-watchdog.md`](docs/process/issues/005-failure-reaping-phase-2-watchdog.md)
 
-- **Failure reaping & quota-exhaustion handling** — a failed run whose agent never settles
-  (OpenCode free-quota modal; observed twice on the Pi, 2026-08-22/23) left a live `working`
-  agent behind, so every later tick skipped the job (`agent_name_live`) until manual cleanup.
-  Spec: [`docs/failure-reaping.md`](docs/failure-reaping.md). **Phase 1 shipped** (reap own pane
-  on failure, post-hoc quota classification, failure-path screen tails — PR #25); phase 2
-  (mid-run fast-fail watchdog) is gated on phase 1 surviving a real overnight cycle and the
-  dead wait mattering once more, and hasn't cleared that gate yet.
+Shipped and removed from this list during curation (stale — `ROADMAP.md`
+hadn't been updated after landing): plugin manifest (PR #29), worktree GC
+dry-run (PR #28), status CLI table view (PR #41, #43). Kept as `status: done`
+issue files for history — see
+[`docs/process/issues/001-plugin-manifest.md`](docs/process/issues/001-plugin-manifest.md),
+[`002-worktree-gc-dry-run.md`](docs/process/issues/002-worktree-gc-dry-run.md),
+[`003-status-cli-table-view.md`](docs/process/issues/003-status-cli-table-view.md).
 
 ## Next
 
@@ -191,6 +106,25 @@ Real designs, but untouched until something demands them. Each names its trigger
   build or keep in sync with the prose. Trigger: the pipeline is actually promoted out of POC and
   running on a schedule — before that, a human picking the feature each run is a feature (keeps
   prioritization judgment in the loop), not a gap to close.
+  **2026-08-25 update:** option (a)'s structured layer now exists —
+  [`docs/process/issues/`](docs/process/issues/) curates the `Now` horizon into frontmatter'd
+  files (`id`/`title`/`status`/`priority`/`area`/`gate`), same shape as `fitted`'s convention.
+  Curation also caught 3 stale `Now` entries that had already shipped (`ROADMAP.md` wasn't
+  updated after landing) — a structured, git-log-cross-checkable layer is easier to keep honest
+  than prose.
+  **Second 2026-08-25 update — deliberate partial trigger-cross:** `herdr-routines pick-feature`
+  now exists (highest-priority, lowest-id `status: open` issue → `FEATURE_IDEA` text,
+  `--mark-in-progress` to claim it) and the orchestrator prompt falls back to it when no
+  `FEATURE_IDEA` is supplied (`docs/pipeline/orchestrator-prompt.md` § Inputs). This closes the
+  "which feature" half of stage-0 selection *before* the item's own trigger cleared — a
+  conscious choice to unblock experimentation with exactly one open issue in the backlog at the
+  time (low blast radius: one candidate, easy to review), not a quiet reversal of the trigger.
+  What it does **not** do: make the pipeline self-scheduling. A human (or a `systemd-run
+  --on-calendar` the human configures) still decides *when* a run happens; only *which*
+  Now-horizon item it builds is now automatable. The original trigger — several real overnight
+  runs finishing end-to-end without human rescue — still gates actually wiring this into a
+  recurring schedule; until then this is a manually-invoked helper a human chooses to use per
+  launch, not unattended autonomy.
 - **API/webhook trigger** — Claude Routines supports "Call via API" (POST to trigger a run) and
   a GitHub-event trigger. Both assume inbound reachability, which the Pi doesn't have without a
   tunnel (declined earlier for the Telegram relay — see
@@ -253,23 +187,36 @@ Now/Next/Later once it's clear it's worth designing properly.
   (`docs/failure-reaping.md` §3.2) with a per-job failover model list, or degrade to a
   smaller tier for the rest of the window. Gate: quota failures recurring after failure-reaping
   phase 1 ships.
-- **Re-investigate or replace the herdr-push Telegram plugin** (2026-08-25 idea) — herdr-push
-  currently does one-way notification relay (verified working for the approval-path Next item
-  above). Two open questions before committing effort either way: (1) is the existing plugin
-  worth extending, or is a small bot we own outright (using Telegram's Bot API directly) less
-  fragile long-term; (2) either way, a **bidirectional** bot only needs Telegram long-polling
-  (the bot process makes outbound `getUpdates` calls), not an inbound webhook — this sidesteps
-  the "Pi has no inbound reachability without a tunnel" constraint noted under Later's
-  API/webhook trigger, since that constraint is specific to *webhook*-style inbound triggers, not
-  polling. Needs a real investigation pass before promoting to Next.
-- **Spawn a session on the fly from Telegram** (2026-08-25 idea) — message the bot from
-  anywhere ("implement X in herdr-routines") to start a fresh `herdr` agent session against a
-  named repo, and keep iterating with it through the Telegram thread rather than only receiving
-  a one-way notification. Depends on the Telegram-bot item above (needs the bidirectional/
-  long-polling piece) plus a mapping from "which repo/job" to a `herdr workspace create` +
-  `agent start`, roughly the same mechanics the pipeline launcher already uses. Bigger scope than
-  a notification-policy tweak — treat as its own design once the bot-transport question above is
-  settled.
+- **Replace the herdr-push Telegram plugin — decided, installed on the Pi (2026-08-25)**:
+  went with an existing community plugin, `cokekitten/herdr-telegram-bridge`, rather than
+  building a bot from scratch — it already does exactly the bidirectional/long-polling shape
+  this item wanted (outbound-only `getUpdates`, no inbound webhook, so the Pi's lack of inbound
+  reachability is a non-issue), reply-to-steer any agent pane from Telegram (covers the
+  "spawn a session on the fly" item below — steering an already-running `herdr-routines` worker
+  pane via reply, not literally spawning a new one from a cold message yet), and notifies on
+  `done`/`blocked` pane transitions (covers the notification-policy want: one push per
+  run-completion or error, not per-step noise). Source-reviewed before install: full docs in
+  `agent-orchestrator-research/herdr/security-reviews.md`. Config skeleton is in place
+  (`~/.config/herdr/plugins/config/telegram.bridge/config.toml` on the Pi) but the bot
+  token/chat_id still need to be filled in by hand — not done yet.
+  **Open verification item**: this plugin's notification hook is `pane.agent_status_changed`,
+  which fires on raw Herdr pane state. The pane-lifecycle-v2 work above (`execute_run` closing
+  a job's pane immediately on settling, `done`/`no_report`) could race against this hook seeing
+  the status before the pane closes. Needs confirming with a real routine run before trusting it
+  for overnight jobs — if it turns out unreliable, the fallback is wiring the notification off
+  `herdr notification show` (the routine's own explicit completion signal) instead of pane
+  status, which this plugin doesn't currently listen for.
+  **2026-08-25 update**: bot token/chat_id moved over from the old `herdr-remote` secrets file
+  (it was independently deployed on the Pi too, not just the laptop) — test notification
+  confirmed received, reply poller confirmed running. `herdr.push` uninstalled from the Pi (it
+  was a silent no-op once `herdr-remote`'s relay was removed). Laptop still has `herdr.push`
+  installed and equally dead — same cleanup still pending there.
+- **Spawn a session on the fly from Telegram** — partially covered by `herdr-telegram-bridge`
+  above (reply-to-steer an existing pane). What's still missing: starting a *brand new* session
+  against a named repo from a cold message (no existing notification to reply to) — needs a
+  mapping from "which repo/job" to `herdr workspace create` + `agent start`, roughly the same
+  mechanics the pipeline launcher already uses. Smaller remaining scope than originally
+  written, now that the transport question is settled.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives
