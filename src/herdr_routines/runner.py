@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import TypedDict
 
 from herdr_routines.config import Job
-from herdr_routines.herdr import HerdrClient, HerdrCliError, build_agent_start_args
+from herdr_routines.herdr import (
+    HerdrClient,
+    HerdrCliError,
+    PromptWatchdogKilled,
+    build_agent_start_args,
+)
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +47,11 @@ PROMPT_RETRY_DELAYS_S = (5.0, 15.0)
 # tuple wholesale (config.py); markers appearing verbatim in the job's own prompt are skipped —
 # the visible screen contains the prompt echo, so scanning would self-match.
 DEFAULT_FAILURE_MARKERS: tuple[str, ...] = ("Free usage exceeded",)
+
+# How often the mid-run watchdog (failure-reaping phase 2) polls the visible screen while
+# the prompt child waits. Mirrors herdr.py's PROMPT_WATCHDOG_POLL_S default; module-level so
+# tests can adjust it, same style as READY_POLL_INTERVAL_S.
+WATCHDOG_POLL_INTERVAL_S = 30.0
 
 
 def _error_body_code(e: HerdrCliError) -> str | None:
@@ -82,19 +92,42 @@ def _is_retryable_prompt_error(e: HerdrCliError) -> bool:
     return code is not None and code != "timeout"
 
 
-def _prompt_with_retry(
+def _prompt_with_watchdog(
     client: HerdrClient,
     *,
     job_name: str,
     target: str,
     text: str,
     timeout_ms: int,
+    markers: tuple[str, ...],
+    prompt_text: str,
 ) -> str:
-    """agent_prompt_wait with bounded retries over provably-early session-not-ready failures
-    (see _is_retryable_prompt_error). Any other error — settle timeouts, wrapper subprocess
-    timeouts, shape errors — raises immediately, because delivery is proven or likely and a
-    resend would double-prompt the agent. Raises the last error if every attempt fails.
-    `target` is the agent name; `job_name` only labels log lines."""
+    """agent_prompt_wait_with_watchdog with bounded retries over provably-early
+    session-not-ready failures — the same whitelist phase 1's _prompt_with_retry enforced
+    (see _is_retryable_prompt_error): settle timeouts, wrapper subprocess timeouts and shape
+    errors raise immediately, because delivery is proven or likely and a resend would
+    double-prompt the agent. While each attempt waits, the visible screen is polled every
+    WATCHDOG_POLL_INTERVAL_S and scanned via _matched_failure_marker; only the SAME marker
+    on two consecutive polls (stability gate against transient screen tear / partial
+    renders) confirms the wedge and kills the delivered child. A watchdog kill is terminal
+    and never retried — one delivery, one terminal record — so it propagates immediately as
+    PromptWatchdogKilled for execute_run's fast-fail classification. Poll reads that fail
+    are inert (the callback sees "", which matches nothing). Raises the last error if every
+    attempt fails. `target` is the agent name; `job_name` only labels log lines."""
+    previous_hit: str | None = None
+
+    def scan(screen_text: str) -> str | None:
+        nonlocal previous_hit
+        marker = _matched_failure_marker(screen_text, markers, prompt_text)
+        if marker is None:
+            previous_hit = None
+            return None
+        if previous_hit == marker:
+            # second consecutive sighting of the same marker — stable, kill
+            return marker
+        previous_hit = marker
+        return None
+
     delays = (None, *PROMPT_RETRY_DELAYS_S)
     for i, delay in enumerate(delays):
         if delay is not None:
@@ -103,9 +136,17 @@ def _prompt_with_retry(
                 "%s: retrying prompt (attempt %d/%d)", job_name, i + 1, len(delays)
             )
         try:
-            return client.agent_prompt_wait(
-                target=target, text=text, timeout_ms=timeout_ms
+            return client.agent_prompt_wait_with_watchdog(
+                target=target,
+                text=text,
+                timeout_ms=timeout_ms,
+                poll_interval_s=WATCHDOG_POLL_INTERVAL_S,
+                on_poll=scan,
             )
+        except PromptWatchdogKilled:
+            # Terminal by construction (no error_body → never retryable anyway); re-raised
+            # explicitly so the double-prompt audit stays a one-line proof.
+            raise
         except HerdrCliError as e:
             if not _is_retryable_prompt_error(e) or i == len(delays) - 1:
                 raise
@@ -121,12 +162,12 @@ def _wait_for_agent_ready(
     timeout_s elapses returns (False, last_error_text). `agent start` returns as soon as the
     process is detected, but the TUI needs another few seconds before typed input is delivered;
     prompting earlier makes the server-side agent.prompt fail (EmptyResponse), which
-    _prompt_with_retry then retries via _is_retryable_prompt_error (terminal agent_prompt_failed
-    only on exhaustion). Polling errors are swallowed and never escape this function — a
-    transiently unreachable server (or a vanished `herdr` binary raising OSError) must not
-    abort the wait nor break execute_run's never-raises contract; the last error's text
-    accompanies the verdict so an eventual agent_not_interactive failure can be attributed to
-    infrastructure rather than a slow agent."""
+    _prompt_with_watchdog then retries via _is_retryable_prompt_error (terminal
+    agent_prompt_failed only on exhaustion). Polling errors are swallowed and never escape
+    this function — a transiently unreachable server (or a vanished `herdr` binary raising
+    OSError) must not abort the wait nor break execute_run's never-raises contract; the last
+    error's text accompanies the verdict so an eventual agent_not_interactive failure can be
+    attributed to infrastructure rather than a slow agent."""
     deadline = time.monotonic() + timeout_s
     last_error: str | None = None
     while True:
@@ -453,13 +494,45 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             branch=branch,
         )
 
+    # `is not None`, not truthiness: an explicit empty failure_markers list is valid config
+    # meaning "scan nothing" — `or` would silently fall back to the defaults (PR #25 review).
+    effective_markers = (
+        job.failure_markers
+        if job.failure_markers is not None
+        else DEFAULT_FAILURE_MARKERS
+    )
+
     try:
-        settled_status = _prompt_with_retry(
+        settled_status = _prompt_with_watchdog(
             client,
             job_name=job.name,
             target=job.agent_name,
             text=prompt,
             timeout_ms=job.timeout_ms,
+            markers=effective_markers,
+            prompt_text=prompt,
+        )
+    except PromptWatchdogKilled as e:
+        # Phase-2 fast-fail (failure-reaping §8 / the run's spec): the quota modal sat
+        # through two consecutive visible-screen polls while the delivered prompt was
+        # wedged. Persist the detection poll's own screen text as the tail — no second read
+        # of a pane we're about to close — then reap immediately so the next tick's
+        # settled_agent_pane / _live_agent_exists check sees nothing live, instead of this
+        # job blocking its full timeout_ms and every later tick skipping it.
+        try:
+            if e.screen_text:
+                (report_path.parent / f"{run_id}.tail.txt").write_text(e.screen_text)
+        except OSError:
+            pass
+        _close_run_pane(client, job_name=job.name, pane_id=pane_id)
+        return RunOutcome(
+            state="failed",
+            run_id=run_id,
+            reason="quota_exhausted",
+            error=f"failure marker matched: {e.marker!r}",
+            agent_name=job.agent_name,
+            pane_id=pane_id,
+            branch=branch,
         )
     except (HerdrCliError, OSError) as e:
         # The wedge case: the prompt was delivered but the agent never settled (e.g. an
@@ -469,14 +542,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         screen_tail = _capture_visible_tail(
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
-        # `is not None`, not truthiness: an explicit empty failure_markers list is valid config
-        # meaning "scan nothing" — `or` would silently fall back to the defaults (PR #25 review).
-        markers = (
-            job.failure_markers
-            if job.failure_markers is not None
-            else DEFAULT_FAILURE_MARKERS
-        )
-        marker = _matched_failure_marker(screen_tail, markers, prompt)
+        marker = _matched_failure_marker(screen_tail, effective_markers, prompt)
         reason = "quota_exhausted" if marker else "agent_prompt_failed"
         error = f"failure marker matched: {marker!r}" if marker else str(e)
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)

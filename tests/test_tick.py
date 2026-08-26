@@ -143,6 +143,11 @@ class FakeFullClient:
         Path(text.rsplit(maxsplit=1)[-1]).write_text("# ok\n")
         return self._settle_status
 
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
+
     def agent_read(self, target, *, lines=200):
         return ""
 
@@ -234,6 +239,11 @@ class FakeClient:
         self._maybe_raise("agent_prompt_wait")
         Path(text.rsplit(maxsplit=1)[-1]).write_text("# ok\n")
         return self.settle_status
+
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
 
     def agent_read(self, target, *, lines=200):
         return ""
