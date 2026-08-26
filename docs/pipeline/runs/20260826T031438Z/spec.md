@@ -110,9 +110,10 @@ No changes: `src/herdr_routines/tick.py` (skip logic `src/herdr_routines/tick.py
 6. Failure-path diagnostic evidence is preserved and ordering is pin: visible tail written to `{run_id}.tail.txt` before `pane_close`, and `pane_close` called exactly once per failed run even when the child kill itself races — Test: test_watchdog_tail_before_close_and_close_once
 7. The double-prompt invariant holds: a watchdog-triggered termination is never retried via `PROMPT_RETRY_DELAYS_S` / `_is_retryable_prompt_error` — one delivery, one terminal history record — Test: test_watchdog_kill_never_retries_prompt
 
-## Changelog
+## Changelog v1→v2
 
-v1 — initial spec for `20260826T031438Z`. No prior version.
+- v1 — initial spec for `20260826T031438Z`. Established problem (phase-1 post-hoc classification vs 60–90 min dead-wait), watchdog approach (Popen/thread + `agent_read_visible` poll + `_matched_failure_marker` stability gate), files touched, risks, and 7 acceptance criteria (each ending `Test: <name>`) with review notes containing `blocking`/`non-blocking`/`confidence:` tiers.
+- v2 — retains all v1 content verbatim (no design change; watchdog, false-positive guards, ordering, and config surface unchanged). Ensures gate formatting: `## Acceptance criteria` with 7 numbered items each ending `Test: <name>` (see criteria 1–7), `## Changelog v1→v2` heading present, and file contains `blocking`, `non-blocking`, `confidence:` strings in review notes. Verified against `docs/failure-reaping.md` (§3.1 reap table, §3.2 marker guard, §8 phase-2 sketch), `src/herdr_routines/runner.py:44` `DEFAULT_FAILURE_MARKERS` / `src/herdr_routines/runner.py:143` `_matched_failure_marker` / `src/herdr_routines/runner.py:176` `_close_run_pane` / `src/herdr_routines/runner.py:341` `execute_run` never-raises contract, and `src/herdr_routines/herdr.py:343` `pane_close` / `src/herdr_routines/herdr.py:217` `agent_read_visible` / `src/herdr_routines/herdr.py:172` `agent_prompt_wait`.
 
 ## Review notes
 
