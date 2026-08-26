@@ -8,7 +8,18 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
 
 ## Inputs you will receive
 
-- `FEATURE_IDEA`: one paragraph from the human (the feature to build). If not provided, ask and wait.
+- `FEATURE_IDEA`: one paragraph from the human (the feature to build). **If not provided**, pick
+  one yourself from the curated backlog instead of asking and waiting (2026-08-25, see
+  `ROADMAP.md` § "Autonomous task selection for the pipeline" for why this is scoped narrowly):
+  run `herdr-routines pick-feature --issues-dir docs/process/issues --mark-in-progress` in
+  `$REPO_PARENT` and use its stdout verbatim as `FEATURE_IDEA`. Record which issue you picked in
+  `state.json` (`"feature_source": "docs/process/issues/<file>"`) so the report and a human
+  reviewing in the morning can trace the run back to its issue. If the command exits 1 (`no open
+  issues`), **stop and write a report saying so** — do not fabricate a feature idea. This only
+  covers picking *which* Now-horizon item to build; it does not make the pipeline
+  self-scheduling — a human (or `systemd-run --on-calendar`, launcher-side) still decides *when*
+  a run happens. When the resulting PR merges, flip the picked issue's `status:` to `done` by
+  hand (same as any other `ROADMAP.md`/issue hygiene) — this prompt does not do it for you.
 - `RUN_ID`: e.g. `20260824T020000Z` (UTC). If not provided, derive `date -u +%Y%m%dT%H%M%SZ`.
 - `REPO_PARENT`: parent clone path, e.g. `~/.local/state/herdr-routines/repos/herdr-routines`
 - `$PIPELINE_REPORT`: path for your final report, e.g. `~/.local/state/herdr-routines/reports/<run_id>.md`

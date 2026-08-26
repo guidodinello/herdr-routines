@@ -31,6 +31,7 @@ from herdr_routines.history import (
     last_terminal_run,
     read_job,
 )
+from herdr_routines.pick_feature import run_pick_feature
 from herdr_routines.ps import collect_ps_rows, render_ps
 from herdr_routines.runner import build_dry_run_argv, execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
@@ -154,6 +155,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="merge target for the merged-check (default: origin/HEAD, else main)",
     )
     p_gc.set_defaults(handler=_cmd_gc)
+
+    p_pick = sub.add_parser(
+        "pick-feature",
+        help="pick the next open docs/process/issues/ item for the pipeline's stage 0",
+    )
+    p_pick.add_argument(
+        "--issues-dir",
+        type=Path,
+        default=Path("docs/process/issues"),
+        help="directory of issue files (default: docs/process/issues, relative to cwd)",
+    )
+    p_pick.add_argument(
+        "--mark-in-progress",
+        action="store_true",
+        help="flip the picked issue's status to in-progress before printing it",
+    )
+    p_pick.set_defaults(handler=_cmd_pick_feature)
 
     return parser
 
@@ -468,6 +486,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_gc(args: argparse.Namespace) -> int:
     # No HerdrClient, no config load — pure git + filesystem (spec.md §No Herdr server).
     return run_gc(args.repo or Path.cwd(), base=args.base)
+
+
+def _cmd_pick_feature(args: argparse.Namespace) -> int:
+    # No HerdrClient — pure filesystem, same posture as gc (docs/process/README.md).
+    return run_pick_feature(args.issues_dir, mark=args.mark_in_progress)
 
 
 if __name__ == "__main__":

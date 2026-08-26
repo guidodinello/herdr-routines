@@ -285,6 +285,17 @@ For the POC the prompt file is checked out alongside the target repo worktree
 so the orchestrator can reference it on disk. A `herdr-routines run orchestrator`
 job wrapper is the later ergonomic improvement — not v1.
 
+**Feature idea (2026-08-25):** neither launch command above appends a
+`FEATURE_IDEA` — that's deliberate. The orchestrator prompt's Inputs section
+now self-selects from `docs/process/issues/` (`herdr-routines pick-feature
+--mark-in-progress`) when none is supplied, so an unattended `systemd-run`
+launch (option A) works without a human pre-authoring an idea file. To force
+a specific feature instead, append it to the prompt text before `cat`, e.g.
+`"$(cat docs/pipeline/orchestrator-prompt.md)\n\nFEATURE_IDEA: <text>"`. See
+`docs/pipeline/orchestrator-prompt.md` § Inputs and `ROADMAP.md` §
+"Autonomous task selection for the pipeline" for scope and the promotion
+gate this doesn't change.
+
 **Blast radius (audit gap 10):** worktree isolation shares the object store and
 can push (`roadmap:58-61`); stage 4 requires push; dogfood target is
 `herdr-routines` itself — the repo containing the scheduler. This is
