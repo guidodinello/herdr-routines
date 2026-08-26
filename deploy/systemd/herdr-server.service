@@ -3,6 +3,9 @@ Description=Herdr headless server
 
 [Service]
 Type=simple
+# Provider API keys (e.g. KILO_API_KEY) live here, not in .bashrc: this is the process that
+# actually spawns agent sessions for scheduled jobs, and systemd units don't source .bashrc.
+EnvironmentFile=-%h/.config/herdr/secrets.env
 ExecStart=%h/.local/bin/herdr server
 Restart=on-failure
 
