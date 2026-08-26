@@ -157,7 +157,18 @@ class _RealWatchdogProcess:
                 self._proc.wait(timeout=WATCHDOG_KILL_GRACE_S)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
-                self._proc.wait()
+                # Even SIGKILL gets a bounded reap: a child stuck in uninterruptible kernel
+                # sleep would otherwise block the watchdog loop forever. Nothing more can be
+                # done at that point — log and leave the reaping to init.
+                try:
+                    self._proc.wait(timeout=WATCHDOG_KILL_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    log.warning(
+                        "herdr prompt child %s survived SIGKILL for %.0fs; giving up on "
+                        "the reap",
+                        self._proc.pid,
+                        WATCHDOG_KILL_GRACE_S,
+                    )
         except Exception as e:  # noqa: BLE001 — best-effort kill must never raise into the wait loop
             log.warning("could not terminate herdr prompt child: %s", e)
 

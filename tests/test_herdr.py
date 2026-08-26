@@ -5,6 +5,7 @@ in tests/fixtures/api-schema.json and observed live output (see docs/plan-v1.md 
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 
 import pytest
@@ -795,3 +796,37 @@ def test_real_process_wrapper_escalates_to_kill_after_grace() -> None:
     inner = StubbornInner()
     _RealWatchdogProcess(inner).terminate()  # type: ignore[arg-type]
     assert inner.events == ["term", "wait", "kill", "reaped"]
+
+
+def test_real_process_wrapper_gives_up_after_sigkill_survivor() -> None:
+    """A child stuck in uninterruptible kernel sleep can ignore even SIGKILL — the bounded
+    post-kill reap logs a warning and returns instead of blocking the watchdog loop forever."""
+
+    class ImmortalInner:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+            self.pid = 4242
+
+        def terminate(self) -> None:
+            self.events.append("term")
+
+        def kill(self) -> None:
+            self.events.append("kill")
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.events.append(f"wait:{timeout}")
+            raise subprocess.TimeoutExpired(cmd="herdr", timeout=float(timeout or 0.0))
+
+    inner = ImmortalInner()
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger = logging.getLogger("herdr_routines.herdr")
+    logger.addHandler(handler)
+    try:
+        _RealWatchdogProcess(inner).terminate()  # type: ignore[arg-type]  # must not raise
+    finally:
+        logger.removeHandler(handler)
+
+    assert inner.events == ["term", "wait:5.0", "kill", "wait:5.0"]
+    assert any("survived SIGKILL" in r.getMessage() for r in records)
