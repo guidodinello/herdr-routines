@@ -9,13 +9,32 @@ Herdr's own SKILL.md guidance.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from herdr_routines.config import AGENT_MODEL_FLAGS
 
 HERDR_BIN = "herdr"
+
+log = logging.getLogger(__name__)
+
+# How long agent_prompt_wait_with_watchdog waits between visible-screen polls while the
+# `herdr agent prompt --wait` child runs. Sparse on purpose (see the phase-2 spec's
+# poll-amplification risk): ~120 reads over a 60-min run, capped to 1–2 in the wedge case
+# by the early exit on marker match.
+PROMPT_WATCHDOG_POLL_S = 30.0
+
+# Wrapper grace on top of timeout_ms before the watchdog declares the child hung — mirrors
+# the blocking agent_prompt_wait's `timeout_ms / 1000 + 30` subprocess timeout exactly, so
+# the no-marker worst case is bit-for-bit today's behavior.
+PROMPT_WAIT_GRACE_S = 30.0
+
+# TERM → wait this long → KILL, when terminating a wedged prompt child.
+WATCHDOG_KILL_GRACE_S = 5.0
 
 # Settle states `agent get`/`agent prompt --wait` can report. Confirmed empirically against
 # herdr 0.8.2 (see docs/plan-v1.md step 5): a never-focused pane settles to "idle", not the
@@ -52,6 +71,20 @@ class HerdrCliError(Exception):
         self.error_body = error_body
 
 
+class PromptWatchdogKilled(HerdrCliError):
+    """Raised by agent_prompt_wait_with_watchdog when the failure-marker watchdog confirmed a
+    match and the delivered-but-wedged prompt child was terminated early. Carries the matched
+    marker and the final visible-screen text so callers can persist the diagnostic tail
+    without re-reading a pane they are about to close. Constructed with no error_body on
+    purpose: `_is_retryable_prompt_error` requires a dict body, so a killed delivery is
+    structurally barred from the resend whitelist — one delivery, one terminal record."""
+
+    def __init__(self, message: str, *, marker: str, screen_text: str) -> None:
+        super().__init__(message, exit_code=1)
+        self.marker = marker
+        self.screen_text = screen_text
+
+
 class CommandRunner(Protocol):
     """The seam tier-2 tests fake: anything that can run an argv and return (exit_code, stdout,
     stderr). `HerdrClient` depends only on this, never on `subprocess` directly."""
@@ -79,6 +112,76 @@ def _subprocess_runner(
     return proc.returncode, proc.stdout, proc.stderr
 
 
+class WatchdogProcess(Protocol):
+    """The Popen lifecycle surface the watchdog wait loop needs (poll → collect on exit /
+    terminate when wedged). Kept as a protocol so tier-2 tests can script exact
+    exit/terminate sequences deterministically instead of spawning real children
+    (docs/plan-v1.md §7)."""
+
+    def poll(self) -> int | None:
+        """The child's exit code once finished, None while still running."""
+        ...
+
+    def collect(self) -> tuple[int, str, str]:
+        """(exit_code, stdout, stderr) — only called after poll() reported an exit."""
+        ...
+
+    def terminate(self) -> None:
+        """Best-effort TERM → short grace → KILL. Never raises: a failed kill must not break
+        the caller's classification path, which still records the run and reaps the pane."""
+
+
+class _RealWatchdogProcess:
+    """subprocess.Popen adapter satisfying WatchdogProcess. Output is captured via pipes;
+    herdr's prompt --wait emits its single small JSON blob only at settle, so not draining
+    the pipes while the poll loop runs cannot deadlock the child."""
+
+    def __init__(self, proc: subprocess.Popen[str]) -> None:
+        self._proc = proc
+
+    def poll(self) -> int | None:
+        return self._proc.poll()
+
+    def collect(self) -> tuple[int, str, str]:
+        stdout, stderr = self._proc.communicate()
+        return (
+            self._proc.returncode,
+            stdout or "",
+            stderr or "",
+        )
+
+    def terminate(self) -> None:
+        try:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=WATCHDOG_KILL_GRACE_S)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+        except Exception as e:  # noqa: BLE001 — best-effort kill must never raise into the wait loop
+            log.warning("could not terminate herdr prompt child: %s", e)
+
+
+class PopenFactory(Protocol):
+    """The seam tier-2 tests fake for the watchdog's child process; the default spawns a real
+    Popen. Sibling of CommandRunner: reads/polls still go through `runner`, only the long-
+    lived prompt child is created here."""
+
+    def __call__(self, argv: list[str]) -> WatchdogProcess: ...
+
+
+def _popen_process(argv: list[str]) -> WatchdogProcess:
+    return _RealWatchdogProcess(
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class HerdrClient:
     """Wraps `herdr` subcommands used by this project. Construct with a fake `runner` in tests;
@@ -86,12 +189,28 @@ class HerdrClient:
 
     runner: CommandRunner = _subprocess_runner
     bin_path: str = HERDR_BIN
+    popen_factory: PopenFactory = _popen_process
 
     def _call(
         self, args: list[str], *, timeout_s: float | None = None
     ) -> dict[str, Any]:
         argv = [self.bin_path, *args]
         exit_code, stdout, stderr = self.runner(argv, timeout_s=timeout_s)
+        return self._parse_result(
+            args, exit_code=exit_code, stdout=stdout, stderr=stderr
+        )
+
+    def _parse_result(
+        self,
+        args: list[str],
+        *,
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+    ) -> dict[str, Any]:
+        """Maps one completed herdr invocation's (exit_code, stdout, stderr) onto _call's
+        return-or-raise contract. Shared by `_call` and the watchdog's Popen path so child
+        exits parse identically no matter how the process was waited on."""
         if exit_code == 124:
             raise HerdrCliError(
                 f"herdr call timed out: {' '.join(args)}", exit_code=exit_code
@@ -174,6 +293,60 @@ class HerdrClient:
         args = ["agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)]
         body = self._call(args, timeout_s=timeout_ms / 1000 + 30)
         return _extract_status(body)
+
+    def agent_prompt_wait_with_watchdog(
+        self,
+        *,
+        target: str,
+        text: str,
+        timeout_ms: int,
+        poll_interval_s: float = PROMPT_WATCHDOG_POLL_S,
+        on_poll: Callable[[str], str | None] | None = None,
+    ) -> str:
+        """agent_prompt_wait with a mid-run fast-fail watchdog (phase 2,
+        docs/pipeline/runs/<run_id>/spec.md). Runs `herdr agent prompt --wait` under Popen
+        and, every poll_interval_s while the child is still running, feeds
+        agent_read_visible's screen text to `on_poll`. A non-None return means the caller
+        confirmed a failure marker (stability gating across polls is the caller's job): the
+        delivered-but-wedged child is terminated (TERM → grace → KILL, never raising) and
+        PromptWatchdogKilled is raised carrying the matched marker plus the screen text that
+        triggered it. Poll reads are inert: any CLI/server failure yields "" into on_poll,
+        never an exception — an unreachable server degrades to today's timeout path. With no
+        marker ever confirmed this is behavior-identical to agent_prompt_wait: child exits
+        parse through _parse_result (including the exit-124 wrapper timeout at
+        timeout_ms + PROMPT_WAIT_GRACE_S) and the settled status string comes back."""
+        args = ["agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)]
+        proc = self.popen_factory([self.bin_path, *args])
+        deadline = time.monotonic() + timeout_ms / 1000 + PROMPT_WAIT_GRACE_S
+        while True:
+            if proc.poll() is not None:
+                exit_code, stdout, stderr = proc.collect()
+                body = self._parse_result(
+                    args, exit_code=exit_code, stdout=stdout, stderr=stderr
+                )
+                return _extract_status(body)
+            if time.monotonic() >= deadline:
+                proc.terminate()
+                raise HerdrCliError(
+                    f"herdr call timed out: {' '.join(args)}", exit_code=124
+                )
+            if on_poll is not None:
+                try:
+                    screen = self.agent_read_visible(target)
+                except (HerdrCliError, OSError):
+                    # agent_read_visible already returns "" on CLI failures; this also covers
+                    # a vanished herdr binary / dead server surfacing as OSError.
+                    screen = ""
+                marker = on_poll(screen)
+                if marker is not None:
+                    proc.terminate()
+                    raise PromptWatchdogKilled(
+                        f"failure marker matched; prompt child terminated: {marker!r}",
+                        marker=marker,
+                        screen_text=screen,
+                    )
+            remaining = deadline - time.monotonic()
+            time.sleep(min(max(poll_interval_s, 0.0), max(remaining, 0.0)))
 
     def agent_get(self, target: str) -> str:
         body = self._call(["agent", "get", target])
