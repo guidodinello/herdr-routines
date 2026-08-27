@@ -1,6 +1,6 @@
 # Failure reaping & quota-exhaustion handling
 
-Status: proposed (phase 1 approved 2026-08-23; phase 2 designed, not scheduled)
+Status: proposed (phase 1 approved 2026-08-23; phase 2 shipped 2026-08-26, see §8)
 Related: [plan-v1.md](plan-v1.md) §4 (state machine), §6 (report contract), §7 (test tiers)
 
 ## 1. Problem
@@ -71,6 +71,7 @@ except the two preserved states:
 | `agent_start_failed`                 | agent_start_failed                             | yes   | our pane, run dead; also stops leaking empty workspaces                                      |
 | readiness poll exhausted             | agent_not_interactive                          | yes   | half-started agent in our pane                                                               |
 | prompt raise (incl. settle-timeout)  | agent_prompt_failed / quota_exhausted          | yes   | the wedge case                                                                               |
+| watchdog marker match (phase 2)      | quota_exhausted                                | yes   | fast-fail: delivered child killed after two consecutive visible-screen hits, tail persisted first — see §8 |
 | settled `blocked`                    | blocked                                        | **no** | answerable from bed via herdr-push (ROADMAP Next)                                            |
 | settled `unknown`                    | unsettled_status_unknown → interrupted_unknown | **no** | evidence preservation (plan-v1 §4 bucket)                                                    |
 | settled other (defensive)            | unsettled_status_<status>                      | yes   | herdr claims it is still working → would wedge                                               |
@@ -182,14 +183,25 @@ test pins the incident: prompt → HerdrCliError(code=timeout) → outcome faile
    `~/.herdr/worktrees/<repo>/auto-*` are safe to remove via `git worktree remove` from the
    primary clone when their branches hold nothing unmerged.
 
-## 8. Phase 2 sketch (built only if the dead wait hurts in practice)
+## 8. Phase 2 (shipped 2026-08-26 — mid-run fast-fail watchdog)
 
-Replace the blocking `subprocess.run` inside `agent_prompt_wait` with Popen + a poll loop
-(~30 s) over `agent_read_visible` + marker scan; on match, terminate the child, reap, return
-`quota_exhausted` within minutes instead of at `timeout_ms`. Cost: the wait loop stops being a
-single auditable syscall-shaped call (the double-prompt safety analysis in
-`_is_retryable_prompt_error` gets harder to keep provably correct). Trigger to build: a
-phase-1 deployment where a quota wedge again delays a subsequent job past tolerance.
+Phase 2 shipped per `docs/pipeline/runs/20260826T031438Z/spec.md` (design, false-positive
+guards, and the seven-test acceptance matrix live there). Shape: `agent_prompt_wait`'s
+blocking wait is replaced on the prompt-settle path only by
+`HerdrClient.agent_prompt_wait_with_watchdog` — the `herdr agent prompt --wait` child runs
+under Popen while a ~30 s loop polls `agent_read_visible` + `_matched_failure_marker`.
+Guards: high-specificity markers only (no duration heuristic), marker-in-prompt skip reused
+verbatim, two-consecutive-poll stability gate before any kill, poll failures inert.
+On a confirmed match: child terminated (TERM → grace → KILL, never raising), the detection
+poll's screen persisted as `{run_id}.tail.txt`, `_close_run_pane`, then
+`RunOutcome(state="failed", reason="quota_exhausted")` — within ~poll interval + stability
+grace instead of at `timeout_ms`. A killed delivery is never retried (`PROMPT_RETRY_DELAYS_S`
+stays limited to provably-early EmptyResponse only): one delivery, one terminal record.
+
+Cost accepted: the wait loop stops being a single auditable syscall-shaped call (the
+double-prompt safety analysis in `_is_retryable_prompt_error` gets harder to keep provably
+correct) — mitigated by pinning the exact poll argv in tier-2 tests and an explicit test that
+a kill never triggers a retry delay.
 
 Provider/model switching on quota exhaustion lives in the ROADMAP Parking Lot (gate: quota
 failures recurring after phase 1 ships).

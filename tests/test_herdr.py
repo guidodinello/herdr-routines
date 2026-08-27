@@ -5,10 +5,17 @@ in tests/fixtures/api-schema.json and observed live output (see docs/plan-v1.md 
 from __future__ import annotations
 
 import json
+import logging
+import subprocess
 
 import pytest
 
-from herdr_routines.herdr import HerdrClient, HerdrCliError
+from herdr_routines.herdr import (
+    HerdrClient,
+    HerdrCliError,
+    PromptWatchdogKilled,
+    _RealWatchdogProcess,
+)
 
 
 class FakeRunner:
@@ -521,3 +528,305 @@ def test_agent_session_id_returns_none_when_session_absent() -> None:
     runner = FakeRunner([ok({"result": {"agent": {"agent_status": "done"}}})])
     client = HerdrClient(runner=runner)
     assert client.agent_session_id("rt-a") is None
+
+
+# -- agent_prompt_wait_with_watchdog (phase 2: mid-run fast-fail watchdog) -------------------
+
+
+class FakeWatchdogProcess:
+    """Scripted WatchdogProcess: `polls` yields successive poll() results (None = child still
+    running); once exhausted, poll() reports `returncode`. Records termination calls."""
+
+    def __init__(
+        self,
+        *,
+        polls: list[int | None],
+        returncode: int = 0,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        self._polls = list(polls)
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+        self.terminate_calls = 0
+
+    def poll(self) -> int | None:
+        if self._polls:
+            return self._polls.pop(0)
+        return self.returncode
+
+    def collect(self) -> tuple[int, str, str]:
+        return self.returncode, self._stdout, self._stderr
+
+    def terminate(self) -> None:
+        # Honors the never-raises contract the real _RealWatchdogProcess.terminate has.
+        self.terminate_calls += 1
+
+
+class ScriptedPopenFactory:
+    """PopenFactory fake handing back one scripted process and recording every argv."""
+
+    def __init__(self, process: FakeWatchdogProcess) -> None:
+        self.process = process
+        self.argvs: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> FakeWatchdogProcess:
+        self.argvs.append(argv)
+        return self.process
+
+
+class ExplodingReadRunner:
+    """CommandRunner fake whose every invocation raises OSError — what spawning a vanished
+    `herdr` binary does mid-run."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(
+        self, argv: list[str], *, timeout_s: float | None
+    ) -> tuple[int, str, str]:
+        self.calls.append(argv)
+        raise FileNotFoundError(2, "No such file or directory: 'herdr'")
+
+
+class FakeTime:
+    """Controllable clock for the watchdog wait loop: sleep() advances monotonic time."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def idle_json() -> str:
+    return json.dumps({"result": {"agent": {"agent_status": "idle"}}})
+
+
+def test_agent_prompt_wait_with_watchdog_argv_and_status() -> None:
+    proc = FakeWatchdogProcess(polls=[None], returncode=0, stdout=idle_json())
+    factory = ScriptedPopenFactory(proc)
+    client = HerdrClient(runner=FakeRunner([]), popen_factory=factory)
+    status = client.agent_prompt_wait_with_watchdog(
+        target="rt-a",
+        text="hello",
+        timeout_ms=60_000,
+        poll_interval_s=0.0,
+        on_poll=None,
+    )
+    assert status == "idle"
+    assert factory.argvs == [
+        ["herdr", "agent", "prompt", "rt-a", "hello", "--wait", "--timeout", "60000"]
+    ]
+
+
+def test_agent_prompt_wait_with_watchdog_polls_visible_argv() -> None:
+    """Each poll is an `agent read --source visible --lines 200` through the CommandRunner
+    seam (the argv pin failure-reaping §8 requires, so a herdr bump renaming flags is caught),
+    and on_poll sees exactly the screens those reads returned."""
+    read_argv = [
+        "herdr",
+        "agent",
+        "read",
+        "rt-a",
+        "--source",
+        "visible",
+        "--lines",
+        "200",
+    ]
+    runner = FakeRunner([(0, "screen one", ""), (0, "screen two", "")])
+    proc = FakeWatchdogProcess(polls=[None, None], returncode=0, stdout=idle_json())
+    client = HerdrClient(runner=runner, popen_factory=ScriptedPopenFactory(proc))
+    seen: list[str] = []
+    status = client.agent_prompt_wait_with_watchdog(
+        target="rt-a",
+        text="hi",
+        timeout_ms=60_000,
+        poll_interval_s=0.0,
+        on_poll=seen.append,
+    )
+    assert status == "idle"
+    assert seen == ["screen one", "screen two"]
+    assert runner.calls == [read_argv, read_argv]
+    assert proc.terminate_calls == 0
+
+
+def test_agent_prompt_wait_with_watchdog_kills_child_on_confirmed_marker() -> None:
+    screen = "Free usage exceeded, subscribe to Go [retrying in 3h 35m attempt #1]"
+    proc = FakeWatchdogProcess(polls=[None], returncode=0, stdout=idle_json())
+    runner = FakeRunner([(0, screen, "")])
+    client = HerdrClient(runner=runner, popen_factory=ScriptedPopenFactory(proc))
+
+    def confirm(screen_text: str) -> str | None:
+        return "Free usage exceeded" if screen_text else None
+
+    with pytest.raises(PromptWatchdogKilled) as excinfo:
+        client.agent_prompt_wait_with_watchdog(
+            target="rt-a",
+            text="hi",
+            timeout_ms=60_000,
+            poll_interval_s=0.0,
+            on_poll=confirm,
+        )
+    assert excinfo.value.marker == "Free usage exceeded"
+    assert excinfo.value.screen_text == screen
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.error_body is None
+    assert proc.terminate_calls == 1
+
+
+def test_agent_prompt_wait_with_watchdog_poll_cli_failure_is_inert() -> None:
+    """A failed read exits non-zero → agent_read_visible returns "" → on_poll sees "" and the
+    loop keeps waiting; the child's own settle still decides the outcome."""
+    runner = FakeRunner([(1, "", "server down"), (1, "", "server down")])
+    proc = FakeWatchdogProcess(polls=[None, None], returncode=0, stdout=idle_json())
+    client = HerdrClient(runner=runner, popen_factory=ScriptedPopenFactory(proc))
+    seen: list[str] = []
+    status = client.agent_prompt_wait_with_watchdog(
+        target="rt-a",
+        text="hi",
+        timeout_ms=60_000,
+        poll_interval_s=0.0,
+        on_poll=seen.append,
+    )
+    assert status == "idle"
+    assert seen == ["", ""]
+    assert proc.terminate_calls == 0
+
+
+def test_agent_prompt_wait_with_watchdog_poll_oserror_is_inert() -> None:
+    """A vanished `herdr` binary raising OSError out of the read must not escape the wait
+    loop either — it degrades to "" this poll, exactly like a CLI-level failure."""
+    runner = ExplodingReadRunner()
+    proc = FakeWatchdogProcess(polls=[None], returncode=0, stdout=idle_json())
+    client = HerdrClient(runner=runner, popen_factory=ScriptedPopenFactory(proc))
+    seen: list[str] = []
+    status = client.agent_prompt_wait_with_watchdog(
+        target="rt-a",
+        text="hi",
+        timeout_ms=60_000,
+        poll_interval_s=0.0,
+        on_poll=seen.append,
+    )
+    assert status == "idle"
+    assert seen == [""]
+    assert proc.terminate_calls == 0
+
+
+def test_agent_prompt_wait_with_watchdog_child_exit_parity() -> None:
+    """Exit-1-with-JSON-body from the child must raise the same HerdrCliError shape the
+    blocking sibling raises — classification code downstream can't tell the difference."""
+    error_body = {"error": {"code": "timeout", "message": "timed out"}}
+    proc = FakeWatchdogProcess(polls=[], returncode=1, stderr=json.dumps(error_body))
+    client = HerdrClient(
+        runner=FakeRunner([]), popen_factory=ScriptedPopenFactory(proc)
+    )
+    with pytest.raises(HerdrCliError) as excinfo:
+        client.agent_prompt_wait_with_watchdog(
+            target="rt-a", text="hi", timeout_ms=1000, poll_interval_s=0.0, on_poll=None
+        )
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.error_body == error_body
+
+
+def test_agent_prompt_wait_with_watchdog_wrapper_deadline_terminates_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that never exits trips the wrapper deadline at timeout_ms + PROMPT_WAIT_GRACE_S
+    — same exit-124 shape as the blocking path — after terminating it."""
+    fake_time = FakeTime()
+    monkeypatch.setattr("herdr_routines.herdr.time", fake_time)
+    proc = FakeWatchdogProcess(polls=[None] * 50)  # wedged: never exits by itself
+    client = HerdrClient(
+        runner=FakeRunner([(0, "", "")]), popen_factory=ScriptedPopenFactory(proc)
+    )
+    with pytest.raises(HerdrCliError) as excinfo:
+        client.agent_prompt_wait_with_watchdog(
+            target="rt-a",
+            text="hi",
+            timeout_ms=60_000,
+            poll_interval_s=30.0,
+            on_poll=None,
+        )
+    assert excinfo.value.exit_code == 124
+    assert proc.terminate_calls == 1
+    # Slept through the full effective window (timeout + grace), then tripped.
+    assert fake_time.now >= 1000.0 + 90.0
+
+
+def test_real_process_wrapper_swallows_terminate_failures() -> None:
+    class ExplodingInner:
+        pid = 4242
+
+        def terminate(self) -> None:
+            raise OSError("no such process")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+    # The wrapper's terminate must never raise, whatever the inner Popen does.
+    _RealWatchdogProcess(ExplodingInner()).terminate()  # type: ignore[arg-type]
+
+
+def test_real_process_wrapper_escalates_to_kill_after_grace() -> None:
+    class StubbornInner:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+            self.pid = 4242
+
+        def terminate(self) -> None:
+            self.events.append("term")
+
+        def kill(self) -> None:
+            self.events.append("kill")
+
+        def wait(self, timeout: float | None = None) -> int:
+            if "wait" not in self.events:
+                self.events.append("wait")
+                raise subprocess.TimeoutExpired(
+                    cmd="herdr", timeout=float(timeout or 0.0)
+                )
+            self.events.append("reaped")
+            return -9
+
+    inner = StubbornInner()
+    _RealWatchdogProcess(inner).terminate()  # type: ignore[arg-type]
+    assert inner.events == ["term", "wait", "kill", "reaped"]
+
+
+def test_real_process_wrapper_gives_up_after_sigkill_survivor() -> None:
+    """A child stuck in uninterruptible kernel sleep can ignore even SIGKILL — the bounded
+    post-kill reap logs a warning and returns instead of blocking the watchdog loop forever."""
+
+    class ImmortalInner:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+            self.pid = 4242
+
+        def terminate(self) -> None:
+            self.events.append("term")
+
+        def kill(self) -> None:
+            self.events.append("kill")
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.events.append(f"wait:{timeout}")
+            raise subprocess.TimeoutExpired(cmd="herdr", timeout=float(timeout or 0.0))
+
+    inner = ImmortalInner()
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[assignment]
+    logger = logging.getLogger("herdr_routines.herdr")
+    logger.addHandler(handler)
+    try:
+        _RealWatchdogProcess(inner).terminate()  # type: ignore[arg-type]  # must not raise
+    finally:
+        logger.removeHandler(handler)
+
+    assert inner.events == ["term", "wait:5.0", "kill", "wait:5.0"]
+    assert any("survived SIGKILL" in r.getMessage() for r in records)

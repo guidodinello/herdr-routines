@@ -11,7 +11,11 @@ from typing import Any
 import pytest
 
 from herdr_routines.config import Job
-from herdr_routines.herdr import HerdrClient, HerdrCliError
+from herdr_routines.herdr import (
+    HerdrClient,
+    HerdrCliError,
+    PromptWatchdogKilled,
+)
 from herdr_routines.runner import (
     _is_retryable_prompt_error,
     _is_settle_timeout,
@@ -133,6 +137,14 @@ class ScriptedClient:
             self.write_report_at.parent.mkdir(parents=True, exist_ok=True)
             self.write_report_at.write_text(self.report_content)
         return self.agent_status
+
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        # Default: the child settles immediately (zero polls), delegating to agent_prompt_wait
+        # so phase-1 overrides and expected call lists stay valid. Watchdog-specific fakes
+        # (WatchdogClient below) override this with a scripted poll loop.
+        return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
 
     def agent_read(self, target, *, lines=200):
         self.calls.append("agent_read")
@@ -634,6 +646,7 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
         "agent_start",
         "agent_interactive_ready",
         "agent_prompt_wait",
+        "agent_prompt_wait_with_watchdog",
         "agent_read",
         "agent_read_visible",
         "agent_session_id",
@@ -898,3 +911,237 @@ def test_failed_pane_close_never_breaks_execute_run(
     assert outcome.state == "failed"
     assert outcome.reason == "quota_exhausted"
     assert "pane_close" in client.calls
+
+
+# -- phase 2: mid-run fast-fail watchdog ------------------------------------------------------
+# (docs/pipeline/runs/20260826T031438Z/spec.md — one test per acceptance criterion)
+
+QUOTA_SCREEN = "Free usage exceeded, subscribe to Go [retrying in 3h 35m attempt #1]"
+
+
+class WatchdogClient(ScriptedClient):
+    """Scripted mid-run watchdog fake, mirroring herdr.py's agent_prompt_wait_with_watchdog
+    loop at the runner level: each entry of `polls` is one visible-screen read fed to the
+    scan callback while the prompt child is still running (each recorded as
+    agent_read_visible, because that is exactly what a poll is). After the scripted polls
+    are exhausted, the child either settles (`settle_status`) or dies with the non-retryable
+    settle-timeout signature (`settle_status=None`) — so a test that expects a fast fail can
+    prove the watchdog fired *instead of* the timeout. `fail_terminate` models the child
+    kill racing/losing; herdr.py swallows kill failures and still raises."""
+
+    def __init__(
+        self,
+        *,
+        polls: tuple[str, ...] = (),
+        settle_status: str | None = None,
+        fail_terminate: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.watchdog_polls = list(polls)
+        self.settle_status = settle_status
+        self.fail_terminate = fail_terminate
+        self.prompt_deliveries = 0
+        self.terminate_calls = 0
+        self.polls_consumed = 0
+
+    def agent_prompt_wait_with_watchdog(  # type: ignore[override]
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        self.calls.append("agent_prompt_wait_with_watchdog")
+        self.prompt_deliveries += 1
+        for screen in self.watchdog_polls:
+            self.polls_consumed += 1
+            self.calls.append("agent_read_visible")
+            assert on_poll is not None
+            marker = on_poll(screen)
+            if marker is not None:
+                self.calls.append("watchdog_kill")
+                # herdr.py's terminate never raises even if the kill loses a race; the
+                # classification that follows is unaffected either way.
+                self.terminate_calls += 1
+                raise PromptWatchdogKilled(
+                    f"failure marker matched; prompt child terminated: {marker!r}",
+                    marker=marker,
+                    screen_text=screen,
+                )
+        if self.settle_status is None:
+            raise HerdrCliError(
+                "timed out waiting for agent status",
+                exit_code=1,
+                error_body={"error": {"code": "timeout", "message": "timed out"}},
+            )
+        if self.write_report_at is not None:
+            self.write_report_at.parent.mkdir(parents=True, exist_ok=True)
+            self.write_report_at.write_text(self.report_content)
+        return self.settle_status
+
+
+def test_watchdog_fast_fails_on_quota_marker_before_timeout(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Criterion 1: a run showing the quota marker on two consecutive visible-screen polls is
+    detected and reaped without waiting out timeout_ms — settle_status=None means the only
+    pre-watchdog escape was the full settle-timeout wait, so reaching quota_exhausted with
+    the child killed and the pane closed IS the before-timeout proof."""
+    job = make_job(tmp_path, timeout_ms=5_400_000)  # must go unconsumed
+    run_id = "a-watch-fast"
+    client = WatchdogClient(
+        polls=(QUOTA_SCREEN, QUOTA_SCREEN),
+        settle_status=None,
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert "'Free usage exceeded'" in (outcome.error or "")
+    assert client.terminate_calls == 1
+    assert client.prompt_deliveries == 1
+    # Reaped before any next tick could classify the agent as live.
+    assert client.closed_panes == ["w1:p1"]
+    assert client.calls[-1] == "pane_close"
+
+
+def test_watchdog_does_not_fire_on_slow_run_without_marker(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Criterion 2: a legitimately slow run whose screen never shows a marker settles exactly
+    as today — no termination, no false-positive reap, done/report semantics unchanged."""
+    job = make_job(tmp_path)
+    run_id = "a-watch-slow"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = WatchdogClient(
+        polls=("implementing module A...", "step 39 of 40: running tests..."),
+        settle_status="idle",
+        write_report_at=report_path,
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert outcome.reason is None
+    assert outcome.final_agent_status == "idle"
+    assert outcome.report_written is True
+    assert outcome.report_bytes > 0
+    assert client.terminate_calls == 0
+    assert "watchdog_kill" not in client.calls
+    # Both polls were clean sightings that matched nothing; normal success-path close.
+    assert client.polls_consumed == 2
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_watchdog_skips_marker_present_in_prompt(
+    tmp_path: Path,
+) -> None:
+    """Criterion 3: a marker appearing verbatim in the job's own prompt is inert (phase-1
+    guard reused per poll via _matched_failure_marker) — even two consecutive sightings of
+    it cannot trigger a self-match kill; the run degrades to today's settle-timeout path."""
+    job = make_job(
+        tmp_path,
+        prompt="Never print the phrase Free usage exceeded. Write $ROUTINE_REPORT.",
+    )
+    client = WatchdogClient(
+        polls=(QUOTA_SCREEN, QUOTA_SCREEN),
+        settle_status=None,
+    )
+    outcome = execute_run(job, client, run_id="a-watch-guard")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_prompt_failed"
+    assert client.terminate_calls == 0
+    assert "watchdog_kill" not in client.calls
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_watchdog_requires_two_consecutive_hits(
+    tmp_path: Path,
+) -> None:
+    """Criterion 4: the stability gate — a single transient sighting does not kill; only the
+    SAME marker on consecutive polls does. An intervening clean screen resets the gate, so
+    hit / miss / hit never terminates the delivered child."""
+    client = WatchdogClient(
+        polls=(QUOTA_SCREEN, "all good, implementing...", QUOTA_SCREEN),
+        settle_status=None,
+    )
+    outcome = execute_run(make_job(tmp_path), client, run_id="a-watch-gate")  # type: ignore[arg-type]
+    assert outcome.reason == "agent_prompt_failed"
+    assert client.terminate_calls == 0
+    assert "watchdog_kill" not in client.calls
+    # All three scripted polls ran — the gate kept resetting rather than firing early.
+    assert client.polls_consumed == 3
+
+
+def test_watchdog_poll_failure_is_inert(
+    tmp_path: Path,
+) -> None:
+    """Criterion 5: failed poll reads ("" — the best-effort read contract when the CLI errors
+    or the server is unreachable; herdr.py also swallows HerdrCliError/OSError into "")
+    match no marker. The loop keeps waiting and degrades to today's settle-timeout path —
+    never a crash, never a false reap."""
+    client = WatchdogClient(
+        polls=("", "", ""),
+        settle_status=None,
+    )
+    outcome = execute_run(make_job(tmp_path), client, run_id="a-watch-pollerr")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_prompt_failed"
+    assert "timed out waiting for agent status" in (outcome.error or "")
+    assert client.terminate_calls == 0
+    assert client.prompt_deliveries == 1
+
+
+def test_watchdog_tail_before_close_and_close_once(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Criterion 6: diagnostic ordering is pinned — the visible tail from the detection poll
+    lands in {run_id}.tail.txt BEFORE pane_close, and the failed run's pane is closed
+    exactly once even when the child kill itself loses the race."""
+    run_id = "a-watch-order"
+
+    class TailProbe(WatchdogClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.tail_exists_at_close: bool | None = None
+
+        def pane_close(self, pane_id):  # type: ignore[override]
+            self.tail_exists_at_close = (
+                _isolated_reports_dir / f"{run_id}.tail.txt"
+            ).exists()
+            super().pane_close(pane_id)
+
+    client = TailProbe(
+        polls=(QUOTA_SCREEN, QUOTA_SCREEN),
+        settle_status=None,
+        fail_terminate=True,
+    )
+    outcome = execute_run(make_job(tmp_path), client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    # Tail written before the close...
+    assert client.tail_exists_at_close is True
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.exists() and "Free usage exceeded" in tail_path.read_text()
+    # ...and exactly one close, despite the kill racing.
+    assert client.terminate_calls == 1
+    assert client.closed_panes == ["w1:p1"]
+    assert client.calls.count("pane_close") == 1
+
+
+def test_watchdog_kill_never_retries_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 7: the double-prompt invariant — a watchdog-triggered termination is never
+    retried via PROMPT_RETRY_DELAYS_S / _is_retryable_prompt_error. One delivery, no
+    retry-delay sleeps, one terminal record."""
+    monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", (5.0, 15.0))
+    sleeps: list[float] = []
+    monkeypatch.setattr("herdr_routines.runner.time.sleep", lambda s: sleeps.append(s))
+    client = WatchdogClient(
+        polls=(QUOTA_SCREEN, QUOTA_SCREEN),
+        settle_status=None,
+    )
+    outcome = execute_run(make_job(tmp_path), client, run_id="a-watch-noresend")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert client.prompt_deliveries == 1
+    assert client.calls.count("agent_prompt_wait_with_watchdog") == 1
+    assert sleeps == []
+    # Structurally barred too: the kill carries no parseable retry-whitelist body.
+    kill = PromptWatchdogKilled("killed", marker="m", screen_text="s")
+    assert _is_retryable_prompt_error(kill) is False
