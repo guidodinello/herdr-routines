@@ -820,7 +820,7 @@ def test_real_process_wrapper_gives_up_after_sigkill_survivor() -> None:
     inner = ImmortalInner()
     records: list[logging.LogRecord] = []
     handler = logging.Handler()
-    handler.emit = records.append  # type: ignore[method-assign]
+    handler.emit = records.append  # type: ignore[assignment]
     logger = logging.getLogger("herdr_routines.herdr")
     logger.addHandler(handler)
     try:
