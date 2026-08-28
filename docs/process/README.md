@@ -26,25 +26,32 @@ gate: what has to be true before/while this is worked on (optional — omit if u
 ```
 
 `gate` is the one field this convention adds beyond fitted's issue template —
-it's how `ROADMAP.md` already reasons about readiness ("Now" = no gate,
-"Next"/"Later" = gate not yet clear), so it's carried into the file instead of
-being lost when an item graduates out of prose.
+it's how `ROADMAP.md` reasoned about readiness by horizon; carried into the
+file so it isn't lost when an item graduates out of prose. On a `blocked`
+issue it names the decision that must land first; omit it once the item is
+`open`.
 
 Query: `grep -l "status: open" docs/process/issues/*.md`
 
 ## Scope
 
-Only `ROADMAP.md`'s **Now** horizon is curated into issues — items with no
-gate, ready to build. Next/Later/Parking Lot items are gated on evidence
-(mostly "a few weeks of real Pi runs") that hasn't arrived yet; converting
-them to files now would be structure for ideas that aren't designed yet.
-Promote an item to an issue file when it graduates to Now.
+Every `ROADMAP.md` item across all horizons is curated into an issue file
+(as of the 2026-08-27 backfill). `status` carries the readiness that the
+horizon used to imply:
+
+- **`open`** — designed enough to build; `pick-feature` selects from these.
+- **`blocked`** — gated on an *unmade design decision* (not elapsed time);
+  the `gate` field says what. Not selectable until promoted to `open`.
+- **`in-progress`** / **`done`** — as usual.
+
+The "a few weeks of real Pi runs" gate that most Next/Later items shared was
+declared met on 2026-08-27 (several days of clean nightly runs); those items
+were promoted to `open` rather than left as prose.
 
 ## Relationship to `ROADMAP.md`
 
 `ROADMAP.md` keeps the one-liner + horizon grouping (light-index pattern,
 same as `~/projects/PENDING.md`); the full narrative — description, update
-log, links to design docs — lives in the issue file. This split exists so a
-future automated selector (see `ROADMAP.md` Later § "Autonomous task
-selection for the pipeline") has a flat, frontmatter-queryable list to pick
-from instead of parsing prose.
+log, links to design docs — lives in the issue file. This split exists so the
+automated selector (`herdr-routines pick-feature`, issue `013`) has a flat,
+frontmatter-queryable list to pick from instead of parsing prose.

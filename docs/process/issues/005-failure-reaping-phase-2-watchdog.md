@@ -1,10 +1,9 @@
 ---
 id: "005"
 title: "Failure reaping & quota-exhaustion handling — phase 2 (mid-run fast-fail watchdog)"
-status: open
+status: done
 priority: medium
 area: pipeline
-gate: phase 1 surviving a real overnight cycle and the dead-wait problem mattering once more
 ---
 
 ## Description
@@ -35,3 +34,7 @@ more.
 - **2026-08-23**: phase 1 shipped (PR #25).
 - Phase 2 remains gated as of curation (2026-08-25) — not yet promoted to
   active work.
+- **2026-08-26**: pipeline run `20260826T031438Z` built phase 2 (Popen-based
+  `agent_prompt_wait_with_watchdog`, fast-fail of quota-wedged runs before
+  `timeout_ms`) — PR #47, merged as `0d1447e`.
+- **2026-08-27**: marked done and gate removed (PR #47 merged).
