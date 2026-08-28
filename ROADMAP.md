@@ -89,15 +89,17 @@ Curated into issue files 2026-08-27. Time-gated items were promoted to
   [`018`](docs/process/issues/018-model-selection-per-job.md)
 - **Log rotation** — `open`, `low`. Size/age rotation of `history.jsonl` +
   opt-in reports prune. → [`021`](docs/process/issues/021-log-rotation.md)
-- **API / webhook trigger** — `blocked`: transport undecided (poll-diff vs.
-  same-LAN HTTP endpoint vs. tunnelled webhook). →
+- **API / webhook trigger** — `blocked` on issue 015 shipping first (it
+  builds the gh-api-polling pattern this would generalize); transport is
+  otherwise settled as poll-based. →
   [`014`](docs/process/issues/014-api-webhook-trigger.md)
-- **Docker image for trivial multi-host setup** — `blocked`: unanswered —
-  does Herdr run cleanly in a container? →
+- **Docker image for trivial multi-host setup** — `blocked`: PTY-in-container
+  worry resolved; now gated on a secret-injection + image-architecture
+  decision, and no live demand (hp migration paused). →
   [`017`](docs/process/issues/017-docker-image.md)
-- **Concurrency beyond the single tick lock** — `blocked`: no start-time
-  starvation observed yet; fix is per-job units, not speculative. →
-  [`019`](docs/process/issues/019-concurrency-beyond-tick-lock.md)
+- **Concurrency beyond the single tick lock** — `blocked`: `history.jsonl`
+  (2026-08-28) shows median 14s start delay, no starvation — gate working as
+  intended. → [`019`](docs/process/issues/019-concurrency-beyond-tick-lock.md)
 - **Web / TUI dashboard** — `blocked`: CLI inspection is enough; friction
   trigger not hit. → [`020`](docs/process/issues/020-web-tui-dashboard.md)
 

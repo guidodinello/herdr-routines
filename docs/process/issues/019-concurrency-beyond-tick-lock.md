@@ -29,3 +29,11 @@ time because another job held the tick).
 - **2026-08-27**: curated from `ROADMAP.md` Later §. Gate is an
   observed-behavior trigger, not a time gate — not affected by the
   2026-08-27 decision to waive the "weeks of runs" gates.
+- **2026-08-28**: checked `history.jsonl` on the Pi for starvation evidence —
+  32 scheduled runs carry a `late_seconds` field. Median start delay is
+  **14.0s**, identical across every job (a fixed startup cost, not
+  contention). One outlier of **3628s** (fitted-pr-review, 2026-08-23) — a
+  single incident, almost certainly the swap-exhaustion night; never
+  recurred. Jobs run ~2 min each, spaced 1 h apart — hours of tick headroom.
+  **No evidence of any job starving another.** Stays `blocked`; the gate is
+  working as intended.

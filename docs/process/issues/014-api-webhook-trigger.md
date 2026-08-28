@@ -4,7 +4,7 @@ title: "API / webhook trigger"
 status: blocked
 priority: low
 area: infra
-gate: a design decision on transport (poll-based diff vs. same-LAN HTTP endpoint vs. tunnelled webhook) — not yet made
+gate: issue 015 (auto-fix PRs) shipping first — it establishes the gh-api-polling pattern this would generalize; revisit after it lands
 ---
 
 ## Description
@@ -14,21 +14,28 @@ GitHub-event trigger. Both assume inbound reachability, which the Pi doesn't
 have without a tunnel (declined earlier for the Telegram relay — see
 `../agent-orchestrator-research/herdr.md`).
 
-Undecided design question, which is why this is `blocked` and not `open`:
-- A GitHub-event-style trigger would likely start **poll-based** (a timer
-  checks `gh api` on a short interval and diffs) rather than a true webhook.
-- A same-LAN "call via API" (small local HTTP endpoint, no tunnel) is more
-  plausible short-term.
+The transport question is largely settled by constraints: the Pi has no
+inbound reachability and tunnels were declined, so a **poll-based** trigger
+(a timer checks `gh api` on an interval and diffs) is the only realistic
+GitHub-event path. A same-LAN "call via API" (small local HTTP endpoint, no
+tunnel) is a separate, smaller thing — split it out if push-button "run job
+X now" is actually wanted.
 
-Nobody has chosen between these, so there is no spec to implement.
+Why this stays `blocked`: issue 015 (auto-fix PRs) will already build a
+"poll `gh api` on each tick" mechanism. Unblocking this now means designing a
+second polling path before the first exists. Once 015 lands, this becomes a
+small "generalize 015's polling into an event-triggered job type"
+follow-up — revisit then.
 
 ## Acceptance
 
-To be written once the transport decision is made.
+To be written once issue 015 has shipped and its polling pattern is known.
 
 ## Log
 
-- **2026-08-27**: curated from `ROADMAP.md` Later §. Kept `blocked` — the
-  waived gates were the "weeks of real runs" ones; this one is gated on an
-  unmade design decision, not on elapsed time. Trigger: a recurring need to
-  start runs from outside the cron model.
+- **2026-08-27**: curated from `ROADMAP.md` Later §.
+- **2026-08-28**: transport question narrowed to "poll-based" by the Pi's
+  no-inbound constraint. Gate changed from "pick a transport" to "wait for
+  issue 015" — 015 establishes the gh-api-polling pattern this generalizes,
+  so building both independently is wasteful. Trigger unchanged: a recurring
+  need to start runs from outside the cron model.
