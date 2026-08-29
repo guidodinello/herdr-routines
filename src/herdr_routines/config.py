@@ -76,8 +76,30 @@ _JOB_REQUIRED_KEYS = frozenset({"name", "cron", "repo"})
 _JOB_ALLOWED_KEYS = (
     _JOB_REQUIRED_KEYS
     | _DEFAULTS_ALLOWED_KEYS
-    | frozenset({"enabled", "base", "model", "prompt"})
+    | frozenset({"enabled", "base", "model", "prompt", "auto_fix"})
 )
+
+_AUTO_FIX_ALLOWED_KEYS = frozenset(
+    {
+        "branch_prefix",
+        "max_prs_per_tick",
+        "max_attempts_per_pr",
+        "timeout_ms",
+        "agent_kind",
+        "model",
+        "prompt",
+    }
+)
+
+_AUTO_FIX_DEFAULTS = {
+    "branch_prefix": "auto/",
+    "max_prs_per_tick": 3,
+    "max_attempts_per_pr": 3,
+    "timeout_ms": 1_800_000,
+    "agent_kind": "claude",
+    "model": None,
+    "prompt": "",
+}
 
 _JOB_DEFAULTS = {
     "enabled": True,
@@ -100,6 +122,19 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class AutoFixConfig:
+    """Configuration for the auto-fix PR standing job."""
+
+    branch_prefix: str = "auto/"
+    max_prs_per_tick: int = 3
+    max_attempts_per_pr: int = 3
+    timeout_ms: int = 1_800_000
+    agent_kind: str = "claude"
+    model: str | None = None
+    prompt: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class Job:
     name: str
     enabled: bool
@@ -118,6 +153,8 @@ class Job:
     # Screen markers scanned after a failed prompt wait (docs/failure-reaping.md §3.2).
     # None = runner.DEFAULT_FAILURE_MARKERS.
     failure_markers: tuple[str, ...] | None = None
+    # Auto-fix PR standing job config (None = not an auto-fix job).
+    auto_fix: AutoFixConfig | None = None
 
     @property
     def agent_name(self) -> str:
@@ -298,6 +335,60 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
             )
         failure_markers = tuple(failure_markers_raw)
 
+    auto_fix_raw = merged.get("auto_fix")
+    auto_fix: AutoFixConfig | None = None
+    if auto_fix_raw is not None:
+        if not isinstance(auto_fix_raw, dict):
+            raise ConfigError(f"{label}: 'auto_fix' must be a mapping")
+        unknown_af = set(auto_fix_raw) - _AUTO_FIX_ALLOWED_KEYS
+        if unknown_af:
+            raise ConfigError(
+                f"{label}: 'auto_fix' has unknown key(s): {sorted(unknown_af)}"
+            )
+        af_merged = {**_AUTO_FIX_DEFAULTS, **auto_fix_raw}
+
+        af_branch_prefix = af_merged["branch_prefix"]
+        if not isinstance(af_branch_prefix, str) or not af_branch_prefix:
+            raise ConfigError(
+                f"{label}: 'auto_fix.branch_prefix' must be a non-empty string"
+            )
+
+        for af_int_key in ("max_prs_per_tick", "max_attempts_per_pr", "timeout_ms"):
+            af_value = af_merged[af_int_key]
+            if not isinstance(af_value, int) or isinstance(af_value, bool) or af_value < 0:
+                raise ConfigError(
+                    f"{label}: 'auto_fix.{af_int_key}' must be a non-negative integer"
+                )
+
+        af_agent_kind = af_merged["agent_kind"]
+        if af_agent_kind not in VALID_AGENT_KINDS:
+            raise ConfigError(
+                f"{label}: 'auto_fix.agent_kind' must be one of {sorted(VALID_AGENT_KINDS)}"
+            )
+
+        af_model = af_merged["model"]
+        if af_model is not None and not isinstance(af_model, str):
+            raise ConfigError(f"{label}: 'auto_fix.model' must be a string or null")
+        if af_model is not None and af_agent_kind not in AGENT_MODEL_FLAGS:
+            raise ConfigError(
+                f"{label}: 'auto_fix.model' is not supported for agent_kind {af_agent_kind!r} "
+                f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
+            )
+
+        af_prompt = af_merged["prompt"]
+        if not isinstance(af_prompt, str):
+            raise ConfigError(f"{label}: 'auto_fix.prompt' must be a string")
+
+        auto_fix = AutoFixConfig(
+            branch_prefix=af_branch_prefix,
+            max_prs_per_tick=af_merged["max_prs_per_tick"],
+            max_attempts_per_pr=af_merged["max_attempts_per_pr"],
+            timeout_ms=af_merged["timeout_ms"],
+            agent_kind=af_agent_kind,
+            model=af_model,
+            prompt=af_prompt,
+        )
+
     return Job(
         name=name,
         enabled=enabled,
@@ -314,4 +405,5 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
         timezone=timezone,
         on_missed=on_missed,
         failure_markers=failure_markers,
+        auto_fix=auto_fix,
     )
