@@ -27,8 +27,11 @@ breakdown of exactly what a Herdr API change vs. an agent-CLI change would touch
 ## Status
 
 v1 implemented and verified end to end against a real Herdr session on the laptop (see
-`docs/plan-v1.md` build-order record). Not yet deployed to the Pi — that's gated on installing
-Herdr there, tracked separately in this operator's own deployment notes (outside this repo).
+`docs/plan-v1.md` build-order record). Deployed and running live on a Raspberry Pi. Also fully
+smoke-tested on a second host (an x86_64 homelab server, more RAM headroom) as a migration
+target, but deliberately kept inactive there (timer disabled) until it has a fixed physical
+location — the Pi remains the live/primary scheduler. Host-specific deployment notes live
+outside this repo, in each operator's own infra docs.
 
 ## Usage
 
