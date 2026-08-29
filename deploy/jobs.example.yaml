@@ -37,3 +37,26 @@ jobs:
     start_timeout_ms: 120000
     catch_up_minutes: 120
     on_missed: log
+  # auto-fix job: the pipeline only opens a PR branch to fix pre-existing CI/lint failures
+  # or unresolved review threads on an *existing* PR — it never creates new PRs on its own.
+  # auto_fix is optional; a job without it is a watchdog/report-and-commit delegate.
+  - name: babysit-prs
+    enabled: true
+    cron: "*/10 * * * *"
+    repo: /home/guido/projects/herdr-routines
+    workspace: worktree
+    base: main
+    agent_kind: opencode
+    model: null
+    prompt: "" # ignored in auto_fix mode; the pipeline injects the fix prompt template
+    timeout_ms: 2700000
+    start_timeout_ms: 120000
+    auto_fix:
+      branch_prefix: auto/
+      max_prs_per_tick: 3
+      max_attempts_per_pr: 3
+      timeout_ms: 1800000
+      agent_kind: opencode
+      model: null # native model flag for the fix worker; null = agent default
+      prompt: ""
+    on_missed: log
