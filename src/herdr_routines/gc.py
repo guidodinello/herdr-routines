@@ -53,14 +53,18 @@ def resolve_repo_root(repo: Path) -> Path | None:
     return Path(root) if root else None
 
 
-def list_auto_branches(repo: Path) -> list[str]:
-    """Local ``auto/*`` branches minus ``auto/pipeline-*`` (G-14), sorted by name."""
+def list_auto_branches(repo: Path) -> list[str] | None:
+    """Local ``auto/*`` branches minus ``auto/pipeline-*`` (G-14), sorted by name.
+
+    Returns ``None`` when the plumbing call itself fails, so delete mode can abort
+    instead of reading a failure as an empty inventory (spec Risks). Dry-run callers
+    keep degrading to an empty table with the warning on stderr.
+    """
     proc = run_git(repo, "for-each-ref", "--format=%(refname:short)", BRANCH_PATTERN)
     if proc.returncode != 0:
-        # Keep going with an empty listing, but never let plumbing failure masquerade as
-        # a clean "0 branch(es) listed" inventory.
+        # Never let plumbing failure masquerade as a clean "0 branch(es) listed" inventory.
         _warn(f"could not list auto/* branches: {proc.stderr.strip()}")
-        return []
+        return None
     names = (line.strip() for line in proc.stdout.splitlines())
     return sorted(n for n in names if n and not n.startswith(PIPELINE_PREFIX))
 
@@ -108,10 +112,26 @@ def branch_worktrees(repo: Path) -> dict[str, Path]:
     return mapping
 
 
-def collect_rows(repo: Path, base: str) -> list[Row]:
-    worktrees = branch_worktrees(repo)
+def collect_rows(
+    repo: Path,
+    base: str,
+    worktrees: dict[str, Path] | None = None,
+) -> tuple[list[Row], bool, dict[str, Path]]:
+    """Inventory rows plus the single worktree mapping used to build them.
+
+    Returns ``(rows, listing_failed, worktrees)``. ``worktrees`` is resolved exactly
+    once per invocation (or reused if the caller passes it) and is meant to be reused
+    for removals — no second ``git worktree list`` race (spec "Execution ordering per
+    branch" step 1). ``listing_failed`` distinguishes an empty listing (nothing to
+    delete) from a plumbing failure so delete mode can abort (spec Risks).
+    """
+    if worktrees is None:
+        worktrees = branch_worktrees(repo)
+    names = list_auto_branches(repo)
+    if names is None:
+        return [], True, worktrees
     rows: list[Row] = []
-    for branch in list_auto_branches(repo):
+    for branch in names:
         path = worktrees.get(branch)
         rows.append(
             Row(
@@ -120,7 +140,7 @@ def collect_rows(repo: Path, base: str) -> list[Row]:
                 merged_into_base=is_merged(branch, base, repo),
             )
         )
-    return rows
+    return rows, False, worktrees
 
 
 def _yn(value: bool) -> str:
@@ -156,7 +176,8 @@ def run_gc(repo: Path, base: str | None = None, out: TextIO | None = None) -> in
             print(f"error: not a git repository: {repo}", file=sys.stderr)
             return 1
         resolved_base = base or detect_base(root)
-        out.write(format_table(collect_rows(root, resolved_base)))
+        rows, _, _ = collect_rows(root, resolved_base)
+        out.write(format_table(rows))
     except subprocess.TimeoutExpired:
         # run_git's 30s cap must fail cleanly (stderr + exit), never as a traceback.
         print(
@@ -173,9 +194,7 @@ def _remove_worktree(repo: Path, row: Row, worktrees: dict[str, Path]) -> bool:
         return True
     proc = run_git(repo, "worktree", "remove", str(path), "--force")
     if proc.returncode != 0:
-        _warn(
-            f"worktree remove failed for {row.branch}: {proc.stderr.strip()}"
-        )
+        _warn(f"worktree remove failed for {row.branch}: {proc.stderr.strip()}")
         return False
     return True
 
@@ -200,9 +219,7 @@ def format_delete_table(rows: Sequence[Row]) -> str:
         for row in rows
     )
     eligible = sum(row.stale for row in rows)
-    lines.append(
-        f"{len(rows)} branch(es) listed (eligible: {eligible})"
-    )
+    lines.append(f"{len(rows)} branch(es) listed (eligible: {eligible})")
     return "\n".join(lines) + "\n"
 
 
@@ -225,8 +242,21 @@ def run_gc_delete(
             print(f"error: not a git repository: {repo}", file=err)
             return 1
         resolved_base = base or detect_base(root)
-        rows = collect_rows(root, resolved_base)
+        # Single worktree list per invocation: collect_rows resolves the mapping once
+        # (or reuses it) and the same dict drives removals below — no second scan (spec
+        # "Execution ordering per branch" step 1).
+        rows, listing_failed, worktrees = collect_rows(root, resolved_base)
         candidates = [r for r in rows if r.stale]
+
+        if listing_failed:
+            # Spec Risks: a failing for-each-ref must not read as "nothing to delete"
+            # silently — abort with a warning (already on stderr from list_auto_branches)
+            # and no deletions, nonzero exit.
+            print(
+                "error: branch listing failed; aborting delete with no deletions",
+                file=err,
+            )
+            return 1
 
         if not candidates:
             out.write(format_delete_table(rows))
@@ -250,7 +280,6 @@ def run_gc_delete(
 
         out.write(format_delete_table(rows))
 
-        worktrees = branch_worktrees(root)
         deleted: list[str] = []
         failed: list[str] = []
 

@@ -424,7 +424,10 @@ def test_gc_delete_refuses_interactive_without_yes(
 
 
 def test_gc_delete_with_yes_succeeds_non_interactive(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """With --yes, non-interactive context proceeds and deletes."""
     branch = "auto/merged-20260821T000000Z"
@@ -463,9 +466,7 @@ def test_gc_delete_is_exactly_dry_run_candidates(
     dry_code, dry_out, _ = _gc(repo, capsys)
     assert dry_code == 0
     dry_eligible = {
-        name
-        for name, (wt, mg) in _rows(dry_out).items()
-        if mg == "yes" or wt == "no"
+        name for name, (wt, mg) in _rows(dry_out).items() if mg == "yes" or wt == "no"
     }
 
     # Delete with --force: all stale (run first since it consumes branches)
@@ -581,3 +582,72 @@ def test_gc_delete_branch_and_worktree_both_gone(
         repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
     ).stdout
     assert merged not in remaining
+
+
+def test_gc_delete_aborts_when_branch_listing_fails(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failing for-each-ref during delete must abort with a nonzero exit and zero
+    deletions, not read as a clean '0 deletion(s) needed.' (spec Risks; PR #49 review)."""
+    _git(repo, "branch", "auto/merged-20260821T000000Z", "main")
+    real_run_git = gc.run_git
+
+    def failing_for_each_ref(
+        repo_path: Path, *args: str
+    ) -> subprocess.CompletedProcess[str]:
+        if args[:1] == ("for-each-ref",):
+            return subprocess.CompletedProcess(
+                args=["git", *args], returncode=128, stdout="", stderr="fatal: bad ref"
+            )
+        return real_run_git(repo_path, *args)
+
+    monkeypatch.setattr(gc, "run_git", failing_for_each_ref)
+
+    code, out, err = _gc_delete(repo, capsys)
+
+    assert code != 0
+    assert "0 deletion(s) needed." not in out
+    assert "deleted: " not in out
+    assert "aborting delete with no deletions" in err
+    assert "could not list auto/* branches" in err
+    # No deletions happened; the surviving branch is untouched
+    remaining = sorted(
+        _git(
+            repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
+        ).stdout.splitlines()
+    )
+    assert remaining == ["auto/merged-20260821T000000Z"]
+
+
+def test_gc_delete_lists_worktrees_once(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Delete mode must reuse the worktree mapping built for eligibility during
+    removal — a single `git worktree list` per invocation (spec "Execution ordering
+    per branch" step 1; PR #49 review)."""
+    merged = "auto/merged-20260821T000000Z"
+    _git(repo, "branch", merged, "main")
+    wt_path = tmp_path / "wt"
+    _git(repo, "worktree", "add", str(wt_path), "-b", "auto/wt-20260821T000000Z")
+
+    real_run_git = gc.run_git
+    worktree_list_count = 0
+
+    def counting_run_git(
+        repo_path: Path, *args: str
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal worktree_list_count
+        if args[:2] == ("worktree", "list"):
+            worktree_list_count += 1
+        return real_run_git(repo_path, *args)
+
+    monkeypatch.setattr(gc, "run_git", counting_run_git)
+
+    code, out, _ = _gc_delete(repo, capsys, "--force")
+
+    assert code == 0
+    assert worktree_list_count == 1
+    assert f"deleted: {merged}" in out
