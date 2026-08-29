@@ -40,6 +40,7 @@ jobs:
   # auto-fix job: the pipeline only opens a PR branch to fix pre-existing CI/lint failures
   # or unresolved review threads on an *existing* PR — it never creates new PRs on its own.
   # auto_fix is optional; a job without it is a watchdog/report-and-commit delegate.
+
   - name: babysit-prs
     enabled: true
     cron: "*/10 * * * *"
@@ -60,3 +61,23 @@ jobs:
       model: null # native model flag for the fix worker; null = agent default
       prompt: ""
     on_missed: log
+
+  # Proposed (docs/pipeline/features/gate-trigger-standing-job.md): a repository-hygiene
+  # routine. The agent runs ONLY when a gate command exits non-zero — e.g. daily ruff+mypy
+  # on the Pi. All commands passing -> done, no agent, no PR.
+  # - name: repo-hygiene
+  #   enabled: true
+  #   cron: "0 3 * * *"
+  #   repo: /home/guido/projects/herdr-routines
+  #   workspace: worktree
+  #   base: main
+  #   auto_fix:
+  #     trigger: gate                        # "pr" (default) | "gate"
+  #     gate_commands:                       # run sequentially, cwd = worktree of base
+  #       - uv run ruff check .
+  #       - uv run mypy
+  #     gate_command_timeout_ms: 120000
+  #     max_attempts_per_pr: 3
+  #     timeout_ms: 1800000
+  #     agent_kind: opencode
+  #     model: null
