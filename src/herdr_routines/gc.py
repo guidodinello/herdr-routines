@@ -1,4 +1,4 @@
-"""Read-only inventory of ``auto/*`` branches backing ``herdr-routines gc --dry-run``.
+"""Inventory and optional deletion of ``auto/*`` branches (``herdr-routines gc``).
 
 Pure git + filesystem: no HerdrClient, no socket, no ``herdr`` binary — the command
 must stay usable with no Herdr server running (spec.md §No Herdr server required).
@@ -165,3 +165,124 @@ def run_gc(repo: Path, base: str | None = None, out: TextIO | None = None) -> in
         )
         return 1
     return 0
+
+
+def _is_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _remove_worktree(repo: Path, row: Row, worktrees: dict[str, Path]) -> bool:
+    path = worktrees.get(row.branch)
+    if path is None:
+        return True
+    proc = run_git(repo, "worktree", "remove", str(path), "--force")
+    if proc.returncode != 0:
+        _warn(
+            f"worktree remove failed for {row.branch}: {proc.stderr.strip()}"
+        )
+        return False
+    return True
+
+
+def _delete_branch(repo: Path, row: Row) -> bool:
+    flag = "-d" if row.merged_into_base else "-D"
+    proc = run_git(repo, "branch", flag, row.branch)
+    if proc.returncode != 0:
+        _warn(f"branch {flag} failed for {row.branch}: {proc.stderr.strip()}")
+        return False
+    return True
+
+
+def format_delete_table(rows: Sequence[Row]) -> str:
+    """Table for delete mode — same columns as dry-run, different summary line."""
+    width = max([len("BRANCH"), *(len(row.branch) for row in rows)])
+    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED-INTO-BASE"]
+    lines.extend(
+        f"{row.branch:<{width}}  {_yn(row.worktree_exists):<16} {_yn(row.merged_into_base)}"
+        for row in rows
+    )
+    eligible = sum(row.stale for row in rows)
+    lines.append(
+        f"{len(rows)} branch(es) listed (eligible: {eligible})"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def run_gc_delete(
+    repo: Path,
+    base: str | None = None,
+    force: bool = False,
+    assume_yes: bool = False,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+) -> int:
+    """Entry point behind ``gc --delete``: remove stale auto/* branches."""
+    if out is None:
+        out = sys.stdout
+    if err is None:
+        err = sys.stderr
+    try:
+        root = resolve_repo_root(repo)
+        if root is None:
+            print(f"error: not a git repository: {repo}", file=err)
+            return 1
+        resolved_base = base or detect_base(root)
+        rows = collect_rows(root, resolved_base)
+        candidates = [r for r in rows if r.stale]
+
+        if not candidates:
+            out.write(format_delete_table(rows))
+            out.write("0 deletion(s) needed.\n")
+            return 0
+
+        if not force:
+            to_delete = [r for r in candidates if r.merged_into_base]
+            skipped = [r for r in candidates if not r.merged_into_base]
+        else:
+            to_delete = candidates
+            skipped = []
+
+        if not assume_yes and not _is_interactive():
+            print(
+                "error: refusing to delete without --yes in non-interactive context",
+                file=err,
+            )
+            return 2
+
+        out.write(format_delete_table(rows))
+
+        worktrees = branch_worktrees(root)
+        deleted: list[str] = []
+        failed: list[str] = []
+
+        for row in to_delete:
+            if not _remove_worktree(root, row, worktrees):
+                failed.append(f"{row.branch} (worktree remove)")
+                continue
+            if not _delete_branch(root, row):
+                failed.append(row.branch)
+                continue
+            deleted.append(row.branch)
+            out.write(f"deleted: {row.branch}\n")
+
+        for row in skipped:
+            out.write(f"skipped (unmerged, needs --force): {row.branch}\n")
+
+        if failed:
+            for entry in failed:
+                out.write(f"failed: {entry}\n")
+
+        summary = (
+            f"deleted: {len(deleted)}, "
+            f"skipped (unmerged): {len(skipped)}, "
+            f"failed: {len(failed)}"
+        )
+        out.write(f"{summary}\n")
+        return 1 if failed else 0
+
+    except subprocess.TimeoutExpired:
+        print(
+            f"error: git timed out after {GIT_TIMEOUT_SECONDS}s in {repo}",
+            file=err,
+        )
+        return 1
