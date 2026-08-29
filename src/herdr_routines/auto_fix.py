@@ -35,8 +35,8 @@ class GhClient(Protocol):
 
     def pr_list(
         self, *, owner: str, repo: str, state: str, limit: int
-    ) -> list[dict[str, str]]:
-        """Return open PRs with number, headRefName, author.login, author.is_bot, url."""
+    ) -> list[dict[str, object]]:
+        """Return open PRs with number, headRefName, author, url."""
         ...
 
     def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
@@ -75,7 +75,11 @@ class RealGhClient:
     def _run(self, argv: list[str]) -> tuple[int, str, str]:
         try:
             proc = subprocess.run(
-                argv, capture_output=True, text=True, timeout=self._timeout_s
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=self._timeout_s,
+                check=False,
             )
         except subprocess.TimeoutExpired:
             return 124, "", "gh timed out"
@@ -92,7 +96,7 @@ class RealGhClient:
 
     def pr_list(
         self, *, owner: str, repo: str, state: str, limit: int
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, object]]:
         exit_code, stdout, stderr = self._run(
             [
                 "gh",
@@ -180,7 +184,7 @@ def list_open_prs(
     """
     try:
         raw = gh.pr_list(owner=owner, repo=repo, state="open", limit=100)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any gh failure means no eligible PRs
         log.warning("gh pr list failed: %s", e)
         return []
 
@@ -200,6 +204,7 @@ def list_open_prs(
             isinstance(head, str)
             and head.startswith(branch_prefix)
             and isinstance(num, int)
+            and isinstance(url, str)
         ):
             continue
         # Human author must match exactly; bot/app accepted on branch-prefix provenance alone.
@@ -212,7 +217,7 @@ def _has_ci_failure(gh: GhClient, *, owner: str, repo: str, number: int) -> bool
     """Check if any statusCheckRollup entry is in a failing state."""
     try:
         view = gh.pr_view(owner=owner, repo=repo, number=number)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any gh failure is treated as "no CI failure"
         log.warning("gh pr view %d failed: %s", number, e)
         return False
 
@@ -229,7 +234,7 @@ def fetch_failing_checks(gh: GhClient, *, owner: str, repo: str, number: int) ->
     """Fetch failing check names and states from statusCheckRollup."""
     try:
         view = gh.pr_view(owner=owner, repo=repo, number=number)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — best-effort detail fetch must not raise
         log.warning("gh pr view %d failed for failing_checks: %s", number, e)
         return "(could not fetch CI status)"
 
@@ -272,7 +277,7 @@ def _has_unresolved_threads(
     """
     try:
         data = gh.graphql(query, owner=owner, repo=repo, number=str(number))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any gh failure is treated as "no unresolved threads"
         log.warning("GraphQL reviewThreads query failed for PR %d: %s", number, e)
         return False
 
@@ -322,7 +327,7 @@ def fetch_thread_bodies(gh: GhClient, *, owner: str, repo: str, number: int) -> 
     """
     try:
         data = gh.graphql(query, owner=owner, repo=repo, number=str(number))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — best-effort detail fetch must not raise
         log.warning("GraphQL reviewThreads query failed for PR %d: %s", number, e)
         return "(could not fetch review threads)"
 
@@ -385,9 +390,12 @@ def attempt_count_for_pr(history_path: Path, job_name: str, pr_number: int) -> i
     records = read_job(history_path, job_name)
     count = 0
     for r in records:
-        if r.state in _COUNTABLE_STATES and r.extra:
-            if r.extra.get("pr_number") == pr_number:
-                count += 1
+        if (
+            r.state in _COUNTABLE_STATES
+            and r.extra
+            and r.extra.get("pr_number") == pr_number
+        ):
+            count += 1
     return count
 
 

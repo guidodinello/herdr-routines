@@ -242,11 +242,12 @@ def _process_auto_fix_job(
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git remote failed: {proc.stderr.strip()}")
         owner, repo_name = repo_owner_and_name(proc.stdout.strip())
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any git failure must not crash the tick
         append(
             history_path,
             HistoryRecord(
@@ -268,7 +269,7 @@ def _process_auto_fix_job(
     # Validate gh auth
     try:
         author = gh.api_user()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any gh failure is treated as auth-missing
         append(
             history_path,
             HistoryRecord(
@@ -420,7 +421,7 @@ def _process_auto_fix_job(
         for elig_pr in dispatched:
             report_lines.append(f"- PR #{elig_pr.pr.number}: {elig_pr.reason}")
         report_path.write_text("\n".join(report_lines) + "\n")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — best-effort report write must not fail the tick
         log.warning("%s: could not write aggregate report: %s", job.name, e)
 
     # Aggregate summary
@@ -524,16 +525,18 @@ def _dispatch_fix_worker(
             capture_output=True,
             text=True,
             timeout=15,
+            check=False,
         )
         proc = subprocess.run(
             ["git", "-C", str(job.repo), "worktree", "add", str(wt_path), pr.head_ref],
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any worktree failure marks the PR failed
         return {
             "state": "failed",
             "reason": "worktree_creation_failed",
@@ -555,8 +558,8 @@ def _dispatch_fix_worker(
         if pane_id is not None:
             try:
                 client.pane_close(pane_id)
-            except Exception:
-                pass
+            except Exception as e2:  # noqa: BLE001 — best-effort close must not mask the real error
+                log.debug("error closing pane %s after start failure: %s", pane_id, e2)
         return {
             "state": "failed",
             "reason": "agent_start_failed",
@@ -591,7 +594,7 @@ def _dispatch_fix_worker(
             markers=job.failure_markers or ("Free usage exceeded",),
             prompt_text=prompt_text,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — any prompt failure marks the PR failed
         _capture_visible_tail(
             client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id
         )
@@ -617,8 +620,8 @@ def _dispatch_fix_worker(
     session_id: str | None = None
     try:
         session_id = client.agent_session_id(agent_name)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 — session id is best-effort reporting data
+        log.debug("could not read session id for %s: %s", agent_name, e)
 
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
 

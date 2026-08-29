@@ -355,7 +355,11 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
 
         for af_int_key in ("max_prs_per_tick", "max_attempts_per_pr", "timeout_ms"):
             af_value = af_merged[af_int_key]
-            if not isinstance(af_value, int) or isinstance(af_value, bool) or af_value < 0:
+            if (
+                not isinstance(af_value, int)
+                or isinstance(af_value, bool)
+                or af_value < 0
+            ):
                 raise ConfigError(
                     f"{label}: 'auto_fix.{af_int_key}' must be a non-negative integer"
                 )

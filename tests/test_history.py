@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from herdr_routines.auto_fix import attempt_count_for_pr
 from herdr_routines.history import (
     HistoryRecord,
     append,
@@ -13,7 +14,6 @@ from herdr_routines.history import (
     read_all,
     read_job,
 )
-from herdr_routines.auto_fix import attempt_count_for_pr
 
 T0 = datetime(2026, 8, 22, 6, 0, 0, tzinfo=UTC)
 
@@ -192,11 +192,15 @@ def test_attempt_count_for_pr_counts_terminal_records(tmp_history_path: Path) ->
 def test_attempt_count_for_pr_ignores_non_terminal(tmp_history_path: Path) -> None:
     append(
         tmp_history_path,
-        HistoryRecord(ts=T0, job="auto-fix", state="running", run_id="r1", extra={"pr_number": 10}),
+        HistoryRecord(
+            ts=T0, job="auto-fix", state="running", run_id="r1", extra={"pr_number": 10}
+        ),
     )
     append(
         tmp_history_path,
-        HistoryRecord(ts=T0, job="auto-fix", state="registered", extra={"pr_number": 10}),
+        HistoryRecord(
+            ts=T0, job="auto-fix", state="registered", extra={"pr_number": 10}
+        ),
     )
     assert attempt_count_for_pr(tmp_history_path, "auto-fix", 10) == 0
 
@@ -204,11 +208,15 @@ def test_attempt_count_for_pr_ignores_non_terminal(tmp_history_path: Path) -> No
 def test_attempt_count_for_pr_ignores_other_pr(tmp_history_path: Path) -> None:
     append(
         tmp_history_path,
-        HistoryRecord(ts=T0, job="auto-fix", state="done", run_id="r1", extra={"pr_number": 10}),
+        HistoryRecord(
+            ts=T0, job="auto-fix", state="done", run_id="r1", extra={"pr_number": 10}
+        ),
     )
     append(
         tmp_history_path,
-        HistoryRecord(ts=T0, job="auto-fix", state="done", run_id="r2", extra={"pr_number": 20}),
+        HistoryRecord(
+            ts=T0, job="auto-fix", state="done", run_id="r2", extra={"pr_number": 20}
+        ),
     )
     assert attempt_count_for_pr(tmp_history_path, "auto-fix", 10) == 1
     assert attempt_count_for_pr(tmp_history_path, "auto-fix", 20) == 1
@@ -217,12 +225,16 @@ def test_attempt_count_for_pr_ignores_other_pr(tmp_history_path: Path) -> None:
 def test_attempt_count_for_pr_ignores_other_job(tmp_history_path: Path) -> None:
     append(
         tmp_history_path,
-        HistoryRecord(ts=T0, job="other-job", state="done", run_id="r1", extra={"pr_number": 10}),
+        HistoryRecord(
+            ts=T0, job="other-job", state="done", run_id="r1", extra={"pr_number": 10}
+        ),
     )
     assert attempt_count_for_pr(tmp_history_path, "auto-fix", 10) == 0
 
 
-def test_attempt_count_for_pr_ignores_records_without_extra(tmp_history_path: Path) -> None:
+def test_attempt_count_for_pr_ignores_records_without_extra(
+    tmp_history_path: Path,
+) -> None:
     append(
         tmp_history_path,
         HistoryRecord(ts=T0, job="auto-fix", state="done", run_id="r1"),

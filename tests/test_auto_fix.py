@@ -35,7 +35,7 @@ class FakeGhClient:
         self,
         *,
         user: str = "testuser",
-        prs: list[dict[str, str]] | None = None,
+        prs: list[dict[str, object]] | None = None,
         pr_views: dict[int, dict[str, object]] | None = None,
         review_threads: dict[int, dict[str, object]] | None = None,
         raise_on: str | None = None,
@@ -55,7 +55,7 @@ class FakeGhClient:
 
     def pr_list(
         self, *, owner: str, repo: str, state: str, limit: int
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, object]]:
         self.calls.append("pr_list")
         if self.raise_on == "pr_list":
             raise RuntimeError("gh pr list failed")
@@ -640,12 +640,12 @@ def test_auto_fix_tick_integration(
     t0 = datetime.now(UTC).replace(microsecond=0)
 
     # First tick: registers
-    outcome1 = run_tick(config, history_path, client=client, now=t0)
+    outcome1 = run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
     assert "registered" in outcome1.summaries[0]
 
     # Second tick: runs auto-fix with empty PR list
     t1 = t0 + timedelta(minutes=1)
-    outcome2 = run_tick(config, history_path, client=client, now=t1)
+    outcome2 = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
     assert "enumerated=0" in outcome2.summaries[0]
     assert outcome2.any_job_failed is False
 

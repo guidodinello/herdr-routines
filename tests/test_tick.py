@@ -10,11 +10,11 @@ from typing import Any
 
 import pytest
 
+from herdr_routines.auto_fix import attempt_count_for_pr
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import _live_agent_exists, run_tick
-from herdr_routines.auto_fix import attempt_count_for_pr
 
 
 def make_job(tmp_path: Path, **overrides: Any) -> Job:
@@ -487,11 +487,11 @@ def test_auto_fix_tick_registers_and_runs(
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
 
     t0 = datetime.now(UTC).replace(microsecond=0)
-    outcome1 = run_tick(config, history_path, client=client, now=t0)
+    outcome1 = run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
     assert "registered" in outcome1.summaries[0]
 
     t1 = t0 + timedelta(minutes=1)
-    outcome2 = run_tick(config, history_path, client=client, now=t1)
+    outcome2 = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
     # Empty PR list: enumerated=0, eligible=0, dispatched=0, skipped=0
     assert "enumerated=0" in outcome2.summaries[0]
     assert outcome2.any_job_failed is False
@@ -513,8 +513,8 @@ def test_auto_fix_tick_skips_when_already_running(
 
     client = LiveAgentClient()
     now = datetime.now(UTC)
-    run_tick(config, history_path, client=client, now=now)
-    outcome = run_tick(config, history_path, client=client, now=now)
+    run_tick(config, history_path, client=client, now=now)  # type: ignore[arg-type]
+    outcome = run_tick(config, history_path, client=client, now=now)  # type: ignore[arg-type]
 
     assert "skipped (agent already live)" in outcome.summaries[0]
     assert outcome.any_job_failed is False
@@ -538,7 +538,6 @@ def test_auto_fix_tick_max_attempts_skip(
             max_attempts_per_pr=2,
         ),
     )
-    config = RoutinesConfig(jobs=(job,))
 
     # Pre-populate history with 2 terminal records for PR 10
     t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
@@ -558,4 +557,5 @@ def test_auto_fix_tick_max_attempts_skip(
     assert count == 2
 
     # Verify the attempt count logic works
+    assert job.auto_fix is not None
     assert count >= job.auto_fix.max_attempts_per_pr
