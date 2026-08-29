@@ -9,5 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-# Pipeline run state (machine-local absolute paths + session ids)
+# Pipeline orchestrator state (shared-worktree artifact — machine-specific paths,
+# session IDs; never commit to the repo, per review on PR #49)
 state.json
+
+# Internal-only notes (competitor research, private planning) — never committed
+docs/internal/
