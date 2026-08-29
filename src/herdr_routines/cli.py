@@ -395,7 +395,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             problems.append(
                 f"{job.name}: repo is not a git repository (no .git): {job.repo}"
             )
-        if job.enabled and "$ROUTINE_REPORT" not in job.prompt:
+        if job.enabled and job.auto_fix is None and "$ROUTINE_REPORT" not in job.prompt:
             # A run only settles as "done" when the report file exists and is non-empty (see
             # runner.execute_run's no_report check); the agent only writes it if the prompt
             # asks. A prompt that never mentions the placeholder can never succeed. Empty

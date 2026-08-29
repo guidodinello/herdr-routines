@@ -379,3 +379,34 @@ def test_validate_disabled_empty_prompt_stays_silent(
     )
     assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
     assert "$ROUTINE_REPORT" not in capsys.readouterr().err
+
+
+def test_validate_auto_fix_job_with_empty_prompt_stays_silent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A auto-fix job dispatches fix workers with the built-in prompt template and never
+    writes $ROUTINE_REPORT (it writes per-PR reports), so an empty prompt is legitimate —
+    validate must not warn about it."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: babysit-prs\n"
+        f"    cron: '*/10 * * * *'\n"
+        f"    repo: {repo}\n"
+        f"    workspace: worktree\n"
+        f"    auto_fix:\n"
+        f"      branch_prefix: auto/\n"
+        f"      max_prs_per_tick: 3\n"
+        f"      max_attempts_per_pr: 3\n"
+        f"      timeout_ms: 1800000\n"
+        f"      agent_kind: opencode\n"
+        f"      model: null\n"
+        f"      prompt: ''\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    err = capsys.readouterr().err
+    assert "prompt is empty" not in err
+    assert "$ROUTINE_REPORT" not in err
