@@ -1,13 +1,20 @@
 {
   "run_id": "20260829T032152Z",
-  "current_stage": 3,
-  "pr_number": null,
+  "current_stage": 4,
+  "pr_number": 49,
   "shared_worktree": "/home/guido/.herdr/worktrees/herdr-routines/auto-pipeline-20260829t032152z",
   "branch": "auto/pipeline-20260829T032152Z",
   "shared_workspace": "w2G",
   "deadline_epoch": 1787998970,
-  "artifact_paths": {"spec": "/home/guido/.herdr/worktrees/herdr-routines/auto-pipeline-20260829t032152z/docs/pipeline/runs/20260829T032152Z/spec.md", "report": "/home/guido/.local/state/herdr-routines/reports/pipeline-20260829T032152Z.md"},
-  "stage_sessions": {"1": "ses_fb474a388ffe3pT83XuyAcFgc8", "2": "ses_fb47361bdffeEjSIFobj6GrAHj", "3": "ses_fb4718e65ffeyRazZgFlEX2I56"},
+  "artifact_paths": {
+    "spec": "/home/guido/.herdr/worktrees/herdr-routines/auto-pipeline-20260829t032152z/docs/pipeline/runs/20260829T032152Z/spec.md",
+    "report": "/home/guido/.local/state/herdr-routines/reports/pipeline-20260829T032152Z.md"
+  },
+  "stage_sessions": {
+    "1": "ses_fb474a388ffe3pT83XuyAcFgc8",
+    "2": "ses_fb47361bdffeEjSIFobj6GrAHj",
+    "3": "ses_fb4718e65ffeyRazZgFlEX2I56"
+  },
   "feature_source": "docs/process/issues/012-worktree-gc-delete-half.md",
   "feature_idea": "Worktree GC, delete half (herdr-routines issue 012)"
 }
