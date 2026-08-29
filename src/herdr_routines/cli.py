@@ -443,9 +443,20 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
         ]
 
     # A tick runs every due job sequentially in one service invocation, so the worst case is
-    # every enabled job being due at once.
+    # every enabled job being due at once. An auto-fix job dispatches up to max_prs_per_tick
+    # fix workers sequentially, each bounded by auto_fix.timeout_ms (per_pr_timeout) on top of
+    # the job's start timeout — worst case is covered by summing those (review finding K).
     total_job_seconds = sum(
-        (job.start_timeout_ms + job.timeout_ms) / 1000 for job in enabled_jobs
+        (
+            (
+                job.start_timeout_ms
+                + job.auto_fix.max_prs_per_tick * job.auto_fix.timeout_ms
+            )
+            if job.auto_fix is not None
+            else (job.start_timeout_ms + job.timeout_ms)
+        )
+        / 1000
+        for job in enabled_jobs
     )
     required_s = total_job_seconds + SYSTEMD_TIMEOUT_MARGIN_SECONDS
     if unit_timeout_s < required_s:

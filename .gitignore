@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Pipeline run state (machine-local absolute paths + session ids)
+state.json

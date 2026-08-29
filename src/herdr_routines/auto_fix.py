@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from herdr_routines.history import HistoryRecord, read_job
+from herdr_routines.history import read_job
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ class GhClient(Protocol):
     def pr_list(
         self, *, owner: str, repo: str, state: str, limit: int
     ) -> list[dict[str, str]]:
-        """Return open PRs with number, headRefName, author.login, url, author.type."""
+        """Return open PRs with number, headRefName, author.login, author.is_bot, url."""
         ...
 
     def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
@@ -82,9 +82,7 @@ class RealGhClient:
         return proc.returncode, proc.stdout, proc.stderr
 
     def api_user(self) -> str:
-        exit_code, stdout, stderr = self._run(
-            ["gh", "api", "user", "--jq", ".login"]
-        )
+        exit_code, stdout, stderr = self._run(["gh", "api", "user", "--jq", ".login"])
         if exit_code != 0:
             raise RuntimeError(f"gh auth failed: {stderr.strip()}")
         login = stdout.strip()
@@ -193,11 +191,16 @@ def list_open_prs(
         head = pr.get("headRefName", "")
         auth = pr.get("author", {})
         login = auth.get("login", "") if isinstance(auth, dict) else ""
-        auth_type = auth.get("type", "") if isinstance(auth, dict) else ""
-        is_bot = auth_type in ("Bot", "Mannequin")
+        # gh returns author.is_bot (not author.type) in pr list JSON — the
+        # finding J bot/app acceptance below reads is_bot directly.
+        is_bot = bool(auth.get("is_bot")) if isinstance(auth, dict) else False
         num = pr.get("number")
         url = pr.get("url", "")
-        if not (isinstance(head, str) and head.startswith(branch_prefix) and isinstance(num, int)):
+        if not (
+            isinstance(head, str)
+            and head.startswith(branch_prefix)
+            and isinstance(num, int)
+        ):
             continue
         # Human author must match exactly; bot/app accepted on branch-prefix provenance alone.
         if is_bot or login == author:
@@ -245,7 +248,9 @@ def fetch_failing_checks(gh: GhClient, *, owner: str, repo: str, number: int) ->
     return "\n".join(failing) if failing else "(no failing checks found)"
 
 
-def _has_unresolved_threads(gh: GhClient, *, owner: str, repo: str, number: int) -> bool:
+def _has_unresolved_threads(
+    gh: GhClient, *, owner: str, repo: str, number: int
+) -> bool:
     """Check if any review thread is unresolved (isResolved == false)."""
     query = """
     query($owner: String!, $repo: String!, $number: Int!) {
@@ -354,36 +359,25 @@ def fetch_thread_bodies(gh: GhClient, *, owner: str, repo: str, number: int) -> 
 
 
 def is_eligible(
-    gh: GhClient, *, owner: str, repo: str, number: int
+    gh: GhClient, *, owner: str, repo: str, pr: PRInfo
 ) -> EligiblePR | None:
     """Check if a PR is eligible for auto-fix (failing CI or unresolved threads).
 
-    Returns EligiblePR with reason, or None if not eligible.
+    Returns EligiblePR carrying the real PRInfo, or None if not eligible.
     """
-    has_ci = _has_ci_failure(gh, owner=owner, repo=repo, number=number)
-    has_threads = _has_unresolved_threads(gh, owner=owner, repo=repo, number=number)
+    has_ci = _has_ci_failure(gh, owner=owner, repo=repo, number=pr.number)
+    has_threads = _has_unresolved_threads(gh, owner=owner, repo=repo, number=pr.number)
 
     if has_ci and has_threads:
-        return EligiblePR(
-            pr=PRInfo(number=number, head_ref="", author="", url=""),
-            reason="both",
-        )
+        return EligiblePR(pr=pr, reason="both")
     if has_ci:
-        return EligiblePR(
-            pr=PRInfo(number=number, head_ref="", author="", url=""),
-            reason="ci_failure",
-        )
+        return EligiblePR(pr=pr, reason="ci_failure")
     if has_threads:
-        return EligiblePR(
-            pr=PRInfo(number=number, head_ref="", author="", url=""),
-            reason="unresolved_threads",
-        )
+        return EligiblePR(pr=pr, reason="unresolved_threads")
     return None
 
 
-def attempt_count_for_pr(
-    history_path: Path, job_name: str, pr_number: int
-) -> int:
+def attempt_count_for_pr(history_path: Path, job_name: str, pr_number: int) -> int:
     """Count prior fix-attempt records for this job+pr_number that were real
     attempts (done or failed — not skipped). Skipped/max_attempts_exceeded
     records the tick itself appends must not count toward the budget, or a

@@ -10,7 +10,7 @@ import subprocess
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +40,6 @@ from herdr_routines.history import (
     has_ever_been_seen,
     is_currently_running,
     last_terminal_run,
-    read_job,
 )
 from herdr_routines.runner import execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
@@ -290,26 +289,19 @@ def _process_auto_fix_job(
 
     # Enumerate open PRs
     open_prs = list_open_prs(
-        gh, owner=owner, repo=repo_name,
-        branch_prefix=af.branch_prefix, author=author,
+        gh,
+        owner=owner,
+        repo=repo_name,
+        branch_prefix=af.branch_prefix,
+        author=author,
     )
 
     # Check eligibility for each PR
     eligible: list[EligiblePR] = []
     for pr_info in open_prs:
-        elig = is_eligible(gh, owner=owner, repo=repo_name, number=pr_info.number)
+        elig = is_eligible(gh, owner=owner, repo=repo_name, pr=pr_info)
         if elig is not None:
-            eligible.append(
-                EligiblePR(
-                    pr=PRInfo(
-                        number=pr_info.number,
-                        head_ref=pr_info.head_ref,
-                        author=pr_info.author,
-                        url=pr_info.url,
-                    ),
-                    reason=elig.reason,
-                )
-            )
+            eligible.append(elig)
 
     # Sort oldest-first (PR number ascending) and cap
     eligible.sort(key=lambda e: e.pr.number)
@@ -355,8 +347,12 @@ def _process_auto_fix_job(
             continue
 
         # Fetch real failing checks and thread bodies for the prompt (review finding C)
-        failing_checks = fetch_failing_checks(gh, owner=owner, repo=repo_name, number=elig_pr.pr.number)
-        thread_bodies = fetch_thread_bodies(gh, owner=owner, repo=repo_name, number=elig_pr.pr.number)
+        failing_checks = fetch_failing_checks(
+            gh, owner=owner, repo=repo_name, number=elig_pr.pr.number
+        )
+        thread_bodies = fetch_thread_bodies(
+            gh, owner=owner, repo=repo_name, number=elig_pr.pr.number
+        )
 
         # Dispatch fix worker
         worker_outcome = _dispatch_fix_worker(
@@ -405,6 +401,7 @@ def _process_auto_fix_job(
     # Write aggregate report file (review finding G)
     try:
         from herdr_routines.runner import default_reports_dir
+
         reports_dir = default_reports_dir()
         reports_dir.mkdir(parents=True, exist_ok=True)
         report_path = reports_dir / f"{run_id}.md"
@@ -499,7 +496,11 @@ def _dispatch_fix_worker(
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        return {"state": "failed", "reason": "report_dir_creation_failed", "error": str(e)}
+        return {
+            "state": "failed",
+            "reason": "report_dir_creation_failed",
+            "error": str(e),
+        }
 
     # Build prompt with real data (review finding C) and report path (review finding D)
     prompt_text = af.prompt or build_fix_prompt(
@@ -520,17 +521,24 @@ def _dispatch_fix_worker(
         # Remove stale worktree if it exists from a prior attempt
         subprocess.run(
             ["git", "-C", str(job.repo), "worktree", "remove", "--force", str(wt_path)],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True,
+            text=True,
+            timeout=15,
         )
         proc = subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "add",
-             str(wt_path), pr.head_ref],
-            capture_output=True, text=True, timeout=30,
+            ["git", "-C", str(job.repo), "worktree", "add", str(wt_path), pr.head_ref],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
     except Exception as e:
-        return {"state": "failed", "reason": "worktree_creation_failed", "error": str(e)}
+        return {
+            "state": "failed",
+            "reason": "worktree_creation_failed",
+            "error": str(e),
+        }
 
     # Start agent in the worktree (review finding B)
     pane_id: str | None = None
@@ -549,16 +557,28 @@ def _dispatch_fix_worker(
                 client.pane_close(pane_id)
             except Exception:
                 pass
-        return {"state": "failed", "reason": "agent_start_failed", "error": str(e), "pane_id": pane_id}
+        return {
+            "state": "failed",
+            "reason": "agent_start_failed",
+            "error": str(e),
+            "pane_id": pane_id,
+        }
 
     # Wait for agent readiness
     ready, last_error = _wait_for_agent_ready(
         client, agent_name, timeout_s=job.start_timeout_ms / 1000
     )
     if not ready:
-        _capture_visible_tail(client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id)
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id
+        )
         _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
-        return {"state": "failed", "reason": "agent_not_interactive", "error": last_error, "pane_id": pane_id}
+        return {
+            "state": "failed",
+            "reason": "agent_not_interactive",
+            "error": last_error,
+            "pane_id": pane_id,
+        }
 
     # Deliver prompt with watchdog
     try:
@@ -572,9 +592,16 @@ def _dispatch_fix_worker(
             prompt_text=prompt_text,
         )
     except Exception as e:
-        _capture_visible_tail(client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id)
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id
+        )
         _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
-        return {"state": "failed", "reason": "agent_prompt_failed", "error": str(e), "pane_id": pane_id}
+        return {
+            "state": "failed",
+            "reason": "agent_prompt_failed",
+            "error": str(e),
+            "pane_id": pane_id,
+        }
 
     # Capture tail and close pane
     try:

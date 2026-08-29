@@ -5,17 +5,13 @@ docs/pipeline/runs/20260829T050025Z/spec.md.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 
 from herdr_routines.auto_fix import (
-    EligiblePR,
     PRInfo,
-    RealGhClient,
     attempt_count_for_pr,
     build_fix_prompt,
     build_worker_agent_name,
@@ -24,10 +20,8 @@ from herdr_routines.auto_fix import (
     repo_owner_and_name,
 )
 from herdr_routines.config import AutoFixConfig, Job, RoutinesConfig
-from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import HistoryRecord, append, read_job
-from herdr_routines.tick import _live_agent_exists, run_tick
-
+from herdr_routines.tick import run_tick
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -160,7 +154,10 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
             },
         ],
         pr_views={
-            10: {"statusCheckRollup": [{"state": "FAILURE"}], "headRefName": "auto/fix-1"},
+            10: {
+                "statusCheckRollup": [{"state": "FAILURE"}],
+                "headRefName": "auto/fix-1",
+            },
             20: {
                 "statusCheckRollup": [{"state": "SUCCESS"}],
                 "headRefName": "auto/fix-2",
@@ -172,7 +169,9 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
                     "repository": {
                         "pullRequest": {
                             "reviewThreads": {
-                                "nodes": [{"isResolved": True, "comments": {"nodes": []}}]
+                                "nodes": [
+                                    {"isResolved": True, "comments": {"nodes": []}}
+                                ]
                             }
                         }
                     }
@@ -184,7 +183,10 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
                         "pullRequest": {
                             "reviewThreads": {
                                 "nodes": [
-                                    {"isResolved": False, "comments": {"nodes": [{"body": "fix this"}]}}
+                                    {
+                                        "isResolved": False,
+                                        "comments": {"nodes": [{"body": "fix this"}]},
+                                    }
                                 ]
                             }
                         }
@@ -200,12 +202,32 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
     assert len(open_prs) == 2
 
     # PR 10: red CI
-    elig10 = is_eligible(gh, owner="test", repo="repo", number=10)
+    elig10 = is_eligible(
+        gh,
+        owner="test",
+        repo="repo",
+        pr=PRInfo(
+            number=10,
+            head_ref="auto/fix-1",
+            author="testuser",
+            url="https://github.com/test/repo/pull/10",
+        ),
+    )
     assert elig10 is not None
     assert elig10.reason == "ci_failure"
 
     # PR 20: unresolved thread
-    elig20 = is_eligible(gh, owner="test", repo="repo", number=20)
+    elig20 = is_eligible(
+        gh,
+        owner="test",
+        repo="repo",
+        pr=PRInfo(
+            number=20,
+            head_ref="auto/fix-2",
+            author="testuser",
+            url="https://github.com/test/repo/pull/20",
+        ),
+    )
     assert elig20 is not None
     assert elig20.reason == "unresolved_threads"
 
@@ -229,7 +251,10 @@ def test_auto_fix_ignores_non_auto_branch(tmp_path: Path) -> None:
             },
         ],
         pr_views={
-            30: {"statusCheckRollup": [{"state": "FAILURE"}], "headRefName": "feature/not-auto"},
+            30: {
+                "statusCheckRollup": [{"state": "FAILURE"}],
+                "headRefName": "feature/not-auto",
+            },
         },
     )
 
@@ -258,7 +283,10 @@ def test_auto_fix_ignores_foreign_author(tmp_path: Path) -> None:
             },
         ],
         pr_views={
-            40: {"statusCheckRollup": [{"state": "FAILURE"}], "headRefName": "auto/fix-foreign"},
+            40: {
+                "statusCheckRollup": [{"state": "FAILURE"}],
+                "headRefName": "auto/fix-foreign",
+            },
         },
     )
 
@@ -288,7 +316,10 @@ def test_auto_fix_caps_max_prs_per_tick(tmp_path: Path) -> None:
             for n in [50, 10, 30, 20, 40]
         ],
         pr_views={
-            n: {"statusCheckRollup": [{"state": "FAILURE"}], "headRefName": f"auto/fix-{n}"}
+            n: {
+                "statusCheckRollup": [{"state": "FAILURE"}],
+                "headRefName": f"auto/fix-{n}",
+            }
             for n in [10, 20, 30, 40, 50]
         },
     )
@@ -301,9 +332,9 @@ def test_auto_fix_caps_max_prs_per_tick(tmp_path: Path) -> None:
     # Check eligibility for all
     eligible = []
     for pr in open_prs:
-        elig = is_eligible(gh, owner="test", repo="repo", number=pr.number)
+        elig = is_eligible(gh, owner="test", repo="repo", pr=pr)
         if elig is not None:
-            eligible.append(replace(elig, pr=pr))
+            eligible.append(elig)
 
     # Sort oldest-first
     eligible.sort(key=lambda e: e.pr.number)
@@ -592,7 +623,13 @@ def test_auto_fix_tick_integration(
             {
                 "run": staticmethod(
                     lambda *a, **kw: type(
-                        "Result", (), {"returncode": 0, "stdout": "git@github.com:test/repo.git", "stderr": ""}
+                        "Result",
+                        (),
+                        {
+                            "returncode": 0,
+                            "stdout": "git@github.com:test/repo.git",
+                            "stderr": "",
+                        },
                     )()
                 ),
             },
@@ -625,11 +662,23 @@ def test_auto_fix_graphql_thread_eligibility(tmp_path: Path) -> None:
     gh = FakeGhClient(
         user="testuser",
         pr_views={
-            1: {"statusCheckRollup": [{"state": "PENDING"}], "headRefName": "auto/fix-1"},
-            2: {"statusCheckRollup": [{"state": "IN_PROGRESS"}], "headRefName": "auto/fix-2"},
-            3: {"statusCheckRollup": [{"state": "FAILURE"}], "headRefName": "auto/fix-3"},
+            1: {
+                "statusCheckRollup": [{"state": "PENDING"}],
+                "headRefName": "auto/fix-1",
+            },
+            2: {
+                "statusCheckRollup": [{"state": "IN_PROGRESS"}],
+                "headRefName": "auto/fix-2",
+            },
+            3: {
+                "statusCheckRollup": [{"state": "FAILURE"}],
+                "headRefName": "auto/fix-3",
+            },
             4: {"statusCheckRollup": [{"state": "ERROR"}], "headRefName": "auto/fix-4"},
-            5: {"statusCheckRollup": [{"state": "TIMED_OUT"}], "headRefName": "auto/fix-5"},
+            5: {
+                "statusCheckRollup": [{"state": "TIMED_OUT"}],
+                "headRefName": "auto/fix-5",
+            },
         },
         review_threads={
             6: {
@@ -638,7 +687,10 @@ def test_auto_fix_graphql_thread_eligibility(tmp_path: Path) -> None:
                         "pullRequest": {
                             "reviewThreads": {
                                 "nodes": [
-                                    {"isResolved": False, "comments": {"nodes": [{"body": "blocking"}]}}
+                                    {
+                                        "isResolved": False,
+                                        "comments": {"nodes": [{"body": "blocking"}]},
+                                    }
                                 ]
                             }
                         }
@@ -649,35 +701,43 @@ def test_auto_fix_graphql_thread_eligibility(tmp_path: Path) -> None:
         raise_on=None,
     )
 
+    def _pr(n: int) -> PRInfo:
+        return PRInfo(
+            number=n,
+            head_ref=f"auto/fix-{n}",
+            author="t",
+            url=f"https://github.com/t/r/pull/{n}",
+        )
+
     # PENDING: not failing
-    assert is_eligible(gh, owner="t", repo="r", number=1) is None
+    assert is_eligible(gh, owner="t", repo="r", pr=_pr(1)) is None
 
     # IN_PROGRESS: not failing
-    assert is_eligible(gh, owner="t", repo="r", number=2) is None
+    assert is_eligible(gh, owner="t", repo="r", pr=_pr(2)) is None
 
     # FAILURE: failing
-    elig3 = is_eligible(gh, owner="t", repo="r", number=3)
+    elig3 = is_eligible(gh, owner="t", repo="r", pr=_pr(3))
     assert elig3 is not None
     assert elig3.reason == "ci_failure"
 
     # ERROR: failing
-    elig4 = is_eligible(gh, owner="t", repo="r", number=4)
+    elig4 = is_eligible(gh, owner="t", repo="r", pr=_pr(4))
     assert elig4 is not None
     assert elig4.reason == "ci_failure"
 
     # TIMED_OUT: failing
-    elig5 = is_eligible(gh, owner="t", repo="r", number=5)
+    elig5 = is_eligible(gh, owner="t", repo="r", pr=_pr(5))
     assert elig5 is not None
     assert elig5.reason == "ci_failure"
 
     # Unresolved thread
-    elig6 = is_eligible(gh, owner="t", repo="r", number=6)
+    elig6 = is_eligible(gh, owner="t", repo="r", pr=_pr(6))
     assert elig6 is not None
     assert elig6.reason == "unresolved_threads"
 
     # GraphQL failure: falls back to empty (no crash)
     gh_fail = FakeGhClient(user="testuser", raise_on="graphql")
-    assert is_eligible(gh_fail, owner="t", repo="r", number=999) is None
+    assert is_eligible(gh_fail, owner="t", repo="r", pr=_pr(999)) is None
 
 
 # ---------------------------------------------------------------------------

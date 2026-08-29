@@ -8,13 +8,14 @@ unit "failed" rather than always reporting success).
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from herdr_routines import cli
 from herdr_routines.cli import _check_systemd_timeout, _cmd_validate, default_log_path
-from herdr_routines.config import Job, RoutinesConfig
+from herdr_routines.config import AutoFixConfig, Job, RoutinesConfig
 from herdr_routines.tick import TickOutcome
 
 
@@ -101,6 +102,26 @@ def test_sums_timeouts_across_enabled_jobs(tmp_path: Path) -> None:
     )
     # small: 60s + 30s start = 90s; big: 1000s + 30s start = 1030s; sum = 1120s + 300s = 1420s
     assert _check_systemd_timeout(config, unit) == []
+
+
+def test_auto_fix_job_counts_max_prs_per_tick_worst_case(tmp_path: Path) -> None:
+    """An auto-fix tick dispatches up to max_prs_per_tick fix workers sequentially,
+    each bounded by auto_fix.timeout_ms plus the job start timeout — the systemd
+    check must budget for that, not just the job's own timeout_ms."""
+    unit = tmp_path / "x.service"
+    af_job = replace(
+        make_job(tmp_path, 60_000, "afix"),  # job.timeout_ms = 60s
+        auto_fix=AutoFixConfig(max_prs_per_tick=3, timeout_ms=1_800_000),
+    )
+    config = RoutinesConfig(jobs=(af_job,))
+    # auto_fix: 30s start + (3 * 1800s) = 5430s; sum = 5430s + 300s margin = 5730s
+    unit.write_text("[Service]\nTimeoutStartSec=5730\n")
+    assert _check_systemd_timeout(config, unit) == []
+
+    unit.write_text("[Service]\nTimeoutStartSec=5700\n")
+    problems = _check_systemd_timeout(config, unit)
+    assert len(problems) == 1
+    assert "5730" in problems[0]
 
 
 def test_missing_directive_is_flagged(tmp_path: Path) -> None:
