@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import subprocess
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,7 +16,18 @@ from typing import Any
 
 from logger import get_logger
 
-from herdr_routines.config import Job, RoutinesConfig
+from herdr_routines.auto_fix import (
+    EligiblePR,
+    PRInfo,
+    RealGhClient,
+    attempt_count_for_pr,
+    build_fix_prompt,
+    build_worker_agent_name,
+    is_eligible,
+    list_open_prs,
+    repo_owner_and_name,
+)
+from herdr_routines.config import AutoFixConfig, Job, RoutinesConfig
 from herdr_routines.herdr import LIVE_AGENT_STATUSES, HerdrClient, HerdrCliError
 from herdr_routines.history import (
     HistoryRecord,
@@ -25,6 +37,7 @@ from herdr_routines.history import (
     has_ever_been_seen,
     is_currently_running,
     last_terminal_run,
+    read_job,
 )
 from herdr_routines.runner import execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
@@ -100,9 +113,378 @@ def run_tick(
     return TickOutcome(summaries=tuple(summaries), any_job_failed=any_job_failed)
 
 
+def _process_auto_fix_job(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+) -> tuple[str, bool]:
+    """Process an auto-fix PR standing job: enumerate eligible PRs, check retry
+    budget, dispatch bounded fix workers."""
+    assert job.auto_fix is not None
+    af = job.auto_fix
+
+    # Standard guards (same as _process_job for regular jobs).
+    if not has_ever_been_seen(history_path, job.name):
+        append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
+        return f"{job.name}: registered", False
+
+    stale = find_stale_running(
+        history_path, job.name, timeout_ms=job.timeout_ms, now=now
+    )
+    if stale is not None:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="interrupted_unknown",
+                run_id=stale.run_id,
+                extra={"reason": "stale_running_record"},
+            ),
+        )
+
+    if is_currently_running(history_path, job.name, timeout_ms=job.timeout_ms, now=now):
+        return f"{job.name}: skipped (already running)", False
+
+    if _live_agent_exists(client, job):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                extra={"reason": "agent_name_live"},
+            ),
+        )
+        return f"{job.name}: skipped (agent already live)", False
+
+    last = last_terminal_run(history_path, job.name)
+    registered_at = first_seen_at(history_path, job.name) or now
+    result = decide(
+        cron=job.cron,
+        timezone=job.timezone,
+        catch_up_minutes=job.catch_up_minutes,
+        now=now,
+        last_terminal=last,
+        job_registered_at=registered_at,
+    )
+
+    if result.decision == Decision.NOT_DUE:
+        return f"{job.name}: not due", False
+
+    if result.decision == Decision.MISSED:
+        assert result.occurrence is not None
+        extra: dict[str, Any] = {
+            "reason": "outside_catch_up_window",
+            "occurrence": result.occurrence.isoformat(),
+        }
+        if result.skipped_occurrences:
+            extra["skipped_occurrences"] = result.skipped_occurrences
+        append(
+            history_path,
+            HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
+        )
+        if job.on_missed == "notify":
+            _notify(
+                client,
+                f"herdr-routines: {job.name} missed",
+                body="outside catch-up window",
+                sound="request",
+            )
+        return f"{job.name}: missed", False
+
+    # Decision.RUN — enumerate eligible PRs
+    assert result.occurrence is not None
+    run_id = make_run_id(job.name, result.occurrence)
+
+    # Collapse earlier occurrences (same as regular jobs)
+    if result.skipped_occurrences:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="missed",
+                extra={
+                    "reason": "collapsed_earlier_occurrences",
+                    "skipped_occurrences": result.skipped_occurrences,
+                    "skipped_first": result.skipped_first.isoformat()
+                    if result.skipped_first
+                    else None,
+                    "skipped_last": result.skipped_last.isoformat()
+                    if result.skipped_last
+                    else None,
+                },
+            ),
+        )
+
+    # Record running state
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="running",
+            run_id=run_id,
+            extra={
+                "scheduled_for": result.occurrence.isoformat(),
+                "late_seconds": result.late_seconds,
+            },
+        ),
+    )
+
+    # --- Auto-fix enumeration and dispatch ---
+    gh = RealGhClient()
+
+    # Detect repo owner/name from git remote
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(job.repo), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"git remote failed: {proc.stderr.strip()}")
+        owner, repo_name = repo_owner_and_name(proc.stdout.strip())
+    except Exception as e:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=datetime.now(UTC),
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={"reason": "repo_detection_failed", "error": str(e)},
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="repo_detection_failed",
+            sound="request",
+        )
+        return f"{job.name}: failed (repo_detection_failed)", True
+
+    # Validate gh auth
+    try:
+        author = gh.api_user()
+    except Exception as e:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=datetime.now(UTC),
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={"reason": "gh_auth_missing", "error": str(e)},
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="gh_auth_missing",
+            sound="request",
+        )
+        return f"{job.name}: failed (gh_auth_missing)", True
+
+    # Enumerate open PRs
+    open_prs = list_open_prs(
+        gh, owner=owner, repo=repo_name,
+        branch_prefix=af.branch_prefix, author=author,
+    )
+
+    # Check eligibility for each PR
+    eligible: list[EligiblePR] = []
+    for pr_info in open_prs:
+        elig = is_eligible(gh, owner=owner, repo=repo_name, number=pr_info.number)
+        if elig is not None:
+            # Replace the placeholder PRInfo with the real one
+            eligible.append(
+                EligiblePR(
+                    pr=PRInfo(
+                        number=pr_info.number,
+                        head_ref=pr_info.head_ref,
+                        author=pr_info.author,
+                        url=pr_info.url,
+                    ),
+                    reason=elig.reason,
+                )
+            )
+
+    # Sort oldest-first (PR number ascending) and cap
+    eligible.sort(key=lambda e: e.pr.number)
+    dispatched = eligible[: af.max_prs_per_tick]
+    skipped_count = len(eligible) - len(dispatched)
+
+    # Check retry budget and dispatch
+    any_failed = False
+    dispatched_count = 0
+    for elig_pr in dispatched:
+        attempt = attempt_count_for_pr(history_path, job.name, elig_pr.pr.number)
+        if attempt >= af.max_attempts_per_pr:
+            # Max attempts exceeded — skip
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    extra={
+                        "reason": "max_attempts_exceeded",
+                        "pr_number": elig_pr.pr.number,
+                        "attempt": attempt,
+                    },
+                ),
+            )
+            _notify(
+                client,
+                f"herdr-routines: {job.name} PR #{elig_pr.pr.number} skipped",
+                body="max_attempts_exceeded",
+                sound="request",
+            )
+            skipped_count += 1
+            continue
+
+        # Per-PR live-agent check
+        agent_name = build_worker_agent_name(job.name, elig_pr.pr.number, run_id)
+        try:
+            status = client.agent_statuses().get(agent_name)
+        except HerdrCliError:
+            status = None
+        if status in LIVE_AGENT_STATUSES:
+            continue
+
+        # Dispatch fix worker
+        worker_outcome = _dispatch_fix_worker(
+            job=job,
+            af=af,
+            pr=elig_pr.pr,
+            reason=elig_pr.reason,
+            run_id=run_id,
+            attempt=attempt,
+            owner=owner,
+            repo=repo_name,
+            client=client,
+        )
+
+        extra: dict[str, Any] = {
+            "pr_number": elig_pr.pr.number,
+            "headRefName": elig_pr.pr.head_ref,
+            "attempt": attempt,
+            "eligible_reason": elig_pr.reason,
+            "fix_worker_agent": agent_name,
+            "pane_id": worker_outcome.get("pane_id"),
+            "report_path": worker_outcome.get("report_path"),
+            "report_written": worker_outcome.get("report_written", False),
+            "final_agent_status": worker_outcome.get("final_agent_status"),
+        }
+
+        append(
+            history_path,
+            HistoryRecord(
+                ts=datetime.now(UTC),
+                job=job.name,
+                state=worker_outcome.get("state", "failed"),
+                run_id=run_id,
+                extra=extra,
+            ),
+        )
+
+        if worker_outcome.get("state") in ("failed", "interrupted_unknown"):
+            any_failed = True
+
+        dispatched_count += 1
+
+    # Aggregate report
+    summary = (
+        f"{job.name}: done "
+        f"(enumerated={len(open_prs)}, eligible={len(eligible)}, "
+        f"dispatched={dispatched_count}, skipped={skipped_count})"
+    )
+
+    if any_failed:
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body=f"{dispatched_count} dispatched, {skipped_count} skipped",
+            sound="request",
+        )
+        return summary, True
+
+    _notify(client, f"herdr-routines: {job.name} done", sound="done")
+    return summary, False
+
+
+def _dispatch_fix_worker(
+    *,
+    job: Job,
+    af: AutoFixConfig,
+    pr: Any,  # PRInfo
+    reason: str,
+    run_id: str,
+    attempt: int,
+    owner: str,
+    repo: str,
+    client: HerdrClient,
+) -> dict[str, Any]:
+    """Dispatch a single fix worker for a PR. Returns outcome dict."""
+    from dataclasses import replace
+
+    from herdr_routines.runner import (
+        RunOutcome,
+        default_reports_dir,
+        execute_run,
+        substitute_prompt,
+    )
+
+    agent_name = build_worker_agent_name(job.name, pr.number, run_id)
+    pr_run_id = f"{run_id}-pr{pr.number}"
+    report_path = default_reports_dir() / f"auto-fix-{run_id}-pr{pr.number}.md"
+
+    # Build prompt
+    failing_checks = "See CI status on the PR"
+    thread_bodies = "See review threads on the PR"
+
+    prompt_text = af.prompt or build_fix_prompt(
+        pr_number=pr.number,
+        branch=pr.head_ref,
+        failing_checks=failing_checks,
+        thread_bodies=thread_bodies,
+        owner_repo=f"{owner}/{repo}",
+    )
+
+    # Create a synthetic Job for the fix worker
+    worker_job = replace(
+        job,
+        name=agent_name.removeprefix("rt-"),
+        agent_kind=af.agent_kind,
+        model=af.model,
+        prompt=prompt_text,
+        timeout_ms=af.timeout_ms,
+        workspace="worktree",
+        base=pr.head_ref,
+    )
+
+    outcome: RunOutcome = execute_run(worker_job, client, run_id=pr_run_id)
+
+    return {
+        "state": outcome.state,
+        "pane_id": outcome.pane_id,
+        "report_path": outcome.report_path,
+        "report_written": outcome.report_written,
+        "final_agent_status": outcome.final_agent_status,
+        "reason": outcome.reason,
+        "error": outcome.error,
+    }
+
+
 def _process_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
+    # Auto-fix jobs follow the same schedule guards but run enumeration+dispatch
+    # instead of execute_run when their cron fires.
+    if job.auto_fix is not None:
+        return _process_auto_fix_job(job, history_path, client=client, now=now)
+
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
         return f"{job.name}: registered", False
