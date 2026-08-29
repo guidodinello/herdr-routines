@@ -698,6 +698,7 @@ def test_auto_fix_worker_dispatch() -> None:
         failing_checks="lint: RUF001",
         thread_bodies='[{"body": "fix this"}]',
         owner_repo="test/repo",
+        report_path="/tmp/report.md",
     )
     assert "#42" in prompt
     assert "auto/fix-42" in prompt
@@ -737,6 +738,7 @@ def test_auto_fix_review_tiers_present() -> None:
         failing_checks="none",
         thread_bodies="none",
         owner_repo="t/r",
+        report_path="/tmp/report.md",
     )
     # The prompt should mention reviewing and resolving threads
     assert "resolveReviewThread" in prompt
