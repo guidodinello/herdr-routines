@@ -72,3 +72,31 @@ No HerdrClient, no socket, no `herdr` binary — same "pure git + filesystem" po
 - **Base detection divergence.** `detect_base` (`src/herdr_routines/gc.py:68`) falls back to `main` when `origin/HEAD` missing; dry-run and delete must use the same `resolved_base` or `is_merged` results differ. Mitigation: both modes call `detect_base` once per invocation; test with `--base` override and without.
 - **Git plumbing failures masquerading as clean state.** `list_auto_branches`/`branch_worktrees` already warn on non-zero exit (`src/herdr_routines/gc.py:62`, `98`) but return empty; a failing `for-each-ref` during delete must not be interpreted as "nothing to delete" silently. Mitigation: propagate warnings to stderr before delete summary; if branch listing failed, abort delete with warning and no deletions.
 - **Spec-path hygiene (G-15).** Must stay at `docs/pipeline/runs/<run_id>/spec.md`; writing to repo-root `spec.md` or `docs/pipeline/spec.md` reintroduces PR #28/#29 full-file merge conflict. This spec is already at the per-run path (`mkdir -p .../20260829T032152Z`).
+
+## Acceptance criteria
+
+1. [blocking] `gc --delete` without `--force` deletes only stale branches where `merged_into_base==True` (merged worktree may exist or already gone) and skips every stale-but-unmerged (orphaned) branch, reporting `skipped (unmerged, needs --force)` for each skipped row Test: test_gc_delete_removes_only_stale_merged_without_force
+2. [blocking] `gc --delete --force` deletes both stale-merged and stale-unmerged (orphaned) branches, using `branch -D` for the unmerged case Test: test_gc_delete_with_force_removes_orphaned_unmerged
+3. [blocking] `gc --delete` (and `--prune` alias) refuses to delete in a non-interactive context without `--yes`/`-y`, prints to stderr and exits 2 with zero deletions Test: test_gc_delete_refuses_non_interactive_without_yes
+4. [blocking] `gc --delete --yes` (and `-y`) succeeds in a non-interactive context and performs the same deletions as the interactive path Test: test_gc_delete_with_yes_succeeds_non_interactive
+5. [blocking] The set deleted by `gc --delete` is exactly the `gc --dry-run` stale set filtered by the merge guard: without `--force` equals `{r.branch for r in dry_run_rows if r.merged_into_base}`, with `--force` equals `{r.branch for r in dry_run_rows if r.stale}` Test: test_gc_delete_is_exactly_dry_run_candidates
+6. [blocking] `gc --delete` (with or without `--force`/`--yes`) never deletes `auto/pipeline-*` branches; a merged `auto/pipeline-*` survives deletion Test: test_gc_delete_excludes_pipeline
+7. [blocking] Per-branch deletion removes the registered worktree first (`worktree remove --force` when `worktree_exists`) then deletes the branch (`branch -d` for merged, `branch -D` for unmerged with --force); on `worktree remove` failure the branch is not deleted and the row is reported `failed`; after success both the worktree path and the branch ref are gone Test: test_gc_delete_branch_and_worktree_both_gone
+8. [non-blocking] `gc --delete` performs only `git` plumbing and filesystem checks, never contacts the Herdr server/socket; the no-server spy from `test_gc_dry_run_needs_no_server` passes for the delete path Test: test_gc_delete_needs_no_server
+
+## Changelog v1→v2
+
+- Added `## Acceptance criteria` (8 numbered items, each with a test hook fixed-string) to make gate 3 machine-checkable per `docs/pipeline/design.md` gate 2/3 (rg -F on test names, rg -c count).
+- Added `## Review notes` with explicit `blocking` / `non-blocking` tier labels and `confidence:` assessments so gate 2 tier checks (`rg -qw blocking`, `rg -qw non-blocking`, `rg -q confidence:`) pass; no semantic change to Problem/Approach/Risks.
+- Clarified `Approach` execution ordering and guard semantics remain v1 text — v2 is strictly additive (acceptance + changelog + review notes) per per-run spec hygiene G-15.
+
+## Review notes
+
+- Tiering: items 1–7 are `blocking` — failure is gate-content failure (`abort`); item 8 is `non-blocking` — advisory paranoid check on server isolation.
+- Confidence assessments (reviewer judgment on v1→v2 delta):
+  - Acceptance criteria coverage of delete semantics and guard: confidence: high
+  - Dry-run parity and pipeline exclusion invariants: confidence: high
+  - Worktree-then-branch ordering and partial-failure handling: confidence: medium
+  - No-server isolation for delete path (spy harness reuse): confidence: medium
+  - Non-interactive `--yes` guard and exit-code 2 contract: confidence: low — requires monkeypatch `isatty` harness and stderr assertion, sensitive to which stream check is used
+- Reviewer: spec review (fresh session) — v1 text preserved verbatim above; v2 additions are additive and scoped to gate-checkable acceptance.
