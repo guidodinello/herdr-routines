@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Pipeline orchestrator state (shared-worktree artifact — machine-specific paths,
+# session IDs; never commit to the repo, per review on PR #49)
+state.json

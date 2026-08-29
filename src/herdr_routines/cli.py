@@ -23,7 +23,7 @@ from herdr_routines.config import (
     default_config_path,
     load_config,
 )
-from herdr_routines.gc import run_gc
+from herdr_routines.gc import run_gc, run_gc_delete
 from herdr_routines.herdr import HerdrClient
 from herdr_routines.history import (
     default_history_path,
@@ -133,15 +133,32 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(handler=_cmd_run)
 
     p_gc = sub.add_parser(
-        "gc", help="read-only inventory of stale auto/* branches (pure git)"
+        "gc", help="inventory and optional deletion of stale auto/* branches (pure git)"
     )
-    # Required in v1: the only mode is the read-only one, and making it explicit on
-    # every invocation reserves --no-dry-run/delete for a later Next item (spec.md).
-    p_gc.add_argument(
+    mode = p_gc.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
         "--dry-run",
         action="store_true",
-        required=True,
-        help="required in v1: list only; writes and deletes nothing",
+        help="list only; writes and deletes nothing",
+    )
+    mode.add_argument(
+        "--delete",
+        "--prune",
+        dest="delete",
+        action="store_true",
+        help="delete stale branches (requires --yes)",
+    )
+    p_gc.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="required for gc --delete; confirms deletion without prompt",
+    )
+    p_gc.add_argument(
+        "--force",
+        "-f",
+        action="store_true",
+        help="also delete stale-but-unmerged (orphaned) branches",
     )
     p_gc.add_argument(
         "--repo",
@@ -485,7 +502,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 def _cmd_gc(args: argparse.Namespace) -> int:
     # No HerdrClient, no config load — pure git + filesystem (spec.md §No Herdr server).
-    return run_gc(args.repo or Path.cwd(), base=args.base)
+    repo = args.repo or Path.cwd()
+    if args.delete:
+        return run_gc_delete(
+            repo, base=args.base, force=args.force, assume_yes=args.yes
+        )
+    return run_gc(repo, base=args.base)
 
 
 def _cmd_pick_feature(args: argparse.Namespace) -> int:
