@@ -146,13 +146,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--prune",
         dest="delete",
         action="store_true",
-        help="delete stale branches (requires --yes unless interactive)",
+        help="delete stale branches (requires --yes)",
     )
     p_gc.add_argument(
         "--yes",
         "-y",
         action="store_true",
-        help="bypass interactive guard; required for non-interactive deletion",
+        help="required for gc --delete; confirms deletion without prompt",
     )
     p_gc.add_argument(
         "--force",

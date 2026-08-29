@@ -383,15 +383,12 @@ def test_gc_delete_with_force_removes_orphaned_unmerged(
     assert remaining == []
 
 
-def test_gc_delete_refuses_non_interactive_without_yes(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_gc_delete_refuses_without_yes(
+    repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Non-interactive stdin without --yes must refuse and exit 2."""
+    """gc --delete always requires --yes; refuses without it regardless of context."""
     branch = "auto/merged-20260821T000000Z"
     _git(repo, "branch", branch, "main")
-
-    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
-    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
 
     code = cli.main(["gc", "--delete", "--repo", str(repo), "--base", "main"])
     captured = capsys.readouterr()
@@ -399,6 +396,27 @@ def test_gc_delete_refuses_non_interactive_without_yes(
     assert code == 2
     assert "refusing to delete without --yes" in captured.err
     # Branch must survive
+    remaining = _git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
+    ).stdout
+    assert branch in remaining
+
+
+def test_gc_delete_refuses_interactive_without_yes(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Even in a TTY, gc --delete without --yes refuses (v1 requires explicit --yes)."""
+    branch = "auto/merged-20260821T000000Z"
+    _git(repo, "branch", branch, "main")
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    code = cli.main(["gc", "--delete", "--repo", str(repo), "--base", "main"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert "refusing to delete without --yes" in captured.err
     remaining = _git(
         repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
     ).stdout

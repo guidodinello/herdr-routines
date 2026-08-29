@@ -167,10 +167,6 @@ def run_gc(repo: Path, base: str | None = None, out: TextIO | None = None) -> in
     return 0
 
 
-def _is_interactive() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()
-
-
 def _remove_worktree(repo: Path, row: Row, worktrees: dict[str, Path]) -> bool:
     path = worktrees.get(row.branch)
     if path is None:
@@ -185,10 +181,12 @@ def _remove_worktree(repo: Path, row: Row, worktrees: dict[str, Path]) -> bool:
 
 
 def _delete_branch(repo: Path, row: Row) -> bool:
-    flag = "-d" if row.merged_into_base else "-D"
-    proc = run_git(repo, "branch", flag, row.branch)
+    # Always -D: we already verified merged_into_base via is_merged() against --base,
+    # so git's HEAD-based safety net in -d is redundant and can fail when running
+    # from a diverged worktree (e.g. auto/pipeline-*).
+    proc = run_git(repo, "branch", "-D", row.branch)
     if proc.returncode != 0:
-        _warn(f"branch {flag} failed for {row.branch}: {proc.stderr.strip()}")
+        _warn(f"branch -D failed for {row.branch}: {proc.stderr.strip()}")
         return False
     return True
 
@@ -242,9 +240,10 @@ def run_gc_delete(
             to_delete = candidates
             skipped = []
 
-        if not assume_yes and not _is_interactive():
+        if not assume_yes:
             print(
-                "error: refusing to delete without --yes in non-interactive context",
+                "error: refusing to delete without --yes; "
+                "--yes is required for gc --delete",
                 file=err,
             )
             return 2
