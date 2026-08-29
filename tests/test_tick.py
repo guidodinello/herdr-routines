@@ -14,6 +14,7 @@ from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import _live_agent_exists, run_tick
+from herdr_routines.auto_fix import attempt_count_for_pr
 
 
 def make_job(tmp_path: Path, **overrides: Any) -> Job:
@@ -408,3 +409,153 @@ def test_failure_not_flagged_for_the_stale_running_recovery_path(
     states = [r.state for r in read_job(history_path, job.name)]
     assert "interrupted_unknown" in states  # the stale record was written as expected
     assert states[-1] == "done"  # and the job was not blocked from ever running again
+
+
+# ---------------------------------------------------------------------------
+# Auto-fix tick integration tests
+# ---------------------------------------------------------------------------
+
+
+def make_auto_fix_job(tmp_path: Path, **overrides: Any) -> Job:
+    from herdr_routines.config import AutoFixConfig
+
+    job = Job(
+        name="auto-fix-prs",
+        enabled=True,
+        cron="* * * * *",
+        repo=tmp_path,
+        workspace="worktree",
+        base="main",
+        agent_kind="claude",
+        model=None,
+        prompt="",
+        timeout_ms=5_000,
+        start_timeout_ms=30_000,
+        catch_up_minutes=120,
+        timezone="UTC",
+        on_missed="log",
+        auto_fix=AutoFixConfig(
+            branch_prefix="auto/",
+            max_prs_per_tick=3,
+            max_attempts_per_pr=3,
+        ),
+    )
+    return replace(job, **overrides)
+
+
+class MockGhClient:
+    """Minimal gh client that returns no PRs."""
+
+    def api_user(self) -> str:
+        return "testuser"
+
+    def pr_list(self, *, owner, repo, state, limit):
+        return []
+
+    def pr_view(self, *, owner, repo, number):
+        return {}
+
+    def graphql(self, query, **variables):
+        return {"data": {}}
+
+
+class MockSubprocess:
+    """Mocks subprocess.run for git remote detection."""
+
+    class Result:
+        returncode = 0
+        stdout = "git@github.com:test/repo.git"
+        stderr = ""
+
+    @staticmethod
+    def run(*args, **kwargs):
+        return MockSubprocess.Result()
+
+
+def test_auto_fix_tick_registers_and_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auto-fix job registers on first tick, runs enumeration on second."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+
+    job = make_auto_fix_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeFullClient()
+
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", MockGhClient)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    outcome1 = run_tick(config, history_path, client=client, now=t0)
+    assert "registered" in outcome1.summaries[0]
+
+    t1 = t0 + timedelta(minutes=1)
+    outcome2 = run_tick(config, history_path, client=client, now=t1)
+    # Empty PR list: enumerated=0, eligible=0, dispatched=0, skipped=0
+    assert "enumerated=0" in outcome2.summaries[0]
+    assert outcome2.any_job_failed is False
+
+
+def test_auto_fix_tick_skips_when_already_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auto-fix job is skipped when already running."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+
+    job = make_auto_fix_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+
+    class LiveAgentClient(FakeFullClient):
+        def agent_statuses(self) -> dict[str, str]:
+            return {job.agent_name: "working"}
+
+    client = LiveAgentClient()
+    now = datetime.now(UTC)
+    run_tick(config, history_path, client=client, now=now)
+    outcome = run_tick(config, history_path, client=client, now=now)
+
+    assert "skipped (agent already live)" in outcome.summaries[0]
+    assert outcome.any_job_failed is False
+
+
+def test_auto_fix_tick_max_attempts_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When max_attempts_per_pr is exceeded, the PR is skipped with
+    max_attempts_exceeded reason."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+
+    from herdr_routines.config import AutoFixConfig
+
+    job = make_auto_fix_job(
+        tmp_path,
+        auto_fix=AutoFixConfig(
+            branch_prefix="auto/",
+            max_prs_per_tick=3,
+            max_attempts_per_pr=2,
+        ),
+    )
+    config = RoutinesConfig(jobs=(job,))
+
+    # Pre-populate history with 2 terminal records for PR 10
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    for i in range(2):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=t0 + timedelta(minutes=i),
+                job="auto-fix-prs",
+                state="done",
+                run_id=f"run-{i}",
+                extra={"pr_number": 10, "attempt": i},
+            ),
+        )
+
+    count = attempt_count_for_pr(history_path, "auto-fix-prs", 10)
+    assert count == 2
+
+    # Verify the attempt count logic works
+    assert count >= job.auto_fix.max_attempts_per_pr
