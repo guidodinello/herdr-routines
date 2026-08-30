@@ -15,7 +15,7 @@ import pytest
 
 from herdr_routines import cli
 from herdr_routines.cli import _check_systemd_timeout, _cmd_validate, default_log_path
-from herdr_routines.config import AutoFixConfig, Job, RoutinesConfig
+from herdr_routines.config import GateCheck, Job, RoutinesConfig
 from herdr_routines.tick import TickOutcome
 
 
@@ -105,23 +105,26 @@ def test_sums_timeouts_across_enabled_jobs(tmp_path: Path) -> None:
 
 
 def test_auto_fix_job_counts_max_prs_per_tick_worst_case(tmp_path: Path) -> None:
-    """An auto-fix tick dispatches up to max_prs_per_tick fix workers sequentially,
-    each bounded by auto_fix.timeout_ms plus the job start timeout — the systemd
+    """A gated tick dispatches up to max_workers_per_tick fix workers sequentially,
+    each bounded by timeout_ms plus the job start timeout — the systemd
     check must budget for that, not just the job's own timeout_ms."""
     unit = tmp_path / "x.service"
     af_job = replace(
         make_job(tmp_path, 60_000, "afix"),  # job.timeout_ms = 60s
-        auto_fix=AutoFixConfig(max_prs_per_tick=3, timeout_ms=1_800_000),
+        checks=(GateCheck(kind="pr_health"),),
+        target="pr",
+        max_workers_per_tick=3,
     )
     config = RoutinesConfig(jobs=(af_job,))
-    # auto_fix: 30s start + (3 * 1800s) = 5430s; sum = 5430s + 300s margin = 5730s
-    unit.write_text("[Service]\nTimeoutStartSec=5730\n")
+    # pr-target: 30s start + 60s gate_slop + 120s pr_health timeout + 3*60s workers
+    # + 3*120s workers re-run checks = 750s + 300s margin = 1050s
+    unit.write_text("[Service]\nTimeoutStartSec=1050\n")
     assert _check_systemd_timeout(config, unit) == []
 
-    unit.write_text("[Service]\nTimeoutStartSec=5700\n")
+    unit.write_text("[Service]\nTimeoutStartSec=500\n")
     problems = _check_systemd_timeout(config, unit)
     assert len(problems) == 1
-    assert "5730" in problems[0]
+    assert "1050" in problems[0]
 
 
 def test_missing_directive_is_flagged(tmp_path: Path) -> None:
@@ -381,10 +384,10 @@ def test_validate_disabled_empty_prompt_stays_silent(
     assert "$ROUTINE_REPORT" not in capsys.readouterr().err
 
 
-def test_validate_auto_fix_job_with_empty_prompt_stays_silent(
+def test_validate_gated_job_with_empty_prompt_stays_silent(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A auto-fix job dispatches fix workers with the built-in prompt template and never
+    """A gated job dispatches fix workers with the built-in prompt template and never
     writes $ROUTINE_REPORT (it writes per-PR reports), so an empty prompt is legitimate —
     validate must not warn about it."""
     repo = tmp_path / "repo"
@@ -397,14 +400,10 @@ def test_validate_auto_fix_job_with_empty_prompt_stays_silent(
         f"    cron: '*/10 * * * *'\n"
         f"    repo: {repo}\n"
         f"    workspace: worktree\n"
-        f"    auto_fix:\n"
-        f"      branch_prefix: auto/\n"
-        f"      max_prs_per_tick: 3\n"
-        f"      max_attempts_per_pr: 3\n"
-        f"      timeout_ms: 1800000\n"
-        f"      agent_kind: opencode\n"
-        f"      model: null\n"
-        f"      prompt: ''\n"
+        f"    checks:\n"
+        f"      - pr_health:\n"
+        f"    max_workers_per_tick: 3\n"
+        f"    max_attempts_per_target: 3\n"
     )
     assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
     err = capsys.readouterr().err

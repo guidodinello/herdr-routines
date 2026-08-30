@@ -370,158 +370,173 @@ jobs:
         load_config(write(tmp_config_path, text))
 
 
-# -- auto_fix config --------------------------------------------------------
+# -- checks config (unified gate model) -------------------------------------------
 
 
-def test_auto_fix_defaults_applied(tmp_config_path: Path) -> None:
+def test_checks_pr_health_inferred_target(tmp_config_path: Path) -> None:
     text = """
 version: 1
 jobs:
-  - name: auto-fix-prs
+  - name: babysit-prs
     cron: "*/5 * * * *"
     repo: /repo/test
-    auto_fix: {}
+    checks:
+      - pr_health:
 """
     cfg = load_config(write(tmp_config_path, text))
-    job = cfg.job("auto-fix-prs")
+    job = cfg.job("babysit-prs")
     assert job is not None
-    assert job.auto_fix is not None
-    assert job.auto_fix.branch_prefix == "auto/"
-    assert job.auto_fix.max_prs_per_tick == 3
-    assert job.auto_fix.max_attempts_per_pr == 3
-    assert job.auto_fix.timeout_ms == 1_800_000
-    assert job.auto_fix.agent_kind == "claude"
-    assert job.auto_fix.model is None
-    assert job.auto_fix.prompt == ""
+    assert job.checks is not None
+    assert len(job.checks) == 1
+    assert job.checks[0].kind == "pr_health"
+    assert job.target == "pr"
 
 
-def test_auto_fix_custom_values(tmp_config_path: Path) -> None:
+def test_checks_command_inferred_target(tmp_config_path: Path) -> None:
     text = """
 version: 1
 jobs:
-  - name: auto-fix-prs
-    cron: "*/5 * * * *"
+  - name: repo-hygiene
+    cron: "0 13 * * *"
     repo: /repo/test
-    auto_fix:
-      branch_prefix: "fix/"
-      max_prs_per_tick: 5
-      max_attempts_per_pr: 10
-      timeout_ms: 600000
-      agent_kind: opencode
-      model: opencode/big-pickle
+    base: main
+    checks:
+      - command: uv run ruff check .
+        timeout_ms: 120000
 """
     cfg = load_config(write(tmp_config_path, text))
-    job = cfg.job("auto-fix-prs")
+    job = cfg.job("repo-hygiene")
     assert job is not None
-    assert job.auto_fix is not None
-    assert job.auto_fix.branch_prefix == "fix/"
-    assert job.auto_fix.max_prs_per_tick == 5
-    assert job.auto_fix.max_attempts_per_pr == 10
-    assert job.auto_fix.timeout_ms == 600_000
-    assert job.auto_fix.agent_kind == "opencode"
-    assert job.auto_fix.model == "opencode/big-pickle"
+    assert job.checks is not None
+    assert len(job.checks) == 1
+    assert job.checks[0].kind == "command"
+    assert job.checks[0].command == "uv run ruff check ."
+    assert job.checks[0].timeout_ms == 120_000
+    assert job.target == "base"
 
 
-def test_auto_fix_empty_branch_prefix_raises(tmp_config_path: Path) -> None:
+def test_checks_empty_list_becomes_none(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: plain-job
+    cron: "0 3 * * *"
+    repo: /repo/test
+    checks: []
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("plain-job")
+    assert job is not None
+    assert job.checks is None
+
+
+def test_checks_mixed_rejected(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: bad
+    cron: "0 3 * * *"
+    repo: /repo/test
+    checks:
+      - pr_health:
+      - command: uv run ruff check .
+"""
+    with pytest.raises(ConfigError, match="mix"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_checks_invalid_target_rejected(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: bad
+    cron: "0 3 * * *"
+    repo: /repo/test
+    target: invalid
+"""
+    with pytest.raises(ConfigError, match="target"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_checks_target_mismatch_rejected(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: bad
+    cron: "0 3 * * *"
+    repo: /repo/test
+    target: base
+    checks:
+      - pr_health:
+"""
+    with pytest.raises(ConfigError, match="does not match"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_checks_invalid_kind_rejected(tmp_config_path: Path) -> None:
+    """A check with neither pr_health nor command is rejected."""
+    text = """
+version: 1
+jobs:
+  - name: bad
+    cron: "0 3 * * *"
+    repo: /repo/test
+    checks:
+      - {}
+"""
+    with pytest.raises(ConfigError, match="must have either"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_checks_command_empty_rejected(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: bad
+    cron: "0 3 * * *"
+    repo: /repo/test
+    checks:
+      - command: ""
+"""
+    with pytest.raises(ConfigError, match="non-empty string"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_checks_negative_timeout_rejected(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: bad
+    cron: "0 3 * * *"
+    repo: /repo/test
+    checks:
+      - command: ruff check .
+        timeout_ms: -1
+"""
+    with pytest.raises(ConfigError, match="positive integer"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_max_workers_per_tick_and_max_attempts(tmp_config_path: Path) -> None:
     text = """
 version: 1
 jobs:
   - name: a
     cron: "0 3 * * *"
-    repo: /repo/a
-    auto_fix:
-      branch_prefix: ""
+    repo: /repo/test
+    max_workers_per_tick: 5
+    max_attempts_per_target: 10
 """
-    with pytest.raises(ConfigError, match="branch_prefix"):
-        load_config(write(tmp_config_path, text))
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.max_workers_per_tick == 5
+    assert job.max_attempts_per_target == 10
 
 
-def test_auto_fix_negative_max_prs_raises(tmp_config_path: Path) -> None:
-    text = """
-version: 1
-jobs:
-  - name: a
-    cron: "0 3 * * *"
-    repo: /repo/a
-    auto_fix:
-      max_prs_per_tick: -1
-"""
-    with pytest.raises(ConfigError, match="max_prs_per_tick"):
-        load_config(write(tmp_config_path, text))
-
-
-def test_auto_fix_negative_max_attempts_raises(tmp_config_path: Path) -> None:
-    text = """
-version: 1
-jobs:
-  - name: a
-    cron: "0 3 * * *"
-    repo: /repo/a
-    auto_fix:
-      max_attempts_per_pr: -5
-"""
-    with pytest.raises(ConfigError, match="max_attempts_per_pr"):
-        load_config(write(tmp_config_path, text))
-
-
-def test_auto_fix_bad_agent_kind_raises(tmp_config_path: Path) -> None:
-    text = """
-version: 1
-jobs:
-  - name: a
-    cron: "0 3 * * *"
-    repo: /repo/a
-    auto_fix:
-      agent_kind: not-a-real-kind
-"""
-    with pytest.raises(ConfigError, match="agent_kind"):
-        load_config(write(tmp_config_path, text))
-
-
-def test_auto_fix_model_without_flag_raises(tmp_config_path: Path) -> None:
-    text = """
-version: 1
-jobs:
-  - name: a
-    cron: "0 3 * * *"
-    repo: /repo/a
-    auto_fix:
-      agent_kind: codex
-      model: some-model
-"""
-    with pytest.raises(ConfigError, match="model"):
-        load_config(write(tmp_config_path, text))
-
-
-def test_auto_fix_unknown_key_raises(tmp_config_path: Path) -> None:
-    text = """
-version: 1
-jobs:
-  - name: a
-    cron: "0 3 * * *"
-    repo: /repo/a
-    auto_fix:
-      bogus_key: true
-"""
-    with pytest.raises(ConfigError, match="unknown key"):
-        load_config(write(tmp_config_path, text))
-
-
-def test_auto_fix_non_mapping_raises(tmp_config_path: Path) -> None:
-    text = """
-version: 1
-jobs:
-  - name: a
-    cron: "0 3 * * *"
-    repo: /repo/a
-    auto_fix: "not a mapping"
-"""
-    with pytest.raises(ConfigError, match="auto_fix"):
-        load_config(write(tmp_config_path, text))
-
-
-def test_job_without_auto_fix_has_none(tmp_config_path: Path) -> None:
+def test_job_without_checks_has_none(tmp_config_path: Path) -> None:
     cfg = load_config(write(tmp_config_path, VALID_MINIMAL))
     job = cfg.job("nightly-audit")
     assert job is not None
-    assert job.auto_fix is None
+    assert job.checks is None
+    assert job.target is None

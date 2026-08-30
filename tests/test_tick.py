@@ -417,7 +417,7 @@ def test_failure_not_flagged_for_the_stale_running_recovery_path(
 
 
 def make_auto_fix_job(tmp_path: Path, **overrides: Any) -> Job:
-    from herdr_routines.config import AutoFixConfig
+    from herdr_routines.config import GateCheck
 
     job = Job(
         name="auto-fix-prs",
@@ -434,11 +434,10 @@ def make_auto_fix_job(tmp_path: Path, **overrides: Any) -> Job:
         catch_up_minutes=120,
         timezone="UTC",
         on_missed="log",
-        auto_fix=AutoFixConfig(
-            branch_prefix="auto/",
-            max_prs_per_tick=3,
-            max_attempts_per_pr=3,
-        ),
+        checks=(GateCheck(kind="pr_health"),),
+        target="pr",
+        max_workers_per_tick=3,
+        max_attempts_per_target=3,
     )
     return replace(job, **overrides)
 
@@ -528,15 +527,14 @@ def test_auto_fix_tick_max_attempts_skip(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
 
-    from herdr_routines.config import AutoFixConfig
+    from herdr_routines.config import GateCheck
 
     job = make_auto_fix_job(
         tmp_path,
-        auto_fix=AutoFixConfig(
-            branch_prefix="auto/",
-            max_prs_per_tick=3,
-            max_attempts_per_pr=2,
-        ),
+        checks=(GateCheck(kind="pr_health"),),
+        target="pr",
+        max_workers_per_tick=3,
+        max_attempts_per_target=2,
     )
 
     # Pre-populate history with 2 terminal records for PR 10
@@ -557,5 +555,4 @@ def test_auto_fix_tick_max_attempts_skip(
     assert count == 2
 
     # Verify the attempt count logic works
-    assert job.auto_fix is not None
-    assert count >= job.auto_fix.max_attempts_per_pr
+    assert count >= job.max_attempts_per_target
