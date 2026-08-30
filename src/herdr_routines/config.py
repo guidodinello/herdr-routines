@@ -76,30 +76,22 @@ _JOB_REQUIRED_KEYS = frozenset({"name", "cron", "repo"})
 _JOB_ALLOWED_KEYS = (
     _JOB_REQUIRED_KEYS
     | _DEFAULTS_ALLOWED_KEYS
-    | frozenset({"enabled", "base", "model", "prompt", "auto_fix"})
+    | frozenset(
+        {
+            "enabled",
+            "base",
+            "model",
+            "prompt",
+            "checks",
+            "target",
+            "max_workers_per_tick",
+            "max_attempts_per_target",
+        }
+    )
 )
 
-_AUTO_FIX_ALLOWED_KEYS = frozenset(
-    {
-        "branch_prefix",
-        "max_prs_per_tick",
-        "max_attempts_per_pr",
-        "timeout_ms",
-        "agent_kind",
-        "model",
-        "prompt",
-    }
-)
-
-_AUTO_FIX_DEFAULTS = {
-    "branch_prefix": "auto/",
-    "max_prs_per_tick": 3,
-    "max_attempts_per_pr": 3,
-    "timeout_ms": 1_800_000,
-    "agent_kind": "claude",
-    "model": None,
-    "prompt": "",
-}
+VALID_CHECK_KINDS = frozenset({"pr_health", "command"})
+VALID_TARGETS = frozenset({"pr", "base"})
 
 _JOB_DEFAULTS = {
     "enabled": True,
@@ -114,6 +106,10 @@ _JOB_DEFAULTS = {
     "timezone": "UTC",
     "on_missed": "log",
     "failure_markers": None,
+    "checks": None,
+    "target": None,
+    "max_workers_per_tick": 3,
+    "max_attempts_per_target": 3,
 }
 
 
@@ -122,16 +118,12 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class AutoFixConfig:
-    """Configuration for the auto-fix PR standing job."""
+class GateCheck:
+    """A single check in the unified gate model."""
 
-    branch_prefix: str = "auto/"
-    max_prs_per_tick: int = 3
-    max_attempts_per_pr: int = 3
-    timeout_ms: int = 1_800_000
-    agent_kind: str = "claude"
-    model: str | None = None
-    prompt: str = ""
+    kind: str  # "pr_health" | "command"
+    command: str | None = None
+    timeout_ms: int = 120_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,8 +145,14 @@ class Job:
     # Screen markers scanned after a failed prompt wait (docs/failure-reaping.md §3.2).
     # None = runner.DEFAULT_FAILURE_MARKERS.
     failure_markers: tuple[str, ...] | None = None
-    # Auto-fix PR standing job config (None = not an auto-fix job).
-    auto_fix: AutoFixConfig | None = None
+    # Unified gate model: ordered checks that gate the fix agent (None = plain job).
+    checks: tuple[GateCheck, ...] | None = None
+    # Inferred from check kinds or explicit override: "pr" | "base".
+    target: str | None = None
+    # Dispatch cap per tick.
+    max_workers_per_tick: int = 3
+    # Retry budget keyed per target (per gate branch for base, per PR number for pr).
+    max_attempts_per_target: int = 3
 
     @property
     def agent_name(self) -> str:
@@ -335,63 +333,93 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
             )
         failure_markers = tuple(failure_markers_raw)
 
-    auto_fix_raw = merged.get("auto_fix")
-    auto_fix: AutoFixConfig | None = None
-    if auto_fix_raw is not None:
-        if not isinstance(auto_fix_raw, dict):
-            raise ConfigError(f"{label}: 'auto_fix' must be a mapping")
-        unknown_af = set(auto_fix_raw) - _AUTO_FIX_ALLOWED_KEYS
-        if unknown_af:
-            raise ConfigError(
-                f"{label}: 'auto_fix' has unknown key(s): {sorted(unknown_af)}"
-            )
-        af_merged = {**_AUTO_FIX_DEFAULTS, **auto_fix_raw}
+    # -- Unified gate model: checks / target / max_workers / max_attempts -----------
 
-        af_branch_prefix = af_merged["branch_prefix"]
-        if not isinstance(af_branch_prefix, str) or not af_branch_prefix:
-            raise ConfigError(
-                f"{label}: 'auto_fix.branch_prefix' must be a non-empty string"
-            )
+    checks_raw = merged.get("checks")
+    checks: tuple[GateCheck, ...] | None = None
+    inferred_target: str | None = None
 
-        for af_int_key in ("max_prs_per_tick", "max_attempts_per_pr", "timeout_ms"):
-            af_value = af_merged[af_int_key]
-            if (
-                not isinstance(af_value, int)
-                or isinstance(af_value, bool)
-                or af_value < 0
-            ):
+    if checks_raw is not None:
+        if not isinstance(checks_raw, list):
+            raise ConfigError(f"{label}: 'checks' must be a list or null")
+        if len(checks_raw) == 0:
+            checks = None
+        else:
+            parsed_checks: list[GateCheck] = []
+            has_pr_health = False
+            has_command = False
+            for ci, c in enumerate(checks_raw):
+                if not isinstance(c, dict):
+                    raise ConfigError(
+                        f"{label}: 'checks[{ci}]' must be a mapping"
+                    )
+                unknown_ck = set(c) - {"pr_health", "command", "timeout_ms"}
+                if unknown_ck:
+                    raise ConfigError(
+                        f"{label}: 'checks[{ci}]' has unknown key(s): {sorted(unknown_ck)}"
+                    )
+                if "pr_health" in c and "command" in c:
+                    raise ConfigError(
+                        f"{label}: 'checks[{ci}]' cannot have both 'pr_health' and 'command'"
+                    )
+                if "pr_health" not in c and "command" not in c:
+                    raise ConfigError(
+                        f"{label}: 'checks[{ci}]' must have either 'pr_health' or 'command'"
+                    )
+                if "pr_health" in c:
+                    has_pr_health = True
+                    parsed_checks.append(GateCheck(kind="pr_health"))
+                else:
+                    has_command = True
+                    cmd = c["command"]
+                    if not isinstance(cmd, str) or not cmd:
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].command' must be a non-empty string"
+                        )
+                    ct = c.get("timeout_ms", 120_000)
+                    if not isinstance(ct, int) or isinstance(ct, bool) or ct <= 0:
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].timeout_ms' must be a positive integer"
+                        )
+                    parsed_checks.append(
+                        GateCheck(kind="command", command=cmd, timeout_ms=ct)
+                    )
+
+            if has_pr_health and has_command:
                 raise ConfigError(
-                    f"{label}: 'auto_fix.{af_int_key}' must be a non-negative integer"
+                    f"{label}: 'checks' cannot mix 'pr_health' and 'command' kinds"
                 )
 
-        af_agent_kind = af_merged["agent_kind"]
-        if af_agent_kind not in VALID_AGENT_KINDS:
+            checks = tuple(parsed_checks)
+            inferred_target = "pr" if has_pr_health else "base"
+
+    target_raw = merged.get("target")
+    target: str | None = None
+    if target_raw is not None:
+        if not isinstance(target_raw, str) or target_raw not in VALID_TARGETS:
             raise ConfigError(
-                f"{label}: 'auto_fix.agent_kind' must be one of {sorted(VALID_AGENT_KINDS)}"
+                f"{label}: 'target' must be 'pr' or 'base' or null"
+            )
+        target = target_raw
+        if inferred_target is not None and target != inferred_target:
+            raise ConfigError(
+                f"{label}: explicit 'target: {target}' does not match inferred "
+                f"'target: {inferred_target}' from checks (not yet supported)"
             )
 
-        af_model = af_merged["model"]
-        if af_model is not None and not isinstance(af_model, str):
-            raise ConfigError(f"{label}: 'auto_fix.model' must be a string or null")
-        if af_model is not None and af_agent_kind not in AGENT_MODEL_FLAGS:
+    if checks is not None and target is None:
+        target = inferred_target
+
+    if target == "base" and checks is not None:
+        if not isinstance(base, str) or not base:
             raise ConfigError(
-                f"{label}: 'auto_fix.model' is not supported for agent_kind {af_agent_kind!r} "
-                f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
+                f"{label}: 'base' must be a non-empty string when target is 'base'"
             )
 
-        af_prompt = af_merged["prompt"]
-        if not isinstance(af_prompt, str):
-            raise ConfigError(f"{label}: 'auto_fix.prompt' must be a string")
-
-        auto_fix = AutoFixConfig(
-            branch_prefix=af_branch_prefix,
-            max_prs_per_tick=af_merged["max_prs_per_tick"],
-            max_attempts_per_pr=af_merged["max_attempts_per_pr"],
-            timeout_ms=af_merged["timeout_ms"],
-            agent_kind=af_agent_kind,
-            model=af_model,
-            prompt=af_prompt,
-        )
+    for int_key in ("max_workers_per_tick", "max_attempts_per_target"):
+        value = merged[int_key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ConfigError(f"{label}: '{int_key}' must be a non-negative integer")
 
     return Job(
         name=name,
@@ -409,5 +437,8 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
         timezone=timezone,
         on_missed=on_missed,
         failure_markers=failure_markers,
-        auto_fix=auto_fix,
+        checks=checks,
+        target=target,
+        max_workers_per_tick=merged["max_workers_per_tick"],
+        max_attempts_per_target=merged["max_attempts_per_target"],
     )
