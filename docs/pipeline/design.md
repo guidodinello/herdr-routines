@@ -79,8 +79,10 @@ the issue. There is deliberately **no separate manual/post-merge flip step**:
 that gap is what left issue 025 `open` after PR #56 implemented it, so tonight's
 `pick-feature` would have re-picked an already-done feature. Because the flip is
 a commit in the PR, a human *closed-without-merge* leaves `main` untouched (issue
-stays `open`/`in-progress`) — correct. Stage 3's gate enforces the PR touches its
-own issue file and the flip is committed.
+stays `open`/`in-progress`) — correct. The implementer does the flip (stage 3),
+and the orchestrator enforces it via **Gate 4** (standalone, not buried in Gate 3:
+the flip only becomes a real "close" once the PR is open, so that's where it's
+checked).
 
 **Spec leakage (G-13):** stage 1's `spec.md` commit(s) on `auto/pipeline-<run_id>`
 ride the PR opened in stage 4. Document as intentional — prefix spec commits
