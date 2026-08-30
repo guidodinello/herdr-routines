@@ -128,6 +128,28 @@ files 2026-08-27.
   `/run <job>` mapping to `workspace create` + `agent start`; transport is
   settled by [`023`]. →
   [`024`](docs/process/issues/024-spawn-session-from-telegram.md)
+- **Review `@me` PRs across repos** — idea, not designed. Scan open PRs authored
+  by me (or `--review-requested`) across all my repos and code-review each one.
+  Distinct from `babysit-prs` (issue 015), which only watches PRs a routine
+  itself opened (`auto/*`). Gate: the jobs refactor (issue 006 / 025 design)
+  — a poll-to-dispatch job shape. 2026-08-30 brainstorm.
+- **Audit skills as report→diff gate jobs** — idea, not designed. Turn fitted's
+  audit skills (`type-health`, `ui-ux-review`, `accessibility-review`,
+  `fix-ignores`, `discover-conventions`, `improve-codebase-architecture`,
+  `api-gap-audit`) into scheduled jobs: run cheap check/report → next cycle
+  diffs against last report → spawn a fix worker only for new/regressed
+  findings. Maps onto issue 025's gate model ("all checks pass → free"). Gate:
+  025 design merged. 2026-08-30 brainstorm.
+- **Release/update strategy for herdr-routines + plugins** — idea, not designed.
+  Industry standard is explicit `update` commands, not auto-updates; but the
+  one safe carve-out: herdr-routines' own changes already flow through PR+CI
+  gate, so the Pi can fast-forward its checkout to released/CI-green commits
+  (folds into issue 016's `repository:` clone+fast-forward). The manual
+  fast-forward is runnable today — see
+  [`docs/process/pi-update-runbook.md`](docs/process/pi-update-runbook.md).
+  Plugins + herdr
+  CLI + `jobs.yaml` stay explicit; never auto-mutate. Needs refinement. Gate:
+  issue 016. 2026-08-30 brainstorm.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives
