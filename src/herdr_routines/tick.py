@@ -406,7 +406,7 @@ def _process_base_target(
     attempt = attempt_count_for_gate_branch(history_path, job.name, gate_branch)
     if attempt >= job.max_attempts_per_target:
         append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="skipped",
+            ts=now, job=job.name, state="skipped", run_id=run_id,
             extra={"reason": "max_attempts_exceeded", "gate_branch": gate_branch, "attempt": attempt},
         ))
         _notify(client, f"herdr-routines: {job.name} skipped", body="max_attempts_exceeded", sound="request")
@@ -419,7 +419,7 @@ def _process_base_target(
             capture_output=True, text=True, timeout=15, check=False,
         )
         proc = subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "add", str(wt_path), job.base],
+            ["git", "-C", str(job.repo), "worktree", "add", "--detach", str(wt_path), job.base],
             capture_output=True, text=True, timeout=30, check=False,
         )
         if proc.returncode != 0:
@@ -473,7 +473,7 @@ def _process_base_target(
 
     prompt_text = job.prompt or build_base_fix_prompt(
         job_name=job.name, gate_output=gate_outcome.combined_output,
-        base=job.base, report_path=str(report_path),
+        base=job.base, report_path=str(report_path), checks=job.checks,
     )
     prompt_text = substitute_prompt(prompt_text, report_path=report_path, job_name=job.name, run_id=run_id)
 
@@ -484,7 +484,7 @@ def _process_base_target(
             capture_output=True, text=True, timeout=15, check=False,
         )
         proc = subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "add", str(fix_wt_path), job.base],
+            ["git", "-C", str(job.repo), "worktree", "add", "--detach", str(fix_wt_path), job.base],
             capture_output=True, text=True, timeout=30, check=False,
         )
         if proc.returncode != 0:
@@ -533,7 +533,7 @@ def _process_base_target(
     try:
         settled_status = _prompt_with_watchdog(
             client, job_name=agent_name, target=agent_name, text=prompt_text,
-            timeout_ms=job.timeout_ms, markers=job.failure_markers or ("Free usage exceeded",),
+            timeout_ms=job.timeout_ms, markers=job.failure_markers if job.failure_markers is not None else ("Free usage exceeded",),
             prompt_text=prompt_text,
         )
     except Exception as e:
@@ -564,6 +564,9 @@ def _process_base_target(
     append(history_path, HistoryRecord(
         ts=now, job=job.name, state=state, run_id=run_id,
         extra={"gate": "failed", "target": "base", "gate_branch": gate_branch,
+               "reason": "gate_failed", "failed_checks": gate_outcome.combined_output,
+               "gate_output_path": str(gate_output_path) if gate_output_path.exists() else None,
+               "branch": gate_branch,
                "pane_id": pane_id, "report_path": str(report_path) if report_written else None,
                "report_written": report_written, "final_agent_status": settled_status},
     ))
@@ -582,8 +585,8 @@ def _cleanup_worktree(repo: Path, wt_path: Path) -> None:
             ["git", "-C", str(repo), "worktree", "remove", "--force", str(wt_path)],
             capture_output=True, text=True, timeout=15, check=False,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("could not remove worktree %s: %s", wt_path, e)
 
 
 def _dispatch_fix_worker(

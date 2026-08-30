@@ -929,11 +929,11 @@ def test_auto_fix_gate_respects_max_attempts_per_target(tmp_history_path: Path) 
 
     from herdr_routines.auto_fix import attempt_count_for_gate_branch
 
-    # Each occurrence has a fresh gate branch, so count is 1 per branch
+    # Budget keyed on job_name only (stable across runs) — all base records count
     count = attempt_count_for_gate_branch(
         tmp_history_path, "repo-hygiene", "auto/repo-hygiene-0"
     )
-    assert count == 1
+    assert count == 3
 
     # PR target: records keyed by pr_number
     for i in range(3):
@@ -1107,8 +1107,8 @@ def test_auto_fix_gate_systemd_timeout_budget(tmp_path: Path) -> None:
         max_workers_per_tick=2,
     )
     config2 = RoutinesConfig(jobs=(pr_job,))
-    # pr: 30 + 60 + 60 + 2*100 = 350 + 300 = 650
-    unit.write_text("[Service]\nTimeoutStartSec=650\n")
+    # pr: 30 + 60 + 60 + 2*100 + 2*60 = 470 + 300 = 770
+    unit.write_text("[Service]\nTimeoutStartSec=770\n")
     assert _check_systemd_timeout(config2, unit) == []
 
 

@@ -116,15 +116,15 @@ def test_auto_fix_job_counts_max_prs_per_tick_worst_case(tmp_path: Path) -> None
         max_workers_per_tick=3,
     )
     config = RoutinesConfig(jobs=(af_job,))
-    # pr-target: 30s start + 60s gate_slop + 120s pr_health timeout + 3*60s workers = 390s
-    # + 300s margin = 690s
-    unit.write_text("[Service]\nTimeoutStartSec=690\n")
+    # pr-target: 30s start + 60s gate_slop + 120s pr_health timeout + 3*60s workers
+    # + 3*120s workers re-run checks = 750s + 300s margin = 1050s
+    unit.write_text("[Service]\nTimeoutStartSec=1050\n")
     assert _check_systemd_timeout(config, unit) == []
 
     unit.write_text("[Service]\nTimeoutStartSec=500\n")
     problems = _check_systemd_timeout(config, unit)
     assert len(problems) == 1
-    assert "690" in problems[0]
+    assert "1050" in problems[0]
 
 
 def test_missing_directive_is_flagged(tmp_path: Path) -> None:

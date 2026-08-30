@@ -464,7 +464,8 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
     # dispatches up to max_workers_per_tick fix workers sequentially, each bounded by
     # timeout_ms on top of the job's start timeout. For base-target: start + gate_slop +
     # sum(check.timeout_ms) + timeout_ms (worker re-runs checks inside timeout_ms). For
-    # pr-target: start + gate_slop + sum(check.timeout_ms) + max_workers * timeout_ms.
+    # pr-target: start + gate_slop + sum(check.timeout_ms) + max_workers * timeout_ms
+    # + max_workers * sum(check.timeout_ms) (each worker may re-run all checks).
     GATE_SLOP_S = 60  # covers worktree add/remove + pr_health polling
     total_job_seconds = 0.0
     for job in enabled_jobs:
@@ -483,6 +484,7 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
                     + GATE_SLOP_S
                     + gate_time_s
                     + job.max_workers_per_tick * job.timeout_ms / 1000
+                    + job.max_workers_per_tick * gate_time_s
                 )
         else:
             total_job_seconds += (job.start_timeout_ms + job.timeout_ms) / 1000

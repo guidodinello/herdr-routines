@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
 import textwrap
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from herdr_routines.history import read_job
 log = logging.getLogger(__name__)
 
 FAILING_CI_STATES = frozenset({"FAILURE", "ERROR", "TIMED_OUT"})
+TIMEOUT_EXIT_CODE = 124
 # Only count real fix attempts toward the retry budget — skipped records the tick
 # appends each time a PR exceeds max_attempts must not increment the counter,
 # otherwise a fixed-then-broken PR is permanently abandoned (review finding F).
@@ -459,7 +461,7 @@ def build_pr_agent_name(job_name: str, pr_number: int) -> str:
 # Unified gate model (docs/pipeline/runs/20260830T050021Z/spec.md)
 # ---------------------------------------------------------------------------
 
-_COUNTABLE_STATES_GATE = frozenset({"done", "failed"})
+# _COUNTABLE_STATES is reused for gate budget (SSOT, no separate _COUNTABLE_STATES_GATE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -523,7 +525,9 @@ def run_checks(
             except _subprocess.TimeoutExpired as e:
                 stdout = e.stdout if isinstance(e.stdout, str) else ""
                 stderr = e.stderr if isinstance(e.stderr, str) else ""
-                return 124, stdout, stderr
+                return TIMEOUT_EXIT_CODE, stdout, stderr
+            except OSError as e:
+                return 127, "", str(e)
 
         runner = _default_runner
 
@@ -538,9 +542,9 @@ def run_checks(
 
         if check.kind == "command" and check.command is not None:
             timeout_s = check.timeout_ms / 1000
-            argv = check.command.split()
+            argv = shlex.split(check.command)
             exit_code, stdout, stderr = runner(argv, timeout_s=timeout_s)
-            timed_out = exit_code == 124
+            timed_out = exit_code == TIMEOUT_EXIT_CODE
             passed = exit_code == 0 and not timed_out
             output = stdout + stderr
             outputs.append(f"[{check.command}] exit={exit_code}\n{output}")
@@ -579,8 +583,18 @@ def build_base_fix_prompt(
     gate_output: str,
     base: str,
     report_path: str,
+    checks: tuple[GateCheck, ...] | None = None,
 ) -> str:
     """Build the prompt for a base-target gate fix worker."""
+    check_lines = ""
+    if checks:
+        cmds = [f"  - {c.command}" for c in checks if c.kind == "command" and c.command]
+        if cmds:
+            check_lines = (
+                "\n        Configured gate checks (re-run these after fixing):\n"
+                + "\n".join(cmds)
+                + "\n"
+            )
     return textwrap.dedent(f"""\
         You are fixing gate failures on the {base} branch. Work in the checked-out worktree.
 
@@ -589,16 +603,14 @@ def build_base_fix_prompt(
         Report: {report_path}
 
         Gate output (failing checks):
-        {gate_output}
-
+        {gate_output}{check_lines}
         Instructions:
         1. Read the gate output above to understand what failed
         2. Fix the code to address the failures
-        3. Run `uv run pytest -q` to verify tests pass
-        4. Run `uv run ruff check .` to verify lint passes
-        5. Commit your changes with a descriptive message
-        6. Create a new branch `auto/{job_name}-<timestamp>` and push it
-        7. Open a PR targeting {base} with `gh pr create --base {base}`
+        3. Re-run the configured gate checks listed above to verify they pass
+        4. Commit your changes with a descriptive message
+        5. Create a new branch `auto/{job_name}-<timestamp>` and push it
+        6. Open a PR targeting {base} with `gh pr create --base {base}`
 
         Write a summary of your findings and fixes to: {report_path}
 
@@ -608,8 +620,10 @@ def build_base_fix_prompt(
 
 def build_gate_worker_agent_name(job_name: str, run_id: str) -> str:
     """Build agent name for a gate fix worker: rt-<job>-gate-<run_id> truncated to
-    32 chars (NAME_RE cap)."""
-    raw = f"rt-{job_name}-gate-{run_id}"
+    32 chars (NAME_RE cap). Use a short hash of run_id to avoid collision."""
+    import hashlib
+    short_hash = hashlib.sha1(run_id.encode()).hexdigest()[:8]
+    raw = f"rt-{job_name}-gate-{short_hash}"
     return raw[:32]
 
 
@@ -617,14 +631,15 @@ def attempt_count_for_gate_branch(
     history_path: Path, job_name: str, gate_branch: str
 ) -> int:
     """Count prior terminal records for this job+gate_branch (base-target retry budget).
-    Mirrors attempt_count_for_pr but keyed by gate branch name."""
+    Keyed on job_name only (stable across runs) so the budget persists per job."""
     records = read_job(history_path, job_name)
     count = 0
     for r in records:
         if (
-            r.state in _COUNTABLE_STATES_GATE
+            r.state in _COUNTABLE_STATES
             and r.extra
-            and r.extra.get("gate_branch") == gate_branch
+            and r.extra.get("target") == "base"
+            and r.extra.get("gate_branch") is not None
         ):
             count += 1
     return count
