@@ -39,7 +39,10 @@ jobs:
     on_missed: log
   # auto-fix job: the pipeline only opens a PR branch to fix pre-existing CI/lint failures
   # or unresolved review threads on an *existing* PR — it never creates new PRs on its own.
-  # auto_fix is optional; a job without it is a watchdog/report-and-commit delegate.
+  # A job is conditional when it has `checks:` — ordered, all must pass; any failure dispatches
+  # the fix agent (the job's own agent fields). No `checks` = a watchdog/report-and-commit
+  # delegate. `target` is optional and inferred from the check kinds (pr_health ⇒ pr, commands
+  # ⇒ base).
 
   - name: babysit-prs
     enabled: true
@@ -47,37 +50,40 @@ jobs:
     repo: /home/guido/projects/herdr-routines
     workspace: worktree
     base: main
+    max_workers_per_tick: 3 # one fix worker per flagged PR, ≤3/tick
+    max_attempts_per_target: 3 # retry budget, keyed per PR
+    checks:
+      - pr_health # builtin: CI red OR review threads unresolved; polls gh, never spawns
     agent_kind: opencode
     model: null
-    prompt: "" # ignored in auto_fix mode; the pipeline injects the fix prompt template
-    timeout_ms: 2700000
+    prompt: "" # empty = pipeline-injected fix prompt template (seeded with the flagged PR's output)
+    timeout_ms: 1800000
     start_timeout_ms: 120000
-    auto_fix:
-      branch_prefix: auto/
-      max_prs_per_tick: 3
-      max_attempts_per_pr: 3
-      timeout_ms: 1800000
-      agent_kind: opencode
-      model: null # native model flag for the fix worker; null = agent default
-      prompt: ""
     on_missed: log
 
   # Proposed (docs/pipeline/features/gate-trigger-standing-job.md): a repository-hygiene
-  # routine. The agent runs ONLY when a gate command exits non-zero — e.g. daily ruff+mypy
-  # on the Pi. All commands passing -> done, no agent, no PR.
+  # routine. Same job shape as babysit-prs but checks are commands — the agent runs ONLY when
+  # a check exits non-zero (e.g. ruff+mypy). All commands passing -> done, no agent, no PR.
+  # target is inferred as base (command checks), so the fix lands on base, opens
+  # auto/<job>-<ts> PR; pr_health infers target: pr. Scheduled at 13:00 (not 03:00): the
+  # overnight pipeline fires at 02:00 on this same repo and builds its own PRs — 13:00 catches
+  # the pipeline's leftover ruff/mypy debt before the next night's build.
   # - name: repo-hygiene
   #   enabled: true
-  #   cron: "0 3 * * *"
+  #   cron: "0 13 * * *"
   #   repo: /home/guido/projects/herdr-routines
   #   workspace: worktree
   #   base: main
-  #   auto_fix:
-  #     trigger: gate                        # "pr" (default) | "gate"
-  #     gate_commands:                       # run sequentially, cwd = worktree of base
-  #       - uv run ruff check .
-  #       - uv run mypy
-  #     gate_command_timeout_ms: 120000
-  #     max_attempts_per_pr: 3
-  #     timeout_ms: 1800000
-  #     agent_kind: opencode
-  #     model: null
+  #   max_workers_per_tick: 1
+  #   max_attempts_per_target: 3
+  #   checks:                           # ordered; any failure dispatches the fix agent
+  #     - command: uv run ruff check . #   cwd = worktree of target
+  #       timeout_ms: 120000
+  #     - command: uv run mypy
+  #       timeout_ms: 120000
+  #   agent_kind: opencode
+  #   model: null
+  #   prompt: "" # empty = injected fix prompt seeded with the failing check output
+  #   timeout_ms: 1800000
+  #   start_timeout_ms: 120000
+  #   on_missed: log
