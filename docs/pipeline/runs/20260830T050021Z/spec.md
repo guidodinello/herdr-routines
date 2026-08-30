@@ -118,7 +118,7 @@ Environment: `command` checks inherit the tick's env (scheduler's `uv`/`gh`); fi
 ## Changelog v1→v2
 
 - v1 (f36472d) established the unified gate model (`checks` + inferred `target`, budgets hoisted to job level, base vs pr semantics, `gate_slop` systemd form) in 8 acceptance items using parenthesized test names.
-- v2 reformats acceptance to 9 numbered items where each line ends `Test: <name>` for `rg -F "Test:"` discovery, adds explicit `blocking`/`non-blocking` tier labels and `confidence:` tiers per item, and splits systemd vs clean-run vs branch/agent concerns for gate-2 discovery.
+- v2 reformats acceptance to 9 numbered items where each line ends with its Test marker for `rg -F "Test:"` discovery, adds explicit `blocking`/`non-blocking` tier labels and `confidence:` tiers per item, and splits systemd vs clean-run vs branch/agent concerns for gate-2 discovery.
 - Added item 6 `test_auto_fix_gate_branch_and_agent_name` (branch `auto/<job>-<ts>`, agent `rt-<job>-gate-<run_id>` 32-char cap) which was implicit in Approach/Semantics v1 but not separately acceptance-mapped; now mirrors `docs/pipeline/features/gate-trigger-standing-job.md:332` acceptance 6.
 - Expanded items 1, 2, 5, 9 to state `any_failed` semantics, no short-circuit/all failures, `base` pure-schema vs runtime ref existence, and clean-run spy-harness split (base zero `gh`, pr reads-only polling) from `docs/process/issues/025-gate-trigger-standing-job.md` acceptance.
 - Preserved all Problem/Approach/Files touched/Risks intent from v1; only tightened verifiability for stage-2 gate. Previous content remains authoritative for implementation.
