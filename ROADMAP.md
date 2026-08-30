@@ -150,6 +150,16 @@ files 2026-08-27.
   Plugins + herdr
   CLI + `jobs.yaml` stay explicit; never auto-mutate. Needs refinement. Gate:
   issue 016. 2026-08-30 brainstorm.
+- **Code-level pipeline gates (prompt → enforcement)** — idea, not designed.
+  Today pipeline stage gates live only in the orchestrator prompt (stages are
+  hardcoded there; there's no `workflows/pipeline.yaml` parser yet), so they're
+  prompt-compliance, not enforced. Promote gates into the job definition as
+  declarative `checks:`, exactly the shape the unified gate model (issue 025 /
+  PR 56) just added to `jobs.yaml` + `tick.py`: e.g. a gate "issue file is
+  `status: done` on the PR branch" would be a real pre/post check the runner
+  enforces, not a prompt instruction. Gate: works when the pipeline (or its
+  stages) move out of prompt-hardcoded form — either issue 013's
+  `workflows/pipeline.yaml`, or per-stage gate fields. 2026-08-30 brainstorm.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives
