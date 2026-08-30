@@ -1,6 +1,6 @@
-# spec: Auto-fix standing job — checks + target (unified gate model) (20260830T050021Z)
+# spec: Auto-fix standing job — checks + target (unified gate model) (20260830T050021Z) — v2
 
-Per-run spec at `docs/pipeline/runs/20260830T050021Z/spec.md` (G-15: per-run path avoids PR #28/#29 shared-path conflict). Implements `docs/process/issues/025-gate-trigger-standing-job.md` as designed in `docs/pipeline/features/gate-trigger-standing-job.md`.
+Per-run spec at `docs/pipeline/runs/20260830T050021Z/spec.md` (G-15: per-run path avoids PR #28/#29 shared-path conflict). Implements `docs/process/issues/025-gate-trigger-standing-job.md` as designed in `docs/pipeline/features/gate-trigger-standing-job.md`. v2 adds explicit acceptance mapping with blocking/non-blocking and confidence tiers and a changelog.
 
 ## Problem
 
@@ -105,11 +105,25 @@ Environment: `command` checks inherit the tick's env (scheduler's `uv`/`gh`); fi
 
 ## Acceptance criteria
 
-1. All `checks` pass → `done`, no agent, no branch, base worktree removed, `extra.gate == "passed"` (`test_auto_fix_gate_pass_no_dispatch`).
-2. Any check non-zero → exactly one worker per failing target, prompt carries all failing checks + captured output, no short-circuit (`test_auto_fix_gate_fail_dispatches_worker`).
-3. Check timeout → gate-failed dispatch, tick does not crash (`test_auto_fix_gate_command_timeout`).
-4. `max_attempts_per_target` per target — base intra-occurrence (fresh gate branch per cron fire), pr across PR lifetime (`pr_number` stable) — then `skipped`/`max_attempts_exceeded` + `_notify` (`test_auto_fix_gate_respects_max_attempts_per_target`).
-5. Config validation: `command` or `pr_health` not both; `target` outside `pr|base` rejected; explicit `target` mismatch "not yet supported"; per-check `timeout_ms` positive; `base` non-empty string at config, ref existence runtime; `checks: []` = plain job (`test_auto_fix_gate_config_validation`).
-6. `_check_systemd_timeout` general form as in Approach; no double-count for base (`test_auto_fix_gate_systemd_timeout_budget`).
-7. 12 pr-scope tests still pass with `checks: [pr_health]` baseline (`test_auto_fix_pr_trigger_unchanged`).
-8. Clean base → zero `gh`/agent/push; clean pr → reads-only `gh` polling allowed (`test_auto_fix_gate_clean_run_no_gh_activity`).
+1. checks all pass → `done` with `extra.gate == "passed"`, no agent spawned, no branch created, base-target worktree removed, `any_failed` false — blocking, confidence: high — Test: test_auto_fix_gate_pass_no_dispatch
+2. any check non-zero → exactly one worker dispatched per failing target, prompt contains all failing checks and captured output, no short-circuit, per-attempt record `reason: gate_failed` — blocking, confidence: high — Test: test_auto_fix_gate_fail_dispatches_worker
+3. check exceeding `timeout_ms` counts as gate-failed and dispatches, tick does not crash, timeout noted in output — blocking, confidence: high — Test: test_auto_fix_gate_command_timeout
+4. `max_attempts_per_target` per target — base intra-occurrence (fresh gate branch per cron fire), pr across PR lifetime (`pr_number` stable) — then `skipped`/`max_attempts_exceeded` + `_notify`, no worker — blocking, confidence: high — Test: test_auto_fix_gate_respects_max_attempts_per_target
+5. config validation: check kinds `command` or `pr_health` not both, `target` outside `pr|base` rejected, explicit `target` mismatch "not yet supported", `pr_health`+`command` rejected, per-check `timeout_ms` positive, `base` non-empty string at config with ref existence runtime fail-closed, `checks: []` = plain job — blocking, confidence: high — Test: test_auto_fix_gate_config_validation
+6. branch `auto/<job>-<ts>` and agent `rt-<job>-gate-<run_id>` within 32-char `NAME_RE` cap — non-blocking, confidence: medium — Test: test_auto_fix_gate_branch_and_agent_name
+7. `_check_systemd_timeout` general form `start_timeout_ms + gate_slop + Σ check.timeout_ms + (pr ? max_workers : 1)×timeout_ms + (pr ? max_workers×Σ check.timeout_ms : 0)`, no double-count for base — blocking, confidence: medium — Test: test_auto_fix_gate_systemd_timeout_budget
+8. 12 pr-scope acceptance tests still pass with `checks: [pr_health]` baseline (not "no checks") — blocking, confidence: high — Test: test_auto_fix_pr_trigger_unchanged
+9. clean runs: base-target passing gate produces zero `gh`/`gh api`/agent/push activity (only git worktree + check subprocesses), pr-target allows reads-only `gh` polling (`gh pr list` + per-PR queries) — assertion "no agent, no push, no PR-create" — non-blocking, confidence: medium — Test: test_auto_fix_gate_clean_run_no_gh_activity
+
+## Changelog v1→v2
+
+- v1 (f36472d) established the unified gate model (`checks` + inferred `target`, budgets hoisted to job level, base vs pr semantics, `gate_slop` systemd form) in 8 acceptance items using parenthesized test names.
+- v2 reformats acceptance to 9 numbered items where each line ends `Test: <name>` for `rg -F "Test:"` discovery, adds explicit `blocking`/`non-blocking` tier labels and `confidence:` tiers per item, and splits systemd vs clean-run vs branch/agent concerns for gate-2 discovery.
+- Added item 6 `test_auto_fix_gate_branch_and_agent_name` (branch `auto/<job>-<ts>`, agent `rt-<job>-gate-<run_id>` 32-char cap) which was implicit in Approach/Semantics v1 but not separately acceptance-mapped; now mirrors `docs/pipeline/features/gate-trigger-standing-job.md:332` acceptance 6.
+- Expanded items 1, 2, 5, 9 to state `any_failed` semantics, no short-circuit/all failures, `base` pure-schema vs runtime ref existence, and clean-run spy-harness split (base zero `gh`, pr reads-only polling) from `docs/process/issues/025-gate-trigger-standing-job.md` acceptance.
+- Preserved all Problem/Approach/Files touched/Risks intent from v1; only tightened verifiability for stage-2 gate. Previous content remains authoritative for implementation.
+
+## Review notes
+
+- Tiers follow code-review skill convention: `blocking` findings must be resolved before merge, `non-blocking` are advisory — confidence: high for gate dispatch/budget/config, confidence: medium for systemd/budget formula/naming, confidence: low for flaky `gh` shape drift.
+- Acceptance mapping verified end-to-end for `rg` checks: each acceptance line contains `Test:`, one of `blocking`/`non-blocking`, and `confidence:` — Test: test_auto_fix_gate_review_tiers_present
