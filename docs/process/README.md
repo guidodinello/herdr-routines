@@ -33,6 +33,15 @@ issue it names the decision that must land first; omit it once the item is
 
 Query: `grep -l "status: open" docs/process/issues/*.md`
 
+## Runbooks
+
+Operational how-tos that aren't curated roadmap features live beside this file
+as `*.md` (not under `issues/`, which is frontmatter-driven for `pick-feature`):
+
+- [`pi-update-runbook.md`](pi-update-runbook.md) — what to do when a
+  herdr-routines PR merges: fast-forward the Pi runner checkout, migrate config
+  if the schema changed, validate.
+
 ## Scope
 
 Every `ROADMAP.md` item across all horizons is curated into an issue file
