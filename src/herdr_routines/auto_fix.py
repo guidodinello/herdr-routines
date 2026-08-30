@@ -453,3 +453,178 @@ def build_pr_agent_name(job_name: str, pr_number: int) -> str:
     Two ticks 5 min apart must not double-dispatch the same PR (review finding E)."""
     raw = f"rt-{job_name}-pr{pr_number}"
     return raw[:32]
+
+
+# ---------------------------------------------------------------------------
+# Unified gate model (docs/pipeline/runs/20260830T050021Z/spec.md)
+# ---------------------------------------------------------------------------
+
+_COUNTABLE_STATES_GATE = frozenset({"done", "failed"})
+
+
+@dataclass(frozen=True, slots=True)
+class CheckResult:
+    """Result of a single check execution."""
+
+    kind: str  # "pr_health" | "command"
+    passed: bool
+    output: str = ""
+    error: str | None = None
+    timed_out: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class GateOutcome:
+    """Aggregate result of running all checks."""
+
+    passed: bool
+    results: tuple[CheckResult, ...]
+    combined_output: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class GateCheck:
+    """A single check in the gate model."""
+
+    kind: str  # "pr_health" | "command"
+    command: str | None = None
+    timeout_ms: int = 120_000
+
+
+def run_checks(
+    checks: tuple[GateCheck, ...],
+    *,
+    cwd: str,
+    env: dict[str, str] | None = None,
+    runner: Any | None = None,
+) -> GateOutcome:
+    """Run all gate checks sequentially, no short-circuit. Returns GateOutcome.
+
+    `runner` is an injectable callable ``(argv, *, timeout_s) -> (exit_code, stdout, stderr)``
+    for testability. Defaults to subprocess.run."""
+    import subprocess as _subprocess
+
+    if runner is None:
+
+        def _default_runner(
+            argv: list[str], *, timeout_s: float
+        ) -> tuple[int, str, str]:
+            try:
+                proc = _subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                    check=False,
+                    cwd=cwd,
+                    env=env,
+                )
+                return proc.returncode, proc.stdout, proc.stderr
+            except _subprocess.TimeoutExpired as e:
+                stdout = e.stdout if isinstance(e.stdout, str) else ""
+                stderr = e.stderr if isinstance(e.stderr, str) else ""
+                return 124, stdout, stderr
+
+        runner = _default_runner
+
+    results: list[CheckResult] = []
+    all_passed = True
+    outputs: list[str] = []
+
+    for check in checks:
+        if check.kind == "pr_health":
+            results.append(CheckResult(kind="pr_health", passed=True))
+            continue
+
+        if check.kind == "command" and check.command is not None:
+            timeout_s = check.timeout_ms / 1000
+            argv = check.command.split()
+            exit_code, stdout, stderr = runner(argv, timeout_s=timeout_s)
+            timed_out = exit_code == 124
+            passed = exit_code == 0 and not timed_out
+            output = stdout + stderr
+            outputs.append(f"[{check.command}] exit={exit_code}\n{output}")
+            if not passed:
+                all_passed = False
+            results.append(
+                CheckResult(
+                    kind="command",
+                    passed=passed,
+                    output=output.strip(),
+                    timed_out=timed_out,
+                    error=f"exit code {exit_code}" if not passed else None,
+                )
+            )
+            continue
+
+        # Unknown check kind — treat as failed
+        all_passed = False
+        results.append(
+            CheckResult(
+                kind=check.kind,
+                passed=False,
+                error=f"unknown check kind: {check.kind}",
+            )
+        )
+
+    return GateOutcome(
+        passed=all_passed,
+        results=tuple(results),
+        combined_output="\n".join(outputs),
+    )
+
+
+def build_base_fix_prompt(
+    job_name: str,
+    gate_output: str,
+    base: str,
+    report_path: str,
+) -> str:
+    """Build the prompt for a base-target gate fix worker."""
+    return textwrap.dedent(f"""\
+        You are fixing gate failures on the {base} branch. Work in the checked-out worktree.
+
+        Job: {job_name}
+        Base: {base}
+        Report: {report_path}
+
+        Gate output (failing checks):
+        {gate_output}
+
+        Instructions:
+        1. Read the gate output above to understand what failed
+        2. Fix the code to address the failures
+        3. Run `uv run pytest -q` to verify tests pass
+        4. Run `uv run ruff check .` to verify lint passes
+        5. Commit your changes with a descriptive message
+        6. Create a new branch `auto/{job_name}-<timestamp>` and push it
+        7. Open a PR targeting {base} with `gh pr create --base {base}`
+
+        Write a summary of your findings and fixes to: {report_path}
+
+        Bounded work: complete the fix and push, then stop.
+    """)
+
+
+def build_gate_worker_agent_name(job_name: str, run_id: str) -> str:
+    """Build agent name for a gate fix worker: rt-<job>-gate-<run_id> truncated to
+    32 chars (NAME_RE cap)."""
+    raw = f"rt-{job_name}-gate-{run_id}"
+    return raw[:32]
+
+
+def attempt_count_for_gate_branch(
+    history_path: Path, job_name: str, gate_branch: str
+) -> int:
+    """Count prior terminal records for this job+gate_branch (base-target retry budget).
+    Mirrors attempt_count_for_pr but keyed by gate branch name."""
+    records = read_job(history_path, job_name)
+    count = 0
+    for r in records:
+        if (
+            r.state in _COUNTABLE_STATES_GATE
+            and r.extra
+            and r.extra.get("gate_branch") == gate_branch
+        ):
+            count += 1
+    return count
