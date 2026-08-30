@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -923,7 +924,11 @@ def test_auto_fix_gate_respects_max_attempts_per_target(tmp_history_path: Path) 
                 job="repo-hygiene",
                 state="done",
                 run_id=f"repo-hygiene-{i}",
-                extra={"gate_branch": f"auto/repo-hygiene-{i}", "gate": "failed", "target": "base"},
+                extra={
+                    "gate_branch": f"auto/repo-hygiene-{i}",
+                    "gate": "failed",
+                    "target": "base",
+                },
             ),
         )
 
@@ -978,8 +983,9 @@ jobs:
     checks: []
 """
     cfg = load_config(_write(tmp_config_path, text))
-    assert cfg.job("a") is not None
-    assert cfg.job("a").checks is None
+    job_a = cfg.job("a")
+    assert job_a is not None
+    assert job_a.checks is None
 
     # target outside pr|base rejected
     text2 = """
@@ -1053,7 +1059,9 @@ def test_auto_fix_gate_branch_and_agent_name() -> None:
     assert len(branch) <= 60  # branch names can be longer
 
     # Agent name: rt-<job>-gate-<run_id> truncated to 32
-    agent = build_gate_worker_agent_name("repo-hygiene", "repo-hygiene-20260830T130000Z")
+    agent = build_gate_worker_agent_name(
+        "repo-hygiene", "repo-hygiene-20260830T130000Z"
+    )
     assert agent.startswith("rt-")
     assert len(agent) <= 32
 
@@ -1078,16 +1086,27 @@ def test_auto_fix_gate_systemd_timeout_budget(tmp_path: Path) -> None:
 
     def _make_job(name: str, timeout_ms: int, **overrides: Any) -> Job:
         return Job(
-            name=name, enabled=True, cron="0 3 * * *", repo=tmp_path,
-            workspace="worktree", base="main", agent_kind="claude", model=None,
-            prompt="", timeout_ms=timeout_ms, start_timeout_ms=30_000,
-            catch_up_minutes=120, timezone="UTC", on_missed="log",
+            name=name,
+            enabled=True,
+            cron="0 3 * * *",
+            repo=tmp_path,
+            workspace="worktree",
+            base="main",
+            agent_kind="claude",
+            model=None,
+            prompt="",
+            timeout_ms=timeout_ms,
+            start_timeout_ms=30_000,
+            catch_up_minutes=120,
+            timezone="UTC",
+            on_missed="log",
             **overrides,
         )
 
     # Base target: start + gate_slop + sum(checks) + timeout_ms (single worker)
     base_job = _make_job(
-        "hygiene", 100_000,
+        "hygiene",
+        100_000,
         checks=(
             GateCheck(kind="command", command="ruff check .", timeout_ms=60_000),
             GateCheck(kind="command", command="mypy", timeout_ms=60_000),
@@ -1101,7 +1120,8 @@ def test_auto_fix_gate_systemd_timeout_budget(tmp_path: Path) -> None:
 
     # PR target with commands: start + gate_slop + sum(checks) + max_workers * timeout_ms
     pr_job = _make_job(
-        "pr-checks", 100_000,
+        "pr-checks",
+        100_000,
         checks=(GateCheck(kind="command", command="ruff", timeout_ms=60_000),),
         target="pr",
         max_workers_per_tick=2,
@@ -1148,7 +1168,9 @@ def test_auto_fix_pr_trigger_unchanged(tmp_history_path: Path) -> None:
             },
         },
     )
-    pr = PRInfo(number=1, head_ref="auto/fix-1", author="testuser", url="https://example.com")
+    pr = PRInfo(
+        number=1, head_ref="auto/fix-1", author="testuser", url="https://example.com"
+    )
     elig = is_eligible(gh, owner="t", repo="r", pr=pr)
     assert elig is not None
     assert elig.reason == "ci_failure"
@@ -1185,11 +1207,9 @@ def test_auto_fix_gate_clean_run_no_gh_activity(
 def test_auto_fix_gate_review_tiers_present() -> None:
     """Review notes: blocking/non-blocking tier convention is documented
     and test discovery via rg -F 'Test:' works."""
-    import re
 
     spec_path = (
-        Path(__file__).parent.parent
-        / "docs/pipeline/runs/20260830T050021Z/spec.md"
+        Path(__file__).parent.parent / "docs/pipeline/runs/20260830T050021Z/spec.md"
     )
     if spec_path.exists():
         content = spec_path.read_text()

@@ -20,8 +20,11 @@ from herdr_routines.auto_fix import (
     EligiblePR,
     PRInfo,
     RealGhClient,
+    attempt_count_for_gate_branch,
     attempt_count_for_pr,
+    build_base_fix_prompt,
     build_fix_prompt,
+    build_gate_worker_agent_name,
     build_pr_agent_name,
     build_worker_agent_name,
     fetch_failing_checks,
@@ -30,11 +33,6 @@ from herdr_routines.auto_fix import (
     list_open_prs,
     repo_owner_and_name,
     run_checks,
-    build_base_fix_prompt,
-    build_gate_worker_agent_name,
-    attempt_count_for_gate_branch,
-    GateCheck,
-    GateOutcome,
 )
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.herdr import LIVE_AGENT_STATUSES, HerdrClient, HerdrCliError
@@ -239,9 +237,13 @@ def _process_gated_job(
     )
 
     if job.target == "pr":
-        return _process_pr_target(job, history_path, client=client, now=now, run_id=run_id)
+        return _process_pr_target(
+            job, history_path, client=client, now=now, run_id=run_id
+        )
     else:
-        return _process_base_target(job, history_path, client=client, now=now, run_id=run_id)
+        return _process_base_target(
+            job, history_path, client=client, now=now, run_id=run_id
+        )
 
 
 def _process_pr_target(
@@ -261,31 +263,49 @@ def _process_pr_target(
         if proc.returncode != 0:
             raise RuntimeError(f"git remote failed: {proc.stderr.strip()}")
         owner, repo_name = repo_owner_and_name(proc.stdout.strip())
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         append(
             history_path,
             HistoryRecord(
-                ts=now, job=job.name, state="failed", run_id=run_id,
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
                 extra={"reason": "repo_detection_failed", "error": str(e)},
             ),
         )
-        _notify(client, f"herdr-routines: {job.name} failed", body="repo_detection_failed", sound="request")
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="repo_detection_failed",
+            sound="request",
+        )
         return f"{job.name}: failed (repo_detection_failed)", True
 
     try:
         author = gh.api_user()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         append(
             history_path,
             HistoryRecord(
-                ts=now, job=job.name, state="failed", run_id=run_id,
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
                 extra={"reason": "gh_auth_missing", "error": str(e)},
             ),
         )
-        _notify(client, f"herdr-routines: {job.name} failed", body="gh_auth_missing", sound="request")
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="gh_auth_missing",
+            sound="request",
+        )
         return f"{job.name}: failed (gh_auth_missing)", True
 
-    open_prs = list_open_prs(gh, owner=owner, repo=repo_name, branch_prefix="auto/", author=author)
+    open_prs = list_open_prs(
+        gh, owner=owner, repo=repo_name, branch_prefix="auto/", author=author
+    )
 
     eligible: list[EligiblePR] = []
     for pr_info in open_prs:
@@ -306,11 +326,22 @@ def _process_pr_target(
             append(
                 history_path,
                 HistoryRecord(
-                    ts=now, job=job.name, state="skipped",
-                    extra={"reason": "max_attempts_exceeded", "pr_number": elig_pr.pr.number, "attempt": attempt},
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    extra={
+                        "reason": "max_attempts_exceeded",
+                        "pr_number": elig_pr.pr.number,
+                        "attempt": attempt,
+                    },
                 ),
             )
-            _notify(client, f"herdr-routines: {job.name} PR #{elig_pr.pr.number} skipped", body="max_attempts_exceeded", sound="request")
+            _notify(
+                client,
+                f"herdr-routines: {job.name} PR #{elig_pr.pr.number} skipped",
+                body="max_attempts_exceeded",
+                sound="request",
+            )
             skipped_count += 1
             continue
 
@@ -322,29 +353,50 @@ def _process_pr_target(
         if status in LIVE_AGENT_STATUSES:
             continue
 
-        failing_checks = fetch_failing_checks(gh, owner=owner, repo=repo_name, number=elig_pr.pr.number)
-        thread_bodies = fetch_thread_bodies(gh, owner=owner, repo=repo_name, number=elig_pr.pr.number)
+        failing_checks = fetch_failing_checks(
+            gh, owner=owner, repo=repo_name, number=elig_pr.pr.number
+        )
+        thread_bodies = fetch_thread_bodies(
+            gh, owner=owner, repo=repo_name, number=elig_pr.pr.number
+        )
 
         worker_outcome = _dispatch_fix_worker(
-            job=job, pr=elig_pr.pr, reason=elig_pr.reason, run_id=run_id,
-            attempt=attempt, owner=owner, repo=repo_name, client=client,
-            failing_checks=failing_checks, thread_bodies=thread_bodies,
+            job=job,
+            pr=elig_pr.pr,
+            reason=elig_pr.reason,
+            run_id=run_id,
+            attempt=attempt,
+            owner=owner,
+            repo=repo_name,
+            client=client,
+            failing_checks=failing_checks,
+            thread_bodies=thread_bodies,
         )
 
         agent_name = build_worker_agent_name(job.name, elig_pr.pr.number, run_id)
         extra_record: dict[str, Any] = {
-            "pr_number": elig_pr.pr.number, "headRefName": elig_pr.pr.head_ref,
-            "attempt": attempt, "eligible_reason": elig_pr.reason,
-            "fix_worker_agent": agent_name, "pane_id": worker_outcome.get("pane_id"),
+            "pr_number": elig_pr.pr.number,
+            "headRefName": elig_pr.pr.head_ref,
+            "attempt": attempt,
+            "eligible_reason": elig_pr.reason,
+            "fix_worker_agent": agent_name,
+            "pane_id": worker_outcome.get("pane_id"),
             "report_path": worker_outcome.get("report_path"),
             "report_written": worker_outcome.get("report_written", False),
-            "final_agent_status": worker_outcome.get("final_agent_status"), "target": "pr",
+            "final_agent_status": worker_outcome.get("final_agent_status"),
+            "target": "pr",
         }
 
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state=worker_outcome.get("state", "failed"),
-            run_id=run_id, extra=extra_record,
-        ))
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state=worker_outcome.get("state", "failed"),
+                run_id=run_id,
+                extra=extra_record,
+            ),
+        )
 
         if worker_outcome.get("state") in ("failed", "interrupted_unknown"):
             any_failed = True
@@ -352,20 +404,27 @@ def _process_pr_target(
 
     try:
         from herdr_routines.runner import default_reports_dir
+
         reports_dir = default_reports_dir()
         reports_dir.mkdir(parents=True, exist_ok=True)
         report_path = reports_dir / f"{run_id}.md"
         report_lines = [
-            f"# Gate tick report: {run_id}", "",
-            f"- **Job**: {job.name}", f"- **Time**: {now.isoformat()}", f"- **Target**: pr",
-            f"- **Enumerated**: {len(open_prs)} open PRs", f"- **Eligible**: {len(eligible)}",
-            f"- **Dispatched**: {dispatched_count}", f"- **Skipped (cap)**: {skipped_over_cap}",
-            f"- **Skipped (attempts)**: {skipped_count - skipped_over_cap}", "",
+            f"# Gate tick report: {run_id}",
+            "",
+            f"- **Job**: {job.name}",
+            f"- **Time**: {now.isoformat()}",
+            "- **Target**: pr",
+            f"- **Enumerated**: {len(open_prs)} open PRs",
+            f"- **Eligible**: {len(eligible)}",
+            f"- **Dispatched**: {dispatched_count}",
+            f"- **Skipped (cap)**: {skipped_over_cap}",
+            f"- **Skipped (attempts)**: {skipped_count - skipped_over_cap}",
+            "",
         ]
         for elig_pr in dispatched:
             report_lines.append(f"- PR #{elig_pr.pr.number}: {elig_pr.reason}")
         report_path.write_text("\n".join(report_lines) + "\n")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.warning("%s: could not write aggregate report: %s", job.name, e)
 
     summary = (
@@ -374,17 +433,31 @@ def _process_pr_target(
         f"dispatched={dispatched_count}, skipped={skipped_count})"
     )
 
-    append(history_path, HistoryRecord(
-        ts=now, job=job.name, state="done" if not any_failed else "failed",
-        run_id=run_id,
-        extra={"gate": "passed" if not any_failed else "failed", "target": "pr",
-               "enumerated": len(open_prs), "eligible": len(eligible),
-               "dispatched": dispatched_count, "skipped": skipped_count},
-    ))
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="done" if not any_failed else "failed",
+            run_id=run_id,
+            extra={
+                "gate": "passed" if not any_failed else "failed",
+                "target": "pr",
+                "enumerated": len(open_prs),
+                "eligible": len(eligible),
+                "dispatched": dispatched_count,
+                "skipped": skipped_count,
+            },
+        ),
+    )
 
     if any_failed:
-        _notify(client, f"herdr-routines: {job.name} failed",
-                body=f"{dispatched_count} dispatched, {skipped_count} skipped", sound="request")
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body=f"{dispatched_count} dispatched, {skipped_count} skipped",
+            sound="request",
+        )
         return summary, True
 
     _notify(client, f"herdr-routines: {job.name} done", sound="done")
@@ -396,8 +469,13 @@ def _process_base_target(
 ) -> tuple[str, bool]:
     """Base-target gate: create worktree at base, run command checks, dispatch fix agent on failure."""
     from herdr_routines.runner import (
-        _capture_visible_tail, _close_run_pane, _prompt_with_watchdog,
-        _wait_for_agent_ready, build_branch_name, default_reports_dir, substitute_prompt,
+        _capture_visible_tail,
+        _close_run_pane,
+        _prompt_with_watchdog,
+        _wait_for_agent_ready,
+        build_branch_name,
+        default_reports_dir,
+        substitute_prompt,
     )
 
     assert job.checks is not None
@@ -405,49 +483,109 @@ def _process_base_target(
 
     attempt = attempt_count_for_gate_branch(history_path, job.name, gate_branch)
     if attempt >= job.max_attempts_per_target:
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="skipped", run_id=run_id,
-            extra={"reason": "max_attempts_exceeded", "gate_branch": gate_branch, "attempt": attempt},
-        ))
-        _notify(client, f"herdr-routines: {job.name} skipped", body="max_attempts_exceeded", sound="request")
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                run_id=run_id,
+                extra={
+                    "reason": "max_attempts_exceeded",
+                    "gate_branch": gate_branch,
+                    "attempt": attempt,
+                },
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} skipped",
+            body="max_attempts_exceeded",
+            sound="request",
+        )
         return f"{job.name}: skipped (max_attempts_exceeded)", False
 
     wt_path = Path(job.repo) / ".worktrees" / f"gate-{run_id}"
     try:
         subprocess.run(
             ["git", "-C", str(job.repo), "worktree", "remove", "--force", str(wt_path)],
-            capture_output=True, text=True, timeout=15, check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
         proc = subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "add", "--detach", str(wt_path), job.base],
-            capture_output=True, text=True, timeout=30, check=False,
+            [
+                "git",
+                "-C",
+                str(job.repo),
+                "worktree",
+                "add",
+                "--detach",
+                str(wt_path),
+                job.base,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
-    except Exception as e:
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="failed", run_id=run_id,
-            extra={"gate": "failed", "reason": "worktree_creation_failed", "error": str(e),
-                   "target": "base", "gate_branch": gate_branch},
-        ))
-        _notify(client, f"herdr-routines: {job.name} failed", body="worktree_creation_failed", sound="request")
+    except Exception as e:  # noqa: BLE001
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": "worktree_creation_failed",
+                    "error": str(e),
+                    "target": "base",
+                    "gate_branch": gate_branch,
+                },
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="worktree_creation_failed",
+            sound="request",
+        )
         return f"{job.name}: failed (worktree_creation_failed)", True
 
-    gate_outcome = run_checks(job.checks, cwd=str(wt_path))
+    gate_outcome = run_checks(job.checks, cwd=str(wt_path))  # type: ignore[arg-type]
 
     try:
         subprocess.run(
             ["git", "-C", str(job.repo), "worktree", "remove", "--force", str(wt_path)],
-            capture_output=True, text=True, timeout=15, check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     if gate_outcome.passed:
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="done", run_id=run_id,
-            extra={"gate": "passed", "target": "base", "gate_branch": gate_branch, "gate_output_path": None},
-        ))
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="done",
+                run_id=run_id,
+                extra={
+                    "gate": "passed",
+                    "target": "base",
+                    "gate_branch": gate_branch,
+                    "gate_output_path": None,
+                },
+            ),
+        )
         _notify(client, f"herdr-routines: {job.name} done", sound="done")
         return f"{job.name}: done (gate passed)", False
 
@@ -464,87 +602,188 @@ def _process_base_target(
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="failed", run_id=run_id,
-            extra={"gate": "failed", "reason": "report_dir_creation_failed", "error": str(e),
-                   "target": "base", "gate_branch": gate_branch},
-        ))
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": "report_dir_creation_failed",
+                    "error": str(e),
+                    "target": "base",
+                    "gate_branch": gate_branch,
+                },
+            ),
+        )
         return f"{job.name}: failed (report_dir_creation_failed)", True
 
     prompt_text = job.prompt or build_base_fix_prompt(
-        job_name=job.name, gate_output=gate_outcome.combined_output,
-        base=job.base, report_path=str(report_path), checks=job.checks,
+        job_name=job.name,
+        gate_output=gate_outcome.combined_output,
+        base=job.base,
+        report_path=str(report_path),
+        checks=job.checks,  # type: ignore[arg-type]
     )
-    prompt_text = substitute_prompt(prompt_text, report_path=report_path, job_name=job.name, run_id=run_id)
+    prompt_text = substitute_prompt(
+        prompt_text, report_path=report_path, job_name=job.name, run_id=run_id
+    )
 
     fix_wt_path = Path(job.repo) / ".worktrees" / f"fix-{run_id}"
     try:
         subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "remove", "--force", str(fix_wt_path)],
-            capture_output=True, text=True, timeout=15, check=False,
+            [
+                "git",
+                "-C",
+                str(job.repo),
+                "worktree",
+                "remove",
+                "--force",
+                str(fix_wt_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
         proc = subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "add", "--detach", str(fix_wt_path), job.base],
-            capture_output=True, text=True, timeout=30, check=False,
+            [
+                "git",
+                "-C",
+                str(job.repo),
+                "worktree",
+                "add",
+                "--detach",
+                str(fix_wt_path),
+                job.base,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
-    except Exception as e:
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="failed", run_id=run_id,
-            extra={"gate": "failed", "reason": "worktree_creation_failed", "error": str(e),
-                   "target": "base", "gate_branch": gate_branch},
-        ))
+    except Exception as e:  # noqa: BLE001
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": "worktree_creation_failed",
+                    "error": str(e),
+                    "target": "base",
+                    "gate_branch": gate_branch,
+                },
+            ),
+        )
         return f"{job.name}: failed (worktree_creation_failed)", True
 
     pane_id: str | None = None
     try:
         pane_id = client.tab_create(cwd=str(fix_wt_path), label=agent_name)
         client.agent_start(
-            name=agent_name, kind=job.agent_kind, pane_id=pane_id,
-            start_timeout_ms=job.start_timeout_ms, model=job.model,
+            name=agent_name,
+            kind=job.agent_kind,
+            pane_id=pane_id,
+            start_timeout_ms=job.start_timeout_ms,
+            model=job.model,
         )
     except (HerdrCliError, OSError) as e:
         if pane_id is not None:
             try:
                 client.pane_close(pane_id)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         _cleanup_worktree(job.repo, fix_wt_path)
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="failed", run_id=run_id,
-            extra={"gate": "failed", "reason": "agent_start_failed", "error": str(e),
-                   "pane_id": pane_id, "target": "base", "gate_branch": gate_branch},
-        ))
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": "agent_start_failed",
+                    "error": str(e),
+                    "pane_id": pane_id,
+                    "target": "base",
+                    "gate_branch": gate_branch,
+                },
+            ),
+        )
         return f"{job.name}: failed (agent_start_failed)", True
 
-    ready, last_error = _wait_for_agent_ready(client, agent_name, timeout_s=job.start_timeout_ms / 1000)
+    ready, last_error = _wait_for_agent_ready(
+        client, agent_name, timeout_s=job.start_timeout_ms / 1000
+    )
     if not ready:
-        _capture_visible_tail(client, agent_name, reports_dir=report_path.parent, run_id=run_id)
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
         _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
         _cleanup_worktree(job.repo, fix_wt_path)
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="failed", run_id=run_id,
-            extra={"gate": "failed", "reason": "agent_not_interactive", "error": last_error,
-                   "pane_id": pane_id, "target": "base", "gate_branch": gate_branch},
-        ))
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": "agent_not_interactive",
+                    "error": last_error,
+                    "pane_id": pane_id,
+                    "target": "base",
+                    "gate_branch": gate_branch,
+                },
+            ),
+        )
         return f"{job.name}: failed (agent_not_interactive)", True
 
     try:
         settled_status = _prompt_with_watchdog(
-            client, job_name=agent_name, target=agent_name, text=prompt_text,
-            timeout_ms=job.timeout_ms, markers=job.failure_markers if job.failure_markers is not None else ("Free usage exceeded",),
+            client,
+            job_name=agent_name,
+            target=agent_name,
+            text=prompt_text,
+            timeout_ms=job.timeout_ms,
+            markers=job.failure_markers
+            if job.failure_markers is not None
+            else ("Free usage exceeded",),
             prompt_text=prompt_text,
         )
-    except Exception as e:
-        _capture_visible_tail(client, agent_name, reports_dir=report_path.parent, run_id=run_id)
+    except Exception as e:  # noqa: BLE001
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
         _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
         _cleanup_worktree(job.repo, fix_wt_path)
-        append(history_path, HistoryRecord(
-            ts=now, job=job.name, state="failed", run_id=run_id,
-            extra={"gate": "failed", "reason": "agent_prompt_failed", "error": str(e),
-                   "pane_id": pane_id, "target": "base", "gate_branch": gate_branch},
-        ))
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": "agent_prompt_failed",
+                    "error": str(e),
+                    "pane_id": pane_id,
+                    "target": "base",
+                    "gate_branch": gate_branch,
+                },
+            ),
+        )
         return f"{job.name}: failed (agent_prompt_failed)", True
 
     try:
@@ -555,24 +794,44 @@ def _process_base_target(
         pass
 
     report_written = report_path.exists()
-    report_bytes = report_path.stat().st_size if report_written else 0
+    _report_bytes = report_path.stat().st_size if report_written else 0
 
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
     _cleanup_worktree(job.repo, fix_wt_path)
 
     state = "done" if settled_status in ("idle", "done") else "failed"
-    append(history_path, HistoryRecord(
-        ts=now, job=job.name, state=state, run_id=run_id,
-        extra={"gate": "failed", "target": "base", "gate_branch": gate_branch,
-               "reason": "gate_failed", "failed_checks": gate_outcome.combined_output,
-               "gate_output_path": str(gate_output_path) if gate_output_path.exists() else None,
-               "branch": gate_branch,
-               "pane_id": pane_id, "report_path": str(report_path) if report_written else None,
-               "report_written": report_written, "final_agent_status": settled_status},
-    ))
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state=state,
+            run_id=run_id,
+            extra={
+                "gate": "failed",
+                "target": "base",
+                "gate_branch": gate_branch,
+                "reason": "gate_failed",
+                "failed_checks": gate_outcome.combined_output,
+                "gate_output_path": str(gate_output_path)
+                if gate_output_path.exists()
+                else None,
+                "branch": gate_branch,
+                "pane_id": pane_id,
+                "report_path": str(report_path) if report_written else None,
+                "report_written": report_written,
+                "final_agent_status": settled_status,
+            },
+        ),
+    )
 
     if state == "failed":
-        _notify(client, f"herdr-routines: {job.name} failed", body="agent_prompt_failed", sound="request")
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="agent_prompt_failed",
+            sound="request",
+        )
         return f"{job.name}: failed (agent_prompt_failed)", True
 
     _notify(client, f"herdr-routines: {job.name} done", sound="done")
@@ -583,9 +842,12 @@ def _cleanup_worktree(repo: Path, wt_path: Path) -> None:
     try:
         subprocess.run(
             ["git", "-C", str(repo), "worktree", "remove", "--force", str(wt_path)],
-            capture_output=True, text=True, timeout=15, check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.warning("could not remove worktree %s: %s", wt_path, e)
 
 
@@ -662,7 +924,7 @@ def _dispatch_fix_worker(
         )
         if proc.returncode != 0:
             raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
-    except Exception as e:  # noqa: BLE001 — any worktree failure marks the PR failed
+    except Exception as e:  # noqa: BLE001  # noqa: BLE001 — any worktree failure marks the PR failed
         return {
             "state": "failed",
             "reason": "worktree_creation_failed",
@@ -720,7 +982,7 @@ def _dispatch_fix_worker(
             markers=job.failure_markers or ("Free usage exceeded",),
             prompt_text=prompt_text,
         )
-    except Exception as e:  # noqa: BLE001 — any prompt failure marks the PR failed
+    except Exception as e:  # noqa: BLE001  # noqa: BLE001 — any prompt failure marks the PR failed
         _capture_visible_tail(
             client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id
         )
@@ -746,7 +1008,7 @@ def _dispatch_fix_worker(
     session_id: str | None = None
     try:
         session_id = client.agent_session_id(agent_name)
-    except Exception as e:  # noqa: BLE001 — session id is best-effort reporting data
+    except Exception as e:  # noqa: BLE001  # noqa: BLE001 — session id is best-effort reporting data
         log.debug("could not read session id for %s: %s", agent_name, e)
 
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)

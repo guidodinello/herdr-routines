@@ -350,9 +350,7 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
             has_command = False
             for ci, c in enumerate(checks_raw):
                 if not isinstance(c, dict):
-                    raise ConfigError(
-                        f"{label}: 'checks[{ci}]' must be a mapping"
-                    )
+                    raise ConfigError(f"{label}: 'checks[{ci}]' must be a mapping")
                 unknown_ck = set(c) - {"pr_health", "command", "timeout_ms"}
                 if unknown_ck:
                     raise ConfigError(
@@ -397,9 +395,7 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
     target: str | None = None
     if target_raw is not None:
         if not isinstance(target_raw, str) or target_raw not in VALID_TARGETS:
-            raise ConfigError(
-                f"{label}: 'target' must be 'pr' or 'base' or null"
-            )
+            raise ConfigError(f"{label}: 'target' must be 'pr' or 'base' or null")
         target = target_raw
         if inferred_target is not None and target != inferred_target:
             raise ConfigError(
@@ -410,11 +406,14 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
     if checks is not None and target is None:
         target = inferred_target
 
-    if target == "base" and checks is not None:
-        if not isinstance(base, str) or not base:
-            raise ConfigError(
-                f"{label}: 'base' must be a non-empty string when target is 'base'"
-            )
+    if (
+        target == "base"
+        and checks is not None
+        and (not isinstance(base, str) or not base)
+    ):
+        raise ConfigError(
+            f"{label}: 'base' must be a non-empty string when target is 'base'"
+        )
 
     for int_key in ("max_workers_per_tick", "max_attempts_per_target"):
         value = merged[int_key]

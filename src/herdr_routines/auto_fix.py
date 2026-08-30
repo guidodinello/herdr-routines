@@ -14,7 +14,7 @@ import subprocess
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from herdr_routines.history import read_job
 
@@ -622,6 +622,7 @@ def build_gate_worker_agent_name(job_name: str, run_id: str) -> str:
     """Build agent name for a gate fix worker: rt-<job>-gate-<run_id> truncated to
     32 chars (NAME_RE cap). Use a short hash of run_id to avoid collision."""
     import hashlib
+
     short_hash = hashlib.sha1(run_id.encode()).hexdigest()[:8]
     raw = f"rt-{job_name}-gate-{short_hash}"
     return raw[:32]
