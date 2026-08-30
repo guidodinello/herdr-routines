@@ -1,7 +1,7 @@
 ---
 id: "025"
 title: "Auto-fix standing job: checks + target (unified gate model)"
-status: open
+status: done
 priority: high
 area: pipeline
 gate: PR #53 (feature spec) merged to main

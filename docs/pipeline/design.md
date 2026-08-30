@@ -56,8 +56,8 @@ Hardcoded stages (mirrors spec §3, stages mirror
 |---|-------|----------------|-------|--------|---------------------------------|
 | 1 | Plan + draft spec | `opencode/muse-spark-1.2-contributor-free` | idea paragraph | `spec.md` v1 | file exists, non-empty |
 | 2 | Spec review + update | `opencode/muse-spark-1.2-contributor-free` (fresh session, ≠ stage 1) | spec v1 | spec v2 + Acceptance criteria & test plan (numbered, each → ≥1 named test) | reviewer posted updated spec + change notes |
-| 3 | Implement | `opencode/x-preview-f-free` (= `ox-alpha-free`, alias per `opencode-e2e:17`) | spec v2 | branch commits + tests from acceptance section | all spec-derived tests pass locally |
-| 4 | Open PR | same session as 3 | branch | PR | `gh pr view` exists |
+| 3 | Implement | `opencode/x-preview-f-free` (= `ox-alpha-free`, alias per `opencode-e2e:17`) | spec v2 | branch commits + tests from acceptance section; **flips picked issue `status: open`→`done`** | all spec-derived tests pass locally; picked issue file committed as `status: done` |
+| 4 | Open PR | same session as 3 | branch | PR **carrying the issue-close commit** | `gh pr view` exists |
 | 5 | Code review | separate session (code-review skill) — **v1 single `opencode/big-pickle` primary** (measured 1/7, 5 high-sev uniques `pr4:106`); **v2 fan-out `hy3-free` + `x-preview-f-free` 2-tie** (`opencode-e2e:19`) | PR number | posted review | review posted (blocking allowed) |
 | 6 | Address comments | same agent as stages 3–4, prompted with review digest + `gh pr view --comments` (preserves code context; audit gap 8) | review findings | fixes + `gh api` thread-resolve + replies | gate 6: no unresolved blocking threads (or replies on every blocking finding per Gates) |
 
@@ -70,6 +70,17 @@ not on arbitrary human comments arriving later; after 60 min with no review,
 abort with partial report (G-12). Human gate stays at merge. Stage 5 code-review
 skill is multi-agent (5 reviewers) — for v1 run as single worker session; full
 5-reviewer fan-out is v2 if needed (audit gap 13).
+
+**Issue close-on-merge (issue-lifecycle contract):** the picked issue's
+`status: done` flip is **carried inside the implementing PR** (stage 3 commits
+`open`/`in-progress` → `done` on `docs/process/issues/<file>`), so it lands on
+`main` atomically **exactly when the PR merges** — merging the PR *is* closing
+the issue. There is deliberately **no separate manual/post-merge flip step**:
+that gap is what left issue 025 `open` after PR #56 implemented it, so tonight's
+`pick-feature` would have re-picked an already-done feature. Because the flip is
+a commit in the PR, a human *closed-without-merge* leaves `main` untouched (issue
+stays `open`/`in-progress`) — correct. Stage 3's gate enforces the PR touches its
+own issue file and the flip is committed.
 
 **Spec leakage (G-13):** stage 1's `spec.md` commit(s) on `auto/pipeline-<run_id>`
 ride the PR opened in stage 4. Document as intentional — prefix spec commits
