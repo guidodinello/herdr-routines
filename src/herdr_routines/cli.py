@@ -72,7 +72,12 @@ def _get_version() -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="herdr-routines")
-    parser.add_argument("--config", type=Path, default=None, help="path to jobs.yaml")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="path to jobs.d/ directory or jobs.yaml file",
+    )
     # On the top-level parser so the version action fires before the required-subcommand
     # check — --version/-V must work with no jobs.yaml and no Herdr server.
     parser.add_argument(
@@ -114,7 +119,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_history.add_argument("--json", action="store_true")
     p_history.set_defaults(handler=_cmd_history)
 
-    p_validate = sub.add_parser("validate", help="check jobs.yaml for problems")
+    p_validate = sub.add_parser(
+        "validate", help="check jobs.d/ or jobs.yaml for problems"
+    )
     p_validate.add_argument(
         "--systemd-unit",
         type=Path,
@@ -196,10 +203,15 @@ def _build_parser() -> argparse.ArgumentParser:
 def _load_config_or_exit(args: argparse.Namespace) -> RoutinesConfig:
     path = args.config or default_config_path()
     try:
-        return load_config(path)
+        config = load_config(path)
     except ConfigError as e:
         log.error("failed to load config %s: %s", path, e)
         raise SystemExit(1) from e
+    if config.errors:
+        for err in config.errors:
+            log.error("config: %s", err)
+        raise SystemExit(1)
+    return config
 
 
 def _cmd_tick(args: argparse.Namespace) -> int:
@@ -381,8 +393,12 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    problems = []
-    warnings = []
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    # Per-file errors from directory loader (jobs.d/ layout).
+    problems.extend(config.errors)
+
     for job in config.jobs:
         if not job.repo.exists():
             problems.append(f"{job.name}: repo path does not exist: {job.repo}")

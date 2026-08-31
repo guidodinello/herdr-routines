@@ -1,19 +1,29 @@
 """Config loading and validation: YAML -> Job dataclasses.
 
-Pure: no filesystem access beyond reading the one YAML file, no subprocess, no clock reads
+Pure: no filesystem access beyond reading YAML files, no subprocess, no clock reads
 (the caller supplies `now` where it matters). This is what makes it fully unit-testable.
+
+Supports two config layouts:
+- Legacy single file: ``jobs.yaml`` (deprecated, emits a warning when used).
+- Directory layout: ``jobs.d/`` with one ``<name>.yaml`` per job and an optional
+  ``defaults.yaml`` for shared fields.  The loader picks directory over file when
+  both exist.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from croniter import croniter
+from logger import get_logger
+
+log = get_logger(__name__)
 
 # Kinds documented by `herdr agent` --help on herdr 0.8.2 (see docs/plan-v1.md).
 VALID_AGENT_KINDS = frozenset(
@@ -162,6 +172,8 @@ class Job:
 @dataclass(frozen=True, slots=True)
 class RoutinesConfig:
     jobs: tuple[Job, ...] = field(default_factory=tuple)
+    # Per-file errors from directory loader (empty for single-file or clean directory load).
+    errors: tuple[str, ...] = field(default_factory=tuple)
 
     def job(self, name: str) -> Job | None:
         for j in self.jobs:
@@ -171,19 +183,46 @@ class RoutinesConfig:
 
 
 def default_config_path() -> Path:
-    """--config > $HERDR_PLUGIN_CONFIG_DIR/jobs.yaml > ~/.config/herdr-routines/jobs.yaml.
+    """Resolve the config base path: ``--config``, ``$HERDR_PLUGIN_CONFIG_DIR/jobs.d``,
+    or ``~/.config/herdr-routines/jobs.d``.
+
+    The returned path may be a *directory* (``jobs.d/`` layout) or a *file* (legacy
+    ``jobs.yaml``).  Callers should pass it straight to :func:`load_config` which
+    auto-detects the shape.
 
     The middle entry is forethought for the optional plugin manifest described in
     docs/plan-v1.md §8.4 — it costs nothing now and keeps that door open later.
     """
     plugin_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
     if plugin_dir:
-        return Path(plugin_dir) / "jobs.yaml"
-    return Path.home() / ".config" / "herdr-routines" / "jobs.yaml"
+        return Path(plugin_dir) / "jobs.d"
+    return Path.home() / ".config" / "herdr-routines" / "jobs.d"
 
 
 def load_config(path: Path) -> RoutinesConfig:
-    """Load and fully validate jobs.yaml. Raises ConfigError on any problem."""
+    """Load and fully validate config from *path*.
+
+    *path* may point to a **directory** (``jobs.d/`` layout) or a **file** (legacy
+    ``jobs.yaml``).  When it is a directory, :func:`load_config_dir` is used.  When it
+    is a file, the legacy single-file loader runs with a deprecation warning.
+
+    Raises :class:`ConfigError` on any problem.
+    """
+    if path.is_dir():
+        return load_config_dir(path)
+
+    # Legacy single-file path — still supported but deprecated.
+    warnings.warn(
+        f"Loading config from a single file ({path}) is deprecated. "
+        "Migrate to a jobs.d/ directory layout.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _load_config_file(path)
+
+
+def _load_config_file(path: Path) -> RoutinesConfig:
+    """Legacy single-file loader (``jobs.yaml``).  Raises :class:`ConfigError` on any problem."""
     try:
         raw_text = path.read_text()
     except OSError as e:
@@ -236,18 +275,149 @@ def load_config(path: Path) -> RoutinesConfig:
     return RoutinesConfig(jobs=tuple(jobs))
 
 
-def _build_job(raw_job: dict, defaults: dict, *, index: int) -> Job:
+def load_config_dir(path: Path) -> RoutinesConfig:
+    """Load config from a ``jobs.d/`` directory layout.
+
+    Directory contract::
+
+        <path>/
+            defaults.yaml   # optional; shared fields merged under each job
+            <name>.yaml     # one per job; filename stem is the canonical name
+
+    Discovery is deterministic (``sorted()`` glob).  ``defaults.yaml`` is excluded
+    from the job file list.
+
+    Per-file YAML syntax errors surface the file name and do **not** prevent other
+    jobs from loading (for diagnostics).  Unknown keys or bad values in one file also
+    skip that file and continue.
+
+    Raises :class:`ConfigError` if the directory does not exist.
+    """
+    if not path.is_dir():
+        raise ConfigError(f"config directory does not exist: {path}")
+
+    # --- load defaults.yaml (optional) -------------------------------------------
+    defaults_path = path / "defaults.yaml"
+    raw_defaults: dict = {}
+    if defaults_path.exists():
+        raw_defaults = _load_yaml_or_error(defaults_path, is_defaults=True)
+        _validate_defaults_keys(raw_defaults, defaults_path)
+
+    # --- discover job files (sorted, exclude defaults.yaml) ----------------------
+    job_files = sorted(p for p in path.glob("*.yaml") if p.name != "defaults.yaml")
+
+    jobs: list[Job] = []
+    seen_names: set[str] = set()
+    errors: list[str] = []
+
+    for job_file in job_files:
+        try:
+            raw_job = _load_yaml_or_error(job_file, is_defaults=False)
+        except ConfigError as e:
+            errors.append(str(e))
+            continue
+
+        if not isinstance(raw_job, dict):
+            errors.append(f"{job_file}: job file must be a mapping")
+            continue
+
+        # --- filename / name contract -------------------------------------------
+        stem = job_file.stem
+        if not NAME_RE.match(stem):
+            errors.append(
+                f"{job_file}: filename stem {stem!r} does not match {NAME_RE.pattern}"
+            )
+            continue
+
+        name_in_file = raw_job.get("name")
+        if name_in_file is not None:
+            if not isinstance(name_in_file, str):
+                errors.append(f"{job_file}: 'name' must be a string")
+                continue
+            if name_in_file != stem:
+                errors.append(
+                    f"{job_file}: 'name' key {name_in_file!r} does not match "
+                    f"filename stem {stem!r}"
+                )
+                continue
+        else:
+            # No 'name' key — filename stem is the canonical name.
+            raw_job["name"] = stem
+
+        try:
+            job = _build_job(
+                raw_job, raw_defaults, index=len(jobs), label_prefix=job_file.name
+            )
+        except ConfigError as e:
+            errors.append(str(e))
+            continue
+
+        # Defensive: the filename=name contract (stem == name) makes duplicates
+        # impossible across different files, but this guard stays as a safety net
+        # in case the contract is relaxed in the future.
+        if job.name in seen_names:
+            errors.append(f"duplicate job name: {job.name!r} (from {job_file})")
+            continue
+        seen_names.add(job.name)
+        jobs.append(job)
+
+    if errors:
+        for err in errors:
+            log.warning("config: %s", err)
+
+    return RoutinesConfig(jobs=tuple(jobs), errors=tuple(errors))
+
+
+def _load_yaml_or_error(path: Path, *, is_defaults: bool) -> dict:
+    """Read and parse a single YAML file.  Raises :class:`ConfigError` with the file
+    name embedded for clear diagnostics."""
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise ConfigError(f"cannot read {path}: {e}") from e
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"{path}: YAML syntax error: {e}") from e
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        kind = "defaults" if is_defaults else "job"
+        raise ConfigError(
+            f"{path}: {kind} file must be a mapping, got {type(raw).__name__}"
+        )
+    return raw
+
+
+def _validate_defaults_keys(raw: dict, path: Path) -> None:
+    """Reject unknown keys in ``defaults.yaml`` (same contract as the legacy top-level
+    ``defaults:`` block)."""
+    unknown = set(raw) - _DEFAULTS_ALLOWED_KEYS
+    if unknown:
+        raise ConfigError(f"{path}: unknown key(s): {sorted(unknown)}")
+
+
+def _build_job(
+    raw_job: dict, defaults: dict, *, index: int, label_prefix: str | None = None
+) -> Job:
     unknown = set(raw_job) - _JOB_ALLOWED_KEYS
     if unknown:
-        raise ConfigError(f"jobs[{index}]: unknown key(s): {sorted(unknown)}")
+        prefix = label_prefix or f"jobs[{index}]"
+        raise ConfigError(f"{prefix}: unknown key(s): {sorted(unknown)}")
 
     missing = _JOB_REQUIRED_KEYS - set(raw_job)
     if missing:
-        raise ConfigError(f"jobs[{index}]: missing required key(s): {sorted(missing)}")
+        prefix = label_prefix or f"jobs[{index}]"
+        raise ConfigError(f"{prefix}: missing required key(s): {sorted(missing)}")
 
     merged = {**_JOB_DEFAULTS, **defaults, **raw_job}
     name = merged["name"]
-    label = f"jobs[{index}] ({name!r})" if isinstance(name, str) else f"jobs[{index}]"
+    if label_prefix:
+        label = f"{label_prefix} ({name!r})" if isinstance(name, str) else label_prefix
+    else:
+        label = (
+            f"jobs[{index}] ({name!r})" if isinstance(name, str) else f"jobs[{index}]"
+        )
 
     if not isinstance(name, str) or not NAME_RE.match(name):
         raise ConfigError(

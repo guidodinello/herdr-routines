@@ -1,0 +1,12 @@
+# Shared defaults merged under each job's own fields.
+# Same key set as the legacy top-level ``defaults:`` block in jobs.yaml.
+# Absent keys fall through to _JOB_DEFAULTS (config.py).
+
+agent_kind: claude
+workspace: worktree
+timeout_ms: 1800000 # 30 min
+catch_up_minutes: 120
+timezone: America/Montevideo
+# failure_markers: ["Free usage exceeded"] # optional (docs/failure-reaping.md §3.4):
+#                                          # screen markers scanned after a failed prompt
+#                                          # wait; omit for the built-in defaults.

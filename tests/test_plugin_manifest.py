@@ -207,7 +207,7 @@ def test_plugin_env_var_paths_fallback(
     monkeypatch.delenv("HERDR_PLUGIN_STATE_DIR", raising=False)
     home = Path.home()
     base = home / ".local" / "state" / "herdr-routines"
-    assert default_config_path() == home / ".config" / "herdr-routines" / "jobs.yaml"
+    assert default_config_path() == home / ".config" / "herdr-routines" / "jobs.d"
     assert default_history_path() == base / "history.jsonl"
     # tick.py/cli.py/runner.py follow the same HERDR_PLUGIN_STATE_DIR fallback.
     assert default_lock_path() == base / "tick.lock"
@@ -216,7 +216,7 @@ def test_plugin_env_var_paths_fallback(
 
     monkeypatch.setenv("HERDR_PLUGIN_CONFIG_DIR", str(config_dir))
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(state_dir))
-    assert default_config_path() == config_dir / "jobs.yaml"
+    assert default_config_path() == config_dir / "jobs.d"
     assert default_history_path() == state_dir / "history.jsonl"
     assert default_lock_path() == state_dir / "tick.lock"
     assert default_log_path() == state_dir / "herdr-routines.log"

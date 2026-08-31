@@ -1,0 +1,26 @@
+# Auto-fix job: the pipeline only opens a PR branch to fix pre-existing CI/lint
+# failures or unresolved review threads on an *existing* PR — it never creates
+# new PRs on its own.
+#
+# A job is conditional when it has ``checks:`` — ordered, all must pass; any
+# failure dispatches the fix agent (the job's own agent fields).  No ``checks``
+# = a watchdog/report-and-commit delegate.
+#
+# ``target`` is optional and inferred from the check kinds (pr_health => pr,
+# commands => base).
+
+enabled: true
+cron: "*/10 * * * *"
+repo: /home/guido/projects/herdr-routines
+workspace: worktree
+base: main
+max_workers_per_tick: 3 # one fix worker per flagged PR, <=3/tick
+max_attempts_per_target: 3 # retry budget, keyed per PR
+checks:
+  - pr_health # builtin: CI red OR review threads unresolved; polls gh, never spawns
+agent_kind: opencode
+model: null
+prompt: "" # empty = pipeline-injected fix prompt template (seeded with the flagged PR's output)
+timeout_ms: 1800000
+start_timeout_ms: 120000
+on_missed: log
