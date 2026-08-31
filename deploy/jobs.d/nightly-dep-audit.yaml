@@ -1,0 +1,28 @@
+# One file per job.  Filename stem (``nightly-dep-audit``) is the canonical name.
+# The ``name:`` key inside is optional — if present it must equal the stem.
+#
+# Copy this directory to the path resolved by
+# ``herdr_routines.config.default_config_path()`` (--config, then
+# $HERDR_PLUGIN_CONFIG_DIR/jobs.d, then ~/.config/herdr-routines/jobs.d) and edit
+# for your own jobs.  See docs/plan-v1.md §2 for the full schema.
+#
+# jobs.d/ is host-specific (repo: paths are local to whichever machine's Herdr
+# server runs the jobs — see docs/plan-v1.md §3) and is deliberately NOT
+# committed; only these examples are.
+
+enabled: true
+cron: "0 3 * * *"
+repo: /home/guido/projects/fitted # a normal clone is fine; `herdr worktree create` makes a
+                                   # new linked worktree elsewhere from it each run
+workspace: worktree
+base: main
+agent_kind: opencode
+model: null # native model flag, e.g. "opencode/big-pickle"; null = agent default.
+            # Only supported for agent_kind claude/opencode (see docs/plan-v1.md §2).
+prompt: |
+  Review the dependency tree for known CVEs and unpinned versions.
+  Write your findings to $ROUTINE_REPORT as Markdown. Do not commit or push.
+timeout_ms: 2700000
+start_timeout_ms: 120000
+catch_up_minutes: 120
+on_missed: log
