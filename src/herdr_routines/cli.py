@@ -72,7 +72,7 @@ def _get_version() -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="herdr-routines")
-    parser.add_argument("--config", type=Path, default=None, help="path to jobs.yaml")
+    parser.add_argument("--config", type=Path, default=None, help="path to jobs.d/ directory or jobs.yaml file")
     # On the top-level parser so the version action fires before the required-subcommand
     # check — --version/-V must work with no jobs.yaml and no Herdr server.
     parser.add_argument(
@@ -114,7 +114,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_history.add_argument("--json", action="store_true")
     p_history.set_defaults(handler=_cmd_history)
 
-    p_validate = sub.add_parser("validate", help="check jobs.yaml for problems")
+    p_validate = sub.add_parser("validate", help="check jobs.d/ or jobs.yaml for problems")
     p_validate.add_argument(
         "--systemd-unit",
         type=Path,
@@ -383,6 +383,11 @@ def _cmd_validate(args: argparse.Namespace) -> int:
 
     problems = []
     warnings = []
+
+    # Per-file errors from directory loader (jobs.d/ layout).
+    for err in config.errors:
+        problems.append(err)
+
     for job in config.jobs:
         if not job.repo.exists():
             problems.append(f"{job.name}: repo path does not exist: {job.repo}")

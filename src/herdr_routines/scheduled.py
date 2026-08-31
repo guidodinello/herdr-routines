@@ -1,4 +1,4 @@
-"""`herdr-routines scheduled`: what's scheduled, per jobs.yaml.
+"""`herdr-routines scheduled`: what's scheduled, per config (jobs.d/ or jobs.yaml).
 
 Read-only view over `config.load_config()` output: for every job (disabled ones
 included and marked), the next cron fire reuses `schedule.occurrences_since`
