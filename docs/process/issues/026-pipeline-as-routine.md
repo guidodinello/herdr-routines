@@ -26,7 +26,7 @@ and the pipeline today is **who schedules them**:
   it does not block the tick cadence*. It has its own `deadline_epoch`,
   `state.json`, and mirror-report.
 
-So the unification being targeted here is real but *narrow and scheduling-only*:
+The unification being targeted here is real but **narrow and scheduling-only**:
 **move pipeline scheduling into `tick`.** It is NOT an immediate engine
 unification — stages stay hardcoded in `orchestrator-prompt.md` either way. Real
 engine unification (a Python stage driver, declarative `workflows/<name>.yaml`,
@@ -43,77 +43,48 @@ The core design decision: **`tick` dispatches the pipeline detached and returns.
 It does not block on it.** A 5-minute `Type=oneshot` tick holding `tick.lock`
 (flock, tick.py:64-83) must not run an orchestrator synchronously — with a
 multi-hour budget that would freeze every other job (`babysit-prs`,
-`repo-hygiene`, …) for the whole night (~84 no-op timer fires, no other job runs).
-This is exactly why the pipeline uses a separate transient unit today.
+`repo-hygiene`, …) for the whole night (~84 no-op timer fires, no other job
+runs). This is exactly why the pipeline uses a separate transient unit today.
 
-Mechanism, on cron fire:
+Mechanism, on cron fire (`_process_pipeline_job`, a sibling of
+`_process_gated_job` branched in `_process_job`, tick.py:1032):
 
-1. `tick` recognizes the job by `kind: pipeline`, writes a `running` record
-   (with the fresh `run_id`).
-2. It launches a **detached** transient unit — `tick` *generates* the same
-   `systemd-run --user --unit=herdr-pipeline-<run_id>` invocation a human runs
-   today (design.md:283-295) — injecting `HERDR_ENV=1` into the orchestrator's
-   pane/workspace and pinning `$PIPELINE_REPORT` to
-   `default_reports_dir()/f"{run_id}.md"` so `tick` and the orchestrator agree on
-   the report path.
-3. `tick` returns immediately. Subsequent ticks see the live `rt-nightly-pipeline`
-   agent (reusing the existing `_live_agent_exists` guard, tick.py:1194) →
-   "skipped (already running)". When the agent is gone, a later tick reconciles
-   completion from `state.json` (`current_stage`, terminal) + the report file,
-   writing `done` / `failed` / `interrupted_unknown` (extending
-   `find_stale_running` semantics against the deadline).
+1. **Launch first, then record.** `tick` generates the *same* detached
+   `systemd-run --user --unit=herdr-pipeline-<RUN_ID>` invocation a human runs
+   today (design.md:283-295), and only after `systemd-run` exits 0 writes the
+   `running` record. (Writing the record before launch wedges the job for the
+   whole deadline if `systemd-run` fails or tick dies between — order matters.)
+2. **The generated command** runs `herdr workspace create --env HERDR_ENV=1 …`
+   (that flag already exists, design.md:133) so the orchestrator's
+   pane/workspace gets `HERDR_ENV=1`. `tick` returns immediately; subsequent
+   ticks see the live agent (existing `_live_agent_exists` guard, tick.py:1194)
+   → "skipped (already running)".
+3. When the agent is gone, a later tick **reconciles completion from the report
+   file's content** (existence = terminal; parse the orchestrator's outcome
+   marker for done vs failed vs partial) — not from `state.json`, which lives in
+   the orchestrator's own worktree, is unpinned, and may be gc'd by a human
+   (design.md G-14). Reuse `find_stale_running` semantics bounded by
+   `deadline_ms` to detect silent death.
 
-The existing codebase already has the right shape for "a job that isn't a plain
-single-agent run": `_process_job` branches to `_process_gated_job` when
-`job.checks is not None` (tick.py:1032). A `kind: pipeline` job gets a **sibling
-`_process_pipeline_job`** — not five special-cases threaded through
-`execute_run` / `_process_job`.
+### The RUN_ID contract (must be stated; the naive choice breaks stage 1)
 
-### Mode discriminator: an explicit `kind:` enum, not overloaded flags
+`tick` mints its own history key with `make_run_id(job.name, occ)` =
+`nightly-pipeline-20260830T020000Z` (runner.py:258-259). It must **not** hand
+that string to the orchestrator as `RUN_ID`: the orchestrator builds worker
+agent names `pl-<N>-<RUN_ID>` (orchestrator-prompt.md Worker spawn template;
+design.md:215), and herdr caps agent names at 32 chars
+(`[a-z][a-z0-9_-]{0,31}`, config.py:58-60). `pl-1-` + the 32-char full run id =
+37 chars — overflow by 5, every worker spawn fails at stage 1.
 
-Today `checks is not None` is an *implicit* mode switch (tick.py:1032). Replace
-that intuition with one explicit, single-source-of-truth field:
+Fix, stated explicitly:
+- `tick` passes the **bare UTC timestamp** (`20260830T020000Z`, 16 chars →
+  `pl-1-…` = 21 chars, fits) as the orchestrator's `RUN_ID`. The full
+  `make_run_id(job.name, occ)` value is used only for `tick`'s own history key.
+- The pinned report path is passed as an **absolute path literal** in the
+  generated invocation (not reconstructed from either run_id on the orchestrator
+  side), so tick and orchestrator need never agree on a run_id namespace.
 
-- `kind: routine` (default) — plain 1-agent job, has `checks` optionally.
-- `kind: gate` — 1-agent job with `checks` (the old implicit gate mode).
-- `kind: pipeline` — detached, deadline-bounded orchestrator dispatch (this issue).
-
-`prompt` *source* (inline string vs file) is a **separate axis** (`prompt_file:`):
-a plain routine may legitimately want a file-backed prompt without becoming a
-pipeline. Do not infer mode from prompt source.
-
-## Config / design shape (draft — for review)
-
-```yaml
-# jobs.d/orchestrator.yaml   (dir mode, issue 006) — or a jobs.yaml block
-- name: nightly-pipeline
-  kind: pipeline                       # explicit mode; SSOT discriminator
-  enabled: true
-  cron: "0 2 * * *"
-  catch_up_minutes: 0                  # never fire a 7h run late into the workday
-  repo: ~/.local/state/herdr-routines/repos/herdr-routines   # the PARENT clone, used as-is
-  prompt_file: docs/pipeline/orchestrator-prompt.md          # I/O convenience axis
-  deadline_ms: 25200000                # orchestrator wall budget → deadline_epoch
-  start_timeout_ms: 120000
-  env:                                 # injected into the orchestrator's pane/workspace
-    HERDR_ENV: "1"
-  on_missed: log
-```
-
-Design notes:
-- **No blocking `timeout_ms`.** `deadline_ms` is the orchestrator's own wall-clock
-  budget; `tick` does not wait it out. This removes the whole systemd
-  `TimeoutStartSec` conflict that a blocking model would create.
-- **`workspace: worktree|root` does not apply** to `kind: pipeline` — the
-  orchestrator runs in the parent clone and creates its own
-  `auto/pipeline-<run_id>` worktree (`orchestrator-prompt.md` Prerequisite 1;
-  design.md:337-338). Document that; do not force-fit it.
-- `default_config_path()`/consumer wiring stays minimal, but the behavioural
-  work lives in `tick` (`_process_pipeline_job`) — not in `cli.py` config
-  loading. `_load_config_or_exit` only loads config; it is not a shortcut for
-  the runner changes here.
-
-## Report semantics: redirect, don't skip
+### Report semantics: redirect, don't skip
 
 `$ROUTINE_REPORT` / `$PIPELINE_REPORT` are placeholder strings today;
 `substitute_prompt` (runner.py:267-274) only knows `$ROUTINE_*`, so the
@@ -124,92 +95,180 @@ Fix by **redirecting** to one name, then **keeping** the `no_report` guard:
 
 1. Teach `substitute_prompt` a single `$REPORT`, substituted for every job kind
    to `default_reports_dir()/f"{run_id}.md"` (keep `$ROUTINE_REPORT` as a
-   back-compat alias). This also unifies the run_id namespace between tick and
-   the orchestrator.
-2. **Do not** skip the "report exists and non-empty" check for pipeline jobs. The
-   guard is the *only* mechanism that turns "agent settled `idle` having done
-   nothing" into `failed` (runner.py:617-623) — and the pipeline has a documented
-   silent-clean-exit failure mode (a killed orchestrator writes nothing,
-   design.md:347-356). The pipeline needs that detector *more*, not less.
-3. The one legitimate content difference: tolerate a **partial** report
-   (deadline exceeded) as non-failure. That is a report-content rule, not a reason
-   to disable the guard.
+   back-compat alias). This also unifies the run_id namespace for the report.
+2. **Do not** skip the "report exists and non-empty" check for pipeline jobs,
+   and reconcile completion **from the report's content**: the orchestrator
+   already writes a report "at end regardless of outcome" (design.md:168), so an
+   empty/missing report after an agent-gone transition is the
+   silent-orchestrator-death detector (the documented incident, design.md:347-356).
+3. The one legitimate content difference — **tolerate a partial report only when
+   the deadline was exceeded.** The signal `tick` reads must be named: the
+   orchestrator writes an explicit outcome marker, e.g. a `## Outcome:
+   partial (deadline exceeded)` line (it already writes a partial report +
+   `notification show` on deadline, design.md:170-173). Reconcile done vs failed
+   vs partial from that marker, not from the clock.
 
-## Hard runtime prerequisite: `HERDR_ENV=1`
+> Note: the orchestrator agent is named `rt-<job>` (i.e. `rt-nightly-pipeline`)
+> in the generated invocation, matching the `_live_agent_exists` guard — this
+> diverges from design.md:289's `pipeline-orchestrator`; implementer should not
+> copy the doc verbatim.
 
-`herdr.py` today has **zero env-injection support**; the orchestrator is dead
-without `HERDR_ENV=1` (it cannot drive `herdr` at all, design.md:131-134) —
-without it, every `herdr` call wedges `blocked` at 02:00. Plumb an env-injection
-path through the launch (pane/workspace creation) and pin `$PIPELINE_REPORT`.
-This is a hard prerequisite, not a detail — it gets its own acceptance criterion.
+### `HERDR_ENV=1` is a string literal, not a `herdr.py` change
+
+Under dispatch-detached, `tick` **emits a shell command** that itself runs
+`herdr workspace create --env HERDR_ENV=1 …`. The env never flows through
+`HerdrClient`/`herdr.py` at all (that client has zero env support and does not
+need any here). `HERDR_ENV=1` is **mandatory** for `kind: pipeline` — it is a
+constant folded into the generated string, not a `env:` config block. Implementer
+builds the invocation string with `HERDR_ENV=1` (and the pinned absolute report
+path) baked in. A separate `env:` map is out of scope (YAGNI; opening env
+config invites "what about routines" and shell-escaping surface).
+
+## Mode discriminator: `kind: pipeline | routine` (scoped, not full SSOT)
+
+Introduce a minimal explicit enum — **only two values for this increment**:
+
+- `kind: routine` (default) — the existing plain 1-agent job.
+- `kind: pipeline` — detached, deadline-bounded orchestrator dispatch (this issue).
+
+Gate mode is **left exactly as today**: `_process_job` still dispatches to
+`_process_gated_job` on `job.checks is not None` (tick.py:1032) inside the
+`routine` branch, untouched — no migration for the Pi's live `babysit-prs` /
+`repo-hygiene` configs. Do **not** add `kind: gate` or a "routine has `checks`
+optionally" clause here — both would make `kind` a non-SSOT (tick would still
+need `checks is not None`), which is worse than today. Full `kind:` SSOT that
+retires `checks is not None` is a separate migration issue.
+
+`prompt` *source* (inline string vs file) is a **separate axis** (`prompt_file:`):
+a plain routine may legitimately want a file-backed prompt without becoming a
+pipeline. Do not infer mode from prompt source.
+
+## Config / design shape (draft — for review)
+
+```yaml
+# jobs.d/orchestrator.yaml   (dir mode, issue 006) — or a jobs.yaml block
+- name: nightly-pipeline
+  kind: pipeline                       # explicit mode
+  enabled: true
+  cron: "0 2 * * *"
+  catch_up_minutes: 0                  # ENFORCED: validate rejects >0 for pipeline
+  repo: ~/.local/state/herdr-routines/repos/herdr-routines   # the PARENT clone, used as-is
+  prompt_file: docs/pipeline/orchestrator-prompt.md          # I/O convenience axis
+  deadline_ms: 25200000                # orchestrator wall budget → deadline_epoch
+  start_timeout_ms: 120000
+  on_missed: log
+```
+
+Design notes:
+- **No blocking `timeout_ms`, no `env:` block, no `workspace:`.**
+  `deadline_ms` is the orchestrator's wall-clock budget; the generated
+  `systemd-run` uses `--timeout $((deadline_ms + margin))` so the unit outlives
+  the orchestrator's deadline and lets it write the partial report + notify
+  before any kill. `workspace: worktree|root` **does not apply** to
+  `kind: pipeline` — the orchestrator runs in the parent clone and creates its
+  own `auto/pipeline-<run_id>` worktree (orchestrator-prompt.md Prerequisite 1;
+  design.md:337-338). `HERDR_ENV=1` and the pinned report path are baked into the
+  generated command, not config.
+- `prompt_file` is read by the runner/validate from disk — **not** in
+  `load_config`, which is documented as pure (no filesystem access beyond the
+  one YAML file, config.py:3-4). Preserve that invariant.
+- `_check_systemd_timeout` (cli.py:430-499) must **skip `kind: pipeline` jobs
+  entirely** — they never run in the tick's process, so they must not inflate the
+  required unit `TimeoutStartSec` (a plain default `Job.timeout_ms` would quietly
+  add ~30 min otherwise).
+- `timeout_ms` on this path is unused; the reconcile-staleness bound comes from
+  `job.deadline_ms`. Make that explicit in the code.
+- `default_config_path()`/consumer wiring stays minimal, but the behavioural
+  work lives in `tick` (`_process_pipeline_job`) — not in `cli.py` config
+  loading.
 
 ## Acceptance criteria
 
 Each ends `Test: <name>`:
 
-1. `validate` accepts a `kind: pipeline` job and **suppresses** the missing-`$REPORT`
-   warning for it (`cli.py:398-414` warns when no `$ROUTINE_REPORT` and no
-   `checks`; must not fire for `kind: pipeline` with `prompt_file`).
+1. `validate` accepts a `kind: pipeline` job and **suppresses** the
+   missing-`$REPORT` warning for it (cli.py:398-414 warns when no
+   `$ROUTINE_REPORT` and no `checks`; must not fire for `kind: pipeline`).
    `Test: test_validate_pipeline_job_suppresses_report_warning`
-2. `tick`, on a `kind: pipeline` cron fire, **dispatches a detached transient unit**
-   (matching the human `systemd-run` invocation, with `env.HERDR_ENV=1` and the
-   report path pinned) and **returns immediately** — it does not block for
-   `deadline_ms`. A stubbed unit short-circuits so the test does not wait hours.
-   `Test: test_tick_dispatches_pipeline_detached`
+2. On a `kind: pipeline` cron fire, `tick` **launches first** (an injectable
+   `systemd-run` launcher seam — a `CommandRunner`-style function that tests
+   monkeypatch, same pattern as `HerdrClient`) returning immediately, then writes
+   the `running` record. A stubbed launcher short-circuits so the test does not
+   wait hours.
+   `Test: test_tick_dispatches_pipeline_launch_before_record`
 3. **Concurrency (make-or-break):** other due jobs are still evaluated and run
    during a pipeline night (the oneshot tick does not wedge while the pipeline
-   runs detached).
+   runs detached). Two jobs in one `run_tick`, pipeline first; assert the second
+   still reaches `execute_run`.
    `Test: test_other_jobs_still_run_during_pipeline`
-4. `substitute_prompt` rewrites `$REPORT` (and back-compat `$ROUTINE_REPORT`) to
+4. The generated invocation is correct: it runs the orchestrator as `rt-<job>`,
+   bakes in `HERDR_ENV=1`, sets the unit `--timeout $((deadline_ms + margin))`,
+   passes the **bare UTC timestamp** as `RUN_ID`, and pins the **absolute** report
+   path. Assert against the generated string.
+   `Test: test_pipeline_invocation_string_contract`
+5. `substitute_prompt` rewrites `$REPORT` (and back-compat `$ROUTINE_REPORT`) to
    `default_reports_dir()/f"{run_id}.md"` for every kind, and the report guard is
-   **redirected, not skipped** — for a pipeline job it still marks `failed` when
-   no/empty report after a non-deadline exit, and tolerates a **partial** report
-   only when the deadline was exceeded.
+   **redirected, not skipped** — for a pipeline job it still marks `failed` on
+   missing/empty report, and tolerates a **partial** report only when the report
+   carries the `## Outcome: partial (deadline exceeded)` marker.
    `Test: test_pipeline_report_guard_redirected_and_partial_tolerant`
-5. `HERDR_ENV=1` reaches the orchestrator's pane/workspace (assert via the
-   launch env plumbing); without it the launch is blocked, not silently degraded.
-   `Test: test_pipeline_launch_injects_herdr_env`
-6. A pipeline job sets `catch_up_minutes: 0` so a missed 02:00 occurrence does
-   **not** launch the 7h run mid-morning.
-   `Test: test_pipeline_job_skips_catchup`
-7. Deadline vs. kill: the orchestrator gets enough wall-clock past `deadline_epoch`
-   to write the partial report + `notification show` before any watchdog/timeout
-   kill — i.e. `deadline_ms` + margin, not `timeout_ms == deadline_ms`.
-   `Test: test_pipeline_deadline_leaves_partial_report_margin`
-8. `scheduled` lists the pipeline's cron, and `status` renders the
-   `rt-nightly-pipeline` orchestrator row sanely while a run is in flight (and
-   `skipped (already running)` on overlap).
-   `Test: test_status_renders_inflight_orchestrator`
-9. Resume: the same-RUN_ID relaunch path (design.md:349-351) still works when
-   `tick` owns launching (or is explicitly replaced/reworked in this issue).
-   `Test: test_pipeline_resume_same_run_id`
-10. `gc` keeps excluding `auto/pipeline-*` now that the branch originates from a
-    scheduled job (design.md G-14).
+6. `_check_systemd_timeout` **skips** `kind: pipeline` jobs entirely (they do not
+   inflate the unit's required `TimeoutStartSec`).
+   `Test: test_systemd_timeout_skips_pipeline_job`
+7. `validate` treats `workspace` as N/A for `kind: pipeline` and instead repo-checks
+   the value as a plain git clone (the parent), not the `workspace == "worktree"`
+   `.git` branch (cli.py:389 / config.py:99 default).
+   `Test: test_validate_pipeline_workspace_na_repo_is_clone`
+8. `validate` **rejects** a `kind: pipeline` job with `catch_up_minutes > 0` — it
+   is enforced, not conventional, so a missed 02:00 never fires the 7h run
+   mid-morning.
+   `Test: test_validate_rejects_pipeline_catchup`
+9. Config schema: the new keys (`kind`, `prompt_file`, `deadline_ms`) parse, get
+   defaults, and reject unknown/malformed values (config.py `_JOB_DEFAULTS`,
+   `_JOB_ALLOWED_KEYS`), matching issue 025's config-validation test pattern.
+   `Test: test_pipeline_config_schema_roundtrip`
+10. `scheduled` lists the pipeline's cron, and `status` renders the
+    `rt-nightly-pipeline` orchestrator row sanely while a run is in flight (and
+    `skipped (already running)` on overlap).
+    `Test: test_status_renders_inflight_orchestrator`
+11. Resume: `herdr-routines run <job> --run-id <id>` (or an equivalent
+    `pipeline-resume <run_id>`) regenerates the same detached invocation with the
+    given RUN_ID, preserving the documented same-RUN_ID relaunch path
+    (design.md:349-351). `_cmd_run` gains the `--run-id` flag; the test drives it.
+    `Test: test_pipeline_resume_same_run_id`
+12. `gc` keeps excluding `auto/pipeline-*` now that the branch originates from a
+    scheduled job (design.md G-14; gc.py:17 `PIPELINE_PREFIX`).
     `Test: test_gc_excludes_pipeline_worktrees`
-11. Legacy behavior intact: `kind: routine` (and default) jobs still write
-    `$REPORT`/`$ROUTINE_REPORT` and the `no_report` guard still applies.
+13. Legacy behavior intact: `kind: routine` (and default) jobs still write
+    `$REPORT`/`$ROUTINE_REPORT`, the `no_report` guard and the gate-mode
+    `checks is not None` dispatch are unchanged.
     `Test: test_regular_routine_guard_unchanged`
 
 ## Why these tests
 
 - 1–3 pin the core fix: pipeline becomes a **detached dispatched** job that does
-  not freeze the tick — concurrency (3) is the make-or-break criterion that the
+  not freeze the tick — concurrency (3) is the make-or-break criterion the
   original synchronous design could not meet.
-- 4 pins the report guard is **redirected, not skipped**, so the
-  silent-orchestrator-death detector survives.
-- 5–7 pin the hard prerequisites the original spec ignored (`HERDR_ENV`, catch-up,
-  deadline-vs-kill margin).
-- 8–10 pin the operational invariants (status rendering, resume, gc exclusion).
-- 11 pins no-regression for ordinary routines.
+- 4–5 pin the two cross-cutting contracts that most easily break: the generated
+  invocation string (RUN_ID, HERDR_ENV, deadline margin, report pin) and the
+  redirected report guard.
+- 6–9 pin the enforcement/schema rules (systemd-timeout skip, workspace N/A,
+  catch-up rejection, config round-trip).
+- 10–12 pin the operational invariants (status, resume, gc exclusion).
+- 13 pins no-regression for ordinary routines and the untouched gate mode.
 
 ## Non-goals (this increment)
 
 - Not promoting stage gates to code — that's the "Code-level pipeline gates"
   roadmap item / issue 013 (`workflows/<name>.yaml` + a Python stage driver).
 - Not changing the orchestrator's prompt-based 6-stage model or stage internals.
+- Not introducing `kind: gate` or retiring the implicit `checks is not None`
+  gate-mode switch — that full-SSOT migration is a separate issue.
 - Not touching `src/herdr_routines/auto_fix.py` / gate internals from issue 025.
 - Not building `workspace: root` semantics for the pipeline (it owns its own
   worktree; see design notes).
+- No generic `env:` config block — `HERDR_ENV=1` is a constant in the generated
+  invocation.
 
 ## Log
 
@@ -217,12 +276,15 @@ Each ends `Test: <name>`:
   stage/spawn loop (verified: `tick.py` runs one agent/job; `ps.py` only reads
   `pl-<N>-<run_id>` names; no module drives stages) and both schedule on systemd
   user timers. Parked as a ROADMAP idea.
-- **2026-08-30**: drafted v1 scoped as "pipeline as a blocking routine";
-  independent review (sonnet-5, `docs/process/issues/026-review-sonnet5.md`)
-  returned SHAKY: the synchronous 7h `tick` blocks the oneshot cadence; it
-  fights `execute_run` in ~5 places; skipped guard hides the silent-death
-  detector; `HERDR_ENV` plumbing and report-path pinning are missing; AC #4
-  contradicted design.md and AC #5 was vacuous. Revised here to
-  dispatch-and-detach with a `kind:` enum, a redirected (not skipped) report
-  guard, `HERDR_ENV` plumbing, `catch_up_minutes: 0`, and rewritten/missing
-  criteria. Re-review pending.
+- **2026-08-30**: drafted v1 scoped as "pipeline as a blocking routine".
+  Review pass 1 (sonnet-5, `026-review-sonnet5.md`) returned SHAKY: the
+  synchronous 7h `tick` blocks the oneshot cadence; it fights `execute_run`;
+  skipping the guard hides the silent-death detector; HERDR_ENV plumbing and
+  report-path pinning missing; AC #4 contradicted design.md; AC #5 vacuous.
+- **2026-08-30**: revised to dispatch-and-detach with a `kind:` enum, redirected
+  guard, HERDR_ENV + report pinning, catch-up, rewritten ACs (commit 11ab2f5).
+  Review pass 2 (`026-review-sonnet5-v2.md`) improved verdict to MOSTLY SOUND;
+  residual items folded here: RUN_ID overflow on worker agent names, reconcile
+  from report content (not state.json), drop `kind: gate`/env-map, systemd-timeout
+  skip, enforced catch-up, named resume mechanism, launch-then-record ordering,
+  injectable launcher seam, 3 added ACs. Re-review pending.
