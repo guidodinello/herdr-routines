@@ -653,12 +653,21 @@ def test_gc_delete_lists_worktrees_once(
     assert f"deleted: {merged}" in out
 
 def test_gc_delete_review_tiers_present() -> None:
-    """Spec v2 review notes contain blocking/non-blocking and confidence tiers."""
+    """Spec v2 review notes: each numbered acceptance line contains Test:, tier, and confidence."""
     from pathlib import Path
+    import re
     spec = Path("docs/pipeline/runs/20260831T050020Z/spec.md")
     if not spec.exists():
         spec = Path(__file__).parent.parent / "docs/pipeline/runs/20260831T050020Z/spec.md"
     text = spec.read_text() if spec.exists() else ""
-    assert "blocking" in text.lower()
-    assert "non-blocking" in text.lower()
-    assert "confidence:" in text.lower()
+    # Extract only the Acceptance criteria section (between ## Acceptance criteria and next ##).
+    m = re.search(r"^## Acceptance criteria\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+    assert m, "no Acceptance criteria section found"
+    section = m.group(1)
+    acceptance_lines = [line for line in section.splitlines() if re.match(r"^\d+\.\s", line)]
+    assert len(acceptance_lines) >= 1, "no numbered acceptance lines found"
+    for line in acceptance_lines:
+        lower = line.lower()
+        assert "test:" in lower, f"missing Test: in acceptance line: {line[:80]}"
+        assert ("blocking" in lower or "non-blocking" in lower), f"missing tier in acceptance line: {line[:80]}"
+        assert "confidence:" in lower, f"missing confidence: in acceptance line: {line[:80]}"
