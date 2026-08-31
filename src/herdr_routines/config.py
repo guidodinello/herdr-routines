@@ -351,6 +351,9 @@ def load_config_dir(path: Path) -> RoutinesConfig:
             errors.append(str(e))
             continue
 
+        # Defensive: the filename=name contract (stem == name) makes duplicates
+        # impossible across different files, but this guard stays as a safety net
+        # in case the contract is relaxed in the future.
         if job.name in seen_names:
             errors.append(f"duplicate job name: {job.name!r} (from {job_file})")
             continue

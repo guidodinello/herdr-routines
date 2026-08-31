@@ -196,10 +196,15 @@ def _build_parser() -> argparse.ArgumentParser:
 def _load_config_or_exit(args: argparse.Namespace) -> RoutinesConfig:
     path = args.config or default_config_path()
     try:
-        return load_config(path)
+        config = load_config(path)
     except ConfigError as e:
         log.error("failed to load config %s: %s", path, e)
         raise SystemExit(1) from e
+    if config.errors:
+        for err in config.errors:
+            log.error("config: %s", err)
+        raise SystemExit(1)
+    return config
 
 
 def _cmd_tick(args: argparse.Namespace) -> int:
