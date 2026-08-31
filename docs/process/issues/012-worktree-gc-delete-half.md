@@ -1,7 +1,7 @@
 ---
 id: "012"
 title: "Worktree GC, delete half"
-status: open
+status: done
 priority: medium
 area: cli
 ---
