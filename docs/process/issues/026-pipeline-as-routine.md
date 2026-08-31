@@ -73,8 +73,9 @@ Mechanism, on cron fire (`_process_pipeline_job`, a sibling of
 that string to the orchestrator as `RUN_ID`: the orchestrator builds worker
 agent names `pl-<N>-<RUN_ID>` (orchestrator-prompt.md Worker spawn template;
 design.md:215), and herdr caps agent names at 32 chars
-(`[a-z][a-z0-9_-]{0,31}`, config.py:58-60). `pl-1-` + the 32-char full run id =
-37 chars — overflow by 5, every worker spawn fails at stage 1.
+(`[a-z][a-z0-9_-]{0,31}`, config.py:58-60). `pl-1-` + the full run id (33 chars
+for `nightly-pipeline-20260830T020000Z`) = 38 chars — overflow by 6, every
+worker spawn fails at stage 1.
 
 Fix, stated explicitly:
 - `tick` passes the **bare UTC timestamp** (`20260830T020000Z`, 16 chars →
@@ -91,22 +92,34 @@ Fix, stated explicitly:
 orchestrator's `$PIPELINE_REPORT` passes through untouched and it computes the
 path itself — a run_id namespace mismatch with the routine path.
 
-Fix by **redirecting** to one name, then **keeping** the `no_report` guard:
+Fix by **redirecting** to one name, then **keeping** the `no_report` guard.
+The substitution contract must cover the token the orchestrator actually
+receives, end to end:
 
 1. Teach `substitute_prompt` a single `$REPORT`, substituted for every job kind
    to `default_reports_dir()/f"{run_id}.md"` (keep `$ROUTINE_REPORT` as a
-   back-compat alias). This also unifies the run_id namespace for the report.
+   back-compat alias). **Also rewrite `$PIPELINE_REPORT` to the same pinned path**
+   — the orchestrator prompt uses `$PIPELINE_REPORT` throughout
+   (orchestrator-prompt.md:52/:155/:163), not `$REPORT`, so without this the pinned
+   path never reaches the orchestrator ("green test, dead contract"). `AC #5`
+   asserts the token the orchestrator receives, i.e. `$PIPELINE_REPORT` too.
+   This also unifies the run_id namespace for the report.
 2. **Do not** skip the "report exists and non-empty" check for pipeline jobs,
    and reconcile completion **from the report's content**: the orchestrator
    already writes a report "at end regardless of outcome" (design.md:168), so an
    empty/missing report after an agent-gone transition is the
    silent-orchestrator-death detector (the documented incident, design.md:347-356).
 3. The one legitimate content difference — **tolerate a partial report only when
-   the deadline was exceeded.** The signal `tick` reads must be named: the
-   orchestrator writes an explicit outcome marker, e.g. a `## Outcome:
-   partial (deadline exceeded)` line (it already writes a partial report +
-   `notification show` on deadline, design.md:170-173). Reconcile done vs failed
-   vs partial from that marker, not from the clock.
+   the deadline was exceeded.** The signal `tick` reads must be named and
+   **emitted**: this issue adds a small, scoped task to `orchestrator-prompt.md`
+   to write an explicit outcome line on its terminal branches — a
+   `## Outcome: ok`, `## Outcome: failed`, or `## Outcome: partial (deadline
+   exceeded)` — so `tick` can reconcile done vs failed vs partial from the report
+   content (it already writes a partial report + `notification show` on deadline,
+   design.md:170-173; the marker makes that machine-readable). This prompt edit
+   is carved out of the "no prompt edits" Non-goal below (it changes no stage
+   model, only adds a terminal status line). Reconcile from the marker, not the
+   clock.
 
 > Note: the orchestrator agent is named `rt-<job>` (i.e. `rt-nightly-pipeline`)
 > in the generated invocation, matching the `_live_agent_exists` guard — this
@@ -162,13 +175,17 @@ pipeline. Do not infer mode from prompt source.
 Design notes:
 - **No blocking `timeout_ms`, no `env:` block, no `workspace:`.**
   `deadline_ms` is the orchestrator's wall-clock budget; the generated
-  `systemd-run` uses `--timeout $((deadline_ms + margin))` so the unit outlives
-  the orchestrator's deadline and lets it write the partial report + notify
-  before any kill. `workspace: worktree|root` **does not apply** to
-  `kind: pipeline` — the orchestrator runs in the parent clone and creates its
-  own `auto/pipeline-<run_id>` worktree (orchestrator-prompt.md Prerequisite 1;
-  design.md:337-338). `HERDR_ENV=1` and the pinned report path are baked into the
-  generated command, not config.
+  `systemd-run` unit cap is set via `-p RuntimeMaxSec=$(( (deadline_ms + margin)
+  / 1000 ))` (systemd property, **seconds**, not the non-existent
+  `--timeout` flag and not ms — `RuntimeMaxSec` is 1000× coarser than
+  `deadline_ms`), so the unit outlives the orchestrator's deadline and lets it
+  write the partial report + notify before any kill. `workspace: worktree|root`
+  **does not apply** to `kind: pipeline` — the orchestrator runs in the parent
+  clone and creates its own `auto/pipeline-<run_id>` worktree
+  (orchestrator-prompt.md Prerequisite 1; design.md:337-338); the schema
+  **rejects** an explicit `workspace:` on a `kind: pipeline` job (or ignores it
+  with a warning) rather than leaving it settable-but-ignored. `HERDR_ENV=1`
+  and the pinned report path are baked into the generated command, not config.
 - `prompt_file` is read by the runner/validate from disk — **not** in
   `load_config`, which is documented as pure (no filesystem access beyond the
   one YAML file, config.py:3-4). Preserve that invariant.
@@ -178,6 +195,10 @@ Design notes:
   add ~30 min otherwise).
 - `timeout_ms` on this path is unused; the reconcile-staleness bound comes from
   `job.deadline_ms`. Make that explicit in the code.
+- `catch_up_minutes` defaults to 120 (config.py:105); because `kind: pipeline`
+  must never fire a missed run late into the workday, `validate` **rejects** a
+  pipeline job whose effective `catch_up_minutes != 0` — whether set or inherited
+  from the default. The schema defaults it to 0 for `kind: pipeline`.
 - `default_config_path()`/consumer wiring stays minimal, but the behavioural
   work lives in `tick` (`_process_pipeline_job`) — not in `cli.py` config
   loading.
@@ -202,15 +223,20 @@ Each ends `Test: <name>`:
    still reaches `execute_run`.
    `Test: test_other_jobs_still_run_during_pipeline`
 4. The generated invocation is correct: it runs the orchestrator as `rt-<job>`,
-   bakes in `HERDR_ENV=1`, sets the unit `--timeout $((deadline_ms + margin))`,
-   passes the **bare UTC timestamp** as `RUN_ID`, and pins the **absolute** report
-   path. Assert against the generated string.
+   bakes in `HERDR_ENV=1`, sets the unit cap `-p RuntimeMaxSec=$(( (deadline_ms +
+   margin) / 1000 ))` (seconds, not `--timeout`, not ms), passes the **bare UTC
+   timestamp** as `RUN_ID`, and pins the **absolute** report path. Assert against
+   the generated string.
    `Test: test_pipeline_invocation_string_contract`
-5. `substitute_prompt` rewrites `$REPORT` (and back-compat `$ROUTINE_REPORT`) to
-   `default_reports_dir()/f"{run_id}.md"` for every kind, and the report guard is
-   **redirected, not skipped** — for a pipeline job it still marks `failed` on
-   missing/empty report, and tolerates a **partial** report only when the report
-   carries the `## Outcome: partial (deadline exceeded)` marker.
+5. The `## Outcome:` marker is a scoped task: `orchestrator-prompt.md` emits an
+   explicit `## Outcome: ok | failed | partial (deadline exceeded)` line on its
+   terminal branches, and `substitute_prompt` rewrites `$PIPELINE_REPORT` (the
+   token the orchestrator actually uses) **and** `$REPORT` / back-compat
+   `$ROUTINE_REPORT` to `default_reports_dir()/f"{run_id}.md"` for every kind.
+   The report guard is **redirected, not skipped** — for a pipeline job it still
+   marks `failed` on missing/empty report, and tolerates a **partial** report
+   only when the report carries the `## Outcome: partial (deadline exceeded)`
+   marker. Assert the token the orchestrator receives, end to end.
    `Test: test_pipeline_report_guard_redirected_and_partial_tolerant`
 6. `_check_systemd_timeout` **skips** `kind: pipeline` jobs entirely (they do not
    inflate the unit's required `TimeoutStartSec`).
@@ -219,9 +245,10 @@ Each ends `Test: <name>`:
    the value as a plain git clone (the parent), not the `workspace == "worktree"`
    `.git` branch (cli.py:389 / config.py:99 default).
    `Test: test_validate_pipeline_workspace_na_repo_is_clone`
-8. `validate` **rejects** a `kind: pipeline` job with `catch_up_minutes > 0` — it
-   is enforced, not conventional, so a missed 02:00 never fires the 7h run
-   mid-morning.
+8. `validate` **rejects** a `kind: pipeline` job whose effective
+   `catch_up_minutes != 0` — whether explicitly set or inherited from the 120
+   default — so a missed 02:00 never fires the 7h run mid-morning. Enforced (a
+   validation rule + a pipeline-specific default of 0), not conventional.
    `Test: test_validate_rejects_pipeline_catchup`
 9. Config schema: the new keys (`kind`, `prompt_file`, `deadline_ms`) parse, get
    defaults, and reject unknown/malformed values (config.py `_JOB_DEFAULTS`,
@@ -234,7 +261,11 @@ Each ends `Test: <name>`:
 11. Resume: `herdr-routines run <job> --run-id <id>` (or an equivalent
     `pipeline-resume <run_id>`) regenerates the same detached invocation with the
     given RUN_ID, preserving the documented same-RUN_ID relaunch path
-    (design.md:349-351). `_cmd_run` gains the `--run-id` flag; the test drives it.
+    (design.md:349-351). `_cmd_run` gains the `--run-id` flag, and **branches on
+    `kind`** so that `herdr-routines run nightly-pipeline` (with *or* without
+    `--run-id`) dispatches via the same detached launcher rather than calling
+    `execute_run` synchronously (cli.py:519). The test drives both the resume and
+    the plain-detached paths.
     `Test: test_pipeline_resume_same_run_id`
 12. `gc` keeps excluding `auto/pipeline-*` now that the branch originates from a
     scheduled job (design.md G-14; gc.py:17 `PIPELINE_PREFIX`).
@@ -261,7 +292,9 @@ Each ends `Test: <name>`:
 
 - Not promoting stage gates to code — that's the "Code-level pipeline gates"
   roadmap item / issue 013 (`workflows/<name>.yaml` + a Python stage driver).
-- Not changing the orchestrator's prompt-based 6-stage model or stage internals.
+- Not changing the orchestrator's prompt-based 6-stage model or stage internals,
+  **except** the scoped `## Outcome:` terminal-status line required to reconcile
+  completion (it adds a status line; it does not alter stages or gates).
 - Not introducing `kind: gate` or retiring the implicit `checks is not None`
   gate-mode switch — that full-SSOT migration is a separate issue.
 - Not touching `src/herdr_routines/auto_fix.py` / gate internals from issue 025.
@@ -269,6 +302,12 @@ Each ends `Test: <name>`:
   worktree; see design notes).
 - No generic `env:` config block — `HERDR_ENV=1` is a constant in the generated
   invocation.
+
+## Known limitation (documented, accepted)
+
+If the orchestrator dies before writing *any* report, the job shows in-flight
+until `find_stale_running` trips at `job.deadline_ms` (~7h) — matching today's
+behaviour (design.md:347-356 incident). Accepted; not fixed by this issue.
 
 ## Log
 
@@ -288,3 +327,9 @@ Each ends `Test: <name>`:
   from report content (not state.json), drop `kind: gate`/env-map, systemd-timeout
   skip, enforced catch-up, named resume mechanism, launch-then-record ordering,
   injectable launcher seam, 3 added ACs. Re-review pending.
+- **2026-08-30**: review pass 3 (`026-review-sonnet5-v3.md`) returned MOSTLY
+  SOUND (close to SOUND), 6/8 residuals closed; residual contracts folded here
+  (v4): put the `## Outcome:` marker and `$PIPELINE_REPORT` substitution in
+  scope, `_cmd_run` `kind` branch, catch-up default-120 rule, `RuntimeMaxSec`
+  seconds + workspace-schema reject, RUN_ID length corrected. Confirmation pass
+  pending.
