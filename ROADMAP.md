@@ -77,6 +77,11 @@ gate is considered met). One-liner index; full detail in the issue file.
   never re-picks the feature an in-flight run already has an open PR for
   (006 collision, 2026-08-31). `medium`. →
   [`028`](docs/process/issues/028-pick-feature-skip-open-prs.md)
+- **Issue refinement job (Parking Lot → PR)** — automate promoting a Parking
+  Lot idea into a refined issue via a bounded author→reviewer loop (product
+  refinement vs the pipeline's implementation refinement), delivered as an
+  open PR for the human to merge; nightly 22:00, `opencode` only. `medium`. →
+  [`029`](docs/process/issues/029-issue-refinement-job.md)
 
 ## Later
 
