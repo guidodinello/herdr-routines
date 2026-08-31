@@ -1,7 +1,7 @@
 ---
 id: "006"
 title: "Split jobs.yaml into one file per job (jobs.d/<name>.yaml)"
-status: open
+status: done
 priority: medium
 area: config
 ---
