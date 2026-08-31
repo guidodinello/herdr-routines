@@ -409,3 +409,73 @@ def test_validate_gated_job_with_empty_prompt_stays_silent(
     err = capsys.readouterr().err
     assert "prompt is empty" not in err
     assert "$ROUTINE_REPORT" not in err
+
+
+# -- jobs.d directory layout CLI tests (spec 20260831T012350Z) ------------------------------------
+
+
+def _make_jobs_d(tmp_path: Path, files: dict[str, str]) -> Path:
+    """Create a jobs.d/ directory with the given filename->content mapping."""
+    jobs_dir = tmp_path / "jobs.d"
+    jobs_dir.mkdir()
+    for name, content in files.items():
+        (jobs_dir / name).write_text(content)
+    return jobs_dir
+
+
+def test_cli_validate_scheduled_ps_history_directory_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance 4: validate/status/scheduled/ps/history all work against directory
+    layout via new directory loader (--config dir, no jobs.yaml hard-code left in src/)."""
+    from herdr_routines import cli
+    from herdr_routines.config import load_config
+
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    (repo / ".git").mkdir()
+
+    jobs_dir = _make_jobs_d(tmp_path, {
+        "defaults.yaml": "agent_kind: opencode\n",
+        "test-job.yaml": (
+            f"name: test-job\n"
+            f"cron: '0 3 * * *'\n"
+            f"repo: {repo}\n"
+            f"workspace: worktree\n"
+            f"prompt: Write findings to $ROUTINE_REPORT.\n"
+        ),
+    })
+
+    # validate works against directory layout
+    args = argparse.Namespace(
+        config=jobs_dir,
+        systemd_unit=tmp_path / "does-not-exist.service",
+    )
+    assert _cmd_validate(args) == 0
+    out = capsys.readouterr()
+    assert "ok: 1 job(s) valid" in out.out
+
+    # status works against directory layout
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(cli, "default_config_path", lambda: jobs_dir)
+    monkeypatch.setattr(cli, "default_history_path", lambda: state_dir / "history.jsonl")
+    monkeypatch.setattr(cli, "default_lock_path", lambda: state_dir / "tick.lock")
+    assert cli.main(["status"]) == 0
+    assert "test-job" in capsys.readouterr().out
+
+    # scheduled works against directory layout
+    assert cli.main(["scheduled"]) == 0
+    assert "test-job" in capsys.readouterr().out
+
+    # history works against directory layout (reads history.jsonl, not config)
+    assert cli.main(["history", "test-job"]) == 0
+
+    # load_config works with --config pointing to directory
+    cfg = load_config(jobs_dir)
+    assert len(cfg.jobs) == 1
+    assert cfg.jobs[0].name == "test-job"
+    assert cfg.jobs[0].agent_kind == "opencode"  # from defaults.yaml
