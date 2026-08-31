@@ -1,6 +1,6 @@
-# spec: Split jobs.yaml into one file per job — jobs.d/<name>.yaml (20260831T012350Z) — v1
+# spec: Split jobs.yaml into one file per job — jobs.d/<name>.yaml (20260831T012350Z) — v2
 
-Per-run spec at `docs/pipeline/runs/20260831T012350Z/spec.md` (G-15: per-run path avoids PR #28/#29 shared-path full-file conflict — `docs/pipeline/design.md:79`). Implements `docs/process/issues/006-jobs-dir-per-file.md` as indexed in `ROADMAP.md:49` Next §. `docs/plan-v1.md:174` documents the monolith this replaces (`jobs.yaml` with top-level `defaults:` + `jobs:` list).
+Per-run spec at `docs/pipeline/runs/20260831T012350Z/spec.md` (G-15: per-run path avoids PR #28/#29 shared-path full-file conflict — `docs/pipeline/design.md:79`). Implements `docs/process/issues/006-jobs-dir-per-file.md` as indexed in `ROADMAP.md:49` Next §. `docs/plan-v1.md:174` documents the monolith this replaces (`jobs.yaml` with top-level `defaults:` + `jobs:` list). v2 adds explicit Acceptance criteria with `blocking`/`non-blocking` and `confidence:` tiers and a Changelog.
 
 ## Problem
 
@@ -63,3 +63,26 @@ Documented path per `docs/process/issues/006-jobs-dir-per-file.md:36` acceptance
 - **Path assumptions across CLI.** `validate`/`status`/`history`/`scheduled`/`ps` currently assume single file path (`docs/process/issues/006-jobs-dir-per-file.md:26`). Mitigation: grep `jobs\.yaml`/`default_config_path`/`load_config` across `src/`, update every caller; add test that each command works with `--config <tmpdir>/jobs.d`.
 - **Filesystem portability (case, sorting).** `jobs.d/*.yaml` glob order non-deterministic on some FS; case-sensitive `NAME_RE` vs case-insensitive FS. Mitigation: `sorted()` file list; keep `NAME_RE` lowercase-only; document that two files differing only by case collide.
 - **Spec-path hygiene (G-15).** Must stay at `docs/pipeline/runs/<run_id>/spec.md`; writing to repo-root `spec.md` or `docs/pipeline/spec.md` reintroduces PR #28/#29 full-file merge conflict. This spec is already at the per-run path (`mkdir -p .../20260831T012350Z` per task).
+
+## Acceptance criteria
+
+1. loader discovers every `jobs.d/*.yaml` sorted excluding `defaults.yaml` and merges `defaults.yaml` under each job's own fields with precedence `_JOB_DEFAULTS < defaults.yaml < job file` — blocking, confidence: high — Test: test_config_discovers_jobs_d
+2. filename/name contract enforced: filename stem is canonical name, `name` key if present must equal stem, both validated against `NAME_RE`, mismatch or `NAME_RE` violation errors with `ConfigError` naming `jobs.d/<name>.yaml` — blocking, confidence: high — Test: test_config_filename_name_mismatch
+3. YAML syntax error in one `jobs.d/<name>.yaml` surfaces that file by name (`ConfigError: jobs.d/<name>.yaml: <yaml error>`) and does not prevent other jobs from loading for diagnostics; `validate` reports per-file and exits 1 while `tick`/`run` fail-closed if any file failed — blocking, confidence: high — Test: test_config_yaml_error_isolated_by_file
+4. `validate`/`status`/`scheduled`/`ps`/`history` all work against directory layout via new directory loader (`--config` dir, no `jobs.yaml` hard-code left in `src/`), `validate` per-file error reporting and `validate --systemd-unit` preserved — blocking, confidence: high — Test: test_cli_validate_scheduled_ps_history_directory_layout
+5. migration path for existing `jobs.yaml` documented: loader accepts both during transition (if `jobs.d/` exists use it else fall back to legacy `jobs.yaml` with deprecation warning) or one-shot split helper, no silent auto-migration, `README.md`/`deploy/README.md` note — blocking, confidence: medium — Test: test_config_migration_jobs_yaml_fallback_documented
+6. `defaults.yaml` absent treated as empty defaults, unknown keys in `defaults.yaml` or per-job file rejected, duplicate job name across files rejected via `seen_names`, `checks: []` still plain — blocking, confidence: medium — Test: test_config_defaults_merge_precedence_and_absent
+7. directory discovery is deterministic (`sorted()` glob) and `deploy/jobs.d/` example layout present, case-only filename collisions documented — non-blocking, confidence: medium — Test: test_config_jobs_d_sorted_and_example_layout
+
+## Changelog v1→v2
+
+- v1 (bde0266) established directory-discovered `jobs.d/<name>.yaml` + `defaults.yaml` merge model, per-file isolated YAML parse, filename/`name` contract against `NAME_RE`, `validate`/`tick` split for partial load, and migration dual-mode vs split-script options.
+- v2 reformats acceptance to 7 numbered items where each line ends with its `Test:` marker for `rg -F` discovery, adds explicit `blocking`/`non-blocking` tier labels and `confidence:` tiers per item, and splits discovery/merge, filename validation, isolated YAML error, consumer CLI parity, migration, and determinism/example concerns for gate-2 discovery.
+- Added item 7 `test_config_jobs_d_sorted_and_example_layout` (deterministic `sorted()` glob, `deploy/jobs.d/` example, case-collision note) which was implicit in Risks/Approach v1 but not separately acceptance-mapped; now mirrors `docs/pipeline/runs/20260830T050021Z/spec.md` v2 style where branch/agent naming was promoted to its own item.
+- Expanded items 1, 2, 3, 4, 6 to state merge precedence `_JOB_DEFAULTS < defaults.yaml < job file`, `NAME_RE` on both stem and key, file-named `ConfigError`, `validate` per-file vs `tick` fail-closed split, and `defaults.yaml` absent / unknown-key / duplicate / `checks: []` plain preservation from `docs/process/issues/006-jobs-dir-per-file.md:31` acceptance.
+- Preserved all Problem/Approach/Files touched/Risks intent from v1; only tightened verifiability for stage-2 gate. Previous content remains authoritative for implementation.
+
+## Review notes
+
+- Tiers follow code-review skill convention: `blocking` findings must be resolved before merge, `non-blocking` are advisory — confidence: high for discovery/merge/filename/YAML isolation/CLI parity, confidence: medium for migration/defaults-absent/determinism, confidence: low for flaky `gh`/`herdr` shape drift.
+- Acceptance mapping verified end-to-end for `rg` checks: each acceptance line contains `Test:`, one of `blocking`/`non-blocking`, and `confidence:` — Test: test_config_review_tiers_present
