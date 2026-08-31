@@ -1,6 +1,6 @@
-# spec: Worktree GC, delete half — opt-in deletion of dry-run inventory (20260831T050020Z) — v1
+# spec: Worktree GC, delete half — opt-in deletion of dry-run inventory (20260831T050020Z) — v2
 
-Per-run spec at `docs/pipeline/runs/20260831T050020Z/spec.md` (G-15: per-run path avoids PR #28/#29 shared-path conflict). Implements `docs/process/issues/012-worktree-gc-delete-half.md` as the delete half of `herdr-routines gc --dry-run` (issue 002, PR #28). Covers the second half intentionally deferred in `docs/plan-v1.md:448`.
+Per-run spec at `docs/pipeline/runs/20260831T050020Z/spec.md` (G-15: per-run path avoids PR #28/#29 shared-path conflict). Implements `docs/process/issues/012-worktree-gc-delete-half.md` as the delete half of `herdr-routines gc --dry-run` (issue 002, PR #28). Covers the second half intentionally deferred in `docs/plan-v1.md:448`. v2 adds explicit acceptance mapping with blocking/non-blocking and confidence tiers and a changelog.
 
 ## Problem
 
@@ -53,3 +53,27 @@ herdr-routines gc --delete|--prune --yes/-y [--force/-f] [--repo PATH] [--base B
 - **Running from diverged worktree.** `git branch -d` safety check against HEAD fails when caller is on `auto/pipeline-*`. Mitigation: always `branch -D` after explicit `is_merged` check against `--base`.
 - **Worktree list shape variance across git versions.** Strict porcelain line pairing breaks. Mitigation: tolerant scan — each `branch refs/heads/` paired with most recent preceding `worktree ` line, no layout assumption.
 - **Git hang wedging the command.** Slow plumbing never returns. Mitigation: `GIT_TIMEOUT_SECONDS=30` on every `run_git`, `TimeoutExpired` mapped to `error: git timed out` with exit 1, never a traceback.
+
+## Acceptance criteria
+
+1. `gc --delete --yes` without `--force` removes only stale branches where `merged_into_base==True`, skips orphaned unmerged `stale==True` as `skipped (unmerged, needs --force)` and leaves non-stale branches untouched — blocking, confidence: high — Test: test_gc_delete_removes_only_stale_merged_without_force
+2. `gc --delete --yes --force` removes orphaned unmerged branches in addition to merged stale, so all `stale` candidates are deleted with zero skipped — blocking, confidence: high — Test: test_gc_delete_with_force_removes_orphaned_unmerged
+3. `gc --delete` without `--yes` refuses with `error: refusing to delete without --yes` on stderr and exit 2, leaving branches untouched in non-interactive context — blocking, confidence: high — Test: test_gc_delete_refuses_without_yes
+4. `gc --delete` without `--yes` refuses even when stdin/stdout is a TTY, same stderr and exit 2, never prompts — blocking, confidence: medium — Test: test_gc_delete_refuses_interactive_without_yes
+5. `gc --delete --yes` succeeds in non-interactive context, deletes the stale merged branch and prints `deleted: <branch>` — blocking, confidence: high — Test: test_gc_delete_with_yes_succeeds_non_interactive
+6. delete set is exactly the dry-run eligible set filtered by the `--force` guard: without `--force` equals merged-into-base subset, with `--force` equals full `stale` set, nothing else — blocking, confidence: high — Test: test_gc_delete_is_exactly_dry_run_candidates
+7. `auto/pipeline-*` branches are never listed nor deleted even with `--force --yes`, remaining ref survives — blocking, confidence: high — Test: test_gc_delete_excludes_pipeline
+8. after `gc --delete --yes` the worktree path no longer exists on filesystem and the branch ref is gone from `for-each-ref` — blocking, confidence: high — Test: test_gc_delete_branch_and_worktree_both_gone
+9. delete path is pure git + filesystem with no `HerdrClient` or socket, succeeds with no server running using only `git` subprocesses — non-blocking, confidence: medium — Test: test_gc_delete_needs_no_server
+
+## Changelog v1→v2
+
+- v1 (7ec855e) established the delete-half inventory as the dry-run's single-scan `collect_rows` tuple reused for removals, `BRANCH_PATTERN`/`PIPELINE_PREFIX` scope, `--yes`/`--force` guards, worktree-then-`-D` per-branch order, and plumbing-failure abort semantics in 55 lines without a formal acceptance table.
+- v2 reformats acceptance to 9 numbered items where each line ends with its `Test:` marker for `rg -F` discovery, adds explicit `blocking`/`non-blocking` tier labels and `confidence:` tiers per item, and maps every required behavior (`stale merged without force`, `orphaned with force`, `refuses non-interactive without yes`, `with yes succeeds`, `exactly dry-run candidates`, `excludes pipeline`, `branch and worktree both gone`) to an exact `test_gc_delete_*` name in `tests/test_gc.py`.
+- Added items 4 `test_gc_delete_refuses_interactive_without_yes` and 9 `test_gc_delete_needs_no_server` which were implicit in Approach/Risks v1 (`--yes` required, `No Herdr dependency`) but not separately acceptance-mapped; now mirrors `docs/process/issues/012-worktree-gc-delete-half.md` interactive-only and pure-git requirements.
+- Preserved all Problem/Approach/Files touched/Risks intent from v1; only tightened verifiability for stage-2 gate. Previous content remains authoritative for implementation.
+
+## Review notes
+
+- Tiers follow code-review skill convention: `blocking` findings must be resolved before merge, `non-blocking` are advisory — confidence: high for deletion correctness / yes-guard / candidate-set equivalence, confidence: medium for TTY refusal and no-server purity.
+- Acceptance mapping verified end-to-end for `rg` checks: each acceptance line contains `Test:`, one of `blocking`/`non-blocking`, and `confidence:` — Test: test_gc_delete_review_tiers_present
