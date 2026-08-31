@@ -68,6 +68,10 @@ gate is considered met). One-liner index; full detail in the issue file.
 - **Worktree GC, delete half** — human-invoked `gc --delete` acting on the
   dry-run's output; never unattended. `medium`. →
   [`012`](docs/process/issues/012-worktree-gc-delete-half.md)
+- **Pi `/tmp` tmpfs hygiene** — age-based cleanup of leaked agent-runtime
+  `.so` + pytest artifacts that fill the 2 GB RAM-backed `/tmp` and stall agent
+  starts; distinguish disk-full from quota. `medium`. →
+  [`027`](docs/process/issues/027-tmp-hygiene.md)
 
 ## Later
 
