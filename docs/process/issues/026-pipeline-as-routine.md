@@ -316,25 +316,26 @@ behaviour (design.md:347-356 incident). Accepted; not fixed by this issue.
   `pl-<N>-<run_id>` names; no module drives stages) and both schedule on systemd
   user timers. Parked as a ROADMAP idea.
 - **2026-08-30**: drafted v1 scoped as "pipeline as a blocking routine".
-  Review pass 1 (sonnet-5, `reviews/026-review-sonnet5.md`) returned SHAKY: the
+  Review pass 1 (sonnet-5, `audits/audit-sonnet5-v1.md`) returned SHAKY: the
   synchronous 7h `tick` blocks the oneshot cadence; it fights `execute_run`;
   skipping the guard hides the silent-death detector; HERDR_ENV plumbing and
   report-path pinning missing; AC #4 contradicted design.md; AC #5 vacuous.
 - **2026-08-30**: revised to dispatch-and-detach with a `kind:` enum, redirected
   guard, HERDR_ENV + report pinning, catch-up, rewritten ACs (commit 11ab2f5).
-  Review pass 2 (`reviews/026-review-sonnet5-v2.md`) improved verdict to MOSTLY SOUND;
+  Review pass 2 (`audits/audit-sonnet5-v2.md`) improved verdict to MOSTLY SOUND;
   residual items folded here: RUN_ID overflow on worker agent names, reconcile
   from report content (not state.json), drop `kind: gate`/env-map, systemd-timeout
   skip, enforced catch-up, named resume mechanism, launch-then-record ordering,
   injectable launcher seam, 3 added ACs. Re-review pending.
-- **2026-08-30**: review pass 3 (`reviews/026-review-sonnet5-v3.md`) returned MOSTLY
+- **2026-08-30**: review pass 3 (`audits/audit-sonnet5-v3.md`) returned MOSTLY
   SOUND (close to SOUND), 6/8 residuals closed; residual contracts folded here
   (v4): put the `## Outcome:` marker and `$PIPELINE_REPORT` substitution in
   scope, `_cmd_run` `kind` branch, catch-up default-120 rule, `RuntimeMaxSec`
   seconds + workspace-schema reject, RUN_ID length corrected. Confirmation pass
   pending.
-- **2026-08-30**: review pass 4 (`reviews/026-review-sonnet5-v4.md`) returned
+- **2026-08-30**: review pass 4 (`audits/audit-sonnet5-v4.md`) returned
   **SOUND (ready to implement)** — both one-sided contracts closed in scope;
-  remaining items were non-blocking polish only. Reviews kept in
-  `docs/process/reviews/` (not `issues/`, which `pick-feature` parses via
-  frontmatter glob).
+  remaining items were non-blocking polish only. Per-revision design-review
+  records live in `docs/process/audits/audit-<reviewer>-v<N>.md`, mirroring
+  `docs/pipeline/audits/` — not `issues/`, which `pick-feature` parses via
+  frontmatter glob.
