@@ -18,8 +18,10 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
   issues`), **stop and write a report saying so** — do not fabricate a feature idea. This only
   covers picking *which* Now-horizon item to build; it does not make the pipeline
   self-scheduling — a human (or `systemd-run --on-calendar`, launcher-side) still decides *when*
-  a run happens. When the resulting PR merges, flip the picked issue's `status:` to `done` by
-  hand (same as any other `ROADMAP.md`/issue hygiene) — this prompt does not do it for you.
+  a run happens. **The implementing PR carries the issue's `status: done` flip** (stage 3
+  commits `status: in-progress` or `open` → `done` on the issue file, so it lands on `main`
+  atomically exactly when the PR merges — merging the PR *is* what closes the issue; this is
+  the only place the flip happens, never a separate manual post-merge step).
 - `RUN_ID`: e.g. `20260824T020000Z` (UTC). If not provided, derive `date -u +%Y%m%dT%H%M%SZ`.
 - `REPO_PARENT`: parent clone path, e.g. `~/.local/state/herdr-routines/repos/herdr-routines`
 - `$PIPELINE_REPORT`: path for your final report, e.g. `~/.local/state/herdr-routines/reports/<run_id>.md`
@@ -121,14 +123,16 @@ Execute sequentially. After each stage, run its **gate commands** (design:205) a
 
 ### Stage 3 — Implement (tests before code)
 - **Harness:** `opencode/x-preview-f-free` (= `ox-alpha-free`, alias `opencode-e2e:17`, 1M ctx, coding best — was generic `opencode`)
-- **Input:** `spec.md` v2
-- **Prompt:** "Implement the feature described in `$WT/docs/pipeline/runs/$RUN_ID/spec.md` spec v2 on branch `auto/pipeline-$RUN_ID` (already checked out at `$WT`). Author **every test** named in `## Acceptance criteria` (each `Test: <name>`) before considering done. Run the suite locally: `uv run pytest -q`. Commit incrementally with conventional messages. Do not push yet."
+- **Input:** `spec.md` v2; the picked issue file (`state.json.feature_source`)
+- **Prompt:** "Implement the feature described in `$WT/docs/pipeline/runs/$RUN_ID/spec.md` spec v2 on branch `auto/pipeline-$RUN_ID` (already checked out at `$WT`). Author **every test** named in `## Acceptance criteria` (each `Test: <name>`) before considering done. Run the suite locally: `uv run pytest -q`. Commit incrementally with conventional messages. After implementation, flip the picked issue `docs/process/issues/<file>` `status:` to `done` and commit it: `git -C \"$WT\" add docs/process/issues/<file> && git commit -m \"chore: mark issue NN done (merging this PR closes it)\"`. Do not push yet."
 - **Gate 3:** extract `Test: <name>` lines → for each `<name>`: `rg -F -q -- "<name>" "$WT/tests"` (fixed-string `-F`, scoped to `tests/` not the spec directory — G-2) then `uv run pytest -q` passes. Existence first, green second.
 
 ### Stage 4 — Open PR
 - **Harness:** same agent as stage 3 (preserve context)
-- **Prompt:** "Push branch and open PR: `git -C \"$WT\" push -u origin auto/pipeline-$RUN_ID && gh pr create --repo <owner>/<repo> --base main --head auto/pipeline-$RUN_ID --title \"feat: <feature> ($RUN_ID)\" --body \"Implements $WT/docs/pipeline/runs/$RUN_ID/spec.md spec v2; acceptance tests: <list>\"` . Record PR number to `state.json:pr_number`."
-- **Gate 4:** `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-'$RUN_ID'"'`
+- **Prompt:** "Push branch and open PR: `git -C \"$WT\" push -u origin auto/pipeline-$RUN_ID && gh pr create --repo <owner>/<repo> --base main --head auto/pipeline-$RUN_ID --title \"feat: <feature> ($RUN_ID)\" --body \"Implements $WT/docs/pipeline/runs/$RUN_ID/spec.md spec v2; acceptance tests: <list>. Closes issue NN — the `status: done` flip rides this PR and lands on main on merge.\"` . Record PR number to `state.json:pr_number`."
+- **Gate 4:** the PR exists **and** the implementing branch carries the issue-close commit (orchestrator verifies — the flip is done by the implementer in stage 3, but whether it's actually committed is enforced here, since "merging closes the issue" only becomes real once the PR is open):
+  - `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-'$RUN_ID'"'` (PR exists on the right branch)
+  - `git -C "$WT" status --porcelain docs/process/issues/<file>` is empty (flip committed, nothing dangling) **and** `git -C "$WT" show HEAD:docs/process/issues/<file> | rg -q '^status: done$'` (issue file committed as `done` on the branch)
 
 ### Stage 5 — Code review (quality gate)
 - **Harness:** `opencode/big-pickle` **single primary reviewer v1** (measured 1/7, 5 high-sev uniques `pr4:106`); fan-out `hy3-free` + `x-preview-f-free` 2-tie is **v2** (`opencode-e2e:19`, dedup `pr4:45` not yet built, so keep single)

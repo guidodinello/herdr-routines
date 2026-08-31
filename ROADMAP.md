@@ -149,7 +149,36 @@ files 2026-08-27.
   [`docs/process/pi-update-runbook.md`](docs/process/pi-update-runbook.md).
   Plugins + herdr
   CLI + `jobs.yaml` stay explicit; never auto-mutate. Needs refinement. Gate:
-  issue 016. 2026-08-30 brainstorm.
+   issue 016. 2026-08-30 brainstorm.
+- **Unify routines + pipeline as one "gated workflow" engine** — idea, not designed.
+  Investigation (2026-08-30) found the pipeline is *not* a distinct engine: it's a
+  single `herdr` agent whose `orchestrator-prompt.md` tells it to spawn `pl-1..pl-6`
+  workers via its own `herdr` tool calls — there is **no Python stage/spawn loop**
+  in `src/herdr_routines/` (only `pick-feature` stage-0 selector + `ps` stage-*display*
+  read `pl-<N>-<run_id>` names; `tick.py` runs exactly one agent per job). So a
+  routine ("1-step pipeline": one agent, one worktree, one report) and the pipeline
+  ("N-step": one agent whose prompt spawns sub-agents + gates) are the **same engine
+  at two scales**, differing only in the *prompt*, not the harness. Both already
+  schedule on **systemd user timers** (`herdr-routines.timer`→`.service`→`tick` for
+  routines vs. transient `systemd-run --on-calendar` for the pipeline) — the only
+  real scheduler difference is a persistent cron-evaluating tick loop vs. a one-shot
+  unit, so the pipeline could trivially become a `jobs.yaml` entry with a `cron:`
+  (long `timeout_ms`) and ride the existing recurring tick. This is design.md's
+  deferred "`herdr-routines run orchestrator` job wrapper" (not v1) + "Option C: tick
+  owns the pipeline as a scheduled job." Toward a shared abstraction: both = a
+  **gated workflow** (routine = single-agent gated [has `checks`]; pipeline =
+  multi-agent gated [has `stages`, each with a gate]). → folds into the
+  "Code-level pipeline gates" item below. 2026-08-30 investigation.
+- **Code-level pipeline gates (prompt → enforcement)** — idea, not designed.
+  Today pipeline stage gates live only in the orchestrator prompt (stages are
+  hardcoded there; there's no `workflows/pipeline.yaml` parser yet), so they're
+  prompt-compliance, not enforced. Promote gates into the job definition as
+  declarative `checks:`, exactly the shape the unified gate model (issue 025 /
+  PR 56) just added to `jobs.yaml` + `tick.py`: e.g. a gate "issue file is
+  `status: done` on the PR branch" would be a real pre/post check the runner
+  enforces, not a prompt instruction. Gate: works when the pipeline (or its
+  stages) move out of prompt-hardcoded form — either issue 013's
+  `workflows/pipeline.yaml`, or per-stage gate fields. 2026-08-30 brainstorm.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives

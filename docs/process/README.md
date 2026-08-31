@@ -42,6 +42,20 @@ as `*.md` (not under `issues/`, which is frontmatter-driven for `pick-feature`):
   herdr-routines PR merges: fast-forward the Pi runner checkout, migrate config
   if the schema changed, validate.
 
+## Audits / design reviews
+
+Independent design-review records (e.g. a spec audited by a separate agent before
+it goes to `pick-feature`) live in [`audits/`](audits/) as
+`audit-<reviewer>-v<N>.md`, one file per revision — keeping the `audit-*` naming
+and `<area>/audits/` location already used by `docs/pipeline/audits/`
+(`audit-muse.md`, `audit-xpreview.md`).
+
+These are **not** placed under [`issues/`](issues/): that directory is
+frontmatter-driven for `herdr-routines pick-feature` (`pick_feature.py` globs
+`*.md` and parses `id/title/status/priority/area`), so any stray file there —
+an audit, a runbook, a scratch note — would break selection (or worse, be picked
+as an issue). Keep audits, runbooks, and prose out of `issues/`.
+
 ## Scope
 
 Every `ROADMAP.md` item across all horizons is curated into an issue file

@@ -78,6 +78,11 @@ checks:
 - `uv` is not on PATH in non-interactive ssh — use `~/.local/bin/uv`.
 - `herdr-routines validate` prints pre-existing `$ROUTINE_REPORT` warnings for
   other jobs; `ok: N job(s) valid` is the pass line.
+- **Issue closing is carried by the PR, not done manually after merge.** The
+  implementing PR commits its issue's `docs/process/issues/<file>` `status:` →
+  `done`, so the flip lands on `main` atomically at merge. After pulling a merged
+  PR, **do not** hand-flip any issue status — it's already in main via the PR, and
+  you shouldn't leave the issue `open`/`in-progress` expecting a manual close.
 - The manual step is the deliberate design: the release/update strategy on
   `ROADMAP.md` Parking lot carves out the runner fast-forward as a human/`update`
   action, keeping self-update off the always-on Pi.
