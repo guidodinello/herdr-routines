@@ -116,7 +116,9 @@ receives, end to end:
    `## Outcome: ok`, `## Outcome: failed`, or `## Outcome: partial (deadline
    exceeded)` — so `tick` can reconcile done vs failed vs partial from the report
    content (it already writes a partial report + `notification show` on deadline,
-   design.md:170-173; the marker makes that machine-readable). This prompt edit
+   design.md:170-173; the marker makes that machine-readable). The natural single
+   insertion point is the "Always write `$PIPELINE_REPORT` …" block at
+   `orchestrator-prompt.md:163`. This prompt edit
    is carved out of the "no prompt edits" Non-goal below (it changes no stage
    model, only adds a terminal status line). Reconcile from the marker, not the
    clock.
@@ -175,16 +177,18 @@ pipeline. Do not infer mode from prompt source.
 Design notes:
 - **No blocking `timeout_ms`, no `env:` block, no `workspace:`.**
   `deadline_ms` is the orchestrator's wall-clock budget; the generated
-  `systemd-run` unit cap is set via `-p RuntimeMaxSec=$(( (deadline_ms + margin)
-  / 1000 ))` (systemd property, **seconds**, not the non-existent
-  `--timeout` flag and not ms — `RuntimeMaxSec` is 1000× coarser than
-  `deadline_ms`), so the unit outlives the orchestrator's deadline and lets it
-  write the partial report + notify before any kill. `workspace: worktree|root`
-  **does not apply** to `kind: pipeline` — the orchestrator runs in the parent
-  clone and creates its own `auto/pipeline-<run_id>` worktree
+  `systemd-run` unit cap is set via
+  `-p RuntimeMaxSec=$(( (deadline_ms + PIPELINE_UNIT_MARGIN_MS) / 1000 ))`
+  (systemd property, **seconds**, not the non-existent `--timeout` flag and not
+  ms — `RuntimeMaxSec` is 1000× coarser than `deadline_ms`), where
+  `PIPELINE_UNIT_MARGIN_MS = 600_000` is a module constant in `tick.py`, so the
+  unit outlives the orchestrator's deadline and lets it write the partial report
+  + notify before any kill, with deterministic arithmetic. `workspace:
+  worktree|root` **does not apply** to `kind: pipeline` — the orchestrator runs
+  in the parent clone and creates its own `auto/pipeline-<run_id>` worktree
   (orchestrator-prompt.md Prerequisite 1; design.md:337-338); the schema
-  **rejects** an explicit `workspace:` on a `kind: pipeline` job (or ignores it
-  with a warning) rather than leaving it settable-but-ignored. `HERDR_ENV=1`
+  **rejects** an explicit `workspace:` on a `kind: pipeline` job rather than
+  leaving it settable-but-ignored. `HERDR_ENV=1`
   and the pinned report path are baked into the generated command, not config.
 - `prompt_file` is read by the runner/validate from disk — **not** in
   `load_config`, which is documented as pure (no filesystem access beyond the
@@ -223,10 +227,11 @@ Each ends `Test: <name>`:
    still reaches `execute_run`.
    `Test: test_other_jobs_still_run_during_pipeline`
 4. The generated invocation is correct: it runs the orchestrator as `rt-<job>`,
-   bakes in `HERDR_ENV=1`, sets the unit cap `-p RuntimeMaxSec=$(( (deadline_ms +
-   margin) / 1000 ))` (seconds, not `--timeout`, not ms), passes the **bare UTC
-   timestamp** as `RUN_ID`, and pins the **absolute** report path. Assert against
-   the generated string.
+   bakes in `HERDR_ENV=1`, sets the unit cap
+   `-p RuntimeMaxSec=$(( (deadline_ms + PIPELINE_UNIT_MARGIN_MS) / 1000 ))`
+   (seconds, not `--timeout`, not ms), passes the **bare UTC timestamp** as
+   `RUN_ID`, and pins the **absolute** report path. Assert against the generated
+   string.
    `Test: test_pipeline_invocation_string_contract`
 5. The `## Outcome:` marker is a scoped task: `orchestrator-prompt.md` emits an
    explicit `## Outcome: ok | failed | partial (deadline exceeded)` line on its
@@ -236,8 +241,10 @@ Each ends `Test: <name>`:
    The report guard is **redirected, not skipped** — for a pipeline job it still
    marks `failed` on missing/empty report, and tolerates a **partial** report
    only when the report carries the `## Outcome: partial (deadline exceeded)`
-   marker. Assert the token the orchestrator receives, end to end.
-   `Test: test_pipeline_report_guard_redirected_and_partial_tolerant`
+   marker. Assessed as three focused sub-tests so a failure attributes cleanly:
+   `Test: test_orchestrator_prompt_emits_outcome_marker`
+   `Test: test_substitute_prompt_rewrites_pipeline_report`
+   `Test: test_pipeline_report_guard_partial_tolerant`
 6. `_check_systemd_timeout` **skips** `kind: pipeline` jobs entirely (they do not
    inflate the unit's required `TimeoutStartSec`).
    `Test: test_systemd_timeout_skips_pipeline_job`
@@ -339,3 +346,9 @@ behaviour (design.md:347-356 incident). Accepted; not fixed by this issue.
   records live in `docs/process/audits/audit-<reviewer>-v<N>.md`, mirroring
   `docs/pipeline/audits/` — not `issues/`, which `pick-feature` parses via
   frontmatter glob.
+- **2026-08-30**: closed the pass-4 polish before the issue reaches the pipeline:
+  named `PIPELINE_UNIT_MARGIN_MS = 600_000` (deterministic `RuntimeMaxSec`
+  arithmetic), changed explicit `workspace:` on a pipeline job to **reject**
+  (dropped the "or ignores with a warning" ambiguity), named
+  `orchestrator-prompt.md:163` as the `## Outcome:` marker insertion point, and
+  split AC #5 into three focused sub-tests.
