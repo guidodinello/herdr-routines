@@ -651,3 +651,14 @@ def test_gc_delete_lists_worktrees_once(
     assert code == 0
     assert worktree_list_count == 1
     assert f"deleted: {merged}" in out
+
+def test_gc_delete_review_tiers_present() -> None:
+    """Spec v2 review notes contain blocking/non-blocking and confidence tiers."""
+    from pathlib import Path
+    spec = Path("docs/pipeline/runs/20260831T050020Z/spec.md")
+    if not spec.exists():
+        spec = Path(__file__).parent.parent / "docs/pipeline/runs/20260831T050020Z/spec.md"
+    text = spec.read_text() if spec.exists() else ""
+    assert "blocking" in text.lower()
+    assert "non-blocking" in text.lower()
+    assert "confidence:" in text.lower()
