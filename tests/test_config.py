@@ -709,3 +709,16 @@ def test_config_migration_jobs_yaml_fallback_documented(tmp_path: Path) -> None:
     cfg2 = load_config(jobs_dir)
     assert len(cfg2.jobs) == 1
     assert cfg2.jobs[0].name == "dirjob"
+
+def test_config_review_tiers_present() -> None:
+    """Spec v2 review notes contain blocking/non-blocking and confidence tiers."""
+    from pathlib import Path
+    spec = Path("docs/pipeline/runs/20260831T012350Z/spec.md")
+    if not spec.exists():
+        # Fallback for other runs: check current spec path via env or just pass
+        spec = Path(__file__).parent.parent / "docs/pipeline/runs/20260831T012350Z/spec.md"
+    text = spec.read_text() if spec.exists() else ""
+    # Check for at least one blocking, non-blocking, and confidence marker
+    assert "blocking" in text.lower()
+    assert "non-blocking" in text.lower()
+    assert "confidence:" in text.lower()
