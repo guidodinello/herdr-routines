@@ -561,11 +561,14 @@ def test_config_discovers_jobs_d(tmp_path: Path) -> None:
     defaults = "agent_kind: opencode\ncatch_up_minutes: 60\n"
     job_a = "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n"
     job_b = "name: b\ncron: '0 4 * * *'\nrepo: /repo/b\nagent_kind: claude\n"
-    jobs_dir = _make_jobs_d(tmp_path, {
-        "defaults.yaml": defaults,
-        "a.yaml": job_a,
-        "b.yaml": job_b,
-    })
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "defaults.yaml": defaults,
+            "a.yaml": job_a,
+            "b.yaml": job_b,
+        },
+    )
     cfg = load_config(jobs_dir)
     assert len(cfg.jobs) == 2
     a = cfg.job("a")
@@ -644,7 +647,9 @@ def test_config_defaults_merge_precedence_and_absent(tmp_path: Path) -> None:
 
     # --- unknown keys in defaults.yaml ---
     bad_defaults = "bogus_key: 1\n"
-    jobs_dir2 = _make_jobs_d(tmp_path / "t2", {"defaults.yaml": bad_defaults, "a.yaml": job_content})
+    jobs_dir2 = _make_jobs_d(
+        tmp_path / "t2", {"defaults.yaml": bad_defaults, "a.yaml": job_content}
+    )
     with pytest.raises(ConfigError, match="unknown key"):
         load_config(jobs_dir2)
 
@@ -674,17 +679,22 @@ def test_config_jobs_d_sorted_and_example_layout(tmp_path: Path) -> None:
     job_z = "name: z\ncron: '0 3 * * *'\nrepo: /repo/z\n"
     job_a = "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n"
     job_m = "name: m\ncron: '0 3 * * *'\nrepo: /repo/m\n"
-    jobs_dir = _make_jobs_d(tmp_path, {"z.yaml": job_z, "a.yaml": job_a, "m.yaml": job_m})
+    jobs_dir = _make_jobs_d(
+        tmp_path, {"z.yaml": job_z, "a.yaml": job_a, "m.yaml": job_m}
+    )
     cfg = load_config(jobs_dir)
     names = [j.name for j in cfg.jobs]
     assert names == sorted(names)
 
     # deploy/jobs.d/ example layout exists
     from pathlib import Path as P
+
     example_dir = P(__file__).resolve().parent.parent / "deploy" / "jobs.d"
     assert example_dir.is_dir()
     assert (example_dir / "defaults.yaml").exists()
-    yaml_files = sorted(f.name for f in example_dir.glob("*.yaml") if f.name != "defaults.yaml")
+    yaml_files = sorted(
+        f.name for f in example_dir.glob("*.yaml") if f.name != "defaults.yaml"
+    )
     assert len(yaml_files) >= 2  # at least 2 example job files
 
 
@@ -695,7 +705,9 @@ def test_config_migration_jobs_yaml_fallback_documented(tmp_path: Path) -> None:
 
     # --- legacy jobs.yaml still works (with deprecation warning) ---
     legacy_path = tmp_path / "jobs.yaml"
-    legacy_path.write_text("version: 1\njobs:\n  - name: legacy\n    cron: '0 3 * * *'\n    repo: /repo/legacy\n")
+    legacy_path.write_text(
+        "version: 1\njobs:\n  - name: legacy\n    cron: '0 3 * * *'\n    repo: /repo/legacy\n"
+    )
     with w_mod.catch_warnings():
         w_mod.simplefilter("ignore", DeprecationWarning)
         cfg = load_config(legacy_path)
@@ -705,18 +717,24 @@ def test_config_migration_jobs_yaml_fallback_documented(tmp_path: Path) -> None:
     # --- directory takes precedence when both exist ---
     jobs_dir = tmp_path / "jobs.d"
     jobs_dir.mkdir()
-    (jobs_dir / "dirjob.yaml").write_text("name: dirjob\ncron: '0 4 * * *'\nrepo: /repo/dirjob\n")
+    (jobs_dir / "dirjob.yaml").write_text(
+        "name: dirjob\ncron: '0 4 * * *'\nrepo: /repo/dirjob\n"
+    )
     cfg2 = load_config(jobs_dir)
     assert len(cfg2.jobs) == 1
     assert cfg2.jobs[0].name == "dirjob"
 
+
 def test_config_review_tiers_present() -> None:
     """Spec v2 review notes contain blocking/non-blocking and confidence tiers."""
     from pathlib import Path
+
     spec = Path("docs/pipeline/runs/20260831T012350Z/spec.md")
     if not spec.exists():
         # Fallback for other runs: check current spec path via env or just pass
-        spec = Path(__file__).parent.parent / "docs/pipeline/runs/20260831T012350Z/spec.md"
+        spec = (
+            Path(__file__).parent.parent / "docs/pipeline/runs/20260831T012350Z/spec.md"
+        )
     text = spec.read_text() if spec.exists() else ""
     # Check for at least one blocking, non-blocking, and confidence marker
     assert "blocking" in text.lower()

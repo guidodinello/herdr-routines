@@ -19,10 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from logger import get_logger
-
 import yaml
 from croniter import croniter
+from logger import get_logger
 
 log = get_logger(__name__)
 
@@ -346,7 +345,9 @@ def load_config_dir(path: Path) -> RoutinesConfig:
             raw_job["name"] = stem
 
         try:
-            job = _build_job(raw_job, raw_defaults, index=len(jobs), label_prefix=job_file.name)
+            job = _build_job(
+                raw_job, raw_defaults, index=len(jobs), label_prefix=job_file.name
+            )
         except ConfigError as e:
             errors.append(str(e))
             continue
@@ -382,7 +383,9 @@ def _load_yaml_or_error(path: Path, *, is_defaults: bool) -> dict:
         return {}
     if not isinstance(raw, dict):
         kind = "defaults" if is_defaults else "job"
-        raise ConfigError(f"{path}: {kind} file must be a mapping, got {type(raw).__name__}")
+        raise ConfigError(
+            f"{path}: {kind} file must be a mapping, got {type(raw).__name__}"
+        )
     return raw
 
 
@@ -394,7 +397,9 @@ def _validate_defaults_keys(raw: dict, path: Path) -> None:
         raise ConfigError(f"{path}: unknown key(s): {sorted(unknown)}")
 
 
-def _build_job(raw_job: dict, defaults: dict, *, index: int, label_prefix: str | None = None) -> Job:
+def _build_job(
+    raw_job: dict, defaults: dict, *, index: int, label_prefix: str | None = None
+) -> Job:
     unknown = set(raw_job) - _JOB_ALLOWED_KEYS
     if unknown:
         prefix = label_prefix or f"jobs[{index}]"
@@ -410,7 +415,9 @@ def _build_job(raw_job: dict, defaults: dict, *, index: int, label_prefix: str |
     if label_prefix:
         label = f"{label_prefix} ({name!r})" if isinstance(name, str) else label_prefix
     else:
-        label = f"jobs[{index}] ({name!r})" if isinstance(name, str) else f"jobs[{index}]"
+        label = (
+            f"jobs[{index}] ({name!r})" if isinstance(name, str) else f"jobs[{index}]"
+        )
 
     if not isinstance(name, str) or not NAME_RE.match(name):
         raise ConfigError(

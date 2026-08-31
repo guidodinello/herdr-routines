@@ -437,16 +437,19 @@ def test_cli_validate_scheduled_ps_history_directory_layout(
     repo.mkdir(parents=True)
     (repo / ".git").mkdir()
 
-    jobs_dir = _make_jobs_d(tmp_path, {
-        "defaults.yaml": "agent_kind: opencode\n",
-        "test-job.yaml": (
-            f"name: test-job\n"
-            f"cron: '0 3 * * *'\n"
-            f"repo: {repo}\n"
-            f"workspace: worktree\n"
-            f"prompt: Write findings to $ROUTINE_REPORT.\n"
-        ),
-    })
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "defaults.yaml": "agent_kind: opencode\n",
+            "test-job.yaml": (
+                f"name: test-job\n"
+                f"cron: '0 3 * * *'\n"
+                f"repo: {repo}\n"
+                f"workspace: worktree\n"
+                f"prompt: Write findings to $ROUTINE_REPORT.\n"
+            ),
+        },
+    )
 
     # validate works against directory layout
     args = argparse.Namespace(
@@ -462,7 +465,9 @@ def test_cli_validate_scheduled_ps_history_directory_layout(
     state_dir.mkdir()
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(state_dir))
     monkeypatch.setattr(cli, "default_config_path", lambda: jobs_dir)
-    monkeypatch.setattr(cli, "default_history_path", lambda: state_dir / "history.jsonl")
+    monkeypatch.setattr(
+        cli, "default_history_path", lambda: state_dir / "history.jsonl"
+    )
     monkeypatch.setattr(cli, "default_lock_path", lambda: state_dir / "tick.lock")
     assert cli.main(["status"]) == 0
     assert "test-job" in capsys.readouterr().out
