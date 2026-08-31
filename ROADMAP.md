@@ -48,7 +48,8 @@ gate is considered met). One-liner index; full detail in the issue file.
 
 - **Split `jobs.yaml` into `jobs.d/<name>.yaml`** — directory-discovered, one
   file per job + sibling `defaults.yaml`; scripted single-job edits and
-  disable-by-rename instead of editing a block in a monolith. `medium`. →
+  disable-by-rename instead of editing a block in a monolith. `medium`. `done`
+  (PR #61, 2026-08-31; Pi live config migrated to `jobs.d/`). →
   [`006`](docs/process/issues/006-jobs-dir-per-file.md)
 - **Approval path for `blocked` runs** — one actionable notification →
   approve the pending permission prompt from the phone; no auto-approve
@@ -72,6 +73,10 @@ gate is considered met). One-liner index; full detail in the issue file.
   `.so` + pytest artifacts that fill the 2 GB RAM-backed `/tmp` and stall agent
   starts; distinguish disk-full from quota. `medium`. →
   [`027`](docs/process/issues/027-tmp-hygiene.md)
+- **pick-feature: skip issues with an open pipeline PR** — so a later launch
+  never re-picks the feature an in-flight run already has an open PR for
+  (006 collision, 2026-08-31). `medium`. →
+  [`028`](docs/process/issues/028-pick-feature-skip-open-prs.md)
 
 ## Later
 
