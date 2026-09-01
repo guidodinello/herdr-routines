@@ -203,8 +203,28 @@ double-prompt safety analysis in `_is_retryable_prompt_error` gets harder to kee
 correct) — mitigated by pinning the exact poll argv in tier-2 tests and an explicit test that
 a kill never triggers a retry delay.
 
-Provider/model switching on quota exhaustion lives in the ROADMAP Parking Lot (gate: quota
-failures recurring after phase 1 ships).
+Provider/model switching on quota exhaustion shipped 2026-08-31 as a scoped v1 (single
+`fallback_model` retried once, not the full ordered failover list) — see issue 022 and §9.
+
+## 9. Phase 3 (shipped 2026-08-31 — single fallback_model retry)
+
+`Job.fallback_model: str | None`, added to `_DEFAULTS_ALLOWED_KEYS` (unlike `model`, so one
+`defaults.yaml` entry covers every job sharing a provider's free-tier pool) and validated the
+same way as `model` (string or null, only for `agent_kind` in `AGENT_MODEL_FLAGS`).
+
+In `tick._process_job`, when the primary `execute_run` settles `state="failed",
+reason="quota_exhausted"` and `job.fallback_model` is set and differs from `job.model`, the
+job is retried exactly once via `dataclasses.replace(job, model=job.fallback_model)` under a
+fresh run_id (`make_run_id(f"{job.name}-fallback", result.occurrence)`) — a new pane/agent,
+not a resume of the wedged one. Both attempts get their own terminal `history.jsonl` record;
+the fallback's "running" record carries `extra={"reason": "fallback_retry", "primary_run_id":
+...}` so the two are traceable to each other. No retry for any other failure reason, and no
+retry-of-the-retry (one fallback attempt, matching PROMPT_RETRY_DELAYS_S's "one delivery, one
+terminal record" philosophy elsewhere in this doc).
+
+Deliberately deferred (YAGNI, issue 022's log): an ordered multi-entry failover list and a
+per-fallback `agent_kind` override. Revisit if quota exhaustion recurs on the fallback
+provider too.
 
 ## Appendix: 2026-08-23 incident timeline
 

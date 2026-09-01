@@ -9,7 +9,7 @@ import os
 import subprocess
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,7 +45,7 @@ from herdr_routines.history import (
     is_currently_running,
     last_terminal_run,
 )
-from herdr_routines.runner import execute_run, make_run_id
+from herdr_routines.runner import RunOutcome, execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
 
 log = get_logger(__name__)
@@ -1024,6 +1024,25 @@ def _dispatch_fix_worker(
     }
 
 
+def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
+    extra: dict[str, Any] = {
+        "agent": outcome.agent_name,
+        "pane_id": outcome.pane_id,
+        "branch": outcome.branch,
+        "final_agent_status": outcome.final_agent_status,
+        "report_written": outcome.report_written,
+        "report_bytes": outcome.report_bytes,
+        "report": outcome.report_path,
+        "duration_seconds": outcome.duration_seconds,
+        "session_id": outcome.session_id,
+    }
+    if outcome.reason:
+        extra["reason"] = outcome.reason
+    if outcome.error:
+        extra["error"] = outcome.error
+    return extra
+
+
 def _process_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
@@ -1140,21 +1159,42 @@ def _process_job(
 
     outcome = execute_run(job, client, run_id=run_id)
 
-    extra = {
-        "agent": outcome.agent_name,
-        "pane_id": outcome.pane_id,
-        "branch": outcome.branch,
-        "final_agent_status": outcome.final_agent_status,
-        "report_written": outcome.report_written,
-        "report_bytes": outcome.report_bytes,
-        "report": outcome.report_path,
-        "duration_seconds": outcome.duration_seconds,
-        "session_id": outcome.session_id,
-    }
-    if outcome.reason:
-        extra["reason"] = outcome.reason
-    if outcome.error:
-        extra["error"] = outcome.error
+    if (
+        outcome.state == "failed"
+        and outcome.reason == "quota_exhausted"
+        and job.fallback_model
+        and job.fallback_model != job.model
+    ):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state=outcome.state,
+                run_id=run_id,
+                extra=_outcome_extra(outcome),
+            ),
+        )
+        log.info(
+            "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
+            job.name,
+            job.fallback_model,
+        )
+        fallback_run_id = make_run_id(f"{job.name}-fallback", result.occurrence)
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="running",
+                run_id=fallback_run_id,
+                extra={"reason": "fallback_retry", "primary_run_id": run_id},
+            ),
+        )
+        run_id = fallback_run_id
+        outcome = execute_run(
+            replace(job, model=job.fallback_model), client, run_id=run_id
+        )
 
     append(
         history_path,
@@ -1163,7 +1203,7 @@ def _process_job(
             job=job.name,
             state=outcome.state,
             run_id=run_id,
-            extra=extra,
+            extra=_outcome_extra(outcome),
         ),
     )
 
