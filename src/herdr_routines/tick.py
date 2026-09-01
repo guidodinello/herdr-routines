@@ -1158,6 +1158,7 @@ def _process_job(
     )
 
     outcome = execute_run(job, client, run_id=run_id)
+    used_fallback = False
 
     if (
         outcome.state == "failed"
@@ -1165,6 +1166,7 @@ def _process_job(
         and job.fallback_model
         and job.fallback_model != job.model
     ):
+        used_fallback = True
         append(
             history_path,
             HistoryRecord(
@@ -1180,7 +1182,14 @@ def _process_job(
             job.name,
             job.fallback_model,
         )
-        fallback_run_id = make_run_id(f"{job.name}-fallback", result.occurrence)
+        # `now` (wall-clock), not `result.occurrence`: build_branch_name derives the branch
+        # suffix from run_id's own trailing timestamp, keyed on job.name alone (not run_id's
+        # prefix) — reusing `result.occurrence` here would produce byte-identical branch names
+        # for the primary and fallback attempts, so `worktree_create` collides with the
+        # primary's still-existing branch/worktree for every workspace:worktree job (the
+        # default, and what fitted-pr-review* uses). Confirmed by two independent code reviews
+        # on PR #65.
+        fallback_run_id = make_run_id(f"{job.name}-fallback", now)
         append(
             history_path,
             HistoryRecord(
@@ -1208,7 +1217,12 @@ def _process_job(
     )
 
     if outcome.state == "done":
-        _notify(client, f"herdr-routines: {job.name} done", sound="done")
+        done_body = (
+            f"via fallback_model={job.fallback_model}" if used_fallback else None
+        )
+        _notify(
+            client, f"herdr-routines: {job.name} done", body=done_body, sound="done"
+        )
         return f"{job.name}: done", False
 
     _notify(

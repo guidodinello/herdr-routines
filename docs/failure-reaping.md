@@ -42,7 +42,8 @@ Goals (phase 1, this spec):
 Non-goals (deferred, see §8 and the Parking Lot):
 
 - Mid-run fast-fail watchdog (phase 2).
-- Automatic provider/model switching on quota exhaustion.
+- Automatic provider/model switching on quota exhaustion for phase 1 — shipped later as a
+  scoped v1 in §9 (single `fallback_model`, retried once; not the full ordered failover list).
 - Reaping `blocked` or `interrupted_unknown` runs (both deliberate human-follow-up states,
   plan-v1 §4; herdr.py SETTLED_AGENT_STATUSES comments).
 - Same-day retry after quota failure (catch_up_minutes governs missed *schedules*, not failed
