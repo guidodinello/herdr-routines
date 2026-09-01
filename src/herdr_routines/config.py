@@ -484,10 +484,18 @@ def _build_job(
     if fallback_model is not None and not isinstance(fallback_model, str):
         raise ConfigError(f"{label}: 'fallback_model' must be a string or null")
     if fallback_model is not None and agent_kind not in AGENT_MODEL_FLAGS:
-        raise ConfigError(
-            f"{label}: 'fallback_model' is not supported for agent_kind {agent_kind!r} "
-            f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
-        )
+        if "fallback_model" in raw_job:
+            # The job itself asked for this — an explicit mistake, not something a shared
+            # default should paper over.
+            raise ConfigError(
+                f"{label}: 'fallback_model' is not supported for agent_kind {agent_kind!r} "
+                f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
+            )
+        # Inherited from defaults.yaml, which is deliberately shared across every job
+        # (unlike `model`) so one entry can cover a whole provider's job set. A job whose
+        # agent_kind doesn't support model selection at all shouldn't fail to load just
+        # because the default doesn't apply to it — it's simply inert here.
+        fallback_model = None
 
     prompt = merged["prompt"]
     if not isinstance(prompt, str):

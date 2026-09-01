@@ -301,6 +301,27 @@ def test_fallback_model_settable_in_defaults_and_overridable_per_job(
     assert b is not None and b.fallback_model == "openrouter/other"
 
 
+def test_defaults_fallback_model_is_inert_for_unsupported_agent_kind(
+    tmp_path: Path,
+) -> None:
+    """Regression (PR #65 review): fallback_model in defaults.yaml is deliberately shared
+    across every job (unlike model). A job whose own agent_kind doesn't support model
+    selection at all (e.g. codex) must still load — the inherited default is simply inert
+    for it, not a config error. Only an *explicit* per-job fallback_model for an unsupported
+    agent_kind stays an error (see test_fallback_model_raises_for_unsupported_agent_kind)."""
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "defaults.yaml": "fallback_model: openrouter/free\n",
+            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\nagent_kind: codex\n",
+        },
+    )
+    cfg = load_config(jobs_dir)
+    a = cfg.job("a")
+    assert a is not None
+    assert a.fallback_model is None
+
+
 def test_fallback_model_raises_for_unsupported_agent_kind(
     tmp_config_path: Path,
 ) -> None:
