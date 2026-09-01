@@ -79,6 +79,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
         "timezone",
         "on_missed",
         "failure_markers",
+        "fallback_model",
     }
 )
 
@@ -116,6 +117,7 @@ _JOB_DEFAULTS = {
     "timezone": "UTC",
     "on_missed": "log",
     "failure_markers": None,
+    "fallback_model": None,
     "checks": None,
     "target": None,
     "max_workers_per_tick": 3,
@@ -155,6 +157,10 @@ class Job:
     # Screen markers scanned after a failed prompt wait (docs/failure-reaping.md §3.2).
     # None = runner.DEFAULT_FAILURE_MARKERS.
     failure_markers: tuple[str, ...] | None = None
+    # Model retried once, under a fresh run_id, when the primary run fails with reason
+    # "quota_exhausted" (tick._process_job). None = no fallback attempt. Usually set under
+    # `defaults:` so every job sharing a provider's free-tier pool shares one fallback provider.
+    fallback_model: str | None = None
     # Unified gate model: ordered checks that gate the fix agent (None = plain job).
     checks: tuple[GateCheck, ...] | None = None
     # Inferred from check kinds or explicit override: "pr" | "base".
@@ -474,6 +480,23 @@ def _build_job(
             f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
         )
 
+    fallback_model = merged["fallback_model"]
+    if fallback_model is not None and not isinstance(fallback_model, str):
+        raise ConfigError(f"{label}: 'fallback_model' must be a string or null")
+    if fallback_model is not None and agent_kind not in AGENT_MODEL_FLAGS:
+        if "fallback_model" in raw_job:
+            # The job itself asked for this — an explicit mistake, not something a shared
+            # default should paper over.
+            raise ConfigError(
+                f"{label}: 'fallback_model' is not supported for agent_kind {agent_kind!r} "
+                f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
+            )
+        # Inherited from defaults.yaml, which is deliberately shared across every job
+        # (unlike `model`) so one entry can cover a whole provider's job set. A job whose
+        # agent_kind doesn't support model selection at all shouldn't fail to load just
+        # because the default doesn't apply to it — it's simply inert here.
+        fallback_model = None
+
     prompt = merged["prompt"]
     if not isinstance(prompt, str):
         raise ConfigError(f"{label}: 'prompt' must be a string")
@@ -599,6 +622,7 @@ def _build_job(
         base=base,
         agent_kind=agent_kind,
         model=model,
+        fallback_model=fallback_model,
         prompt=prompt,
         timeout_ms=merged["timeout_ms"],
         start_timeout_ms=merged["start_timeout_ms"],

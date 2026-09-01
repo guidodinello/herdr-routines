@@ -1,7 +1,7 @@
 ---
 id: "022"
 title: "Switch provider/model on quota exhaustion"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
@@ -34,3 +34,21 @@ survive the window instead of dead-ending.
   (PR #25) and quota modals have continued to be the dominant failure class,
   so the gate is met. Closely related to issues 005 (watchdog) and 008
   (retries).
+- **2026-08-31**: shipped a scoped v1, not the full ordered failover list —
+  `fallback_model: str | None` (config.py, settable in `defaults.yaml` so a
+  whole provider's job set shares one fallback, or per-job override). On a
+  primary run settling `reason=quota_exhausted`, `tick._process_job` retries
+  exactly once with `dataclasses.replace(job, model=job.fallback_model)`
+  under a fresh run_id (`<job>-fallback-<ts>`); both attempts land as
+  distinct `history.jsonl` records (`fallback_retry`/`primary_run_id` in
+  `extra`), never for other failure reasons. No `agent_kind` override and no
+  multi-entry chain — deliberately deferred (YAGNI) until a single fallback
+  proves insufficient. Deployed on the Pi: `opencode` (Zen) primary,
+  `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free` fallback in
+  `~/.config/herdr-routines/jobs.d/defaults.yaml`, after the Pi's OpenRouter
+  credential was wired up and verified live. Tests:
+  `test_fallback_model_retried_once_after_quota_exhausted`,
+  `test_no_fallback_retry_when_fallback_model_not_set` (tick), plus
+  `config.py` validation tests. If quota exhaustion recurs on the fallback
+  provider too, reopen for the ordered-list shape this issue originally
+  described.
