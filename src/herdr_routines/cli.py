@@ -400,17 +400,24 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     problems.extend(config.errors)
 
     for job in config.jobs:
-        if not job.repo.exists():
-            problems.append(f"{job.name}: repo path does not exist: {job.repo}")
-        elif job.workspace == "worktree" and not (job.repo / ".git").exists():
-            # `workspace: worktree` calls `herdr worktree create --cwd <repo>`, which creates a
-            # *new* linked worktree elsewhere (under ~/.herdr/worktrees/) from whatever `repo`
-            # is — confirmed empirically against a live herdr server: a plain clone (`.git` a
-            # directory) works exactly like an already-linked worktree (`.git` a file) here.
-            # `repo` just needs to be a git repo at all, either shape.
-            problems.append(
-                f"{job.name}: repo is not a git repository (no .git): {job.repo}"
-            )
+        if job.repository is not None:
+            # Repository jobs: skip existence/.git errors, warn if not yet cloned
+            if not job.repo.exists():
+                warnings.append(
+                    f"{job.name}: repository job not yet cloned: {job.repo}"
+                )
+        else:
+            if not job.repo.exists():
+                problems.append(f"{job.name}: repo path does not exist: {job.repo}")
+            elif job.workspace == "worktree" and not (job.repo / ".git").exists():
+                # `workspace: worktree` calls `herdr worktree create --cwd <repo>`, which creates a
+                # *new* linked worktree elsewhere (under ~/.herdr/worktrees/) from whatever `repo`
+                # is — confirmed empirically against a live herdr server: a plain clone (`.git` a
+                # directory) works exactly like an already-linked worktree (`.git` a file) here.
+                # `repo` just needs to be a git repo at all, either shape.
+                problems.append(
+                    f"{job.name}: repo is not a git repository (no .git): {job.repo}"
+                )
         if job.enabled and job.checks is None and "$ROUTINE_REPORT" not in job.prompt:
             # A run only settles as "done" when the report file exists and is non-empty (see
             # runner.execute_run's no_report check); the agent only writes it if the prompt
