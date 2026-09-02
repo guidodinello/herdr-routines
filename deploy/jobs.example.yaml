@@ -25,6 +25,10 @@ jobs:
     cron: "0 3 * * *"
     repo: /home/guido/projects/fitted # a normal clone is fine; `herdr worktree create` makes a
                                        # new linked worktree elsewhere from it each run
+    # repository: https://github.com/org/repo.git  # optional: managed clone lifecycle.
+    # When repo: is absent, checkout is auto-derived to $HERDR_PLUGIN_STATE_DIR/repos/<name>
+    # (or ~/.local/state/herdr-routines/repos/<name>). When both are present, repo: is the
+    # explicit checkout path and repository: is its remote.
     workspace: worktree
     base: main
     agent_kind: opencode
