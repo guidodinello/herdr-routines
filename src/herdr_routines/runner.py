@@ -320,13 +320,6 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
         job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
     )
 
-    # Resolve derived repo path for dry-run display
-    from herdr_routines.config import default_repos_dir as _repos_dir
-
-    checkout = job.repo
-    if job.repository is not None and not checkout.exists():
-        checkout = _repos_dir() / job.name
-
     argv: list[list[str]] = []
     if job.workspace == "worktree":
         branch = build_branch_name(job.name, run_id)
@@ -336,7 +329,7 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
                 "worktree",
                 "create",
                 "--cwd",
-                str(checkout),
+                str(job.repo),
                 "--branch",
                 branch,
                 "--base",
@@ -353,7 +346,7 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
                 "tab",
                 "create",
                 "--cwd",
-                str(checkout),
+                str(job.repo),
                 "--no-focus",
                 "--label",
                 job.name,

@@ -47,26 +47,24 @@ def ensure_repo(job: object, *, repos_dir: Path | None = None) -> Path:
     """
     repository: str | None = getattr(job, "repository", None)
     repo: Path = getattr(job, "repo")
-    run_id: str | None = getattr(job, "_run_id", None)
 
     if repository is None:
         return repo
 
     checkout = repo
     if not (checkout / ".git").exists():
-        _clone(repository, checkout, run_id=run_id)
+        _clone(repository, checkout)
     else:
         _fetch_and_fast_forward(checkout, base=getattr(job, "base", "main"))
 
     return checkout
 
 
-def _clone(url: str, dest: Path, *, run_id: str | None = None) -> None:
+def _clone(url: str, dest: Path) -> None:
     """Clone *url* into *dest* atomically: clone to a tmp dir then rename.
     On failure the tmp dir is removed so the next tick retries a full clone."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    suffix = f".tmp.{run_id}" if run_id else ""
-    tmp_dir = Path(tempfile.mkdtemp(dir=dest.parent, suffix=suffix))
+    tmp_dir = Path(tempfile.mkdtemp(dir=dest.parent, suffix=".tmp"))
     try:
         proc = subprocess.run(
             ["git", "clone", url, str(tmp_dir / "checkout")],
@@ -78,14 +76,14 @@ def _clone(url: str, dest: Path, *, run_id: str | None = None) -> None:
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr.strip() or f"git clone failed (rc={proc.returncode})")
         # Atomic rename into place
-        shutil.move(str(tmp_dir / "checkout"), str(dest))
+        os.replace(str(tmp_dir / "checkout"), str(dest))
     finally:
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _fetch_and_fast_forward(checkout: Path, *, base: str = "main") -> None:
-    """Fetch and fast-forward the current branch.  For detached HEAD (worktree
+    """Fetch and fast-forward to ``origin/<base>``.  For detached HEAD (worktree
     base-target gate), fetch alone is enough."""
     # Fetch
     proc = subprocess.run(
@@ -98,7 +96,7 @@ def _fetch_and_fast_forward(checkout: Path, *, base: str = "main") -> None:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "git fetch failed")
 
-    # Check if detached
+    # Check if detached — fetch alone is sufficient for detached HEAD
     head_proc = subprocess.run(
         ["git", "-C", str(checkout), "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True,
@@ -107,13 +105,11 @@ def _fetch_and_fast_forward(checkout: Path, *, base: str = "main") -> None:
         check=False,
     )
     if head_proc.stdout.strip() == "HEAD":
-        # Detached — fetch alone is sufficient
         return
 
-    # Fast-forward current branch
-    branch = head_proc.stdout.strip()
+    # Fast-forward to origin/<base>
     proc = subprocess.run(
-        ["git", "-C", str(checkout), "merge", "--ff-only", f"origin/{branch}"],
+        ["git", "-C", str(checkout), "merge", "--ff-only", f"origin/{base}"],
         capture_output=True,
         text=True,
         timeout=REPO_TIMEOUT_S,
@@ -121,5 +117,5 @@ def _fetch_and_fast_forward(checkout: Path, *, base: str = "main") -> None:
     )
     if proc.returncode != 0:
         raise RuntimeError(
-            proc.stderr.strip() or f"non-fast-forward merge on {branch}"
+            proc.stderr.strip() or f"non-fast-forward merge on origin/{base}"
         )
