@@ -19,6 +19,7 @@ from herdr_routines.herdr import (
     PromptWatchdogKilled,
     build_agent_start_args,
 )
+from herdr_routines.repos import ensure_repo
 
 log = logging.getLogger(__name__)
 
@@ -319,6 +320,13 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
         job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
     )
 
+    # Resolve derived repo path for dry-run display
+    from herdr_routines.config import default_repos_dir as _repos_dir
+
+    checkout = job.repo
+    if job.repository is not None and not checkout.exists():
+        checkout = _repos_dir() / job.name
+
     argv: list[list[str]] = []
     if job.workspace == "worktree":
         branch = build_branch_name(job.name, run_id)
@@ -328,7 +336,7 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
                 "worktree",
                 "create",
                 "--cwd",
-                str(job.repo),
+                str(checkout),
                 "--branch",
                 branch,
                 "--base",
@@ -345,7 +353,7 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
                 "tab",
                 "create",
                 "--cwd",
-                str(job.repo),
+                str(checkout),
                 "--no-focus",
                 "--label",
                 job.name,
@@ -390,6 +398,20 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     branch = (
         build_branch_name(job.name, run_id) if job.workspace == "worktree" else None
     )
+
+    # Ensure the repo checkout exists (clone-if-missing / fetch) before any worktree
+    # or tab creation.
+    if job.repository is not None:
+        try:
+            ensure_repo(job)
+        except (RuntimeError, OSError) as e:
+            return RunOutcome(
+                state="failed",
+                run_id=run_id,
+                reason="clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed",
+                error=str(e),
+                branch=branch,
+            )
 
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
