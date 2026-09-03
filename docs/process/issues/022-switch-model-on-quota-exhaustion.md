@@ -1,7 +1,7 @@
 ---
 id: "022"
 title: "Switch provider/model on quota exhaustion"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
