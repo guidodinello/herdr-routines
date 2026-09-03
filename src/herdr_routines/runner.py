@@ -401,7 +401,9 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             return RunOutcome(
                 state="failed",
                 run_id=run_id,
-                reason="clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed",
+                reason="clone_failed"
+                if not (job.repo / ".git").exists()
+                else "repo_sync_failed",
                 error=str(e),
                 branch=branch,
             )

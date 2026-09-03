@@ -12,7 +12,7 @@ import pytest
 
 from herdr_routines.auto_fix import attempt_count_for_pr
 from herdr_routines.config import Job, RoutinesConfig
-from herdr_routines.herdr import HerdrCliError
+from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import _live_agent_exists, run_tick
 
@@ -199,10 +199,20 @@ class FakeClient:
     verified 3x on the Pi that this module's fix makes visible to systemd)."""
 
     def __init__(
-        self, *, fail_at: str | None = None, settle_status: str = "idle"
+        self,
+        *,
+        fail_at: str | None = None,
+        settle_status: str = "idle",
+        quota_exhausted_for_model: str | None = None,
     ) -> None:
         self.fail_at = fail_at
         self.settle_status = settle_status
+        # Simulates a provider's free-tier quota wall: any run started with this model raises
+        # PromptWatchdogKilled (the same path runner.py hits on a real "Free usage exceeded"
+        # screen match), while any other model (e.g. a job's fallback_model) succeeds normally.
+        self.quota_exhausted_for_model = quota_exhausted_for_model
+        self._last_model: str | None = None
+        self._worktree_branches: set[str] = set()
 
     def _maybe_raise(self, call: str) -> None:
         if self.fail_at == call:
@@ -214,10 +224,17 @@ class FakeClient:
 
     def worktree_create(self, *, cwd, branch, base, label=None):
         self._maybe_raise("worktree_create")
+        # Mirrors real `git worktree add` on a branch that already has a checkout: a fallback
+        # retry reusing the primary attempt's branch name must fail here, the same way it would
+        # against a real repo (PR #65 review finding).
+        if branch in self._worktree_branches:
+            raise HerdrCliError(f"branch {branch!r} already checked out", exit_code=1)
+        self._worktree_branches.add(branch)
         return "w1:p1"
 
     def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
         self._maybe_raise("agent_start")
+        self._last_model = model
 
     def agent_interactive_ready(self, target):
         self._maybe_raise("agent_interactive_ready")
@@ -244,6 +261,15 @@ class FakeClient:
     def agent_prompt_wait_with_watchdog(
         self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
     ):
+        if (
+            self.quota_exhausted_for_model is not None
+            and self._last_model == self.quota_exhausted_for_model
+        ):
+            raise PromptWatchdogKilled(
+                "quota modal wedge",
+                marker="Free usage exceeded",
+                screen_text="Free usage exceeded",
+            )
         return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
 
     def agent_read(self, target, *, lines=200):
@@ -291,6 +317,119 @@ def test_no_failure_for_a_successful_run(
 
     assert outcome.summaries == ("a: done",)
     assert outcome.any_job_failed is False
+
+
+def test_fallback_model_retried_once_after_quota_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job with `fallback_model` set gets one automatic retry, under a fresh run_id, when
+    the primary model's run fails with reason quota_exhausted — the scenario this feature
+    exists for: the Pi's opencode free-tier pool exhausted, OpenRouter still has quota."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model="opencode/muse-spark-1.2-contributor-free",
+        fallback_model="openrouter/free",
+    )
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(
+        settle_status="idle",
+        quota_exhausted_for_model="opencode/muse-spark-1.2-contributor-free",
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    assert outcome.any_job_failed is False
+
+    records = read_job(history_path, job.name)
+    run_records = [r for r in records if r.run_id is not None]
+    # primary "running" + primary "failed" (quota_exhausted) + fallback "running" + fallback "done"
+    assert [r.state for r in run_records] == ["running", "failed", "running", "done"]
+    primary_run, primary_failed, fallback_running, fallback_done = run_records
+    assert primary_failed.extra is not None
+    assert primary_failed.extra["reason"] == "quota_exhausted"
+    assert fallback_running.extra is not None
+    assert fallback_running.extra["reason"] == "fallback_retry"
+    assert fallback_running.extra["primary_run_id"] == primary_run.run_id
+    assert fallback_done.run_id == fallback_running.run_id != primary_run.run_id
+
+
+def test_fallback_retry_uses_a_distinct_branch_in_worktree_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (PR #65 review, confirmed by two independent reviewers): the fallback's
+    run_id must not share the primary's timestamp suffix, or `build_branch_name` — which keys
+    on job.name plus that suffix, not on run_id's own prefix — produces the identical branch
+    name for both attempts. For `workspace: worktree` (the default, and what fitted-pr-review*
+    uses), that collides with the primary's still-existing branch/worktree and
+    `worktree_create` fails. `test_fallback_model_retried_once_after_quota_exhausted` alone
+    can't catch this: `make_job` defaults to `workspace="root"`, which never calls
+    `worktree_create` at all."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(
+        tmp_path,
+        workspace="worktree",
+        agent_kind="opencode",
+        model="opencode/muse-spark-1.2-contributor-free",
+        fallback_model="openrouter/free",
+    )
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(
+        settle_status="idle",
+        quota_exhausted_for_model="opencode/muse-spark-1.2-contributor-free",
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    assert outcome.any_job_failed is False
+
+    records = read_job(history_path, job.name)
+    branches = {r.extra["branch"] for r in records if r.extra and r.extra.get("branch")}
+    assert len(branches) == 2, (
+        f"expected distinct primary/fallback branches, got {branches}"
+    )
+
+
+def test_no_fallback_retry_when_fallback_model_not_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a configured fallback_model, quota_exhausted is terminal — no change from
+    pre-fallback behavior."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model="opencode/muse-spark-1.2-contributor-free",
+    )
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(
+        settle_status="idle",
+        quota_exhausted_for_model="opencode/muse-spark-1.2-contributor-free",
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: failed (quota_exhausted)",)
+    assert outcome.any_job_failed is True
+
+    records = read_job(history_path, job.name)
+    run_records = [r for r in records if r.run_id is not None]
+    assert [r.state for r in run_records] == ["running", "failed"]
 
 
 def test_failure_flagged_when_a_due_job_actually_fails(
@@ -565,11 +704,8 @@ def test_repo_url_tick_runner_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """runner.execute_run calls ensure_repo before any worktree/tab creation for repository jobs."""
-    from herdr_routines.runner import execute_run as real_execute_run
 
     calls: list[str] = []
-
-    original_ensure = None
 
     def fake_ensure_repo(job, *, repos_dir=None):
         calls.append("ensure_repo")
@@ -584,7 +720,6 @@ def test_repo_url_tick_runner_gate(
     # execute_run should call ensure_repo before pane creation
     history_path = tmp_path / "state" / "history.jsonl"
     t0 = datetime.now(UTC).replace(microsecond=0)
-    from herdr_routines.history import append, HistoryRecord
 
     config = RoutinesConfig(jobs=(job,))
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]

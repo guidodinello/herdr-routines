@@ -15,6 +15,8 @@ from pathlib import Path
 
 from logger import get_logger
 
+from herdr_routines.config import Job
+
 log = get_logger(__name__)
 
 REPO_TIMEOUT_S = 120
@@ -33,7 +35,7 @@ def default_repos_dir() -> Path:
     return base / "repos"
 
 
-def ensure_repo(job: object, *, repos_dir: Path | None = None) -> Path:
+def ensure_repo(job: Job, *, repos_dir: Path | None = None) -> Path:
     """Ensure the job's checkout exists and is up-to-date.
 
     For ``repository:`` jobs:
@@ -42,20 +44,21 @@ def ensure_repo(job: object, *, repos_dir: Path | None = None) -> Path:
 
     For plain ``repo:`` jobs: returns ``job.repo`` unchanged.
 
+    ``repos_dir`` is accepted for callers that pre-resolve the managed repos
+    base dir (e.g. via ``default_repos_dir``); ``job.repo`` is already the
+    resolved checkout path, so it is not otherwise used here.
+
     Returns the checkout path on success.  Raises ``RuntimeError`` on
     clone/sync failure so callers can map it to a terminal ``RunOutcome``.
     """
-    repository: str | None = getattr(job, "repository", None)
-    repo: Path = getattr(job, "repo")
+    if job.repository is None:
+        return job.repo
 
-    if repository is None:
-        return repo
-
-    checkout = repo
+    checkout = job.repo
     if not (checkout / ".git").exists():
-        _clone(repository, checkout)
+        _clone(job.repository, checkout)
     else:
-        _fetch_and_fast_forward(checkout, base=getattr(job, "base", "main"))
+        _fetch_and_fast_forward(checkout, base=job.base)
 
     return checkout
 
@@ -74,7 +77,9 @@ def _clone(url: str, dest: Path) -> None:
             check=False,
         )
         if proc.returncode != 0:
-            raise RuntimeError(proc.stderr.strip() or f"git clone failed (rc={proc.returncode})")
+            raise RuntimeError(
+                proc.stderr.strip() or f"git clone failed (rc={proc.returncode})"
+            )
         # Atomic rename into place
         os.replace(str(tmp_dir / "checkout"), str(dest))
     finally:

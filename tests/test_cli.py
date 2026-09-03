@@ -489,7 +489,9 @@ def test_cli_validate_scheduled_ps_history_directory_layout(
 # -- repository: <url> validation (issue 016) -------------------------------------------
 
 
-def test_repo_url_validate_skips_existence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_repo_url_validate_skips_existence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """repository jobs skip repo.exists()/.git hard errors in validate, warn instead."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     jobs_dir = tmp_path / "jobs.d"
@@ -508,13 +510,6 @@ def test_repo_url_validate_skips_existence(tmp_path: Path, monkeypatch: pytest.M
     assert not job.repo.exists()
     # The validate function should produce a warning, not an error for repository jobs
     # We test the logic by checking the validate path
-    from herdr_routines.cli import _cmd_validate
-
-    import argparse
-
-    args = argparse.Namespace(config=jobs_dir, systemd_unit=tmp_path / "no.service")
-    # Should return 0 (warnings only, no errors for missing checkout on repository jobs)
-    # but may fail on prompt warnings — let's check directly
     problems: list[str] = []
     warnings: list[str] = []
     for j in config.jobs:

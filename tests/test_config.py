@@ -277,6 +277,80 @@ jobs:
         load_config(write(tmp_config_path, text))
 
 
+def test_fallback_model_settable_in_defaults_and_overridable_per_job(
+    tmp_path: Path,
+) -> None:
+    """fallback_model lives in _DEFAULTS_ALLOWED_KEYS (unlike model) so one entry in
+    defaults.yaml covers every job sharing a provider's free-tier pool; a job can still
+    override it."""
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "defaults.yaml": "agent_kind: opencode\nfallback_model: openrouter/free\n",
+            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n",
+            "b.yaml": (
+                "name: b\ncron: '0 4 * * *'\nrepo: /repo/b\n"
+                "fallback_model: openrouter/other\n"
+            ),
+        },
+    )
+    cfg = load_config(jobs_dir)
+    a = cfg.job("a")
+    b = cfg.job("b")
+    assert a is not None and a.fallback_model == "openrouter/free"
+    assert b is not None and b.fallback_model == "openrouter/other"
+
+
+def test_defaults_fallback_model_is_inert_for_unsupported_agent_kind(
+    tmp_path: Path,
+) -> None:
+    """Regression (PR #65 review): fallback_model in defaults.yaml is deliberately shared
+    across every job (unlike model). A job whose own agent_kind doesn't support model
+    selection at all (e.g. codex) must still load — the inherited default is simply inert
+    for it, not a config error. Only an *explicit* per-job fallback_model for an unsupported
+    agent_kind stays an error (see test_fallback_model_raises_for_unsupported_agent_kind)."""
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "defaults.yaml": "fallback_model: openrouter/free\n",
+            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\nagent_kind: codex\n",
+        },
+    )
+    cfg = load_config(jobs_dir)
+    a = cfg.job("a")
+    assert a is not None
+    assert a.fallback_model is None
+
+
+def test_fallback_model_raises_for_unsupported_agent_kind(
+    tmp_config_path: Path,
+) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: codex
+    fallback_model: some-model
+"""
+    with pytest.raises(ConfigError, match="fallback_model"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_non_string_fallback_model_raises(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    fallback_model: 123
+"""
+    with pytest.raises(ConfigError, match="fallback_model"):
+        load_config(write(tmp_config_path, text))
+
+
 def test_no_permission_mode_key_exists_in_schema(tmp_config_path: Path) -> None:
     """Deliberate: v1 has no escape hatch for unattended auto-approve (see docs/plan-v1.md §2)."""
     text = """
@@ -947,4 +1021,3 @@ jobs:
     assert job is not None
     assert job.repo == Path("/some/repo")
     assert job.repository is None
-

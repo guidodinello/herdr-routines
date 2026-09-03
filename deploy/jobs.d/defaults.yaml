@@ -10,3 +10,10 @@ timezone: America/Montevideo
 # failure_markers: ["Free usage exceeded"] # optional (docs/failure-reaping.md §3.4):
 #                                          # screen markers scanned after a failed prompt
 #                                          # wait; omit for the built-in defaults.
+# fallback_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free" # optional: retried
+#                                          # once, under a fresh run_id, when the primary
+#                                          # model's run fails with reason quota_exhausted —
+#                                          # point it at a second free-tier provider so one
+#                                          # exhausted pool doesn't stall every job using it.
+#                                          # Only valid for agent_kind in AGENT_MODEL_FLAGS
+#                                          # (claude, opencode).
