@@ -79,6 +79,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
         "timezone",
         "on_missed",
         "failure_markers",
+        "fallbacks",
     }
 )
 
@@ -120,6 +121,7 @@ _JOB_DEFAULTS = {
     "target": None,
     "max_workers_per_tick": 3,
     "max_attempts_per_target": 3,
+    "fallbacks": None,
 }
 
 
@@ -134,6 +136,24 @@ class GateCheck:
     kind: str  # "pr_health" | "command"
     command: str | None = None
     timeout_ms: int = 120_000
+
+
+@dataclass(frozen=True, slots=True)
+class FallbackEntry:
+    """A single entry in a job's ``fallbacks`` list: an ``agent_kind`` and/or ``model`` override
+    used for one retry attempt after a classified ``quota_exhausted`` settle.
+
+    At least one of ``agent_kind`` or ``model`` must be present; ``agent_kind`` defaults to the
+    job's own ``agent_kind`` when omitted, ``model`` may be ``null`` (= agent default)."""
+
+    agent_kind: str | None = None
+    model: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.agent_kind is None and self.model is None:
+            raise ValueError(
+                "fallback entry must have at least one of 'agent_kind' or 'model'"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +183,8 @@ class Job:
     max_workers_per_tick: int = 3
     # Retry budget keyed per target (per gate branch for base, per PR number for pr).
     max_attempts_per_target: int = 3
+    # Ordered failover list for quota_exhausted retries (None/absent = no failover).
+    fallbacks: tuple[FallbackEntry, ...] | None = None
 
     @property
     def agent_name(self) -> str:
@@ -503,6 +525,62 @@ def _build_job(
             )
         failure_markers = tuple(failure_markers_raw)
 
+    # -- Fallbacks: ordered failover list for quota_exhausted retries -----------------
+
+    fallbacks_raw = merged.get("fallbacks")
+    fallbacks: tuple[FallbackEntry, ...] | None = None
+    if fallbacks_raw is not None:
+        if not isinstance(fallbacks_raw, list):
+            raise ConfigError(f"{label}: 'fallbacks' must be a list or null")
+        if len(fallbacks_raw) == 0:
+            fallbacks = None  # empty list = no failover
+        else:
+            parsed_fallbacks: list[FallbackEntry] = []
+            for fi, fb in enumerate(fallbacks_raw):
+                if not isinstance(fb, dict):
+                    raise ConfigError(
+                        f"{label}: 'fallbacks[{fi}]' must be a mapping"
+                    )
+                unknown_fb = set(fb) - {"agent_kind", "model"}
+                if unknown_fb:
+                    raise ConfigError(
+                        f"{label}: 'fallbacks[{fi}]' has unknown key(s): "
+                        f"{sorted(unknown_fb)}"
+                    )
+                fb_agent_kind = fb.get("agent_kind")
+                fb_model = fb.get("model")
+                if fb_agent_kind is None and fb_model is None:
+                    raise ConfigError(
+                        f"{label}: 'fallbacks[{fi}]' must have at least one of "
+                        "'agent_kind' or 'model'"
+                    )
+                if fb_agent_kind is not None:
+                    if not isinstance(fb_agent_kind, str):
+                        raise ConfigError(
+                            f"{label}: 'fallbacks[{fi}].agent_kind' must be a string"
+                        )
+                    if fb_agent_kind not in VALID_AGENT_KINDS:
+                        raise ConfigError(
+                            f"{label}: 'fallbacks[{fi}].agent_kind' must be one of "
+                            f"{sorted(VALID_AGENT_KINDS)}"
+                        )
+                if fb_model is not None and not isinstance(fb_model, str):
+                    raise ConfigError(
+                        f"{label}: 'fallbacks[{fi}].model' must be a string or null"
+                    )
+                # Validate model against the fallback's agent_kind (or the job's default).
+                effective_kind = fb_agent_kind or agent_kind
+                if fb_model is not None and effective_kind not in AGENT_MODEL_FLAGS:
+                    raise ConfigError(
+                        f"{label}: 'fallbacks[{fi}].model' is not supported for "
+                        f"agent_kind {effective_kind!r} (supported: "
+                        f"{sorted(AGENT_MODEL_FLAGS)})"
+                    )
+                parsed_fallbacks.append(
+                    FallbackEntry(agent_kind=fb_agent_kind, model=fb_model)
+                )
+            fallbacks = tuple(parsed_fallbacks)
+
     # -- Unified gate model: checks / target / max_workers / max_attempts -----------
 
     checks_raw = merged.get("checks")
@@ -610,4 +688,5 @@ def _build_job(
         target=target,
         max_workers_per_tick=merged["max_workers_per_tick"],
         max_attempts_per_target=merged["max_attempts_per_target"],
+        fallbacks=fallbacks,
     )

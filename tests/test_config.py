@@ -740,3 +740,224 @@ def test_config_review_tiers_present() -> None:
     assert "blocking" in text.lower()
     assert "non-blocking" in text.lower()
     assert "confidence:" in text.lower()
+
+
+# -- fallbacks (issue 022: switch provider/model on quota exhaustion) ----------------------
+
+
+def test_failover_config_ordered_list(tmp_config_path: Path) -> None:
+    """Acceptance 1: job can declare ordered fallbacks list of {model?, agent_kind?}
+    where agent_kind defaults to job's agent_kind if omitted, model may be null,
+    at least one present per entry, validated against VALID_AGENT_KINDS/AGENT_MODEL_FLAGS,
+    fallbacks absent/null/empty means no failover, per-job list wins wholesale over
+    defaults.yaml."""
+    from herdr_routines.config import FallbackEntry, load_config
+
+    text = """
+version: 1
+jobs:
+  - name: nightly-dep-audit
+    cron: "0 3 * * *"
+    repo: /repo/test
+    agent_kind: opencode
+    model: opencode/big-pickle
+    fallbacks:
+      - model: opencode/gpt-5-nano
+      - agent_kind: claude
+        model: haiku
+      - agent_kind: opencode
+        model: opencode/x-preview-f-free
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("nightly-dep-audit")
+    assert job is not None
+    assert job.fallbacks is not None
+    assert len(job.fallbacks) == 3
+    # First: same kind (opencode), different model
+    assert job.fallbacks[0] == FallbackEntry(model="opencode/gpt-5-nano")
+    # Second: different kind, different model
+    assert job.fallbacks[1] == FallbackEntry(agent_kind="claude", model="haiku")
+    # Third: same kind, different model
+    assert job.fallbacks[2] == FallbackEntry(
+        agent_kind="opencode", model="opencode/x-preview-f-free"
+    )
+
+
+def test_failover_config_absent_means_none(tmp_config_path: Path) -> None:
+    """fallbacks absent → None (no failover, today's behaviour)."""
+    cfg = load_config(write(tmp_config_path, VALID_MINIMAL))
+    job = cfg.job("nightly-audit")
+    assert job is not None
+    assert job.fallbacks is None
+
+
+def test_failover_config_null_means_none(tmp_config_path: Path) -> None:
+    """fallbacks: null → None."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    fallbacks: null
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    assert cfg.job("a").fallbacks is None
+
+
+def test_failover_config_empty_list_means_no_failover(tmp_config_path: Path) -> None:
+    """fallbacks: [] → None (explicitly no failover)."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    fallbacks: []
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    assert cfg.job("a").fallbacks is None
+
+
+def test_failover_config_model_null_means_agent_default(tmp_config_path: Path) -> None:
+    """model: null in a fallback entry is valid (agent default model)."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: claude
+    fallbacks:
+      - agent_kind: claude
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job.fallbacks is not None
+    assert job.fallbacks[0].model is None
+    assert job.fallbacks[0].agent_kind == "claude"
+
+
+def test_failover_config_agent_kind_defaults_to_job(tmp_config_path: Path) -> None:
+    """When agent_kind is omitted in a fallback, it defaults to the job's agent_kind
+    via _resolve_attempt_kind_model (validated at resolve time, not parse time)."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: opencode
+    fallbacks:
+      - model: opencode/gpt-5-nano
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job.fallbacks is not None
+    assert job.fallbacks[0].agent_kind is None  # omitted
+    assert job.fallbacks[0].model == "opencode/gpt-5-nano"
+
+
+def test_failover_config_rejects_unknown_kind(tmp_config_path: Path) -> None:
+    """Unknown agent_kind in fallback is rejected."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    fallbacks:
+      - agent_kind: definitely-not-a-real-kind
+        model: foo
+"""
+    with pytest.raises(ConfigError, match="agent_kind"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_failover_config_rejects_model_on_unsupported_kind(tmp_config_path: Path) -> None:
+    """model on a kind without AGENT_MODEL_FLAGS is rejected."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    fallbacks:
+      - agent_kind: codex
+        model: some-model
+"""
+    with pytest.raises(ConfigError, match="model"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_failover_config_rejects_unknown_keys(tmp_config_path: Path) -> None:
+    """Unknown keys in a fallback entry are rejected."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    fallbacks:
+      - model: opencode/gpt-5-nano
+        bogus: true
+"""
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_failover_config_rejects_empty_entry(tmp_config_path: Path) -> None:
+    """A fallback entry with neither agent_kind nor model is rejected."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    fallbacks:
+      - {}
+"""
+    with pytest.raises(ConfigError, match="at least one of"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_failover_config_from_defaults_inherited(tmp_config_path: Path) -> None:
+    """fallbacks from defaults.yaml are inherited by jobs."""
+    text = """
+version: 1
+defaults:
+  fallbacks:
+    - model: opencode/gpt-5-nano
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: opencode
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job.fallbacks is not None
+    assert len(job.fallbacks) == 1
+    assert job.fallbacks[0].model == "opencode/gpt-5-nano"
+
+
+def test_failover_config_job_overrides_defaults_wholesale(tmp_config_path: Path) -> None:
+    """Per-job fallbacks win wholesale over defaults.yaml (no merge)."""
+    text = """
+version: 1
+defaults:
+  fallbacks:
+    - model: opencode/gpt-5-nano
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: opencode
+    fallbacks:
+      - model: opencode/x-preview-f-free
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job.fallbacks is not None
+    assert len(job.fallbacks) == 1
+    assert job.fallbacks[0].model == "opencode/x-preview-f-free"
