@@ -1434,3 +1434,14 @@ def test_failover_exhaustion_and_pane_lifecycle(
     close_calls = [i for i, c in enumerate(client.calls) if c == "pane_close"]
     for vis_idx, close_idx in zip(vis_calls, close_calls):
         assert vis_idx < close_idx
+
+def test_failover_review_tiers_present() -> None:
+    """Spec v2 review notes contain blocking/non-blocking and confidence tiers."""
+    from pathlib import Path
+    spec = Path("docs/pipeline/runs/20260903T050016Z/spec.md")
+    if not spec.exists():
+        spec = Path(__file__).parent.parent / "docs/pipeline/runs/20260903T050016Z/spec.md"
+    text = spec.read_text() if spec.exists() else ""
+    assert "blocking" in text.lower()
+    assert "non-blocking" in text.lower()
+    assert "confidence:" in text.lower()
