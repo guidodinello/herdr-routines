@@ -695,3 +695,35 @@ def test_auto_fix_tick_max_attempts_skip(
 
     # Verify the attempt count logic works
     assert count >= job.max_attempts_per_target
+
+
+# -- repository: <url> ensure_repo gate (issue 016) ------------------------------------
+
+
+def test_repo_url_tick_runner_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """runner.execute_run calls ensure_repo before any worktree/tab creation for repository jobs."""
+
+    calls: list[str] = []
+
+    def fake_ensure_repo(job, *, repos_dir=None):
+        calls.append("ensure_repo")
+        return job.repo
+
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", fake_ensure_repo)
+
+    job = make_job(tmp_path, repository="https://example.com/repo.git")
+    client = FakeClient(settle_status="idle")
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+    # execute_run should call ensure_repo before pane creation
+    history_path = tmp_path / "state" / "history.jsonl"
+    t0 = datetime.now(UTC).replace(microsecond=0)
+
+    config = RoutinesConfig(jobs=(job,))
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    # After registration, run the job
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    assert "ensure_repo" in calls

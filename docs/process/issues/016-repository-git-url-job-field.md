@@ -1,7 +1,7 @@
 ---
 id: "016"
 title: "repository: <git-url> job field"
-status: open
+status: done
 priority: medium
 area: config
 ---

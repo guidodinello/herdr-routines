@@ -83,7 +83,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
     }
 )
 
-_JOB_REQUIRED_KEYS = frozenset({"name", "cron", "repo"})
+_JOB_REQUIRED_KEYS = frozenset({"name", "cron"})
 _JOB_ALLOWED_KEYS = (
     _JOB_REQUIRED_KEYS
     | _DEFAULTS_ALLOWED_KEYS
@@ -97,6 +97,8 @@ _JOB_ALLOWED_KEYS = (
             "target",
             "max_workers_per_tick",
             "max_attempts_per_target",
+            "repo",
+            "repository",
         }
     )
 )
@@ -110,6 +112,7 @@ _JOB_DEFAULTS = {
     "workspace": "worktree",
     "base": "main",
     "model": None,
+    "repo": None,
     "prompt": "",
     "timeout_ms": 1_800_000,
     "start_timeout_ms": 120_000,
@@ -122,6 +125,7 @@ _JOB_DEFAULTS = {
     "target": None,
     "max_workers_per_tick": 3,
     "max_attempts_per_target": 3,
+    "repository": None,
 }
 
 
@@ -154,6 +158,8 @@ class Job:
     catch_up_minutes: int
     timezone: str
     on_missed: str  # "log" | "notify"
+    # Optional git URL for managed clone lifecycle.
+    repository: str | None = None
     # Screen markers scanned after a failed prompt wait (docs/failure-reaping.md §3.2).
     # None = runner.DEFAULT_FAILURE_MARKERS.
     failure_markers: tuple[str, ...] | None = None
@@ -186,6 +192,18 @@ class RoutinesConfig:
             if j.name == name:
                 return j
         return None
+
+
+def default_repos_dir() -> Path:
+    """Resolve the managed repos base dir, following the same
+    ``HERDR_PLUGIN_STATE_DIR`` pattern as ``history.default_history_path``."""
+    plugin_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    base = (
+        Path(plugin_dir)
+        if plugin_dir
+        else Path.home() / ".local" / "state" / "herdr-routines"
+    )
+    return base / "repos"
 
 
 def default_config_path() -> Path:
@@ -403,6 +421,14 @@ def _validate_defaults_keys(raw: dict, path: Path) -> None:
         raise ConfigError(f"{path}: unknown key(s): {sorted(unknown)}")
 
 
+_REPO_URL_PREFIXES = ("https://", "ssh://", "git@", "git://")
+
+
+def _is_valid_repo_url(value: str) -> bool:
+    """Check if value looks like a git URL (not a bare path)."""
+    return any(value.startswith(p) for p in _REPO_URL_PREFIXES)
+
+
 def _build_job(
     raw_job: dict, defaults: dict, *, index: int, label_prefix: str | None = None
 ) -> Job:
@@ -440,9 +466,31 @@ def _build_job(
         raise ConfigError(f"{label}: invalid cron expression {cron!r}: {e}") from e
 
     repo_raw = merged["repo"]
-    if not isinstance(repo_raw, str) or not repo_raw:
-        raise ConfigError(f"{label}: 'repo' must be a non-empty string path")
-    repo = Path(repo_raw).expanduser()
+    repository = merged["repository"]
+
+    # URL-shape validation for repository
+    if repository is not None:
+        if not isinstance(repository, str) or not repository:
+            raise ConfigError(f"{label}: 'repository' must be a non-empty string")
+        if not _is_valid_repo_url(repository):
+            raise ConfigError(
+                f"{label}: 'repository' must be a git URL "
+                "(https://, ssh://, git@host:, or git://) — bare paths rejected"
+            )
+
+    # Conditional repo requirement
+    if repo_raw is None and repository is None:
+        raise ConfigError(f"{label}: missing 'repo' or 'repository'")
+
+    if repo_raw is None:
+        # repository present, repo absent → derive deterministic path
+        from herdr_routines.repos import default_repos_dir
+
+        repo = default_repos_dir() / name
+    else:
+        if not isinstance(repo_raw, str) or not repo_raw:
+            raise ConfigError(f"{label}: 'repo' must be a non-empty string path")
+        repo = Path(repo_raw).expanduser()
 
     workspace = merged["workspace"]
     if workspace not in VALID_WORKSPACE_MODES:
@@ -629,6 +677,7 @@ def _build_job(
         catch_up_minutes=merged["catch_up_minutes"],
         timezone=timezone,
         on_missed=on_missed,
+        repository=repository,
         failure_markers=failure_markers,
         checks=checks,
         target=target,

@@ -45,6 +45,7 @@ from herdr_routines.history import (
     is_currently_running,
     last_terminal_run,
 )
+from herdr_routines.repos import ensure_repo
 from herdr_routines.runner import RunOutcome, execute_run, make_run_id
 from herdr_routines.schedule import Decision, decide
 
@@ -251,6 +252,34 @@ def _process_pr_target(
 ) -> tuple[str, bool]:
     """PR-target gate: enumerate eligible PRs, dispatch fix workers per flagged PR."""
     gh = RealGhClient()
+
+    # Ensure repo checkout before any git remote / worktree operations
+    if job.repository is not None:
+        try:
+            ensure_repo(job)
+        except (RuntimeError, OSError) as e:
+            reason = (
+                "clone_failed"
+                if not (job.repo / ".git").exists()
+                else "repo_sync_failed"
+            )
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="failed",
+                    run_id=run_id,
+                    extra={"reason": reason, "error": str(e)},
+                ),
+            )
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=reason,
+                sound="request",
+            )
+            return f"{job.name}: failed ({reason})", True
 
     try:
         proc = subprocess.run(
@@ -504,6 +533,39 @@ def _process_base_target(
             sound="request",
         )
         return f"{job.name}: skipped (max_attempts_exceeded)", False
+
+    # Ensure repo checkout before any worktree creation
+    if job.repository is not None:
+        try:
+            ensure_repo(job)
+        except (RuntimeError, OSError) as e:
+            reason = (
+                "clone_failed"
+                if not (job.repo / ".git").exists()
+                else "repo_sync_failed"
+            )
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="failed",
+                    run_id=run_id,
+                    extra={
+                        "gate": "failed",
+                        "reason": reason,
+                        "error": str(e),
+                        "target": "base",
+                    },
+                ),
+            )
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=reason,
+                sound="request",
+            )
+            return f"{job.name}: failed ({reason})", True
 
     wt_path = Path(job.repo) / ".worktrees" / f"gate-{run_id}"
     try:
@@ -880,6 +942,22 @@ def _dispatch_fix_worker(
     agent_name = build_worker_agent_name(job.name, pr.number, run_id)
     pr_run_id = f"{run_id}-pr{pr.number}"
     report_path = default_reports_dir() / f"auto-fix-{run_id}-pr{pr.number}.md"
+
+    # Ensure repo checkout before any worktree creation
+    if job.repository is not None:
+        try:
+            ensure_repo(job)
+        except (RuntimeError, OSError) as e:
+            reason = (
+                "clone_failed"
+                if not (job.repo / ".git").exists()
+                else "repo_sync_failed"
+            )
+            return {
+                "state": "failed",
+                "reason": reason,
+                "error": str(e),
+            }
 
     # Create report dir
     try:

@@ -19,6 +19,7 @@ from herdr_routines.herdr import (
     PromptWatchdogKilled,
     build_agent_start_args,
 )
+from herdr_routines.repos import ensure_repo
 
 log = logging.getLogger(__name__)
 
@@ -390,6 +391,22 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     branch = (
         build_branch_name(job.name, run_id) if job.workspace == "worktree" else None
     )
+
+    # Ensure the repo checkout exists (clone-if-missing / fetch) before any worktree
+    # or tab creation.
+    if job.repository is not None:
+        try:
+            ensure_repo(job)
+        except (RuntimeError, OSError) as e:
+            return RunOutcome(
+                state="failed",
+                run_id=run_id,
+                reason="clone_failed"
+                if not (job.repo / ".git").exists()
+                else "repo_sync_failed",
+                error=str(e),
+                branch=branch,
+            )
 
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)

@@ -118,7 +118,7 @@ jobs:
   - name: a
     cron: "0 3 * * *"
 """
-    with pytest.raises(ConfigError, match="missing required"):
+    with pytest.raises(ConfigError, match="missing"):
         load_config(write(tmp_config_path, text))
 
 
@@ -814,3 +814,210 @@ def test_config_review_tiers_present() -> None:
     assert "blocking" in text.lower()
     assert "non-blocking" in text.lower()
     assert "confidence:" in text.lower()
+
+
+# -- repository: <url> job field (issue 016) -------------------------------------------
+
+
+def test_repo_url_accepted(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repository: https://github.com/org/repo.git
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.repository == "https://github.com/org/repo.git"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/org/repo.git",
+        "ssh://git@github.com/org/repo.git",
+        "git@github.com:org/repo.git",
+        "git://github.com/org/repo.git",
+    ],
+)
+def test_repo_url_various_protocols_accepted(tmp_config_path: Path, url: str) -> None:
+    text = f"""
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repository: {url}
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    assert cfg.job("a") is not None
+
+
+@pytest.mark.parametrize("bad_url", ["/local/path", "not-a-url", "ftp://wrong-scheme"])
+def test_repo_url_bare_paths_rejected(tmp_config_path: Path, bad_url: str) -> None:
+    text = f"""
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repository: {bad_url}
+"""
+    with pytest.raises(ConfigError, match="repository"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_repo_url_derives_repo_from_name(tmp_config_path: Path) -> None:
+    """repository present, repo absent → repo = default_repos_dir() / name."""
+    text = """
+version: 1
+jobs:
+  - name: myjob
+    cron: "0 3 * * *"
+    repository: https://github.com/org/repo.git
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("myjob")
+    assert job is not None
+    assert job.repository == "https://github.com/org/repo.git"
+    assert job.repo.name == "myjob"
+    assert "repos" in str(job.repo)
+
+
+def test_repo_url_and_explicit_repo_uses_explicit(tmp_config_path: Path) -> None:
+    """Both repository and repo → repo is explicit, repository is the remote."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /explicit/path
+    repository: https://github.com/org/repo.git
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.repo == Path("/explicit/path")
+    assert job.repository == "https://github.com/org/repo.git"
+
+
+def test_neither_repo_nor_repository_raises(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+"""
+    with pytest.raises(ConfigError, match="missing"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_explicit_repo_only_still_works(tmp_config_path: Path) -> None:
+    """Legacy repo-only jobs continue to work unchanged."""
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /some/repo
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.repo == Path("/some/repo")
+    assert job.repository is None
+
+
+def test_repo_url_example_and_docs() -> None:
+    """deploy/jobs.example.yaml has a commented repository example."""
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parent.parent / "deploy" / "jobs.example.yaml"
+    assert example.exists()
+    text = example.read_text()
+    assert "repository:" in text
+
+
+def test_repo_url_validation_and_derivation(tmp_config_path: Path) -> None:
+    """Config validation: URL-shape accepted, bare paths rejected, repo derived from name."""
+    # Valid URLs accepted
+    for url in [
+        "https://github.com/org/repo.git",
+        "ssh://git@github.com/org/repo.git",
+        "git@github.com:org/repo.git",
+        "git://github.com/org/repo.git",
+    ]:
+        text = f"""
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repository: {url}
+"""
+        cfg = load_config(write(tmp_config_path, text))
+        assert cfg.job("a") is not None
+
+    # Bare paths rejected
+    for bad_url in ["/local/path", "not-a-url", "ftp://wrong-scheme"]:
+        text = f"""
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repository: {bad_url}
+"""
+        with pytest.raises(ConfigError, match="repository"):
+            load_config(write(tmp_config_path, text))
+
+    # repository alone derives repos/<name>
+    text = """
+version: 1
+jobs:
+  - name: myjob
+    cron: "0 3 * * *"
+    repository: https://github.com/org/repo.git
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("myjob")
+    assert job is not None
+    assert job.repo.name == "myjob"
+    assert "repos" in str(job.repo)
+
+    # Both present: explicit repo + repository as remote
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /explicit/path
+    repository: https://github.com/org/repo.git
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.repo == Path("/explicit/path")
+    assert job.repository == "https://github.com/org/repo.git"
+
+    # Neither → error
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+"""
+    with pytest.raises(ConfigError, match="missing"):
+        load_config(write(tmp_config_path, text))
+
+    # repo-only legacy still works
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /some/repo
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.repo == Path("/some/repo")
+    assert job.repository is None
