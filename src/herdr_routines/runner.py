@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict
 
-from herdr_routines.config import Job
+from herdr_routines.config import FallbackEntry, Job
 from herdr_routines.herdr import (
     HerdrClient,
     HerdrCliError,
@@ -623,3 +623,115 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         )
 
     return RunOutcome(state="done", session_id=session_id, **common)
+
+
+# -- Failover: retry on quota_exhausted with ordered fallback list ----------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRecord:
+    """Intermediate history entry for a quota_exhausted attempt that will be retried.
+    Returned by `execute_run_with_failover` so tick.py can append it to history.jsonl
+    without the runner owning the history path."""
+
+    attempt: int
+    failover_to: str
+    error: str
+    agent_kind: str
+    model: str | None
+
+
+def _resolve_attempt_kind_model(
+    job: Job,
+    fallbacks: tuple[FallbackEntry, ...] | None,
+    attempt_idx: int,
+) -> tuple[str, str | None]:
+    """Return (agent_kind, model) for attempt at ``attempt_idx``.  Index 0 is the primary
+    (job.agent_kind, job.model); indices 1..N map to fallbacks[0..N-1]."""
+    if attempt_idx == 0:
+        return job.agent_kind, job.model
+    fb = fallbacks[attempt_idx - 1]
+    kind = fb.agent_kind if fb.agent_kind is not None else job.agent_kind
+    model = fb.model  # may be None (= agent default)
+    return kind, model
+
+
+def execute_run_with_failover(
+    job: Job,
+    client: HerdrClient,
+    *,
+    run_id: str,
+) -> tuple[RunOutcome, tuple[AttemptRecord, ...]]:
+    """Failover wrapper around ``execute_run``.  Loops over ``[primary, *fallbacks]``,
+    stopping on the first non-``quota_exhausted`` outcome.  Returns the terminal
+    ``RunOutcome`` plus a tuple of intermediate ``AttemptRecord`` entries for quota
+    attempts that were retried (empty when no failover fired).
+
+    Per-attempt pane lifecycle: each attempt creates its own pane and reaps it on
+    failure, so ``_live_agent_exists`` never sees a leaked ``working`` agent between
+    attempts.
+    """
+    fallbacks = job.fallbacks
+    attempts: list[tuple[str, str | None]] = [
+        _resolve_attempt_kind_model(job, fallbacks, i)
+        for i in range(1 + (len(fallbacks) if fallbacks else 0))
+    ]
+
+    intermediate_records: list[AttemptRecord] = []
+    last_idx = len(attempts) - 1
+
+    for attempt_idx, (kind, model) in enumerate(attempts):
+        attempt_job = (
+            job
+            if attempt_idx == 0
+            else Job(
+                name=job.name,
+                enabled=job.enabled,
+                cron=job.cron,
+                repo=job.repo,
+                workspace=job.workspace,
+                base=job.base,
+                agent_kind=kind,
+                model=model,
+                prompt=job.prompt,
+                timeout_ms=job.timeout_ms,
+                start_timeout_ms=job.start_timeout_ms,
+                catch_up_minutes=job.catch_up_minutes,
+                timezone=job.timezone,
+                on_missed=job.on_missed,
+                failure_markers=job.failure_markers,
+                checks=job.checks,
+                target=job.target,
+                max_workers_per_tick=job.max_workers_per_tick,
+                max_attempts_per_target=job.max_attempts_per_target,
+                fallbacks=None,  # inner attempts have no nested failover
+            )
+        )
+
+        outcome = execute_run(attempt_job, client, run_id=run_id)
+
+        if outcome.reason != "quota_exhausted" or attempt_idx == last_idx:
+            return outcome, tuple(intermediate_records)
+
+        # Quota exhausted with more fallbacks remaining — record and continue.
+        next_kind, next_model = attempts[attempt_idx + 1]
+        fb_label = f"{next_kind}/{next_model}" if next_model else next_kind
+        intermediate_records.append(
+            AttemptRecord(
+                attempt=attempt_idx,
+                failover_to=fb_label,
+                error=outcome.error or "",
+                agent_kind=kind,
+                model=model,
+            )
+        )
+        log.info(
+            "%s: quota_exhausted on attempt %d, trying fallback %d: %s",
+            job.name,
+            attempt_idx,
+            attempt_idx + 1,
+            fb_label,
+        )
+
+    # Unreachable — loop always returns above, but satisfies the type checker.
+    raise AssertionError("unreachable")

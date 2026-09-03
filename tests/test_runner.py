@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from herdr_routines.config import Job
+from herdr_routines.config import FallbackEntry, Job
 from herdr_routines.herdr import (
     HerdrClient,
     HerdrCliError,
@@ -22,6 +22,7 @@ from herdr_routines.runner import (
     build_branch_name,
     build_dry_run_argv,
     execute_run,
+    execute_run_with_failover,
     make_run_id,
     substitute_prompt,
 )
@@ -1145,3 +1146,291 @@ def test_watchdog_kill_never_retries_prompt(
     # Structurally barred too: the kill carries no parseable retry-whitelist body.
     kill = PromptWatchdogKilled("killed", marker="m", screen_text="s")
     assert _is_retryable_prompt_error(kill) is False
+
+
+# -- failover: retry on quota_exhausted with ordered fallback list (issue 022) ------------
+
+
+def test_failover_retry_on_watchdog_quota_exhausted(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Acceptance 2: on quota_exhausted via watchdog PromptWatchdogKilled the run retries
+    once per remaining fallback entry in declared order until first non-quota outcome.
+    Attempt sequence is [primary, ...fallbacks]."""
+    from herdr_routines.config import FallbackEntry
+
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model="opencode/big-pickle",
+        fallbacks=(
+            FallbackEntry(model="opencode/gpt-5-nano"),
+            FallbackEntry(agent_kind="claude", model="haiku"),
+        ),
+    )
+    run_id = "a-failover-wd"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+
+    start_calls: list[tuple[str, str | None]] = []
+    call_count = 0
+    prompt_deliveries = 0
+    polls_consumed = 0
+    terminate_calls = 0
+
+    class FailoverWatchdogClient(ScriptedClient):
+        def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+            start_calls.append((kind, model))
+            super().agent_start(
+                name=name,
+                kind=kind,
+                pane_id=pane_id,
+                start_timeout_ms=start_timeout_ms,
+                model=model,
+            )
+
+        def agent_prompt_wait_with_watchdog(
+            self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+        ):
+            nonlocal call_count, prompt_deliveries, polls_consumed, terminate_calls
+            call_count += 1
+            prompt_deliveries += 1
+            self.calls.append("agent_prompt_wait_with_watchdog")
+            if call_count == 1:
+                # First attempt: watchdog kills on quota
+                for screen in (QUOTA_SCREEN, QUOTA_SCREEN):
+                    polls_consumed += 1
+                    self.calls.append("agent_read_visible")
+                    assert on_poll is not None
+                    marker = on_poll(screen)
+                    if marker is not None:
+                        self.calls.append("watchdog_kill")
+                        terminate_calls += 1
+                        raise PromptWatchdogKilled(
+                            f"failure marker matched; prompt child terminated: {marker!r}",
+                            marker=marker,
+                            screen_text=screen,
+                        )
+                raise AssertionError("should not reach here")
+            else:
+                # Subsequent attempts: succeed
+                if self.write_report_at is not None:
+                    self.write_report_at.parent.mkdir(parents=True, exist_ok=True)
+                    self.write_report_at.write_text(self.report_content)
+                return "idle"
+
+    client = FailoverWatchdogClient(write_report_at=report_path)
+    outcome, records = execute_run_with_failover(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert outcome.final_agent_status == "idle"
+    # Primary attempt used opencode/big-pickle, fallback used opencode/gpt-5-nano.
+    assert start_calls[0] == ("opencode", "opencode/big-pickle")
+    assert start_calls[1] == ("opencode", "opencode/gpt-5-nano")
+    # One intermediate record for the quota_exhausted attempt.
+    assert len(records) == 1
+    assert records[0].attempt == 0
+    assert records[0].failover_to == "opencode/opencode/gpt-5-nano"
+    # Both attempts created and closed their own panes.
+    assert client.closed_panes == ["w1:p1", "w1:p1"]
+
+
+def test_failover_retry_on_marker_quota_exhausted(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Acceptance 3: on quota_exhausted via marker-classified agent_prompt_failed
+    the run retries with correct kind/model override per attempt."""
+    from herdr_routines.config import FallbackEntry
+
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model="opencode/big-pickle",
+        failure_markers=("Free usage exceeded",),
+        fallbacks=(
+            FallbackEntry(agent_kind="claude", model="haiku"),
+        ),
+    )
+    run_id = "a-failover-mk"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+
+    start_calls: list[tuple[str, str | None]] = []
+    call_count = 0
+
+    class MarkerFailoverClient(ScriptedClient):
+        def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+            start_calls.append((kind, model))
+            super().agent_start(
+                name=name,
+                kind=kind,
+                pane_id=pane_id,
+                start_timeout_ms=start_timeout_ms,
+                model=model,
+            )
+
+        def agent_prompt_wait_with_watchdog(
+            self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+        ):
+            nonlocal call_count
+            call_count += 1
+            self.calls.append("agent_prompt_wait_with_watchdog")
+            if call_count == 1:
+                # First attempt: settle timeout + quota marker on screen
+                raise HerdrCliError(
+                    "timed out waiting for agent status",
+                    exit_code=1,
+                    error_body={"error": {"code": "timeout", "message": "timed out"}},
+                )
+            else:
+                # Second attempt: succeeds
+                if self.write_report_at is not None:
+                    self.write_report_at.parent.mkdir(parents=True, exist_ok=True)
+                    self.write_report_at.write_text(self.report_content)
+                return "idle"
+
+        def agent_read_visible(self, target, *, lines=200):
+            self.calls.append("agent_read_visible")
+            if call_count == 1:
+                return "Free usage exceeded, subscribe to Go"
+            return ""
+
+    client = MarkerFailoverClient(write_report_at=report_path)
+    outcome, records = execute_run_with_failover(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert start_calls[0] == ("opencode", "opencode/big-pickle")
+    assert start_calls[1] == ("claude", "haiku")
+    assert len(records) == 1
+    assert records[0].attempt == 0
+    assert records[0].failover_to == "claude/haiku"
+
+
+def test_failover_no_retry_on_non_quota(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Acceptance 5: no failover on non-quota failures — agent_prompt_failed without
+    marker, agent_start_failed, agent_not_interactive, blocked, interrupted_unknown,
+    no_report, and marker contained in prompt_text is inert — exactly one attempt."""
+    from herdr_routines.config import FallbackEntry
+
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model="opencode/big-pickle",
+        fallbacks=(
+            FallbackEntry(agent_kind="claude", model="haiku"),
+        ),
+    )
+    run_id = "a-failover-noq"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+
+    start_calls: list[tuple[str, str | None]] = []
+
+    class NonQuotaFailClient(ScriptedClient):
+        def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+            start_calls.append((kind, model))
+            super().agent_start(
+                name=name,
+                kind=kind,
+                pane_id=pane_id,
+                start_timeout_ms=start_timeout_ms,
+                model=model,
+            )
+
+        def agent_prompt_wait_with_watchdog(
+            self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+        ):
+            self.calls.append("agent_prompt_wait_with_watchdog")
+            # Non-quota failure: empty screen, settle timeout
+            raise HerdrCliError(
+                "timed out waiting for agent status",
+                exit_code=1,
+                error_body={"error": {"code": "timeout", "message": "timed out"}},
+            )
+
+        def agent_read_visible(self, target, *, lines=200):
+            self.calls.append("agent_read_visible")
+            return ""  # no quota marker
+
+    client = NonQuotaFailClient(write_report_at=report_path)
+    outcome, records = execute_run_with_failover(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_prompt_failed"
+    # Only one attempt — no failover on non-quota.
+    assert len(start_calls) == 1
+    assert len(records) == 0
+
+
+def test_failover_exhaustion_and_pane_lifecycle(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Acceptance 6: exhausting all fallbacks with quota_exhausted on every attempt
+    yields terminal failed/quota_exhausted after N attempts, per-attempt pane lifecycle
+    preserves tail-before-close and no leaked working agent, any_job_failed reflects
+    final attempt only."""
+    from herdr_routines.config import FallbackEntry
+
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model="opencode/big-pickle",
+        failure_markers=("Free usage exceeded",),
+        fallbacks=(
+            FallbackEntry(model="opencode/gpt-5-nano"),
+            FallbackEntry(agent_kind="claude", model="haiku"),
+        ),
+    )
+    run_id = "a-failover-exhaust"
+
+    start_calls: list[tuple[str, str | None]] = []
+    call_count = 0
+
+    class AlwaysQuotaClient(ScriptedClient):
+        def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+            start_calls.append((kind, model))
+            super().agent_start(
+                name=name,
+                kind=kind,
+                pane_id=pane_id,
+                start_timeout_ms=start_timeout_ms,
+                model=model,
+            )
+
+        def agent_prompt_wait_with_watchdog(
+            self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+        ):
+            nonlocal call_count
+            call_count += 1
+            self.calls.append("agent_prompt_wait_with_watchdog")
+            # Every attempt hits quota_exhausted
+            raise HerdrCliError(
+                "timed out waiting for agent status",
+                exit_code=1,
+                error_body={"error": {"code": "timeout", "message": "timed out"}},
+            )
+
+        def agent_read_visible(self, target, *, lines=200):
+            self.calls.append("agent_read_visible")
+            return "Free usage exceeded, subscribe to Go"
+
+    client = AlwaysQuotaClient()
+    outcome, records = execute_run_with_failover(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    # 3 attempts: primary + 2 fallbacks
+    assert len(start_calls) == 3
+    assert start_calls[0] == ("opencode", "opencode/big-pickle")
+    assert start_calls[1] == ("opencode", "opencode/gpt-5-nano")
+    assert start_calls[2] == ("claude", "haiku")
+    # 2 intermediate records (attempts 0 and 1 quota_exhausted)
+    assert len(records) == 2
+    assert records[0].attempt == 0
+    assert records[0].failover_to == "opencode/opencode/gpt-5-nano"
+    assert records[1].attempt == 1
+    assert records[1].failover_to == "claude/haiku"
+    # Per-attempt pane lifecycle: each attempt creates and closes its own pane.
+    # 3 attempts × (pane_close for tail + pane_close for reap) = 6 pane_close calls,
+    # but each attempt closes exactly one pane (w1:p1).
+    assert client.closed_panes == ["w1:p1", "w1:p1", "w1:p1"]
+    # Tail-before-close ordering: agent_read_visible before pane_close for each attempt.
+    vis_calls = [i for i, c in enumerate(client.calls) if c == "agent_read_visible"]
+    close_calls = [i for i, c in enumerate(client.calls) if c == "pane_close"]
+    for vis_idx, close_idx in zip(vis_calls, close_calls):
+        assert vis_idx < close_idx
