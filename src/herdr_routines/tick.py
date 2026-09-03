@@ -45,7 +45,7 @@ from herdr_routines.history import (
     is_currently_running,
     last_terminal_run,
 )
-from herdr_routines.runner import execute_run, make_run_id
+from herdr_routines.runner import execute_run, execute_run_with_failover, make_run_id
 from herdr_routines.schedule import Decision, decide
 
 log = get_logger(__name__)
@@ -1138,7 +1138,27 @@ def _process_job(
         ),
     )
 
-    outcome = execute_run(job, client, run_id=run_id)
+    outcome, failover_records = execute_run_with_failover(job, client, run_id=run_id)
+
+    # Append intermediate quota_exhausted attempt records (failover history).
+    for rec in failover_records:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "reason": "quota_exhausted",
+                    "attempt": rec.attempt,
+                    "failover_to": rec.failover_to,
+                    "error": rec.error,
+                    "agent_kind": rec.agent_kind,
+                    "model": rec.model,
+                },
+            ),
+        )
 
     extra = {
         "agent": outcome.agent_name,
@@ -1155,6 +1175,8 @@ def _process_job(
         extra["reason"] = outcome.reason
     if outcome.error:
         extra["error"] = outcome.error
+    if failover_records:
+        extra["failover_attempts"] = len(failover_records)
 
     append(
         history_path,

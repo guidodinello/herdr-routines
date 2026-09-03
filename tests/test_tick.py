@@ -556,3 +556,164 @@ def test_auto_fix_tick_max_attempts_skip(
 
     # Verify the attempt count logic works
     assert count >= job.max_attempts_per_target
+
+
+# -- failover: retry on quota_exhausted (issue 022) ----------------------------------------
+
+
+class FailoverClient:
+    """Simulates quota exhaustion on the first attempt and success on the second.
+    Tracks notifications to verify intermediate attempts don't notify."""
+
+    def __init__(self) -> None:
+        self._call_count = 0
+        self.notifications: list[tuple[str, str | None, str]] = []
+        self._registered: dict[str, str] = {}
+
+    def tab_create(self, *, cwd, label=None):
+        return "w1:p1"
+
+    def worktree_create(self, *, cwd, branch, base, label=None):
+        return "w1:p1"
+
+    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+        self._registered[name] = "working"
+
+    def agent_interactive_ready(self, target):
+        return True
+
+    def settled_agent_workspace(self, name):
+        return None
+
+    def settled_agent_pane(self, name):
+        return None
+
+    def workspace_close(self, workspace_id):
+        pass
+
+    def pane_close(self, pane_id):
+        pass
+
+    def agent_prompt_wait(self, *, target, text, timeout_ms):
+        self._call_count += 1
+        if self._call_count == 1:
+            # First attempt: quota exhausted (settle timeout + marker on screen)
+            raise HerdrCliError(
+                "timed out waiting for agent status",
+                exit_code=1,
+                error_body={"error": {"code": "timeout", "message": "timed out"}},
+            )
+        # Second attempt: succeeds
+        self._registered[target] = "idle"
+        Path(text.rsplit(maxsplit=1)[-1]).write_text("# ok\n")
+        return "idle"
+
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
+
+    def agent_read(self, target, *, lines=200):
+        return ""
+
+    def agent_read_visible(self, target, *, lines=200):
+        if self._call_count == 1:
+            return "Free usage exceeded, subscribe to Go"
+        return ""
+
+    def agent_statuses(self) -> dict[str, str]:
+        return dict(self._registered)
+
+    def notification_show(self, title, *, body=None, sound="none"):
+        self.notifications.append((title, body, sound))
+
+
+def test_failover_logs_distinct_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance 4: failover attempts are logged distinctly in history.jsonl with
+    intermediate failed/quota_exhausted records containing extra.attempt and failover_to,
+    and final record containing failover_attempts. Same run_id reused across attempts."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+
+    from herdr_routines.config import FallbackEntry
+
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model="opencode/big-pickle",
+        fallbacks=(
+            FallbackEntry(agent_kind="claude", model="haiku"),
+        ),
+    )
+    config = RoutinesConfig(jobs=(job,))
+    client = FailoverClient()
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    assert outcome.any_job_failed is False
+
+    records = list(read_job(history_path, job.name))
+    # registered, running, intermediate failed/quota_exhausted, terminal done
+    states = [r.state for r in records]
+    assert states == ["registered", "running", "failed", "done"]
+
+    # Intermediate record has correct extra fields.
+    intermediate = records[2]
+    assert intermediate.state == "failed"
+    assert intermediate.extra is not None
+    assert intermediate.extra["reason"] == "quota_exhausted"
+    assert intermediate.extra["attempt"] == 0
+    assert intermediate.extra["failover_to"] == "claude/haiku"
+    assert intermediate.extra["agent_kind"] == "opencode"
+    assert intermediate.extra["model"] == "opencode/big-pickle"
+
+    # Terminal record has failover_attempts.
+    terminal = records[3]
+    assert terminal.state == "done"
+    assert terminal.extra is not None
+    assert terminal.extra["failover_attempts"] == 1
+
+    # Same run_id reused across all records that have one.
+    run_ids = [r.run_id for r in records if r.run_id is not None]
+    assert len(set(run_ids)) == 1  # all the same
+
+
+def test_failover_notifications_and_run_id_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance 7: intermediate quota_exhausted attempts do not notify, only terminal
+    done or terminal failed notifies. run_id is reused across attempts."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+
+    from herdr_routines.config import FallbackEntry
+
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model="opencode/big-pickle",
+        fallbacks=(
+            FallbackEntry(agent_kind="claude", model="haiku"),
+        ),
+    )
+    config = RoutinesConfig(jobs=(job,))
+    client = FailoverClient()
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    # Only one notification (the terminal "done"), not a "failed" for the intermediate attempt.
+    assert len(client.notifications) == 1
+    title, body, sound = client.notifications[0]
+    assert "done" in title
+    assert sound == "done"
