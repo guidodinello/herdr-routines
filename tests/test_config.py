@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from herdr_routines.config import PIPELINE_CATCH_UP_MINUTES, ConfigError, load_config
+from herdr_routines.config import (
+    PIPELINE_CATCH_UP_MINUTES,
+    ConfigError,
+    load_config,
+    load_config_dir,
+)
 
 VALID_MINIMAL = """
 version: 1
@@ -1170,3 +1175,25 @@ jobs:
 """
     with pytest.raises(ConfigError, match="checks"):
         load_config(write(tmp_config_path, text))
+
+
+def test_pipeline_deploy_example_loads_cleanly(tmp_path: Path) -> None:
+    """deploy/jobs.d/nightly-pipeline.yaml (issue 026) parses with no config errors —
+    the deploy example a human copies onto the Pi must actually be schema-valid,
+    including under the raw-dict validation rules (no workspace/timeout_ms/catch_up_minutes
+    keys present). Loaded in isolation, not alongside the other (unrelated) examples in
+    deploy/jobs.d/, so a pre-existing issue in one of those never masks a regression here."""
+    example = (
+        Path(__file__).resolve().parent.parent
+        / "deploy"
+        / "jobs.d"
+        / "nightly-pipeline.yaml"
+    )
+    assert example.exists()
+    (tmp_path / "nightly-pipeline.yaml").write_text(example.read_text())
+    cfg = load_config_dir(tmp_path)
+    assert cfg.errors == ()
+    job = cfg.job("nightly-pipeline")
+    assert job is not None
+    assert job.kind == "pipeline"
+    assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
