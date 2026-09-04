@@ -442,6 +442,94 @@ def test_settled_agent_pane_absent_name_returns_none() -> None:
     assert client.settled_agent_pane("rt-a") is None
 
 
+# -- live_pipeline_agent_panes tier-2 tests (issue 031) --------------------------------------
+
+
+def test_live_pipeline_agent_panes_matches_working_pl_agent() -> None:
+    run_id = "20260903T050016Z"
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": f"pl-6-{run_id}".lower(),
+                    "agent_status": "working",
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.live_pipeline_agent_panes(run_id) == {
+        f"pl-6-{run_id}".lower(): "w1:p1"
+    }
+    assert runner.calls[0][1:3] == ["agent", "list"]
+
+
+def test_live_pipeline_agent_panes_excludes_settled_agent() -> None:
+    run_id = "20260903T050016Z"
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": f"pl-6-{run_id}".lower(),
+                    "agent_status": "idle",
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.live_pipeline_agent_panes(run_id) == {}
+
+
+def test_live_pipeline_agent_panes_excludes_non_pl_agent() -> None:
+    run_id = "20260903T050016Z"
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": "rt-babysit-prs",
+                    "agent_status": "working",
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.live_pipeline_agent_panes(run_id) == {}
+
+
+def test_live_pipeline_agent_panes_excludes_other_run_id() -> None:
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": "pl-6-20260101t000000z",
+                    "agent_status": "working",
+                    "pane_id": "w1:p1",
+                    "workspace_id": "w1",
+                }
+            ]
+        }
+    }
+    runner = FakeRunner([ok(body)])
+    client = HerdrClient(runner=runner)
+    assert client.live_pipeline_agent_panes("20260903T050016Z") == {}
+
+
+def test_live_pipeline_agent_panes_raises_on_unexpected_shape() -> None:
+    runner = FakeRunner([ok({"result": None})])
+    client = HerdrClient(runner=runner)
+    with pytest.raises(HerdrCliError):
+        client.live_pipeline_agent_panes("20260903T050016Z")
+
+
 @pytest.mark.parametrize(
     "body",
     [

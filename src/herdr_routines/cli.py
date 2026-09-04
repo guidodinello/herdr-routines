@@ -32,8 +32,18 @@ from herdr_routines.history import (
     read_job,
 )
 from herdr_routines.pick_feature import run_pick_feature
+from herdr_routines.pipeline_watchdog import (
+    default_heartbeat_dir,
+    default_worktrees_root,
+    run_watchdog,
+)
 from herdr_routines.ps import collect_ps_rows, render_ps
-from herdr_routines.runner import build_dry_run_argv, execute_run, make_run_id
+from herdr_routines.runner import (
+    build_dry_run_argv,
+    default_reports_dir,
+    execute_run,
+    make_run_id,
+)
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
 from herdr_routines.tick import default_lock_path, run_tick, tick_lock
@@ -196,6 +206,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="flip the picked issue's status to in-progress before printing it",
     )
     p_pick.set_defaults(handler=_cmd_pick_feature)
+
+    p_watchdog = sub.add_parser(
+        "pipeline-watchdog",
+        help=(
+            "maintenance sweep: kill any pl-<N>-<run_id> worker left running past its "
+            "run's deadline by a silently-dead orchestrator, and write a terminal "
+            "report in its place (issue 031)"
+        ),
+    )
+    p_watchdog.set_defaults(handler=_cmd_pipeline_watchdog)
 
     return parser
 
@@ -560,6 +580,36 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 def _cmd_pick_feature(args: argparse.Namespace) -> int:
     # No HerdrClient — pure filesystem, same posture as gc (docs/process/README.md).
     return run_pick_feature(args.issues_dir, mark=args.mark_in_progress)
+
+
+def _cmd_pipeline_watchdog(args: argparse.Namespace) -> int:
+    # Cron-driven maintenance sweep (systemd timer, not tick.py — see pipeline_watchdog's
+    # module docstring): log the summary, don't print a human table like gc/ps do.
+    client = HerdrClient()
+    actions = run_watchdog(
+        client=client,
+        worktrees_root=default_worktrees_root(),
+        reports_dir=default_reports_dir(),
+        heartbeat_dir=default_heartbeat_dir(),
+    )
+    for action in actions:
+        if action.killed_agents:
+            log.warning(
+                "pipeline-watchdog: %s stalled, killed %s (stage %s), report at %s",
+                action.run_id,
+                ", ".join(action.killed_agents),
+                action.stage_killed,
+                action.report_path,
+            )
+        else:
+            log.warning(
+                "pipeline-watchdog: %s stalled, no live worker found, report at %s",
+                action.run_id,
+                action.report_path,
+            )
+    if not actions:
+        log.info("pipeline-watchdog: no stalled runs")
+    return 0
 
 
 if __name__ == "__main__":

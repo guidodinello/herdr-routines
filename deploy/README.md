@@ -12,9 +12,17 @@ copying the unit to a host with a different checkout path or `uv` install locati
 ```sh
 mkdir -p ~/.config/systemd/user
 cp systemd/herdr-server.service systemd/herdr-routines.timer systemd/herdr-routines.service \
+   systemd/herdr-routines-watchdog.timer systemd/herdr-routines-watchdog.service \
    ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
+
+`herdr-routines-watchdog.{timer,service}` is a third, independent unit pair (own
+`ExecStart=... herdr-routines pipeline-watchdog`, own 15-min `OnCalendar`) — **not** a
+`jobs.d/` entry. `tick`'s job model (`herdr-routines.timer` above) only ever dispatches an
+agent prompt per job; the pipeline stall watchdog (issue 031) spawns no agent and issues no
+prompt, so it gets its own timer the same way `tick` itself does, rather than being forced
+into a job shape it doesn't fit.
 
 **On a fresh Pi (not needed on this laptop — `Linger` is already `yes` here):**
 
@@ -37,6 +45,7 @@ uv sync
 uv run herdr-routines validate
 systemctl --user enable --now herdr-server.service
 systemctl --user enable --now herdr-routines.timer
+systemctl --user enable --now herdr-routines-watchdog.timer
 ```
 
 ## Manual smoke checklist
