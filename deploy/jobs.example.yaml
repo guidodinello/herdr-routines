@@ -18,6 +18,10 @@ defaults:
   # failure_markers: ["Free usage exceeded"] # optional (docs/failure-reaping.md §3.4):
   #                                          # screen markers scanned after a failed prompt
   #                                          # wait; omit for the built-in defaults.
+  tmp_hygiene: # optional (issue 027): age-based /tmp cleanup for leaked agent .so files
+    enabled: true
+    max_age_s: 3600 # reap files older than 1h (default)
+    tmp_dir: /tmp
 
 jobs:
   - name: nightly-dep-audit

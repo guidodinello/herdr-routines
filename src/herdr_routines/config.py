@@ -100,6 +100,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
         "on_missed",
         "failure_markers",
         "fallback_model",
+        "tmp_hygiene",
     }
 )
 
@@ -122,6 +123,7 @@ _JOB_ALLOWED_KEYS = (
             "kind",
             "prompt_file",
             "deadline_ms",
+            "tmp_hygiene",
         }
     )
 )
@@ -152,11 +154,25 @@ _JOB_DEFAULTS = {
     "kind": "routine",
     "prompt_file": None,
     "deadline_ms": None,
+    "tmp_hygiene": None,
 }
 
 
 class ConfigError(ValueError):
     """Raised for any problem with jobs.yaml — unknown keys, bad cron, duplicate names, etc."""
+
+
+DEFAULT_TMP_DIR = "/tmp"
+DEFAULT_MAX_AGE_S = 3600
+
+
+@dataclass(frozen=True, slots=True)
+class TmphgieneConfig:
+    """Configuration for /tmp age-based cleanup (issue 027)."""
+
+    enabled: bool = True
+    max_age_s: int = DEFAULT_MAX_AGE_S
+    tmp_dir: str = DEFAULT_TMP_DIR
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +226,8 @@ class Job:
     # RuntimeMaxSec and the reconcile-staleness bound in tick._process_pipeline_job.
     # Required for kind: pipeline; unused for kind: routine (job.timeout_ms applies instead).
     deadline_ms: int | None = None
+    # Optional /tmp hygiene config (issue 027). None = use global defaults.
+    tmp_hygiene: TmphgieneConfig | None = None
 
     @property
     def agent_name(self) -> str:
@@ -761,6 +779,34 @@ def _build_job(
                 f"{label}: 'prompt_file' must be a non-empty string or null"
             )
 
+    # -- tmp_hygiene (issue 027) ---------------------------------------------------
+    tmp_hygiene_raw = merged.get("tmp_hygiene")
+    tmp_hygiene: TmphgieneConfig | None = None
+    if tmp_hygiene_raw is not None:
+        if not isinstance(tmp_hygiene_raw, dict):
+            raise ConfigError(f"{label}: 'tmp_hygiene' must be a mapping or null")
+        unknown_th = set(tmp_hygiene_raw) - {"enabled", "max_age_s", "tmp_dir"}
+        if unknown_th:
+            raise ConfigError(
+                f"{label}: 'tmp_hygiene' has unknown key(s): {sorted(unknown_th)}"
+            )
+        th_enabled = tmp_hygiene_raw.get("enabled", True)
+        if not isinstance(th_enabled, bool):
+            raise ConfigError(f"{label}: 'tmp_hygiene.enabled' must be a boolean")
+        th_max_age_s = tmp_hygiene_raw.get("max_age_s", DEFAULT_MAX_AGE_S)
+        if not isinstance(th_max_age_s, int) or isinstance(th_max_age_s, bool) or th_max_age_s <= 0:
+            raise ConfigError(
+                f"{label}: 'tmp_hygiene.max_age_s' must be a positive integer"
+            )
+        th_tmp_dir = tmp_hygiene_raw.get("tmp_dir", DEFAULT_TMP_DIR)
+        if not isinstance(th_tmp_dir, str) or not th_tmp_dir:
+            raise ConfigError(
+                f"{label}: 'tmp_hygiene.tmp_dir' must be a non-empty string"
+            )
+        tmp_hygiene = TmphgieneConfig(
+            enabled=th_enabled, max_age_s=th_max_age_s, tmp_dir=th_tmp_dir
+        )
+
     return Job(
         name=name,
         enabled=enabled,
@@ -786,4 +832,5 @@ def _build_job(
         kind=kind,
         prompt_file=prompt_file,
         deadline_ms=deadline_ms,
+        tmp_hygiene=tmp_hygiene,
     )

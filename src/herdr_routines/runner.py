@@ -6,6 +6,8 @@ contract and the post-run verification rationale.
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -59,6 +61,40 @@ WATCHDOG_POLL_INTERVAL_S = 30.0
 # is a small top-up prompt, not another full run — job.timeout_ms is already spent by the time
 # this fires — so it gets its own short, fixed budget. Module-level so tests can adjust it.
 NUDGE_TIMEOUT_MS = 120_000
+
+
+def diagnose_tmp() -> dict[str, str | bool]:
+    """Best-effort /tmp disk diagnosis for agent start failures (issue 027).
+    Returns dict with df_tmp, du_tmp, tmp_full keys. Never raises — all subprocess
+    calls are bounded by 5s timeout."""
+    diagnosis: dict[str, str | bool] = {"tmp_full": False}
+    try:
+        proc = subprocess.run(
+            ["df", "-h", "/tmp"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        diagnosis["df_tmp"] = proc.stdout.strip()
+        # Parse Use% from df output (second line, 4th column is Use%)
+        for line in proc.stdout.strip().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 5:
+                pct_str = parts[4].rstrip("%")
+                try:
+                    if int(pct_str) >= 95:
+                        diagnosis["tmp_full"] = True
+                except ValueError:
+                    pass
+    except (OSError, subprocess.TimeoutExpired):
+        diagnosis["df_tmp"] = "(unavailable)"
+    try:
+        proc = subprocess.run(
+            ["du", "-sh", "/tmp/.3cdc*", "/tmp/pytest-of-*", "/tmp/opencode"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        diagnosis["du_tmp"] = proc.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        diagnosis["du_tmp"] = "(unavailable)"
+    return diagnosis
 
 
 def _error_body_code(e: HerdrCliError) -> str | None:
@@ -307,6 +343,29 @@ def substitute_prompt(
     )
 
 
+def _best_effort_tmp_diagnosis(reports_dir: Path, run_id: str) -> dict[str, str | bool] | None:
+    """Best-effort /tmp diagnosis appended to the tail file. Returns None on total failure
+    so RunOutcome.diagnosis stays clean."""
+    try:
+        diagnosis = diagnose_tmp()
+        # Append diagnosis to the tail file for post-mortem visibility.
+        tail_path = reports_dir / f"{run_id}.tail.txt"
+        try:
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            with tail_path.open("a") as f:
+                f.write(f"\n--- /tmp diagnosis ---\n")
+                f.write(f"tmp_full: {diagnosis.get('tmp_full', False)}\n")
+                if diagnosis.get("df_tmp"):
+                    f.write(f"df -h /tmp:\n{diagnosis['df_tmp']}\n")
+                if diagnosis.get("du_tmp"):
+                    f.write(f"du summary:\n{diagnosis['du_tmp']}\n")
+        except OSError:
+            pass
+        return diagnosis
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class _CommonOutcomeFields(TypedDict):
     """The fields `execute_run` fills in identically for every terminal outcome, so they can
     be splatted into RunOutcome without restating nine keyword arguments at six call sites.
@@ -340,6 +399,7 @@ class RunOutcome:
     duration_seconds: float | None = None
     session_id: str | None = None
     nudged: bool = False  # issue 032: a no_report settle got one follow-up prompt
+    diagnosis: dict[str, str | bool] | None = None  # issue 027: /tmp disk diagnosis
 
 
 def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
@@ -507,13 +567,15 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)
+        diagnosis = _best_effort_tmp_diagnosis(report_path.parent, run_id)
         return RunOutcome(
             state="failed",
             run_id=run_id,
-            reason="agent_start_failed",
+            reason="tmp_full" if diagnosis and diagnosis.get("tmp_full") else "agent_start_failed",
             error=str(e),
             pane_id=pane_id,
             branch=branch,
+            diagnosis=diagnosis,
         )
 
     # The prompt must not race the TUI's own startup (see _wait_for_agent_ready): reuse
@@ -533,14 +595,16 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)
+        diagnosis = _best_effort_tmp_diagnosis(report_path.parent, run_id)
         return RunOutcome(
             state="failed",
             run_id=run_id,
-            reason="agent_not_interactive",
+            reason="tmp_full" if diagnosis and diagnosis.get("tmp_full") else "agent_not_interactive",
             error=error,
             agent_name=job.agent_name,
             pane_id=pane_id,
             branch=branch,
+            diagnosis=diagnosis,
         )
 
     # `is not None`, not truthiness: an explicit empty failure_markers list is valid config

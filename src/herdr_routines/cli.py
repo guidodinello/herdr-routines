@@ -25,6 +25,7 @@ from herdr_routines.config import (
 )
 from herdr_routines.gc import run_gc, run_gc_delete
 from herdr_routines.herdr import HerdrClient
+from herdr_routines.tmp_hygiene import reap_tmp
 from herdr_routines.history import (
     default_history_path,
     first_seen_at,
@@ -223,6 +224,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="flip the picked issue's status to in-progress before printing it",
     )
     p_pick.set_defaults(handler=_cmd_pick_feature)
+
+    p_tmp_hygiene = sub.add_parser(
+        "tmp-hygiene",
+        help="age-based /tmp cleanup for leaked agent-runtime .so files and pytest artifacts",
+    )
+    p_tmp_hygiene.add_argument(
+        "--tmp-dir",
+        type=Path,
+        default=Path("/tmp"),
+        help="directory to clean (default: /tmp)",
+    )
+    p_tmp_hygiene.add_argument(
+        "--max-age",
+        type=int,
+        default=3600,
+        help="max age in seconds for files to be reaped (default: 3600 = 1h)",
+    )
+    p_tmp_hygiene.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be removed without mutating",
+    )
+    p_tmp_hygiene.set_defaults(handler=_cmd_tmp_hygiene)
 
     p_sync_repo = sub.add_parser(
         "sync-repo",
@@ -663,6 +687,22 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 def _cmd_pick_feature(args: argparse.Namespace) -> int:
     # No HerdrClient — pure filesystem, same posture as gc (docs/process/README.md).
     return run_pick_feature(args.issues_dir, mark=args.mark_in_progress)
+
+
+def _cmd_tmp_hygiene(args: argparse.Namespace) -> int:
+    result = reap_tmp(
+        tmp_dir=args.tmp_dir, max_age_s=args.max_age, dry_run=args.dry_run,
+    )
+    label = "would remove" if args.dry_run else "removed"
+    log.info(
+        "tmp-hygiene: %s %d file(s), skipped %d fresh, %d errors",
+        label, result.removed, result.skipped_fresh, result.errors,
+    )
+    if args.dry_run:
+        print(f"{label}: {result.removed}, fresh (skipped): {result.skipped_fresh}, errors: {result.errors}")
+    else:
+        print(f"removed: {result.removed}, fresh (skipped): {result.skipped_fresh}, errors: {result.errors}")
+    return 0
 
 
 def _cmd_sync_repo(args: argparse.Namespace) -> int:
