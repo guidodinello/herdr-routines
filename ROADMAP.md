@@ -98,8 +98,13 @@ gate is considered met). One-liner index; full detail in the issue file.
   idle/done with no summary file one bounded follow-up prompt to write it,
   before the run is declared failed; `no_report` is 5 of 9 recent `fitted-*`
   job failures, and a whole-job retry (issue 008) can't safely apply since
-  re-running risks duplicate side effects. `medium`. →
+  re-running risks duplicate side effects. `medium`. `done`. →
   [`032`](docs/process/issues/032-nudge-before-no-report-failure.md)
+- **Capture a diagnostic tail on `blocked`, not just other failure paths** —
+  every other failure path in `execute_run` saves a screen tail for
+  post-mortem; `blocked` doesn't, so 3 real `blocked` failures left zero
+  diagnostic evidence. `medium`. →
+  [`033`](docs/process/issues/033-capture-tail-on-blocked.md)
 
 ## Later
 
