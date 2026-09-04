@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import subprocess
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -37,6 +38,7 @@ from herdr_routines.auto_fix import (
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.herdr import LIVE_AGENT_STATUSES, HerdrClient, HerdrCliError
 from herdr_routines.history import (
+    TERMINAL_STATES,
     HistoryRecord,
     append,
     find_stale_running,
@@ -44,9 +46,15 @@ from herdr_routines.history import (
     has_ever_been_seen,
     is_currently_running,
     last_terminal_run,
+    read_job,
 )
 from herdr_routines.repos import ensure_repo
-from herdr_routines.runner import RunOutcome, execute_run, make_run_id
+from herdr_routines.runner import (
+    RunOutcome,
+    default_reports_dir,
+    execute_run,
+    make_run_id,
+)
 from herdr_routines.schedule import Decision, decide
 
 log = get_logger(__name__)
@@ -1117,6 +1125,13 @@ def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
 def _process_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
+    # kind: pipeline dispatches a detached systemd-run unit and returns immediately —
+    # tick must never block on the multi-hour orchestrator run (issue 026). Checked first
+    # since config.py already rejects `checks:` on a pipeline job (mutually exclusive
+    # dispatch paths); the order here is belt-and-braces, not load-bearing.
+    if job.kind == "pipeline":
+        return _process_pipeline_job(job, history_path, client=client, now=now)
+
     # Gated jobs follow the same schedule guards but run gate checks + dispatch
     # instead of execute_run when their cron fires.
     if job.checks is not None:
@@ -1300,6 +1315,356 @@ def _process_job(
         sound="request",
     )
     return f"{job.name}: failed ({outcome.reason})", True
+
+
+# -- kind: pipeline dispatch (issue 026) --------------------------------------------
+#
+# tick launches the overnight orchestrator as a detached `systemd-run --user` unit
+# (scripts/pipeline-launch.sh) and returns immediately — it must never block on the
+# multi-hour run while holding tick.lock. A later tick reconciles the run purely by
+# reading the terminal report the orchestrator (or pipeline_watchdog.py, issue 031, if
+# the orchestrator dies silently) writes — both write the same `## Outcome:` marker
+# (docs/pipeline/orchestrator-prompt.md "Final report"), so tick has one reconcile
+# contract regardless of which side wrote it.
+
+# Matches the launcher script's `-p RuntimeMaxSec=...` margin (scripts/pipeline-launch.sh
+# and design.md's TimeoutStartSec precedent): the systemd unit outlives the orchestrator's
+# own `deadline_ms` so it can write a partial report + notify before any kill.
+PIPELINE_UNIT_MARGIN_MS = 600_000
+
+# How far past `deadline_ms` tick waits for a terminal report before declaring a silently
+# dead orchestrator itself. Deliberately generous — pipeline_watchdog.py is the fast path
+# (deadline + 30min grace, checked every 15min) and normally writes the report long before
+# this trips; this is the slow backstop for "the watchdog timer itself isn't running"
+# (the documented "Known limitation": issue 026 doesn't promise a bound tighter than this).
+PIPELINE_RECONCILE_GRACE_MS = 60 * 60 * 1000  # 1h
+
+_OUTCOME_RE = re.compile(r"^##\s*Outcome:\s*(?P<status>.+?)\s*$", re.MULTILINE)
+
+
+def pipeline_report_path(run_id: str) -> Path:
+    """Bare-timestamp run_id -> the pinned terminal-report path. Matches both the
+    launcher script's `--report` argument and pipeline_watchdog._write_report's own
+    convention — one filename contract regardless of which side writes it."""
+    return default_reports_dir() / f"pipeline-{run_id}.md"
+
+
+def _bare_pipeline_run_id(job_name: str, run_id: str) -> str:
+    """`nightly-pipeline-20260904T020000Z` -> `20260904T020000Z` — the same
+    remove-the-job-name-prefix idiom `runner.build_branch_name` uses. This bare timestamp
+    is what the orchestrator receives as RUN_ID (herdr caps agent names at 32 chars;
+    `pl-1-<full run_id>` overflows, `pl-1-<bare_ts>` fits — see the issue's RUN_ID
+    contract)."""
+    return run_id.removeprefix(f"{job_name}-")
+
+
+def _classify_pipeline_outcome(report_text: str) -> tuple[str, str | None]:
+    """(history_state, reason) from a terminal report's first `## Outcome:` line.
+
+    `partial (deadline exceeded)` is tolerated content-wise (the orchestrator is
+    documented to wait out an in-flight stage before writing it, design.md G-7) but is
+    still reported `failed` here — a run that didn't finish is not silently green."""
+    match = _OUTCOME_RE.search(report_text)
+    if match is None:
+        return "interrupted_unknown", "outcome_marker_missing"
+    status = match.group("status").strip().lower()
+    if status.startswith("ok"):
+        return "done", None
+    if status.startswith("partial"):
+        return "failed", "partial_deadline"
+    if status.startswith("failed"):
+        if "watchdog" in status:
+            return "failed", "watchdog_killed"
+        return "failed", "orchestrator_failed"
+    return "interrupted_unknown", "outcome_marker_unrecognized"
+
+
+def _open_pipeline_run(history_path: Path, job_name: str) -> HistoryRecord | None:
+    """Latest 'running' record for this job with no terminal record for the same run_id
+    yet — regardless of staleness. Deliberately distinct from `is_currently_running`,
+    which folds a clock-based staleness check into the same predicate: the pipeline
+    reconcile below needs "is there an open run" and "has it gone stale" as two separate
+    questions, since staleness alone must never flip a healthy run to failed (see the
+    dispatch-window comment in `_process_pipeline_job`)."""
+    records = read_job(history_path, job_name)
+    terminal_run_ids = {
+        r.run_id for r in records if r.state in TERMINAL_STATES and r.run_id
+    }
+    latest_running: HistoryRecord | None = None
+    for record in records:
+        if record.state == "running":
+            latest_running = record
+    if latest_running is None or latest_running.run_id in terminal_run_ids:
+        return None
+    return latest_running
+
+
+def launch_pipeline(
+    argv: list[str], *, timeout_s: float = 30.0
+) -> tuple[int, str, str]:
+    """The one impure seam in the pipeline dispatch path: registers the detached
+    `systemd-run --user` unit and returns as soon as it's registered — never waits for
+    the orchestrator. Module-level so tests monkeypatch it by string
+    (`herdr_routines.tick.launch_pipeline`), the same convention already used for
+    `ensure_repo` (see the autouse fixtures in tests/test_tick.py)."""
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_s, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 124, "", str(e)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _build_pipeline_launch_argv(
+    job: Job, *, run_id: str, report_path: Path, unit_name: str
+) -> list[str]:
+    assert job.deadline_ms is not None  # config.py requires this for kind: pipeline
+    assert job.prompt_file is not None
+    runtime_max_sec = (job.deadline_ms + PIPELINE_UNIT_MARGIN_MS) // 1000
+    script = job.repo / "scripts" / "pipeline-launch.sh"
+    argv = [
+        "systemd-run",
+        "--user",
+        "--collect",
+        f"--unit={unit_name}",
+        "-p",
+        f"RuntimeMaxSec={runtime_max_sec}",
+        "/bin/bash",
+        str(script),
+        "--run-id",
+        run_id,
+        "--repo-parent",
+        str(job.repo),
+        "--report",
+        str(report_path),
+        "--agent-name",
+        job.agent_name,
+        "--agent-kind",
+        job.agent_kind,
+        "--prompt-file",
+        str(job.repo / job.prompt_file),
+        "--wait-timeout-ms",
+        str(job.deadline_ms),
+    ]
+    if job.model:
+        argv += ["--model", job.model]
+    return argv
+
+
+def _process_pipeline_job(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+) -> tuple[str, bool]:
+    if not has_ever_been_seen(history_path, job.name):
+        append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
+        return f"{job.name}: registered", False
+
+    open_run = _open_pipeline_run(history_path, job.name)
+    if open_run is not None:
+        if _live_agent_exists(client, job):
+            return f"{job.name}: skipped (already running)", False
+
+        assert open_run.run_id is not None
+        bare_run_id = _bare_pipeline_run_id(job.name, open_run.run_id)
+        report_path = pipeline_report_path(bare_run_id)
+        report_text = ""
+        if report_path.exists():
+            try:
+                report_text = report_path.read_text()
+            except OSError:
+                report_text = ""
+
+        if report_text.strip():
+            state, reason = _classify_pipeline_outcome(report_text)
+            extra: dict[str, Any] = {
+                "pipeline_run_id": bare_run_id,
+                "report": str(report_path),
+            }
+            if reason is not None:
+                extra["reason"] = reason
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state=state,
+                    run_id=open_run.run_id,
+                    extra=extra,
+                ),
+            )
+            if state == "done":
+                _notify(client, f"herdr-routines: {job.name} done", sound="done")
+                return f"{job.name}: done", False
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=reason or "unknown",
+                sound="request",
+            )
+            return f"{job.name}: {state} ({reason})", True
+
+        # No usable report yet. This is deliberately *not* "agent gone => failed": the
+        # window between systemd-run returning and the launcher script's `herdr agent
+        # start` landing (workspace create + a settle sleep) looks identical from here —
+        # a naive check would kill a perfectly healthy run's history record on the very
+        # next tick. Only a report (handled above) or a genuinely stale deadline
+        # (handled below) is allowed to close this run out.
+        stale = find_stale_running(
+            history_path,
+            job.name,
+            timeout_ms=(job.deadline_ms or 0) + PIPELINE_RECONCILE_GRACE_MS,
+            now=now,
+        )
+        if stale is None:
+            return f"{job.name}: in flight ({open_run.run_id})", False
+
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=open_run.run_id,
+                extra={"reason": "no_report", "pipeline_run_id": bare_run_id},
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="no_report",
+            sound="request",
+        )
+        return f"{job.name}: failed (no_report)", True
+
+    if _live_agent_exists(client, job):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                extra={"reason": "agent_name_live"},
+            ),
+        )
+        return f"{job.name}: skipped (agent already live)", False
+
+    last = last_terminal_run(history_path, job.name)
+    registered_at = first_seen_at(history_path, job.name) or now
+    result = decide(
+        cron=job.cron,
+        timezone=job.timezone,
+        catch_up_minutes=job.catch_up_minutes,  # fixed PIPELINE_CATCH_UP_MINUTES, config-enforced
+        now=now,
+        last_terminal=last,
+        job_registered_at=registered_at,
+    )
+
+    if result.decision == Decision.NOT_DUE:
+        return f"{job.name}: not due", False
+
+    if result.decision == Decision.MISSED:
+        assert result.occurrence is not None
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="missed",
+                extra={
+                    "reason": "outside_catch_up_window",
+                    "scheduled_for": result.occurrence.isoformat(),
+                },
+            ),
+        )
+        # Unlike a routine job's ~2h default grace, PIPELINE_CATCH_UP_MINUTES is tight
+        # enough that a starved night (tick busy dispatching other jobs) is a real,
+        # not just theoretical, way to land here — silently losing a whole night's run
+        # is worse for a nightly job than for a 5-min routine, so surface it whenever
+        # on_missed asks for that (the deploy example sets on_missed: notify).
+        if job.on_missed == "notify":
+            _notify(
+                client,
+                f"herdr-routines: {job.name} missed",
+                body="outside catch-up window",
+                sound="request",
+            )
+        return f"{job.name}: missed", False
+
+    # Decision.RUN
+    assert result.occurrence is not None
+    run_id = make_run_id(job.name, result.occurrence)
+    bare_run_id = _bare_pipeline_run_id(job.name, run_id)
+    report_path = pipeline_report_path(bare_run_id)
+    unit_name = f"herdr-pipeline-{bare_run_id}"
+
+    try:
+        ensure_repo(job)
+    except RuntimeError as e:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={"reason": "repo_sync_failed", "error": str(e)},
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="repo_sync_failed",
+            sound="request",
+        )
+        return f"{job.name}: failed (repo_sync_failed)", True
+
+    argv = _build_pipeline_launch_argv(
+        job, run_id=bare_run_id, report_path=report_path, unit_name=unit_name
+    )
+    # Launch first, record second: writing the `running` record before confirming the
+    # launch succeeded would wedge this job for the full deadline if `systemd-run` failed
+    # or tick died in between (issue 026 AC #2).
+    rc, _out, err = launch_pipeline(argv)
+    if rc != 0:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "reason": "launch_failed",
+                    "rc": rc,
+                    "error": err.strip()[:2000],
+                },
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body="launch_failed",
+            sound="request",
+        )
+        return f"{job.name}: failed (launch_failed)", True
+
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="running",
+            run_id=run_id,
+            extra={
+                "scheduled_for": result.occurrence.isoformat(),
+                "late_seconds": result.late_seconds,
+                "pipeline_run_id": bare_run_id,
+                "report": str(report_path),
+                "unit": unit_name,
+            },
+        ),
+    )
+    return f"{job.name}: dispatched ({unit_name})", False
 
 
 def _notify(

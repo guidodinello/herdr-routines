@@ -1,0 +1,51 @@
+# One file per job.  Filename stem (``nightly-pipeline``) is the canonical name.
+# The ``name:`` key inside is optional — if present it must equal the stem.
+#
+# Copy this directory to the path resolved by
+# ``herdr_routines.config.default_config_path()`` (--config, then
+# $HERDR_PLUGIN_CONFIG_DIR/jobs.d, then ~/.config/herdr-routines/jobs.d) and edit
+# for your own jobs.  See docs/process/issues/026-pipeline-as-routine.md for the
+# full design and acceptance criteria this schema implements.
+#
+# kind: pipeline is the overnight feature-pipeline orchestrator (docs/pipeline/), not
+# a plain routine — `tick` dispatches it as a detached `systemd-run --user` unit
+# (scripts/pipeline-launch.sh) and returns immediately, never blocking the 5-minute
+# tick cadence on the multi-hour run. A later tick reconciles the run purely by
+# reading the terminal report's `## Outcome:` marker.
+#
+# jobs.d/ is host-specific (repo: paths are local to whichever machine's Herdr
+# server runs the jobs) and is deliberately NOT committed; only these examples are.
+
+enabled: true
+cron: "0 2 * * *"
+kind: pipeline
+repo: /home/guido/.local/state/herdr-routines/repos/herdr-routines # the PARENT clone,
+    # used as-is — the orchestrator creates its own auto/pipeline-<run_id> worktree
+    # from it. Must be a plain git clone (not a herdr-managed worktree).
+prompt_file: docs/pipeline/orchestrator-prompt.md # read by the launcher script, not
+    # by `load_config` — resolved relative to `repo` at dispatch/validate time.
+deadline_ms: 25200000 # 7h orchestrator wall budget. Feeds the generated systemd
+    # unit's RuntimeMaxSec (deadline_ms + a fixed margin, so the unit outlives the
+    # orchestrator's own deadline check and lets it write a partial report first).
+start_timeout_ms: 120000
+agent_kind: opencode
+model: opencode/muse-spark-1.2-contributor-free # native model flag; null = agent
+    # default. See docs/pipeline/opencode-e2e-workflow-recommendations.md for the
+    # per-stage model table this launches with.
+on_missed: notify # a starved night (tick busy dispatching other jobs past
+    # PIPELINE_CATCH_UP_MINUTES) is rare but worth surfacing, unlike a routine job's
+    # every-5-minutes retry.
+
+# No `workspace:`, no `timeout_ms:`, no `catch_up_minutes:` — all three are rejected
+# outright for kind: pipeline (config.py), even when a shared defaults.yaml sets them
+# for every other job:
+#   - workspace: the orchestrator manages its own worktree; there is nothing for
+#     `workspace: worktree|root` to mean here.
+#   - timeout_ms: unused; the bound is `deadline_ms` above.
+#   - catch_up_minutes: fixed at PIPELINE_CATCH_UP_MINUTES (60) regardless of what
+#     you set — large enough to absorb ordinary same-night tick delay (jobs are
+#     evaluated sequentially under one lock, so a slower job listed first can push
+#     this one back 30+ minutes on an ordinary night), small enough to never fire a
+#     missed 02:00 run late into the workday.
+# `checks:` is also rejected — gate mode and pipeline mode are mutually exclusive
+# dispatch paths.

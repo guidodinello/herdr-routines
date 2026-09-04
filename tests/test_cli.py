@@ -127,6 +127,31 @@ def test_auto_fix_job_counts_max_prs_per_tick_worst_case(tmp_path: Path) -> None
     assert "1050" in problems[0]
 
 
+def test_systemd_timeout_skips_pipeline_job(tmp_path: Path) -> None:
+    """kind: pipeline never runs in the tick process (issue 026) — a large default
+    timeout_ms must not inflate the required TimeoutStartSec."""
+    unit = tmp_path / "x.service"
+    unit.write_text("[Service]\nTimeoutStartSec=90\n")
+    pipeline_job = replace(
+        make_job(tmp_path, 25_200_000, "nightly-pipeline"),  # would dominate if counted
+        kind="pipeline",
+        catch_up_minutes=0,
+        deadline_ms=25_200_000,
+        prompt_file="docs/pipeline/orchestrator-prompt.md",
+    )
+    plain_job = make_job(
+        tmp_path, 60_000, "small"
+    )  # 60s + 30s start = 90s + 300s margin
+    config = RoutinesConfig(jobs=(pipeline_job, plain_job))
+    unit.write_text("[Service]\nTimeoutStartSec=390\n")
+    assert _check_systemd_timeout(config, unit) == []
+
+    unit.write_text("[Service]\nTimeoutStartSec=100\n")
+    problems = _check_systemd_timeout(config, unit)
+    assert len(problems) == 1
+    assert "390" in problems[0]
+
+
 def test_missing_directive_is_flagged(tmp_path: Path) -> None:
     unit = tmp_path / "x.service"
     unit.write_text("[Service]\nExecStart=/bin/true\n")
@@ -297,6 +322,74 @@ def test_validate_stays_silent_when_prompt_targets_the_report(
     )
     assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
     assert "$ROUTINE_REPORT" not in capsys.readouterr().err
+
+
+def test_validate_pipeline_job_suppresses_report_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A kind: pipeline job's prompt lives in prompt_file, not the inline `prompt` field
+    (which is legitimately empty) — the $ROUTINE_REPORT warning must not fire for it."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "orchestrator-prompt.md").write_text("do the thing\n")
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: nightly-pipeline\n"
+        f"    cron: '0 2 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    kind: pipeline\n"
+        f"    prompt_file: orchestrator-prompt.md\n"
+        f"    deadline_ms: 25200000\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 0
+    err = capsys.readouterr().err
+    assert "$ROUTINE_REPORT" not in err
+    assert "prompt is empty" not in err
+
+
+def test_validate_pipeline_workspace_na_repo_is_clone(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """validate treats `workspace` as N/A for kind: pipeline and always checks `repo` as
+    a plain git clone (the parent the orchestrator branches its own worktree from),
+    regardless of the (unused, possibly defaults.yaml-inherited) workspace value."""
+    repo = tmp_path / "repo"  # deliberately NOT a git repo
+    repo.mkdir()
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: nightly-pipeline\n"
+        f"    cron: '0 2 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    kind: pipeline\n"
+        f"    prompt_file: orchestrator-prompt.md\n"
+        f"    deadline_ms: 25200000\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 1
+    assert "not a git repository" in capsys.readouterr().err
+
+
+def test_validate_pipeline_missing_prompt_file_is_flagged(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: nightly-pipeline\n"
+        f"    cron: '0 2 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    kind: pipeline\n"
+        f"    prompt_file: does-not-exist.md\n"
+        f"    deadline_ms: 25200000\n"
+    )
+    assert _cmd_validate(_validate_args(config_path, tmp_path)) == 1
+    assert "prompt_file does not exist" in capsys.readouterr().err
 
 
 def test_validate_does_not_warn_for_disabled_job_missing_report(
@@ -523,3 +616,89 @@ def test_repo_url_validate_skips_existence(
     assert len(problems) == 0
     assert len(warnings) == 1
     assert "not yet cloned" in warnings[0]
+
+
+# -- kind: pipeline `run --run-id` (issue 026 AC #11) --------------------------------
+
+
+def _write_pipeline_job_config(tmp_path: Path, repo: Path) -> Path:
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: nightly-pipeline\n"
+        f"    cron: '0 2 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    kind: pipeline\n"
+        f"    prompt_file: docs/pipeline/orchestrator-prompt.md\n"
+        f"    deadline_ms: 25200000\n"
+    )
+    return config_path
+
+
+def test_cmd_run_pipeline_dry_run_prints_systemd_argv(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "docs" / "pipeline").mkdir(parents=True)
+    (repo / "docs" / "pipeline" / "orchestrator-prompt.md").write_text("do it\n")
+    config_path = _write_pipeline_job_config(tmp_path, repo)
+    monkeypatch.setattr(cli, "default_config_path", lambda: config_path)
+
+    assert cli.main(["run", "nightly-pipeline", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "systemd-run" in out
+    assert "rt-nightly-pipeline" in out
+    argv = out.split()
+    assert "--wait" not in argv  # tick must never block on the orchestrator
+
+
+def test_cmd_run_pipeline_resume_uses_distinct_unit_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed run (--run-id given) must not collide with a still-registered prior
+    attempt's transient unit name."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "docs" / "pipeline").mkdir(parents=True)
+    (repo / "docs" / "pipeline" / "orchestrator-prompt.md").write_text("do it\n")
+    config_path = _write_pipeline_job_config(tmp_path, repo)
+    monkeypatch.setattr(cli, "default_config_path", lambda: config_path)
+
+    assert (
+        cli.main(
+            ["run", "nightly-pipeline", "--run-id", "20260904T020000Z", "--dry-run"]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "--unit=herdr-pipeline-20260904T020000Z-r" in out
+    assert "--run-id 20260904T020000Z" in out
+
+
+def test_cmd_run_pipeline_never_calls_execute_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "docs" / "pipeline").mkdir(parents=True)
+    (repo / "docs" / "pipeline" / "orchestrator-prompt.md").write_text("do it\n")
+    config_path = _write_pipeline_job_config(tmp_path, repo)
+    monkeypatch.setattr(cli, "default_config_path", lambda: config_path)
+
+    def fail_execute_run(*a, **kw):
+        raise AssertionError("execute_run must never be called for kind: pipeline")
+
+    monkeypatch.setattr(cli, "execute_run", fail_execute_run)
+
+    launched: list[list[str]] = []
+
+    def fake_launch(argv, **kw):
+        launched.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "launch_pipeline", fake_launch)
+
+    assert cli.main(["run", "nightly-pipeline"]) == 0
+    assert len(launched) == 1

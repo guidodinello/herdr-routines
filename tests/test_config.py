@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from herdr_routines.config import ConfigError, load_config
+from herdr_routines.config import (
+    PIPELINE_CATCH_UP_MINUTES,
+    ConfigError,
+    load_config,
+    load_config_dir,
+)
 
 VALID_MINIMAL = """
 version: 1
@@ -1021,3 +1026,174 @@ jobs:
     assert job is not None
     assert job.repo == Path("/some/repo")
     assert job.repository is None
+
+
+# -- kind: pipeline (issue 026) ------------------------------------------------------
+
+
+PIPELINE_MINIMAL = """
+version: 1
+jobs:
+  - name: nightly-pipeline
+    cron: "0 2 * * *"
+    repo: /home/guido/repos/herdr-routines
+    kind: pipeline
+    prompt_file: docs/pipeline/orchestrator-prompt.md
+    deadline_ms: 25200000
+"""
+
+
+def test_pipeline_config_schema_roundtrip(tmp_config_path: Path) -> None:
+    """kind/prompt_file/deadline_ms parse, default sanely, and round-trip onto Job."""
+    cfg = load_config(write(tmp_config_path, PIPELINE_MINIMAL))
+    job = cfg.job("nightly-pipeline")
+    assert job is not None
+    assert job.kind == "pipeline"
+    assert job.prompt_file == "docs/pipeline/orchestrator-prompt.md"
+    assert job.deadline_ms == 25_200_000
+    # fixed per-kind value (PIPELINE_CATCH_UP_MINUTES) — neither the routine default of
+    # 120 nor a literal 0, which would make schedule.decide() report MISSED on
+    # essentially every tick-sampled run (see PIPELINE_CATCH_UP_MINUTES's docstring)
+    assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
+
+    # Plain routine jobs default kind to "routine" and leave prompt_file/deadline_ms null.
+    cfg = load_config(write(tmp_config_path, VALID_MINIMAL))
+    job = cfg.job("nightly-audit")
+    assert job is not None
+    assert job.kind == "routine"
+    assert job.prompt_file is None
+    assert job.deadline_ms is None
+
+    # Unknown kind rejected.
+    with pytest.raises(ConfigError, match="'kind'"):
+        load_config(
+            write(
+                tmp_config_path,
+                PIPELINE_MINIMAL.replace("kind: pipeline", "kind: orchestrator"),
+            )
+        )
+
+
+def test_validate_pipeline_requires_prompt_file_and_deadline(
+    tmp_config_path: Path,
+) -> None:
+    text = """
+version: 1
+jobs:
+  - name: nightly-pipeline
+    cron: "0 2 * * *"
+    repo: /home/guido/repos/herdr-routines
+    kind: pipeline
+"""
+    with pytest.raises(ConfigError, match="prompt_file"):
+        load_config(write(tmp_config_path, text))
+
+    text = """
+version: 1
+jobs:
+  - name: nightly-pipeline
+    cron: "0 2 * * *"
+    repo: /home/guido/repos/herdr-routines
+    kind: pipeline
+    prompt_file: docs/pipeline/orchestrator-prompt.md
+"""
+    with pytest.raises(ConfigError, match="deadline_ms"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_validate_pipeline_workspace_na_repo_is_clone(tmp_config_path: Path) -> None:
+    """An explicit `workspace:` on a pipeline job is rejected outright — it does not apply,
+    since the orchestrator manages its own worktree from the plain parent clone."""
+    text = PIPELINE_MINIMAL + "    workspace: worktree\n"
+    with pytest.raises(ConfigError, match="workspace"):
+        load_config(write(tmp_config_path, text))
+
+    # workspace absent from the job itself is fine even when a shared defaults.yaml sets one —
+    # inherited defaults must not retroactively invalidate a pipeline job (the live Pi's
+    # jobs.d/defaults.yaml sets workspace: worktree for every job).
+    cfg = load_config(write(tmp_config_path, PIPELINE_MINIMAL))
+    assert cfg.job("nightly-pipeline") is not None
+
+
+def test_validate_rejects_pipeline_catchup(tmp_config_path: Path) -> None:
+    """`catch_up_minutes` is not settable at all for kind: pipeline — it is fixed at
+    PIPELINE_CATCH_UP_MINUTES regardless of value, whether explicitly set on the job
+    itself (even to the "correct" value) or inherited from a shared defaults.yaml."""
+    text = PIPELINE_MINIMAL + "    catch_up_minutes: 120\n"
+    with pytest.raises(ConfigError, match="catch_up_minutes"):
+        load_config(write(tmp_config_path, text))
+
+    # Even setting it to the value it would get anyway is rejected — the key itself
+    # doesn't belong on a pipeline job.
+    text = PIPELINE_MINIMAL + f"    catch_up_minutes: {PIPELINE_CATCH_UP_MINUTES}\n"
+    with pytest.raises(ConfigError, match="catch_up_minutes"):
+        load_config(write(tmp_config_path, text))
+
+    cfg = load_config(write(tmp_config_path, PIPELINE_MINIMAL))
+    job = cfg.job("nightly-pipeline")
+    assert job is not None
+    assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
+
+
+def test_pipeline_ignores_shared_defaults_catchup(tmp_config_path: Path) -> None:
+    """A `defaults:` block's catch_up_minutes: 120 (the live Pi's shape) must not leak into
+    a pipeline job — it gets the fixed per-kind value regardless."""
+    text = """
+version: 1
+defaults:
+  catch_up_minutes: 120
+  workspace: worktree
+jobs:
+  - name: nightly-pipeline
+    cron: "0 2 * * *"
+    repo: /home/guido/repos/herdr-routines
+    kind: pipeline
+    prompt_file: docs/pipeline/orchestrator-prompt.md
+    deadline_ms: 25200000
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("nightly-pipeline")
+    assert job is not None
+    assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
+
+
+def test_pipeline_rejects_checks(tmp_config_path: Path) -> None:
+    """kind: pipeline and the unified gate model (`checks:`) are mutually exclusive
+    dispatch paths — silently ignoring one would be a worse failure mode than rejecting
+    the config outright."""
+    text = """
+version: 1
+jobs:
+  - name: nightly-pipeline
+    cron: "0 2 * * *"
+    repo: /home/guido/repos/herdr-routines
+    kind: pipeline
+    prompt_file: docs/pipeline/orchestrator-prompt.md
+    deadline_ms: 25200000
+    checks:
+      - pr_health: null
+"""
+    with pytest.raises(ConfigError, match="checks"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_pipeline_deploy_example_loads_cleanly(tmp_path: Path) -> None:
+    """deploy/jobs.d/nightly-pipeline.yaml (issue 026) parses with no config errors —
+    the deploy example a human copies onto the Pi must actually be schema-valid,
+    including under the raw-dict validation rules (no workspace/timeout_ms/catch_up_minutes
+    keys present). Loaded in isolation, not alongside the other (unrelated) examples in
+    deploy/jobs.d/, so a pre-existing issue in one of those never masks a regression here."""
+    example = (
+        Path(__file__).resolve().parent.parent
+        / "deploy"
+        / "jobs.d"
+        / "nightly-pipeline.yaml"
+    )
+    assert example.exists()
+    (tmp_path / "nightly-pipeline.yaml").write_text(example.read_text())
+    cfg = load_config_dir(tmp_path)
+    assert cfg.errors == ()
+    job = cfg.job("nightly-pipeline")
+    assert job is not None
+    assert job.kind == "pipeline"
+    assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES

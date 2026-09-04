@@ -352,3 +352,32 @@ behaviour (design.md:347-356 incident). Accepted; not fixed by this issue.
   (dropped the "or ignores with a warning" ambiguity), named
   `orchestrator-prompt.md:163` as the `## Outcome:` marker insertion point, and
   split AC #5 into three focused sub-tests.
+- **2026-09-05**: implementation surfaced two corrections, both audited-but-never-run
+  gaps (same class of error as each other — a plausible-sounding contract nobody
+  executed against the real mechanism):
+  1. AC #5's premise was wrong once the launcher became a repo-tracked script
+     (per-issue decision, not this doc originally): `substitute_prompt` is only
+     called from `execute_run`, which `kind: pipeline` never reaches — so
+     "`substitute_prompt` rewrites `$PIPELINE_REPORT`" targeted a function nothing
+     calls. `runner.py` stays untouched; the report-path contract moved to the
+     `systemd-run` argv/script boundary instead (asserted directly, plus the
+     appended `RUN_ID:`/`REPO_PARENT:`/`PIPELINE_REPORT:` trailer the script
+     already writes).
+  2. **`catch_up_minutes: 0` does not work once folded into the shared 5-minute
+     tick.** `schedule.decide()`'s grace is a strict `late <= grace`; with grace 0,
+     any nonzero delay between the cron instant and when tick actually evaluates
+     the job reports `MISSED` — confirmed by the repo's own
+     `test_catch_up_zero_means_no_backfill_at_all` (30s late, grace 0 → MISSED).
+     Since `run_tick` evaluates jobs sequentially under one flock and a slower
+     gated job (e.g. `babysit-prs`) can easily run first, a pipeline job could
+     legitimately be evaluated 30–60+ minutes after 02:00:00 on an ordinary
+     night — `catch_up_minutes: 0` would then report MISSED on essentially every
+     run, not just genuine multi-hour outages. Fixed: `kind: pipeline` now gets a
+     **fixed, non-settable** `PIPELINE_CATCH_UP_MINUTES = 60` (config.py) instead
+     of a literal 0 — any explicit `catch_up_minutes` key on a pipeline job is
+     rejected outright (not just a nonzero one), since the key doesn't belong on
+     this kind at all. 60 minutes comfortably exceeds realistic same-night tick
+     delay while staying far short of "into the workday." The MISSED branch in
+     `_process_pipeline_job` also gained the same `on_missed: notify` handling
+     the routine/gated paths already have, since a starved night is now a real
+     (if uncommon) outcome worth surfacing, not a purely theoretical one.

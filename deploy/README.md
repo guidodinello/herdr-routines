@@ -38,6 +38,15 @@ Copy [`jobs.example.yaml`](jobs.example.yaml) to
 resolves to) and edit it for your actual jobs. `jobs.yaml` is host-specific — `repo:` paths are
 local to whichever machine runs the jobs (see plan §3) — so it is not committed.
 
+**The overnight feature-pipeline is one of these jobs, not a separate launcher** (issue
+026): copy [`jobs.d/nightly-pipeline.yaml`](jobs.d/nightly-pipeline.yaml) alongside your
+other `jobs.d/` entries. `tick` dispatches a `kind: pipeline` job as a detached
+`systemd-run --user` unit (`scripts/pipeline-launch.sh`) and returns immediately — it does
+**not** need its own timer the way the pre-026 launcher did. Migrating an existing
+standalone `pipeline-nightly.timer`/`.service` pair: disable and remove them
+(`systemctl --user disable --now pipeline-nightly.timer`) once the `jobs.d/` entry is
+validated — running both would double-dispatch the same nightly run.
+
 Then:
 
 ```sh

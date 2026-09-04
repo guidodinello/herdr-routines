@@ -47,7 +47,14 @@ from herdr_routines.runner import (
 )
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
-from herdr_routines.tick import default_lock_path, run_tick, tick_lock
+from herdr_routines.tick import (
+    _build_pipeline_launch_argv,
+    default_lock_path,
+    launch_pipeline,
+    pipeline_report_path,
+    run_tick,
+    tick_lock,
+)
 
 log = get_logger(__name__)
 
@@ -147,6 +154,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("job")
     p_run.add_argument(
         "--dry-run", action="store_true", help="print the herdr argv, run nothing"
+    )
+    p_run.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "resume with an existing run id. For a plain job this is the full "
+            "<job>-<timestamp>; for kind: pipeline it is the orchestrator's bare "
+            "UTC timestamp RUN_ID (design.md's same-RUN_ID relaunch path)"
+        ),
     )
     p_run.set_defaults(handler=_cmd_run)
 
@@ -443,16 +459,30 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         else:
             if not job.repo.exists():
                 problems.append(f"{job.name}: repo path does not exist: {job.repo}")
-            elif job.workspace == "worktree" and not (job.repo / ".git").exists():
+            elif (job.workspace == "worktree" or job.kind == "pipeline") and not (
+                job.repo / ".git"
+            ).exists():
                 # `workspace: worktree` calls `herdr worktree create --cwd <repo>`, which creates a
                 # *new* linked worktree elsewhere (under ~/.herdr/worktrees/) from whatever `repo`
                 # is — confirmed empirically against a live herdr server: a plain clone (`.git` a
                 # directory) works exactly like an already-linked worktree (`.git` a file) here.
-                # `repo` just needs to be a git repo at all, either shape.
+                # `repo` just needs to be a git repo at all, either shape. `workspace:` doesn't
+                # apply to kind: pipeline (config.py rejects it explicitly), but its `repo` is
+                # still always the plain parent clone the orchestrator branches its own worktree
+                # from — checked the same way regardless of the (unused, possibly
+                # defaults.yaml-inherited) `job.workspace` value.
                 problems.append(
                     f"{job.name}: repo is not a git repository (no .git): {job.repo}"
                 )
-        if job.enabled and job.checks is None and "$ROUTINE_REPORT" not in job.prompt:
+        if job.kind == "pipeline":
+            if (
+                job.prompt_file is not None
+                and not (job.repo / job.prompt_file).exists()
+            ):
+                problems.append(
+                    f"{job.name}: prompt_file does not exist: {job.repo / job.prompt_file}"
+                )
+        elif job.enabled and job.checks is None and "$ROUTINE_REPORT" not in job.prompt:
             # A run only settles as "done" when the report file exists and is non-empty (see
             # runner.execute_run's no_report check); the agent only writes it if the prompt
             # asks. A prompt that never mentions the placeholder can never succeed. Empty
@@ -526,6 +556,12 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
     GATE_SLOP_S = 60  # covers worktree add/remove + pr_health polling
     total_job_seconds = 0.0
     for job in enabled_jobs:
+        # kind: pipeline never runs in the tick process — it launches a detached
+        # systemd-run unit and returns immediately (issue 026) — so it contributes
+        # nothing to tick's own worst-case sequential runtime. A default `timeout_ms`
+        # would otherwise silently inflate the required TimeoutStartSec by ~30 min.
+        if job.kind == "pipeline":
+            continue
         if job.checks is not None and job.target is not None:
             gate_time_s = sum(c.timeout_ms for c in job.checks) / 1000
             if job.target == "base":
@@ -564,7 +600,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     now = datetime.now(UTC)
-    run_id = make_run_id(job.name, now)
+
+    if job.kind == "pipeline":
+        return _cmd_run_pipeline(job, args, now=now)
+
+    run_id = args.run_id or make_run_id(job.name, now)
 
     if args.dry_run:
         for command in build_dry_run_argv(job, run_id=run_id):
@@ -579,6 +619,35 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.error("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
     return 0 if outcome.state == "done" else 1
+
+
+def _cmd_run_pipeline(job, args: argparse.Namespace, *, now: datetime) -> int:
+    """`--run-id`, for kind: pipeline, is the orchestrator's bare UTC timestamp
+    (design.md's same-RUN_ID relaunch path), not the full <job>-<ts> tick uses for its
+    own history key. A resumed run gets an `-r<HHMMSS>` unit-name suffix so the
+    transient `systemd-run --unit=` doesn't collide with a still-registered prior
+    attempt (`--collect` in build_launch_argv only unregisters a *finished* unit)."""
+    bare_run_id = args.run_id or now.strftime("%Y%m%dT%H%M%SZ")
+    report_path = pipeline_report_path(bare_run_id)
+    unit_name = (
+        f"herdr-pipeline-{bare_run_id}"
+        if not args.run_id
+        else f"herdr-pipeline-{bare_run_id}-r{now:%H%M%S}"
+    )
+    argv = _build_pipeline_launch_argv(
+        job, run_id=bare_run_id, report_path=report_path, unit_name=unit_name
+    )
+
+    if args.dry_run:
+        print(" ".join(argv))
+        return 0
+
+    log.info("%s: dispatching pipeline run %s (%s)", job.name, bare_run_id, unit_name)
+    rc, _out, err = launch_pipeline(argv)
+    if rc != 0:
+        log.error("%s: launch_failed: %s", job.name, err.strip())
+        return 1
+    return 0
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:

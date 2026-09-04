@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from herdr_routines.auto_fix import attempt_count_for_pr
-from herdr_routines.config import Job, RoutinesConfig
+from herdr_routines.config import PIPELINE_CATCH_UP_MINUTES, Job, RoutinesConfig
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import _live_agent_exists, run_tick
@@ -860,3 +860,294 @@ def test_plain_repo_job_sync_failure_is_mapped_to_failed_history(
     assert len(failed) == 1
     assert failed[0].extra is not None
     assert failed[0].extra["reason"] == "repo_sync_failed"
+
+
+# -- kind: pipeline dispatch (issue 026) ---------------------------------------------
+
+
+def make_pipeline_job(tmp_path: Path, **overrides: Any) -> Job:
+    job = make_job(
+        tmp_path,
+        name="nightly-pipeline",
+        kind="pipeline",
+        # PIPELINE_CATCH_UP_MINUTES, not 0 — schedule.decide()'s grace is a strict
+        # `late <= grace`, and 0 would report MISSED for any nonzero tick-loop delay
+        # (see config.PIPELINE_CATCH_UP_MINUTES's docstring for the incident).
+        catch_up_minutes=PIPELINE_CATCH_UP_MINUTES,
+        deadline_ms=25_200_000,
+        prompt_file="docs/pipeline/orchestrator-prompt.md",
+        prompt="",
+    )
+    return replace(job, **overrides)
+
+
+class FakePipelineClient:
+    """Enough of HerdrClient for the pipeline dispatch path: agent_statuses (the
+    _live_agent_exists overlap guard) and notification_show (best-effort on failure)."""
+
+    def __init__(self, statuses: dict[str, str] | None = None) -> None:
+        self._statuses = statuses or {}
+        self.notifications: list[tuple[str, str | None, str]] = []
+
+    def agent_statuses(self) -> dict[str, str]:
+        return dict(self._statuses)
+
+    def notification_show(self, title, *, body=None, sound="none"):
+        self.notifications.append((title, body, sound))
+
+
+def test_tick_dispatches_pipeline_launch_before_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launch-then-record: the `running` history record only appears once the launcher
+    has confirmed exit 0. A failed launch must not wedge the job for the full deadline —
+    it writes a terminal `failed` record instead."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+
+    calls: list[list[str]] = []
+
+    def fake_launch(argv, *, timeout_s=30.0):
+        calls.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert len(calls) == 1
+    assert "systemd-run" in calls[0]
+    assert "--run-id" in calls[0]
+    assert outcome.summaries[0].startswith("nightly-pipeline: dispatched")
+    records = read_job(history_path, job.name)
+    running = [r for r in records if r.state == "running"]
+    assert len(running) == 1
+    assert running[0].extra is not None
+    assert running[0].extra["unit"].startswith("herdr-pipeline-")
+
+
+def test_pipeline_dispatches_despite_realistic_tick_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for the bug PIPELINE_CATCH_UP_MINUTES exists to fix: tick samples every
+    5 minutes and evaluates jobs sequentially under one lock, so a pipeline job can easily
+    be evaluated 30+ minutes after its exact cron instant on an ordinary night (e.g. a
+    slower gated job dispatched first). `catch_up_minutes: 0` would report MISSED here —
+    schedule.decide()'s grace is a strict `late <= grace`, and late is essentially never
+    exactly 0 for a sampled scheduler (see test_schedule.py's
+    test_catch_up_zero_means_no_backfill_at_all). Must still dispatch."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    # A realistic same-night delay (well under PIPELINE_CATCH_UP_MINUTES=60, far beyond
+    # the naive "must be within seconds" a grace of 0 would require).
+    t_delayed = t0 + timedelta(minutes=35)
+    outcome = run_tick(config, history_path, client=client, now=t_delayed)  # type: ignore[arg-type]
+    assert outcome.summaries[0].startswith("nightly-pipeline: dispatched")
+
+
+def test_tick_pipeline_launch_failure_writes_terminal_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (1, "", "boom")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.any_job_failed is True
+    records = read_job(history_path, job.name)
+    assert [r.state for r in records if r.ts >= t1] == ["failed"]
+    failed = next(r for r in records if r.state == "failed")
+    assert failed.extra is not None
+    assert failed.extra["reason"] == "launch_failed"
+    assert client.notifications  # a failure must notify
+
+
+def test_other_jobs_still_run_during_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The make-or-break concurrency claim: a oneshot tick must not wedge on the
+    pipeline's dispatch — a plain job listed after it must still be evaluated and
+    actually run in the same tick."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+
+    pipeline_job = make_pipeline_job(tmp_path / "pipeline-repo")
+    (pipeline_job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    plain_job = make_job(tmp_path / "plain-repo", name="plain")
+    plain_job.repo.mkdir(parents=True, exist_ok=True)
+
+    config = RoutinesConfig(jobs=(pipeline_job, plain_job))
+    client = FakeFullClient(settle_status="idle")
+
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    outcome1 = run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    assert set(outcome1.summaries) == {
+        "nightly-pipeline: registered",
+        "plain: registered",
+    }
+
+    t1 = t0 + timedelta(minutes=1)
+    outcome2 = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    summaries = dict(s.split(": ", 1) for s in outcome2.summaries)
+    assert summaries["nightly-pipeline"].startswith("dispatched")
+    assert summaries["plain"] == "done"  # reached execute_run despite the pipeline job
+
+
+def test_pipeline_reconciles_ok_report_as_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    records = read_job(history_path, job.name)
+    running = next(r for r in records if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("# report\n\n## Outcome: ok\n")
+
+    t2 = t0 + timedelta(minutes=2)
+    outcome3 = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome3.summaries == ("nightly-pipeline: done",)
+    records = read_job(history_path, job.name)
+    assert [r.state for r in records[-1:]] == ["done"]
+
+
+def test_pipeline_report_guard_partial_tolerant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three reconcile cases off a report body: missing -> stays in flight until the
+    deadline+grace bound trips; watchdog marker -> failed watchdog_killed; partial
+    (deadline exceeded) -> failed but tolerated (not silently green)."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+
+    # No report yet, well within the deadline+grace window -> stays in flight, not failed.
+    t_soon = t1 + timedelta(minutes=5)
+    outcome_soon = run_tick(config, history_path, client=client, now=t_soon)  # type: ignore[arg-type]
+    assert outcome_soon.summaries == (
+        f"nightly-pipeline: in flight ({running.run_id})",
+    )
+
+    # Watchdog wrote its marker before tick's own bound trips.
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("## Outcome: failed (watchdog killed)\n")
+    t_watchdog = t1 + timedelta(minutes=10)
+    outcome_watchdog = run_tick(config, history_path, client=client, now=t_watchdog)  # type: ignore[arg-type]
+    assert outcome_watchdog.summaries == ("nightly-pipeline: failed (watchdog_killed)",)
+    assert outcome_watchdog.any_job_failed is True
+
+
+def test_pipeline_partial_deadline_report_is_tolerated_but_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("## Outcome: partial (deadline exceeded)\n")
+
+    t2 = t1 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: failed (partial_deadline)",)
+    assert outcome.any_job_failed is True
+
+
+def test_pipeline_skipped_while_agent_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once dispatched, a live `rt-<name>` orchestrator agent — not merely an open
+    history record — is what makes the next tick skip rather than re-reconcile."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    dispatched = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    assert dispatched.summaries[0].startswith("nightly-pipeline: dispatched")
+
+    client._statuses[job.agent_name] = "working"
+    t2 = t1 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: skipped (already running)",)
