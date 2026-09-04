@@ -694,6 +694,11 @@ def _build_job(
         raise ConfigError(f"{label}: 'kind' must be one of {sorted(VALID_JOB_KINDS)}")
 
     if kind == "pipeline":
+        if checks is not None:
+            raise ConfigError(
+                f"{label}: 'checks' is not applicable to kind: pipeline "
+                "(gate mode and pipeline mode are mutually exclusive dispatch paths)"
+            )
         if "workspace" in raw_job:
             raise ConfigError(
                 f"{label}: 'workspace' is not applicable to kind: pipeline "

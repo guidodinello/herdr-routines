@@ -240,8 +240,19 @@ def _write_report(
         for s in (_stage_from_agent_name(n, run.run_id) for n in killed_agents)
         if s is not None
     )
+    # `## Outcome:` is the one contract `tick._process_pipeline_job` reconciles on,
+    # regardless of whether the orchestrator itself or this watchdog wrote the terminal
+    # report (docs/pipeline/orchestrator-prompt.md "Final report"). Always "failed" here —
+    # a watchdog-authored report is definitionally not a clean completion.
+    outcome_marker = (
+        "## Outcome: failed (watchdog killed)"
+        if killed
+        else "## Outcome: failed (watchdog: no live worker found)"
+    )
     lines = [
         f"# Pipeline run {run.run_id} — watchdog report",
+        "",
+        outcome_marker,
         "",
         f"watchdog_killed: {'true' if killed else 'false'}",
         f"stage_killed: {stages_killed[0] if stages_killed else 'none'}",

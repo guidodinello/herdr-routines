@@ -174,6 +174,14 @@ Any gate-content failure → abort pipeline, never open PR off failed spec, neve
 
 Always write `$PIPELINE_REPORT` (and mirror to `~/.local/state/herdr-routines/reports/<run_id>.md`) with stage-by-stage status, artifacts, PR number, gate outputs, where it stopped and why, and whether fan-out dedup is still needed. Fire `herdr notification show` on terminal state.
 
+**Always emit an explicit `## Outcome:` line, on every terminal branch** (issue 026): this is the one machine-readable contract `tick` reconciles a dispatched pipeline run's history record from — `tick` never blocks on this run and only learns it finished by parsing this line out of the report.
+
+- `## Outcome: ok` — completed all stages, PR open/reviewed per the gates above (design:168's "completed" case).
+- `## Outcome: failed` — aborted on a gate-content failure (`spec:57`) or any other non-deadline failure.
+- `## Outcome: partial (deadline exceeded)` — the run hit `deadline_epoch` and stopped remaining stages (the case already documented above: "wait for in-flight `--wait` to return, then skip remaining stages and write partial `$PIPELINE_REPORT`", design:146, G-7). `tick` treats this as failed-but-tolerated: the partial report is expected, not a silent-death signal.
+
+Put the line near the top of the report, right after the title, so it is trivial to `grep -m1`.
+
 ## First manual run checklist (before overnight)
 
 1. Ensure `~/.config/opencode/opencode.json` allowlist + `GH_TOKEN` valid on Pi (dry-run one stage, confirm no `blocked`).

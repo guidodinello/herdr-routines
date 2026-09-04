@@ -1144,3 +1144,23 @@ jobs:
     job = cfg.job("nightly-pipeline")
     assert job is not None
     assert job.catch_up_minutes == 0
+
+
+def test_pipeline_rejects_checks(tmp_config_path: Path) -> None:
+    """kind: pipeline and the unified gate model (`checks:`) are mutually exclusive
+    dispatch paths — silently ignoring one would be a worse failure mode than rejecting
+    the config outright."""
+    text = """
+version: 1
+jobs:
+  - name: nightly-pipeline
+    cron: "0 2 * * *"
+    repo: /home/guido/repos/herdr-routines
+    kind: pipeline
+    prompt_file: docs/pipeline/orchestrator-prompt.md
+    deadline_ms: 25200000
+    checks:
+      - pr_health: null
+"""
+    with pytest.raises(ConfigError, match="checks"):
+        load_config(write(tmp_config_path, text))

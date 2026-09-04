@@ -443,16 +443,30 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         else:
             if not job.repo.exists():
                 problems.append(f"{job.name}: repo path does not exist: {job.repo}")
-            elif job.workspace == "worktree" and not (job.repo / ".git").exists():
+            elif (job.workspace == "worktree" or job.kind == "pipeline") and not (
+                job.repo / ".git"
+            ).exists():
                 # `workspace: worktree` calls `herdr worktree create --cwd <repo>`, which creates a
                 # *new* linked worktree elsewhere (under ~/.herdr/worktrees/) from whatever `repo`
                 # is — confirmed empirically against a live herdr server: a plain clone (`.git` a
                 # directory) works exactly like an already-linked worktree (`.git` a file) here.
-                # `repo` just needs to be a git repo at all, either shape.
+                # `repo` just needs to be a git repo at all, either shape. `workspace:` doesn't
+                # apply to kind: pipeline (config.py rejects it explicitly), but its `repo` is
+                # still always the plain parent clone the orchestrator branches its own worktree
+                # from — checked the same way regardless of the (unused, possibly
+                # defaults.yaml-inherited) `job.workspace` value.
                 problems.append(
                     f"{job.name}: repo is not a git repository (no .git): {job.repo}"
                 )
-        if job.enabled and job.checks is None and "$ROUTINE_REPORT" not in job.prompt:
+        if job.kind == "pipeline":
+            if (
+                job.prompt_file is not None
+                and not (job.repo / job.prompt_file).exists()
+            ):
+                problems.append(
+                    f"{job.name}: prompt_file does not exist: {job.repo / job.prompt_file}"
+                )
+        elif job.enabled and job.checks is None and "$ROUTINE_REPORT" not in job.prompt:
             # A run only settles as "done" when the report file exists and is non-empty (see
             # runner.execute_run's no_report check); the agent only writes it if the prompt
             # asks. A prompt that never mentions the placeholder can never succeed. Empty
@@ -526,6 +540,12 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
     GATE_SLOP_S = 60  # covers worktree add/remove + pr_health polling
     total_job_seconds = 0.0
     for job in enabled_jobs:
+        # kind: pipeline never runs in the tick process — it launches a detached
+        # systemd-run unit and returns immediately (issue 026) — so it contributes
+        # nothing to tick's own worst-case sequential runtime. A default `timeout_ms`
+        # would otherwise silently inflate the required TimeoutStartSec by ~30 min.
+        if job.kind == "pipeline":
+            continue
         if job.checks is not None and job.target is not None:
             gate_time_s = sum(c.timeout_ms for c in job.checks) / 1000
             if job.target == "base":

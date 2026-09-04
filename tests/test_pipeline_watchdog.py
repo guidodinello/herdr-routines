@@ -267,6 +267,7 @@ def test_run_watchdog_kills_stalled_worker_and_writes_report(tmp_path: Path) -> 
     report_path = reports_dir / f"pipeline-{RUN_ID}.md"
     assert report_path.exists()
     text = report_path.read_text()
+    assert "## Outcome: failed (watchdog killed)" in text
     assert "watchdog_killed: true" in text
     assert "stage_killed: 6" in text
     assert "stage 5 poll 05:44:10Z" in text
@@ -303,7 +304,9 @@ def test_run_watchdog_writes_report_even_with_no_live_worker(tmp_path: Path) -> 
     assert client.closed_panes == []
     report_path = reports_dir / f"pipeline-{RUN_ID}.md"
     assert report_path.exists()
-    assert "watchdog_killed: false" in report_path.read_text()
+    text = report_path.read_text()
+    assert "## Outcome: failed (watchdog: no live worker found)" in text
+    assert "watchdog_killed: false" in text
     assert len(client.notifications) == 1
 
 
