@@ -1,7 +1,7 @@
 ---
 id: "026"
 title: "Unify routines + pipeline into one gated-workflow model"
-status: open
+status: done
 priority: medium
 area: pipeline
 gate: PR #58 (issue close-on-merge + roadmaps) merged; issue 006 (jobs.d) landed
@@ -381,3 +381,11 @@ behaviour (design.md:347-356 incident). Accepted; not fixed by this issue.
      `_process_pipeline_job` also gained the same `on_missed: notify` handling
      the routine/gated paths already have, since a starved night is now a real
      (if uncommon) outcome worth surfacing, not a purely theoretical one.
+- **2026-09-04**: closed. Shipped as PR #79 (5 commits: config schema, repo-tracked
+  launcher + `## Outcome:` contract, tick dispatch/reconcile, `run --run-id`, deploy
+  example), 420 tests green. This closes the scoped first increment described above
+  ("pipeline is a dispatched (detached) job, not a blocking routine") — per this
+  issue's own "Scope honesty" note, real engine unification (a Python stage driver,
+  declarative `workflows/<name>.yaml`) stays with issue 013, not reopened here.
+  Pi migration (disable `pipeline-nightly.timer`, install `jobs.d/nightly-pipeline.yaml`,
+  one supervised live run) still needs to happen before the next scheduled 02:00 run.
