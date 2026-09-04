@@ -1,4 +1,4 @@
-# spec: Pi /tmp tmpfs hygiene (agent-runtime .so leak) (20260904T050000Z) — v1
+# spec: Pi /tmp tmpfs hygiene (agent-runtime .so leak) (20260904T050000Z) — v2
 
 Per-run spec at `docs/pipeline/runs/20260904T050000Z/spec.md` (G-15: per-run path avoids PR #28/#29 shared-path conflict — `docs/pipeline/design.md:79`). Implements `docs/process/issues/027-tmp-hygiene.md`.
 
@@ -99,3 +99,11 @@ Config: optional `tmp_hygiene:` block in `jobs.yaml` / `jobs.d/defaults.yaml` (`
 
 - Tiers follow code-review skill convention: `blocking` findings must be resolved before merge, `non-blocking` are advisory — confidence: high for age-gate/safety/narrow patterns/diagnosis, confidence: medium for threshold/dry-run/config.
 - Acceptance mapping verified end-to-end for `rg` checks: each acceptance line contains `Test:`, one of `blocking`/`non-blocking`, and `confidence:` — Test: test_tmp_hygiene_review_tiers_present
+
+## Changelog v1→v2
+
+- Bump spec version v1 → v2 per pipeline stage 2 gate (design.md:58 — spec v2 + Acceptance criteria & test plan).
+- Verified and retained ## Acceptance criteria with 7 numbered items, each line ending with the required suffix (exact test name) for `rg -c` extraction and `rg -F -q` existence check in `tests/` (gate 3).
+- Ensured blocking/non-blocking and confidence: tiers are present on every acceptance line: items 1–5 blocking, confidence: high (age-gate, live-run safety, threshold, diagnosis, narrow patterns); items 6–7 non-blocking, confidence: medium (dry-run/tick preamble, config/docs) — satisfies `rg -qw "blocking" && rg -qw "non-blocking" && rg -q "confidence:"` (gate 2, G-2 `-w` fix).
+- Added this ## Changelog v1→v2 section inside the same per-run file (`docs/pipeline/runs/20260904T050000Z/spec.md`, G-15) so `rg -q "^## Changelog"` passes without leaving per-run path.
+- No functional change to Problem/Approach/Files touched/Risks; v2 is a gate-formatting promotion of v1 to make acceptance criteria machine-checkable.
