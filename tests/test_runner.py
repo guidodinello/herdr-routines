@@ -975,14 +975,51 @@ def test_agent_not_interactive_reaps_pane(
 
 
 def test_blocked_status_keeps_pane_alive(tmp_path: Path) -> None:
-    """blocked is answerable from bed via herdr-push (ROADMAP Next) — never reaped, and it is
-    a settled state so the recent-unwrapped success-path tail still works."""
+    """blocked is answerable from bed via herdr-push (ROADMAP Next) — never reaped. It still
+    captures a diagnostic tail (issue 033) via agent_read_visible, since the pane may not
+    survive until a human resumes it (manual close, host reboot)."""
     job = make_job(tmp_path)
     client = ScriptedClient(agent_status="blocked")
     outcome = execute_run(job, client, run_id="a-blocked")  # type: ignore[arg-type]
     assert outcome.reason == "blocked"
     assert "pane_close" not in client.calls
-    assert "agent_read_visible" not in client.calls
+    assert "agent_read_visible" in client.calls
+
+
+def test_blocked_status_writes_diagnostic_tail(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Issue 033: a blocked settle is the failure mode most likely to need a human to see what
+    it was blocked on, so it must leave a {run_id}.tail.txt behind exactly like every other
+    failure path, even though the pane itself stays open."""
+    job = make_job(tmp_path)
+    run_id = "a-blocked-tail"
+    client = ScriptedClient(
+        agent_status="blocked", visible_screen="stuck on a y/n prompt"
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.reason == "blocked"
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.read_text() == "stuck on a y/n prompt"
+    assert "pane_close" not in client.calls
+
+
+def test_blocked_status_survives_tail_read_failure(tmp_path: Path) -> None:
+    """_capture_visible_tail already swallows OSError from agent_read_visible internally — a
+    blocked settle whose visible-tail read fails must still terminate cleanly as
+    state="failed", reason="blocked" with no new exception escaping."""
+
+    class UnreadableBlockedClient(ScriptedClient):
+        def agent_read_visible(self, target, *, lines=200):
+            self.calls.append("agent_read_visible")
+            raise OSError("pane gone")
+
+    job = make_job(tmp_path)
+    client = UnreadableBlockedClient(agent_status="blocked")
+    outcome = execute_run(job, client, run_id="a-blocked-unreadable")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "blocked"
+    assert "pane_close" not in client.calls
 
 
 def test_unknown_status_keeps_pane_alive(tmp_path: Path) -> None:

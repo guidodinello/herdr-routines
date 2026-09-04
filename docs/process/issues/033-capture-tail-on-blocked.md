@@ -1,7 +1,7 @@
 ---
 id: "033"
 title: "Capture a diagnostic tail on a blocked settle, not just other failure paths"
-status: open
+status: done
 priority: medium
 area: runner
 ---

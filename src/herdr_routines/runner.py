@@ -629,6 +629,15 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     }
 
     if settled_status == "blocked":
+        # Leave the pane open (no _close_run_pane/_capture_session_id) so a human can
+        # resume and see what it's stuck on — but still capture a diagnostic tail, since
+        # the pane may not survive until then (manual close, host reboot). The best-effort
+        # block above uses plain agent_read, which is rejected while unsettled/blocked; use
+        # _capture_visible_tail's agent_read_visible instead, same as every other failure
+        # path (issue 033).
+        _capture_visible_tail(
+            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
         return RunOutcome(state="failed", reason="blocked", **common)
 
     if settled_status == "unknown":
