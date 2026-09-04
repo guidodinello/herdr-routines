@@ -65,6 +65,13 @@ AGENT_MODEL_FLAGS: dict[str, str] = {
 VALID_WORKSPACE_MODES = frozenset({"worktree", "root"})
 VALID_ON_MISSED = frozenset({"log", "notify"})
 
+# Scheduling-only mode discriminator (issue 026). "routine" (default) is the existing plain
+# 1-agent job, dispatched synchronously by `execute_run`. "pipeline" is a detached,
+# deadline-bounded orchestrator dispatch, launched by `tick._process_pipeline_job` and never
+# blocking the tick. Gate mode (`checks is not None`) is an orthogonal axis, unchanged by this
+# enum — see docs/process/issues/026-pipeline-as-routine.md "Mode discriminator".
+VALID_JOB_KINDS = frozenset({"routine", "pipeline"})
+
 # Job name feeds the live agent name as f"rt-{name}", and Herdr caps agent names at 32 chars
 # matching [a-z][a-z0-9_-]{0,31}. "rt-" costs 3, so the job name gets 24.
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,23}$")
@@ -99,6 +106,9 @@ _JOB_ALLOWED_KEYS = (
             "max_attempts_per_target",
             "repo",
             "repository",
+            "kind",
+            "prompt_file",
+            "deadline_ms",
         }
     )
 )
@@ -126,6 +136,9 @@ _JOB_DEFAULTS = {
     "max_workers_per_tick": 3,
     "max_attempts_per_target": 3,
     "repository": None,
+    "kind": "routine",
+    "prompt_file": None,
+    "deadline_ms": None,
 }
 
 
@@ -175,6 +188,15 @@ class Job:
     max_workers_per_tick: int = 3
     # Retry budget keyed per target (per gate branch for base, per PR number for pr).
     max_attempts_per_target: int = 3
+    # Scheduling-only mode discriminator (issue 026): "routine" | "pipeline".
+    kind: str = "routine"
+    # Prompt source file, read by the pipeline launcher script (not by `load_config`).
+    # Required for kind: pipeline; a plain routine may also use it as an I/O convenience.
+    prompt_file: str | None = None
+    # Orchestrator wall-clock budget in ms, feeding the generated systemd unit's
+    # RuntimeMaxSec and the reconcile-staleness bound in tick._process_pipeline_job.
+    # Required for kind: pipeline; unused for kind: routine (job.timeout_ms applies instead).
+    deadline_ms: int | None = None
 
     @property
     def agent_name(self) -> str:
@@ -661,6 +683,64 @@ def _build_job(
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ConfigError(f"{label}: '{int_key}' must be a non-negative integer")
 
+    # -- kind: pipeline (issue 026) ---------------------------------------------------
+    #
+    # Rules key off `raw_job`, never the merged value: a shared `defaults.yaml` (e.g. the
+    # live Pi's `workspace: worktree` + `catch_up_minutes: 120`) must not retroactively
+    # invalidate every pipeline job — only an *explicit* per-job setting is rejected.
+
+    kind = merged["kind"]
+    if kind not in VALID_JOB_KINDS:
+        raise ConfigError(f"{label}: 'kind' must be one of {sorted(VALID_JOB_KINDS)}")
+
+    if kind == "pipeline":
+        if "workspace" in raw_job:
+            raise ConfigError(
+                f"{label}: 'workspace' is not applicable to kind: pipeline "
+                "(the orchestrator owns its own worktree, created from the parent clone)"
+            )
+        if "catch_up_minutes" in raw_job and raw_job["catch_up_minutes"] != 0:
+            raise ConfigError(
+                f"{label}: 'catch_up_minutes' must be 0 for kind: pipeline "
+                "(a missed run must never fire late into the day)"
+            )
+        # Per-kind default of 0, independent of defaults.yaml's shared value.
+        catch_up_minutes = 0
+
+        prompt_file = merged["prompt_file"]
+        if not isinstance(prompt_file, str) or not prompt_file:
+            raise ConfigError(f"{label}: 'prompt_file' is required for kind: pipeline")
+
+        deadline_ms = merged["deadline_ms"]
+        if (
+            not isinstance(deadline_ms, int)
+            or isinstance(deadline_ms, bool)
+            or deadline_ms <= 0
+        ):
+            raise ConfigError(
+                f"{label}: 'deadline_ms' must be a positive integer for kind: pipeline"
+            )
+    else:
+        catch_up_minutes = merged["catch_up_minutes"]
+
+        deadline_ms = merged["deadline_ms"]
+        if deadline_ms is not None and (
+            not isinstance(deadline_ms, int)
+            or isinstance(deadline_ms, bool)
+            or deadline_ms <= 0
+        ):
+            raise ConfigError(
+                f"{label}: 'deadline_ms' must be a positive integer or null"
+            )
+
+        prompt_file = merged["prompt_file"]
+        if prompt_file is not None and (
+            not isinstance(prompt_file, str) or not prompt_file
+        ):
+            raise ConfigError(
+                f"{label}: 'prompt_file' must be a non-empty string or null"
+            )
+
     return Job(
         name=name,
         enabled=enabled,
@@ -674,7 +754,7 @@ def _build_job(
         prompt=prompt,
         timeout_ms=merged["timeout_ms"],
         start_timeout_ms=merged["start_timeout_ms"],
-        catch_up_minutes=merged["catch_up_minutes"],
+        catch_up_minutes=catch_up_minutes,
         timezone=timezone,
         on_missed=on_missed,
         repository=repository,
@@ -683,4 +763,7 @@ def _build_job(
         target=target,
         max_workers_per_tick=merged["max_workers_per_tick"],
         max_attempts_per_target=merged["max_attempts_per_target"],
+        kind=kind,
+        prompt_file=prompt_file,
+        deadline_ms=deadline_ms,
     )
