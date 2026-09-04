@@ -401,19 +401,18 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
 
     # Ensure the repo checkout exists (clone-if-missing / fetch) before any worktree
     # or tab creation.
-    if job.repository is not None:
-        try:
-            ensure_repo(job)
-        except (RuntimeError, OSError) as e:
-            return RunOutcome(
-                state="failed",
-                run_id=run_id,
-                reason="clone_failed"
-                if not (job.repo / ".git").exists()
-                else "repo_sync_failed",
-                error=str(e),
-                branch=branch,
-            )
+    try:
+        ensure_repo(job)
+    except (RuntimeError, OSError) as e:
+        return RunOutcome(
+            state="failed",
+            run_id=run_id,
+            reason="clone_failed"
+            if not (job.repo / ".git").exists()
+            else "repo_sync_failed",
+            error=str(e),
+            branch=branch,
+        )
 
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)

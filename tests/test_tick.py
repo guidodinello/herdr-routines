@@ -17,6 +17,17 @@ from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import _live_agent_exists, run_tick
 
 
+@pytest.fixture(autouse=True)
+def _stub_ensure_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dispatch/scheduling tests in this file don't exercise repo-sync behavior (that's
+    test_repos.py's job) and mostly point `job.repo` at a bare tmp_path that isn't a real
+    git checkout — stub ensure_repo so it's not called for real. Tests that specifically
+    verify the ensure_repo-in-dispatch gate (e.g. test_repo_url_tick_runner_gate) override
+    this with their own monkeypatch.setattr."""
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
+
+
 def make_job(tmp_path: Path, **overrides: Any) -> Job:
     # Built directly, then `replace`d: a defaults dict splatted into Job() widens to
     # dict[str, object] and fails the typecheck gate on every field.
@@ -735,3 +746,69 @@ def test_repo_url_tick_runner_gate(
     t1 = t0 + timedelta(minutes=1)
     run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
     assert "ensure_repo" in calls
+
+
+def test_plain_repo_job_is_synced_in_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 030 AC1: a plain `repo:` job (no `repository:` field) must still reach
+    ensure_repo on the dispatch path — the call sites must not gate on
+    `job.repository is not None` (regression: they did, until this fix)."""
+    calls: list[str] = []
+
+    def recording_ensure_repo(job):
+        calls.append(job.name)
+        return job.repo
+
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", recording_ensure_repo)
+
+    job = make_job(tmp_path)  # repository defaults to None: plain repo: job
+    assert job.repository is None
+    client = FakeClient(settle_status="idle")
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+    history_path = tmp_path / "state" / "history.jsonl"
+    t0 = datetime.now(UTC).replace(microsecond=0)
+
+    config = RoutinesConfig(jobs=(job,))
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert calls == [job.name]
+
+
+def test_plain_repo_job_sync_failure_is_mapped_to_failed_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 030 AC2: ensure_repo raising for a plain repo: job (e.g. a diverged local
+    checkout) must fail the run loudly, not be silently skipped because the dispatch
+    site never called ensure_repo for a non-`repository:` job."""
+
+    def failing_ensure_repo(job):
+        raise RuntimeError("non-fast-forward merge on origin/main")
+
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", failing_ensure_repo)
+
+    job = make_job(tmp_path)
+    assert job.repository is None
+    # Simulate a pre-existing checkout so the reason maps to repo_sync_failed rather
+    # than clone_failed (the latter is only reachable for repository:-managed jobs).
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    client = FakeClient(settle_status="idle")
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+    history_path = tmp_path / "state" / "history.jsonl"
+    t0 = datetime.now(UTC).replace(microsecond=0)
+
+    config = RoutinesConfig(jobs=(job,))
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.any_job_failed is True
+    records = read_job(history_path, job.name)
+    failed = [r for r in records if r.state == "failed"]
+    assert len(failed) == 1
+    assert failed[0].extra is not None
+    assert failed[0].extra["reason"] == "repo_sync_failed"
