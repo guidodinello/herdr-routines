@@ -521,6 +521,44 @@ class HerdrClient:
         pane_id = matched[0].get("pane_id")
         return pane_id if isinstance(pane_id, str) and pane_id else None
 
+    def live_pipeline_agent_panes(self, run_id: str) -> dict[str, str]:
+        """Every registered `pl-<N>-<run_id>` agent still reporting a LIVE_AGENT_STATUSES
+        status (working), mapped to its pane_id — used by the pipeline stall watchdog
+        (issue 031) to find the worker an orchestrator that died silently left running.
+        Scoped to names starting with "pl-" so an unrelated `rt-<job>` routine agent can
+        never be swept up, and matched by `run_id` substring case-insensitively (herdr
+        lowercases agent names on registration — see ps.py's `build_ps_rows`). Empty dict
+        when nothing matches; raises HerdrCliError on an unexpected response shape like
+        its settled_agent_* siblings."""
+        body = self._call(["agent", "list"], timeout_s=10)
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        agents = result.get("agents")
+        if not isinstance(agents, list):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        lowered_run_id = run_id.lower()
+        panes: dict[str, str] = {}
+        for agent in agents:
+            if not isinstance(agent, dict):
+                continue
+            name = agent.get("name")
+            status = agent.get("agent_status")
+            pane_id = agent.get("pane_id")
+            if not (isinstance(name, str) and isinstance(status, str)):
+                continue
+            if not name.lower().startswith("pl-") or lowered_run_id not in name.lower():
+                continue
+            if status not in LIVE_AGENT_STATUSES:
+                continue
+            if isinstance(pane_id, str) and pane_id:
+                panes[name] = pane_id
+        return panes
+
     def workspace_close(self, workspace_id: str) -> None:
         self._call(["workspace", "close", workspace_id], timeout_s=10)
 

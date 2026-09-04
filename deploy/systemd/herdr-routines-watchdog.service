@@ -1,0 +1,18 @@
+[Unit]
+Description=herdr-routines pipeline stall watchdog (issue 031)
+After=herdr-server.service
+Wants=herdr-server.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/herdr-routines
+# Same PATH note as herdr-routines.service: a systemd --user unit does not inherit your
+# login shell's PATH, and herdr.py invokes the bare command name "herdr" via subprocess.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=%h/.local/bin/uv run herdr-routines pipeline-watchdog
+
+# One sweep is a handful of `herdr` calls plus filesystem reads/writes — bounded well
+# under a minute in practice. Finite on purpose (see herdr-routines.service's own
+# TimeoutStartSec comment on why `infinity` is a trap): a wedged sweep must not block
+# every future 15-min fire forever.
+TimeoutStartSec=120

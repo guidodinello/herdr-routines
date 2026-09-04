@@ -1,0 +1,10 @@
+[Unit]
+Description=Sweep for stalled overnight pipeline runs every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
