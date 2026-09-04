@@ -93,38 +93,6 @@ def _detect_bare_default_branch(bare_path: Path) -> str:
     return proc.stdout.strip().replace("refs/heads/", "")
 
 
-def _init_git_repo_with_commit(path: Path, filename: str = "README.md") -> None:
-    """Create a git repo with an initial commit at *path*."""
-    subprocess.run(
-        ["git", "init", str(path)], capture_output=True, text=True, check=True
-    )
-    subprocess.run(
-        ["git", "-C", str(path), "config", "user.email", "test@test.com"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(path), "config", "user.name", "Test"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    (path / filename).write_text("# test\n")
-    subprocess.run(
-        ["git", "-C", str(path), "add", filename],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(path), "commit", "-m", "init"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-
-
 # --- Acceptance 1: test_repo_url_clone_if_missing ---
 
 
@@ -199,16 +167,75 @@ def test_repo_url_fetch_fast_forward(tmp_path: Path) -> None:
     assert (checkout / "NEW.md").exists()
 
 
-# --- Acceptance 3: test_repo_url_explicit_repo_unchanged ---
+# --- Acceptance 3: plain repo: jobs are fetched+fast-forwarded too (issue 030) ---
 
 
-def test_repo_url_explicit_repo_unchanged(tmp_path: Path) -> None:
-    """Legacy repo-only jobs never enter the ensure_repo fetch path."""
+def test_repo_plain_job_fetches_and_fast_forwards(tmp_path: Path) -> None:
+    """A plain repo: job (no repository: field) is fetched+fast-forwarded to origin/<base>
+    just like a repository:-managed job — issue 030's core behavior change."""
+    bare = tmp_path / "bare.git"
+    _init_bare_git_repo(bare)
+    base = _detect_bare_default_branch(bare)
+
     checkout = tmp_path / "checkout"
-    _init_git_repo_with_commit(checkout)
-    job = make_job(tmp_path, repo=checkout, repository=None)
+    subprocess.run(
+        ["git", "clone", str(bare), str(checkout)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    job = make_job(tmp_path, repo=checkout, repository=None, base=base)
+
+    # Push a new commit to bare that the local checkout doesn't have yet.
+    tmp_work = tmp_path / "work"
+    subprocess.run(
+        ["git", "clone", str(bare), str(tmp_work)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_work), "config", "user.email", "test@test.com"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_work), "config", "user.name", "Test"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    (tmp_work / "NEW.md").write_text("new\n")
+    subprocess.run(
+        ["git", "-C", str(tmp_work), "add", "NEW.md"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_work), "commit", "-m", "add new"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_work), "push"], capture_output=True, text=True, check=True
+    )
+
     result = ensure_repo(job)
     assert result == checkout
+    assert (checkout / "NEW.md").exists()
+
+
+def test_repo_plain_job_without_git_dir_fails_loudly(tmp_path: Path) -> None:
+    """A plain repo: job never clones (only repository: jobs may), so a missing/non-git
+    checkout must fail loudly rather than silently returning the path unchanged."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    job = make_job(tmp_path, repo=checkout, repository=None)
+    with pytest.raises(RuntimeError):
+        ensure_repo(job)
 
 
 # --- Acceptance 4: test_repo_url_clone_failed_clean ---

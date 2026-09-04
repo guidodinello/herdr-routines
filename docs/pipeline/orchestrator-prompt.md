@@ -29,7 +29,19 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
 
 ## Prerequisite (do once, before stage 1)
 
-1. Create the **single shared worktree+branch** (design:68, spec:72):
+1. Sync `$REPO_PARENT` to `origin/main` before branching off it (issue 030: a stale local
+   checkout here previously produced a run that branched days behind `origin/main` and
+   duplicated already-merged work). Use the same fetch+fast-forward primitive
+   `tick.py`/`runner.py` already run before every routine job — one source of truth, not a
+   bespoke `git fetch` here:
+
+```sh
+herdr-routines sync-repo --path "$REPO_PARENT" --base main
+# non-zero exit ⇒ stop and write a report saying so; never branch off a stale/diverged
+# $REPO_PARENT (mirrors ensure_repo's fail-loud behavior in repos.py)
+```
+
+2. Create the **single shared worktree+branch** (design:68, spec:72):
 
 ```sh
 herdr worktree create --cwd "$REPO_PARENT" --base main --branch "auto/pipeline-$RUN_ID"
@@ -38,7 +50,7 @@ herdr worktree create --cwd "$REPO_PARENT" --base main --branch "auto/pipeline-$
 # if $SHARED_WS not found, herdr workspace create --cwd "$WT" --label "pipeline-$RUN_ID" --env HERDR_ENV=1 | jq -r '.result.workspace.workspace_id'
 ```
 
-2. Write `state.json` atomically to `$WT/state.json` (design:131):
+3. Write `state.json` atomically to `$WT/state.json` (design:131):
 
 ```json
 {
