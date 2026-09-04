@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from herdr_routines.config import ConfigError, load_config
+from herdr_routines.config import PIPELINE_CATCH_UP_MINUTES, ConfigError, load_config
 
 VALID_MINIMAL = """
 version: 1
@@ -1046,8 +1046,10 @@ def test_pipeline_config_schema_roundtrip(tmp_config_path: Path) -> None:
     assert job.kind == "pipeline"
     assert job.prompt_file == "docs/pipeline/orchestrator-prompt.md"
     assert job.deadline_ms == 25_200_000
-    # per-kind default, not the routine default of 120
-    assert job.catch_up_minutes == 0
+    # fixed per-kind value (PIPELINE_CATCH_UP_MINUTES) — neither the routine default of
+    # 120 nor a literal 0, which would make schedule.decide() report MISSED on
+    # essentially every tick-sampled run (see PIPELINE_CATCH_UP_MINUTES's docstring)
+    assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
 
     # Plain routine jobs default kind to "routine" and leave prompt_file/deadline_ms null.
     cfg = load_config(write(tmp_config_path, VALID_MINIMAL))
@@ -1109,24 +1111,28 @@ def test_validate_pipeline_workspace_na_repo_is_clone(tmp_config_path: Path) -> 
 
 
 def test_validate_rejects_pipeline_catchup(tmp_config_path: Path) -> None:
-    """catch_up_minutes must be 0 for kind: pipeline — a missed 02:00 must never fire the
-    7h run mid-morning. Rejected only when explicitly set on the job itself; a shared
-    defaults.yaml's catch_up_minutes: 120 must not retroactively invalidate it."""
+    """`catch_up_minutes` is not settable at all for kind: pipeline — it is fixed at
+    PIPELINE_CATCH_UP_MINUTES regardless of value, whether explicitly set on the job
+    itself (even to the "correct" value) or inherited from a shared defaults.yaml."""
     text = PIPELINE_MINIMAL + "    catch_up_minutes: 120\n"
     with pytest.raises(ConfigError, match="catch_up_minutes"):
         load_config(write(tmp_config_path, text))
 
-    # Explicit 0 is fine.
-    text = PIPELINE_MINIMAL + "    catch_up_minutes: 0\n"
-    cfg = load_config(write(tmp_config_path, text))
+    # Even setting it to the value it would get anyway is rejected — the key itself
+    # doesn't belong on a pipeline job.
+    text = PIPELINE_MINIMAL + f"    catch_up_minutes: {PIPELINE_CATCH_UP_MINUTES}\n"
+    with pytest.raises(ConfigError, match="catch_up_minutes"):
+        load_config(write(tmp_config_path, text))
+
+    cfg = load_config(write(tmp_config_path, PIPELINE_MINIMAL))
     job = cfg.job("nightly-pipeline")
     assert job is not None
-    assert job.catch_up_minutes == 0
+    assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
 
 
 def test_pipeline_ignores_shared_defaults_catchup(tmp_config_path: Path) -> None:
     """A `defaults:` block's catch_up_minutes: 120 (the live Pi's shape) must not leak into
-    a pipeline job — it gets the per-kind 0 default regardless."""
+    a pipeline job — it gets the fixed per-kind value regardless."""
     text = """
 version: 1
 defaults:
@@ -1143,7 +1149,7 @@ jobs:
     cfg = load_config(write(tmp_config_path, text))
     job = cfg.job("nightly-pipeline")
     assert job is not None
-    assert job.catch_up_minutes == 0
+    assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
 
 
 def test_pipeline_rejects_checks(tmp_config_path: Path) -> None:

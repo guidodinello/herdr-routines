@@ -72,6 +72,19 @@ VALID_ON_MISSED = frozenset({"log", "notify"})
 # enum — see docs/process/issues/026-pipeline-as-routine.md "Mode discriminator".
 VALID_JOB_KINDS = frozenset({"routine", "pipeline"})
 
+# A pipeline job's fixed catch_up_minutes. NOT 0: `schedule.decide()`'s grace window is a
+# strict `late <= grace`, and tick only samples every 5 minutes and evaluates jobs
+# sequentially under one lock — a job listed after a slow gated job (e.g. babysit-prs
+# dispatching PR-fix workers) can easily be evaluated 30-60+ minutes after its cron
+# instant on an ordinary night. `catch_up_minutes: 0` would then report MISSED on
+# essentially every run, not just genuine multi-hour outages (confirmed empirically:
+# test_schedule.py's own test_catch_up_zero_means_no_backfill_at_all shows even 30s late
+# with grace 0 -> MISSED). This value only needs to comfortably exceed realistic
+# same-night tick delay while staying far short of "into the workday" — see the issue's
+# log for the incident this corrects (an earlier revision required exactly 0, audited but
+# never run against a real multi-job tick).
+PIPELINE_CATCH_UP_MINUTES = 60
+
 # Job name feeds the live agent name as f"rt-{name}", and Herdr caps agent names at 32 chars
 # matching [a-z][a-z0-9_-]{0,31}. "rt-" costs 3, so the job name gets 24.
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,23}$")
@@ -704,13 +717,15 @@ def _build_job(
                 f"{label}: 'workspace' is not applicable to kind: pipeline "
                 "(the orchestrator owns its own worktree, created from the parent clone)"
             )
-        if "catch_up_minutes" in raw_job and raw_job["catch_up_minutes"] != 0:
+        if "catch_up_minutes" in raw_job:
             raise ConfigError(
-                f"{label}: 'catch_up_minutes' must be 0 for kind: pipeline "
-                "(a missed run must never fire late into the day)"
+                f"{label}: 'catch_up_minutes' is not applicable to kind: pipeline "
+                f"(fixed at PIPELINE_CATCH_UP_MINUTES={PIPELINE_CATCH_UP_MINUTES} — "
+                "enough to absorb ordinary same-night tick delay, not to fire late into "
+                "the workday; remove the key)"
             )
-        # Per-kind default of 0, independent of defaults.yaml's shared value.
-        catch_up_minutes = 0
+        # Fixed per-kind value, independent of defaults.yaml's shared value.
+        catch_up_minutes = PIPELINE_CATCH_UP_MINUTES
 
         prompt_file = merged["prompt_file"]
         if not isinstance(prompt_file, str) or not prompt_file:
