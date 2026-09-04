@@ -254,32 +254,29 @@ def _process_pr_target(
     gh = RealGhClient()
 
     # Ensure repo checkout before any git remote / worktree operations
-    if job.repository is not None:
-        try:
-            ensure_repo(job)
-        except (RuntimeError, OSError) as e:
-            reason = (
-                "clone_failed"
-                if not (job.repo / ".git").exists()
-                else "repo_sync_failed"
-            )
-            append(
-                history_path,
-                HistoryRecord(
-                    ts=now,
-                    job=job.name,
-                    state="failed",
-                    run_id=run_id,
-                    extra={"reason": reason, "error": str(e)},
-                ),
-            )
-            _notify(
-                client,
-                f"herdr-routines: {job.name} failed",
-                body=reason,
-                sound="request",
-            )
-            return f"{job.name}: failed ({reason})", True
+    try:
+        ensure_repo(job)
+    except (RuntimeError, OSError) as e:
+        reason = (
+            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
+        )
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={"reason": reason, "error": str(e)},
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body=reason,
+            sound="request",
+        )
+        return f"{job.name}: failed ({reason})", True
 
     try:
         proc = subprocess.run(
@@ -535,37 +532,34 @@ def _process_base_target(
         return f"{job.name}: skipped (max_attempts_exceeded)", False
 
     # Ensure repo checkout before any worktree creation
-    if job.repository is not None:
-        try:
-            ensure_repo(job)
-        except (RuntimeError, OSError) as e:
-            reason = (
-                "clone_failed"
-                if not (job.repo / ".git").exists()
-                else "repo_sync_failed"
-            )
-            append(
-                history_path,
-                HistoryRecord(
-                    ts=now,
-                    job=job.name,
-                    state="failed",
-                    run_id=run_id,
-                    extra={
-                        "gate": "failed",
-                        "reason": reason,
-                        "error": str(e),
-                        "target": "base",
-                    },
-                ),
-            )
-            _notify(
-                client,
-                f"herdr-routines: {job.name} failed",
-                body=reason,
-                sound="request",
-            )
-            return f"{job.name}: failed ({reason})", True
+    try:
+        ensure_repo(job)
+    except (RuntimeError, OSError) as e:
+        reason = (
+            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
+        )
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": reason,
+                    "error": str(e),
+                    "target": "base",
+                },
+            ),
+        )
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body=reason,
+            sound="request",
+        )
+        return f"{job.name}: failed ({reason})", True
 
     wt_path = Path(job.repo) / ".worktrees" / f"gate-{run_id}"
     try:
@@ -944,20 +938,17 @@ def _dispatch_fix_worker(
     report_path = default_reports_dir() / f"auto-fix-{run_id}-pr{pr.number}.md"
 
     # Ensure repo checkout before any worktree creation
-    if job.repository is not None:
-        try:
-            ensure_repo(job)
-        except (RuntimeError, OSError) as e:
-            reason = (
-                "clone_failed"
-                if not (job.repo / ".git").exists()
-                else "repo_sync_failed"
-            )
-            return {
-                "state": "failed",
-                "reason": reason,
-                "error": str(e),
-            }
+    try:
+        ensure_repo(job)
+    except (RuntimeError, OSError) as e:
+        reason = (
+            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
+        )
+        return {
+            "state": "failed",
+            "reason": reason,
+            "error": str(e),
+        }
 
     # Create report dir
     try:
@@ -1260,13 +1251,10 @@ def _process_job(
             job.name,
             job.fallback_model,
         )
-        # `now` (wall-clock), not `result.occurrence`: build_branch_name derives the branch
-        # suffix from run_id's own trailing timestamp, keyed on job.name alone (not run_id's
-        # prefix) — reusing `result.occurrence` here would produce byte-identical branch names
-        # for the primary and fallback attempts, so `worktree_create` collides with the
-        # primary's still-existing branch/worktree for every workspace:worktree job (the
-        # default, and what fitted-pr-review* uses). Confirmed by two independent code reviews
-        # on PR #65.
+        # `now` (wall-clock) rather than `result.occurrence` for the fallback's own run_id
+        # (both are fine now that `build_branch_name` is injective in run_id — see its
+        # docstring — but keeping `now` preserves the original PR #65 intent of the fallback
+        # attempt recording when it actually ran, not the primary's scheduled occurrence).
         fallback_run_id = make_run_id(f"{job.name}-fallback", now)
         append(
             history_path,

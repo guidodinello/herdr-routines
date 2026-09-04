@@ -1,8 +1,12 @@
-"""Repository lifecycle helpers for ``repository: <url>`` jobs.
+"""Repository lifecycle helpers, shared by ``repository: <url>``-managed jobs and plain
+``repo: <path>`` jobs.
 
 Pure-subprocess: no Herdr dependency, no config writes.  ``ensure_repo`` is called at the top
 of ``runner.execute_run`` and gated-dispatch paths in ``tick.py`` so every worktree/tab
-creation starts from a known-good checkout.
+creation starts from a known-good checkout — fetched+fast-forwarded to ``origin/<base>``
+regardless of whether the job's checkout is managed or a pre-existing local clone.  The
+``sync-repo`` CLI subcommand (``cli.py``) wraps ``_fetch_and_fast_forward`` directly for
+callers outside the job-dispatch path (e.g. the overnight pipeline launcher).
 """
 
 from __future__ import annotations
@@ -35,27 +39,26 @@ def default_repos_dir() -> Path:
     return base / "repos"
 
 
-def ensure_repo(job: Job, *, repos_dir: Path | None = None) -> Path:
+def ensure_repo(job: Job) -> Path:
     """Ensure the job's checkout exists and is up-to-date.
 
     For ``repository:`` jobs:
       - clone-if-missing (atomic tmp+rename)
       - fetch + fast-forward on every subsequent run
 
-    For plain ``repo:`` jobs: returns ``job.repo`` unchanged.
+    For plain ``repo:`` jobs (a pre-existing local clone path — the checkout
+    must already exist, it is never cloned): fetch + fast-forward on every
+    run, same as ``repository:`` jobs.
 
-    ``repos_dir`` is accepted for callers that pre-resolve the managed repos
-    base dir (e.g. via ``default_repos_dir``); ``job.repo`` is already the
-    resolved checkout path, so it is not otherwise used here.
+    ``job.repo`` is already the resolved checkout path (``config.py`` resolves
+    it against ``default_repos_dir()`` for ``repository:`` jobs at load time),
+    so no separate ``repos_dir`` parameter is needed here.
 
     Returns the checkout path on success.  Raises ``RuntimeError`` on
     clone/sync failure so callers can map it to a terminal ``RunOutcome``.
     """
-    if job.repository is None:
-        return job.repo
-
     checkout = job.repo
-    if not (checkout / ".git").exists():
+    if job.repository is not None and not (checkout / ".git").exists():
         _clone(job.repository, checkout)
     else:
         _fetch_and_fast_forward(checkout, base=job.base)

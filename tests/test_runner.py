@@ -168,6 +168,14 @@ def _isolated_reports_dir(tmp_path, monkeypatch):
     return reports_dir
 
 
+@pytest.fixture(autouse=True)
+def _stub_ensure_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """execute_run's orchestration tests exercise agent dispatch, not repo-sync behavior
+    (that's test_repos.py's job), and `make_job` points `job.repo` at a bare tmp_path
+    that isn't a real git checkout — stub ensure_repo so it's not called for real."""
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
+
+
 def test_make_run_id_is_deterministic_from_occurrence() -> None:
     occ = datetime(2026, 8, 22, 3, 0, 0, tzinfo=UTC)
     assert make_run_id("nightly-audit", occ) == "nightly-audit-20260822T030000Z"

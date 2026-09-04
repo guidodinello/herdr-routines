@@ -24,6 +24,16 @@ from herdr_routines.config import GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import run_tick
 
+
+@pytest.fixture(autouse=True)
+def _stub_ensure_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise PR enumeration/dispatch/gating logic, not repo-sync behavior
+    (that's test_repos.py's job), and mostly point `job.repo` at a bare tmp_path that
+    isn't a real git checkout — stub ensure_repo so it's not called for real."""
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------

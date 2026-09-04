@@ -38,6 +38,7 @@ from herdr_routines.pipeline_watchdog import (
     run_watchdog,
 )
 from herdr_routines.ps import collect_ps_rows, render_ps
+from herdr_routines.repos import _fetch_and_fast_forward
 from herdr_routines.runner import (
     build_dry_run_argv,
     default_reports_dir,
@@ -206,6 +207,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="flip the picked issue's status to in-progress before printing it",
     )
     p_pick.set_defaults(handler=_cmd_pick_feature)
+
+    p_sync_repo = sub.add_parser(
+        "sync-repo",
+        help="fetch+fast-forward a checkout to origin/<base> (for callers outside "
+        "tick.py/runner.py, e.g. the overnight pipeline launcher)",
+    )
+    p_sync_repo.add_argument(
+        "--path", type=Path, required=True, help="checkout to fetch+fast-forward"
+    )
+    p_sync_repo.add_argument(
+        "--base", default="main", help="branch to fast-forward to (default: main)"
+    )
+    p_sync_repo.set_defaults(handler=_cmd_sync_repo)
 
     p_watchdog = sub.add_parser(
         "pipeline-watchdog",
@@ -580,6 +594,19 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 def _cmd_pick_feature(args: argparse.Namespace) -> int:
     # No HerdrClient — pure filesystem, same posture as gc (docs/process/README.md).
     return run_pick_feature(args.issues_dir, mark=args.mark_in_progress)
+
+
+def _cmd_sync_repo(args: argparse.Namespace) -> int:
+    # Pure git, no HerdrClient — same primitive ensure_repo (repos.py) uses for every
+    # job's checkout, exposed here for callers outside the tick.py/runner.py dispatch
+    # path (issue 030: the overnight pipeline launcher's $REPO_PARENT).
+    try:
+        _fetch_and_fast_forward(args.path, base=args.base)
+    except RuntimeError as e:
+        log.error("sync-repo failed for %s: %s", args.path, e)
+        return 1
+    log.info("sync-repo: %s up to date with origin/%s", args.path, args.base)
+    return 0
 
 
 def _cmd_pipeline_watchdog(args: argparse.Namespace) -> int:

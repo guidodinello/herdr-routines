@@ -88,3 +88,20 @@ current), `tests/test_repos.py`.
   the human: fix belongs in code as a structural guarantee shared by
   routines and the pipeline, not a `docs/pipeline/orchestrator-prompt.md`
   instruction and not a bespoke reuse of `repos.py`'s `Job`-shaped API as-is.
+- **2026-09-03**: review caught acceptance criterion 1 still unmet after the
+  first pass — `ensure_repo()` itself was correctly generalized, but all 4
+  call sites (`tick.py` x3, `runner.py` x1) still gated the call behind
+  `if job.repository is not None:`, so the fixed function never ran for
+  plain `repo:` jobs in the actual dispatch path. Removed the gate at each
+  call site (unconditional `ensure_repo(job)`, same try/except mapping to a
+  terminal outcome/history record already there). Fixed test fixtures in
+  `tests/test_tick.py`, `tests/test_auto_fix.py`, `tests/test_runner.py`
+  that pointed `job.repo` at a non-git tmp_path and don't exercise repo-sync
+  behavior — added autouse fixtures stubbing `ensure_repo` in those files
+  (real-git-fixture coverage of `ensure_repo` itself stays in
+  `tests/test_repos.py`). Added `test_plain_repo_job_is_synced_in_dispatch` and
+  `test_plain_repo_job_sync_failure_is_mapped_to_failed_history` in
+  `tests/test_tick.py`, which build a `repository: None` job and assert
+  `ensure_repo` is actually reached (and its failure mapped to a `failed`
+  history record) via `run_tick` — verified these fail against the pre-fix
+  gated call sites before confirming green.

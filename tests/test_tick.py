@@ -17,6 +17,17 @@ from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import _live_agent_exists, run_tick
 
 
+@pytest.fixture(autouse=True)
+def _stub_ensure_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Dispatch/scheduling tests in this file don't exercise repo-sync behavior (that's
+    test_repos.py's job) and mostly point `job.repo` at a bare tmp_path that isn't a real
+    git checkout — stub ensure_repo so it's not called for real. Tests that specifically
+    verify the ensure_repo-in-dispatch gate (e.g. test_repo_url_tick_runner_gate) override
+    this with their own monkeypatch.setattr."""
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
+
+
 def make_job(tmp_path: Path, **overrides: Any) -> Job:
     # Built directly, then `replace`d: a defaults dict splatted into Job() widens to
     # dict[str, object] and fails the typecheck gate on every field.
@@ -364,13 +375,21 @@ def test_fallback_retry_uses_a_distinct_branch_in_worktree_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Regression (PR #65 review, confirmed by two independent reviewers): the fallback's
-    run_id must not share the primary's timestamp suffix, or `build_branch_name` — which keys
-    on job.name plus that suffix, not on run_id's own prefix — produces the identical branch
-    name for both attempts. For `workspace: worktree` (the default, and what fitted-pr-review*
-    uses), that collides with the primary's still-existing branch/worktree and
+    run_id must not share the primary's timestamp suffix, or `build_branch_name` produces the
+    identical branch name for both attempts. For `workspace: worktree` (the default, and what
+    fitted-pr-review* uses), that collides with the primary's still-existing branch/worktree and
     `worktree_create` fails. `test_fallback_model_retried_once_after_quota_exhausted` alone
     can't catch this: `make_job` defaults to `workspace="root"`, which never calls
-    `worktree_create` at all."""
+    `worktree_create` at all.
+
+    `t0`/`t1` are pinned to a `:00`-second minute boundary deliberately, not just any timestamp:
+    the production timer (`deploy/systemd/herdr-routines.timer`, `OnCalendar=*:0/5`) fires
+    ticks right on `:00`, so `result.occurrence` (floored to the minute) and `now` (wall-clock)
+    coincide almost every real run. An earlier version of this test used
+    `datetime.now(UTC).replace(microsecond=0)`, which only exercised this collision when the
+    real wall-clock second happened to be `:00` (~1/60 of runs) — a CI flake (see PR #72) that
+    was actually this exact production bug caught by accident. Pinning to a boundary makes the
+    regression deterministic instead of a lottery."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
     job = make_job(
@@ -386,7 +405,7 @@ def test_fallback_retry_uses_a_distinct_branch_in_worktree_mode(
         quota_exhausted_for_model="opencode/muse-spark-1.2-contributor-free",
     )
 
-    t0 = datetime.now(UTC).replace(microsecond=0)
+    t0 = datetime(2026, 1, 1, 0, 5, 0, tzinfo=UTC)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
     t1 = t0 + timedelta(minutes=1)
     outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
@@ -707,7 +726,7 @@ def test_repo_url_tick_runner_gate(
 
     calls: list[str] = []
 
-    def fake_ensure_repo(job, *, repos_dir=None):
+    def fake_ensure_repo(job):
         calls.append("ensure_repo")
         return job.repo
 
@@ -727,3 +746,69 @@ def test_repo_url_tick_runner_gate(
     t1 = t0 + timedelta(minutes=1)
     run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
     assert "ensure_repo" in calls
+
+
+def test_plain_repo_job_is_synced_in_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 030 AC1: a plain `repo:` job (no `repository:` field) must still reach
+    ensure_repo on the dispatch path — the call sites must not gate on
+    `job.repository is not None` (regression: they did, until this fix)."""
+    calls: list[str] = []
+
+    def recording_ensure_repo(job):
+        calls.append(job.name)
+        return job.repo
+
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", recording_ensure_repo)
+
+    job = make_job(tmp_path)  # repository defaults to None: plain repo: job
+    assert job.repository is None
+    client = FakeClient(settle_status="idle")
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+    history_path = tmp_path / "state" / "history.jsonl"
+    t0 = datetime.now(UTC).replace(microsecond=0)
+
+    config = RoutinesConfig(jobs=(job,))
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert calls == [job.name]
+
+
+def test_plain_repo_job_sync_failure_is_mapped_to_failed_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 030 AC2: ensure_repo raising for a plain repo: job (e.g. a diverged local
+    checkout) must fail the run loudly, not be silently skipped because the dispatch
+    site never called ensure_repo for a non-`repository:` job."""
+
+    def failing_ensure_repo(job):
+        raise RuntimeError("non-fast-forward merge on origin/main")
+
+    monkeypatch.setattr("herdr_routines.runner.ensure_repo", failing_ensure_repo)
+
+    job = make_job(tmp_path)
+    assert job.repository is None
+    # Simulate a pre-existing checkout so the reason maps to repo_sync_failed rather
+    # than clone_failed (the latter is only reachable for repository:-managed jobs).
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    client = FakeClient(settle_status="idle")
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+    history_path = tmp_path / "state" / "history.jsonl"
+    t0 = datetime.now(UTC).replace(microsecond=0)
+
+    config = RoutinesConfig(jobs=(job,))
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.any_job_failed is True
+    records = read_job(history_path, job.name)
+    failed = [r for r in records if r.state == "failed"]
+    assert len(failed) == 1
+    assert failed[0].extra is not None
+    assert failed[0].extra["reason"] == "repo_sync_failed"
