@@ -1,7 +1,7 @@
 ---
 id: "031"
 title: "Pipeline stall watchdog: detect deadline overrun and kill orphaned workers"
-status: open
+status: done
 priority: high
 area: pipeline
 ---

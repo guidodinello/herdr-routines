@@ -1,7 +1,7 @@
 ---
 id: "004"
 title: Overnight feature-pipeline orchestrator (POC)
-status: in-progress
+status: done
 priority: high
 area: pipeline
 gate: promotion out of POC needs a few real overnight runs finishing end-to-end without human rescue
@@ -84,6 +84,15 @@ feature idea and the final merge decision.
   immediately on every settled terminal path, capturing the agent's session
   id first (`RunOutcome.session_id`, now in `history.jsonl`) so a human can
   still resume-and-inspect (PR #42, shipped as commit `3516491`).
+- **2026-08-29 to 2026-09-02**: five consecutive overnight runs completed all
+  6 stages end-to-end with no human intervention beyond the merge decision —
+  PR #49 (worktree GC delete-half, 276 tests), PR #50 (auto-fix PRs standing
+  job, 300 tests), PR #56 (gate model, 324 tests), PR #67 (worktree GC, 336
+  tests), PR #68 (repository job field, 357 tests). Each run's full report
+  is under `~/.local/state/herdr-routines/reports/pipeline-<run_id>.md` on
+  the Pi (not checked into this repo). This satisfies the acceptance bar
+  above (initially missed when this log was last updated after the 031
+  entry below — the log had gone stale while the runs kept succeeding).
 - **2026-09-03**: run `20260903T050016Z` (PR #69) hit two separate bugs, both
   filed as their own issues since each is independently actionable: (1) the
   run branched from a checkout 2 days / 6 merged PRs behind `origin/main`
@@ -95,3 +104,8 @@ feature idea and the final merge decision.
   [`031`](031-pipeline-stall-watchdog.md), which turns G-4's manual "morning
   checklist" into an automated kill+report watchdog. PR #69 closed manually,
   stuck worker killed manually, no code fix shipped yet for either.
+- **2026-09-04**: closing as done. 030 and 031 both shipped (PRs #72, #73),
+  and five clean runs already preceded the 09-03 infra failures they fix —
+  the orchestrator chain itself is proven; remaining risk is
+  environment/infra hardening (tracked as it surfaces, not a reason to keep
+  this POC open indefinitely).

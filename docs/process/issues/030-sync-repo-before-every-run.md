@@ -1,7 +1,7 @@
 ---
 id: "030"
 title: "Fetch+fast-forward every job's repo before every run, routine or pipeline"
-status: open
+status: done
 priority: high
 area: config
 ---
