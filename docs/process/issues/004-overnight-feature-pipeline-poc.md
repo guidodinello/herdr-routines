@@ -84,3 +84,14 @@ feature idea and the final merge decision.
   immediately on every settled terminal path, capturing the agent's session
   id first (`RunOutcome.session_id`, now in `history.jsonl`) so a human can
   still resume-and-inspect (PR #42, shipped as commit `3516491`).
+- **2026-09-03**: run `20260903T050016Z` (PR #69) hit two separate bugs, both
+  filed as their own issues since each is independently actionable: (1) the
+  run branched from a checkout 2 days / 6 merged PRs behind `origin/main`
+  (including PR #65, the same feature issue 022 asked for), producing a
+  conflicting, duplicative PR — filed as
+  [`030`](030-sync-repo-before-every-run.md); (2) the run's heartbeat died
+  after stage 5 and its stage-6 worker was found still running 19.5 hours
+  later, past `deadline_epoch`, with nothing having reaped it — filed as
+  [`031`](031-pipeline-stall-watchdog.md), which turns G-4's manual "morning
+  checklist" into an automated kill+report watchdog. PR #69 closed manually,
+  stuck worker killed manually, no code fix shipped yet for either.

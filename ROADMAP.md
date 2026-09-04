@@ -82,6 +82,18 @@ gate is considered met). One-liner index; full detail in the issue file.
   refinement vs the pipeline's implementation refinement), delivered as an
   open PR for the human to merge; nightly 22:00, `opencode` only. `medium`. →
   [`029`](docs/process/issues/029-issue-refinement-job.md)
+- **Fetch+fast-forward every job's repo before every run** — generalize
+  `ensure_repo` to sync `repo:` jobs too (not just `repository:`-managed
+  ones), and give the pipeline launcher the same guarantee instead of
+  running against a possibly-stale local clone (PR #69 branched 2 days / 6
+  PRs behind `main`). `high`. →
+  [`030`](docs/process/issues/030-sync-repo-before-every-run.md)
+- **Pipeline stall watchdog** — automate G-4's manual "morning checklist"
+  into a routine that detects a stalled/dead orchestrator past
+  `deadline_epoch` and kills the orphaned worker instead of it running
+  unnoticed for hours (run `20260903T050016Z`'s stage-6 worker ran 19.5h
+  past deadline before being found and killed by hand). `high`. →
+  [`031`](docs/process/issues/031-pipeline-stall-watchdog.md)
 
 ## Later
 
