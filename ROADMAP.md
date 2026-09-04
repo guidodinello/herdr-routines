@@ -94,6 +94,12 @@ gate is considered met). One-liner index; full detail in the issue file.
   unnoticed for hours (run `20260903T050016Z`'s stage-6 worker ran 19.5h
   past deadline before being found and killed by hand). `high`. →
   [`031`](docs/process/issues/031-pipeline-stall-watchdog.md)
+- **One-shot nudge before `no_report` failure** — give an agent that settled
+  idle/done with no summary file one bounded follow-up prompt to write it,
+  before the run is declared failed; `no_report` is 5 of 9 recent `fitted-*`
+  job failures, and a whole-job retry (issue 008) can't safely apply since
+  re-running risks duplicate side effects. `medium`. →
+  [`032`](docs/process/issues/032-nudge-before-no-report-failure.md)
 
 ## Later
 
