@@ -52,10 +52,17 @@ Then:
 ```sh
 uv sync
 uv run herdr-routines validate
+uv run herdr-routines tmp-hygiene --dry-run  # optional: preview /tmp cleanup
 systemctl --user enable --now herdr-server.service
 systemctl --user enable --now herdr-routines.timer
 systemctl --user enable --now herdr-routines-watchdog.timer
 ```
+
+**Note on /tmp hygiene (issue 027):** `tick` now runs an age-based `/tmp` reap
+before every job dispatch (under the tick lock). On agent start failure, `df -h /tmp`
+is logged to the report tail and the `RunOutcome.diagnosis` field distinguishes
+`tmp_full` from quota `blocked`. Configure via `tmp_hygiene:` under `defaults:` or
+per-job in `jobs.yaml`/`jobs.d/` — see `jobs.example.yaml`.
 
 ## Manual smoke checklist
 
