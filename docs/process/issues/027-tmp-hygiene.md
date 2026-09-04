@@ -1,7 +1,7 @@
 ---
 id: "027"
 title: "Pi /tmp tmpfs hygiene (agent-runtime .so leak)"
-status: open
+status: done
 priority: medium
 area: infra
 ---
