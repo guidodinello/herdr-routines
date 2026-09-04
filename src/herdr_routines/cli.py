@@ -47,7 +47,14 @@ from herdr_routines.runner import (
 )
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
-from herdr_routines.tick import default_lock_path, run_tick, tick_lock
+from herdr_routines.tick import (
+    _build_pipeline_launch_argv,
+    default_lock_path,
+    launch_pipeline,
+    pipeline_report_path,
+    run_tick,
+    tick_lock,
+)
 
 log = get_logger(__name__)
 
@@ -147,6 +154,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("job")
     p_run.add_argument(
         "--dry-run", action="store_true", help="print the herdr argv, run nothing"
+    )
+    p_run.add_argument(
+        "--run-id",
+        default=None,
+        help=(
+            "resume with an existing run id. For a plain job this is the full "
+            "<job>-<timestamp>; for kind: pipeline it is the orchestrator's bare "
+            "UTC timestamp RUN_ID (design.md's same-RUN_ID relaunch path)"
+        ),
     )
     p_run.set_defaults(handler=_cmd_run)
 
@@ -584,7 +600,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     now = datetime.now(UTC)
-    run_id = make_run_id(job.name, now)
+
+    if job.kind == "pipeline":
+        return _cmd_run_pipeline(job, args, now=now)
+
+    run_id = args.run_id or make_run_id(job.name, now)
 
     if args.dry_run:
         for command in build_dry_run_argv(job, run_id=run_id):
@@ -599,6 +619,35 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.error("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
     return 0 if outcome.state == "done" else 1
+
+
+def _cmd_run_pipeline(job, args: argparse.Namespace, *, now: datetime) -> int:
+    """`--run-id`, for kind: pipeline, is the orchestrator's bare UTC timestamp
+    (design.md's same-RUN_ID relaunch path), not the full <job>-<ts> tick uses for its
+    own history key. A resumed run gets an `-r<HHMMSS>` unit-name suffix so the
+    transient `systemd-run --unit=` doesn't collide with a still-registered prior
+    attempt (`--collect` in build_launch_argv only unregisters a *finished* unit)."""
+    bare_run_id = args.run_id or now.strftime("%Y%m%dT%H%M%SZ")
+    report_path = pipeline_report_path(bare_run_id)
+    unit_name = (
+        f"herdr-pipeline-{bare_run_id}"
+        if not args.run_id
+        else f"herdr-pipeline-{bare_run_id}-r{now:%H%M%S}"
+    )
+    argv = _build_pipeline_launch_argv(
+        job, run_id=bare_run_id, report_path=report_path, unit_name=unit_name
+    )
+
+    if args.dry_run:
+        print(" ".join(argv))
+        return 0
+
+    log.info("%s: dispatching pipeline run %s (%s)", job.name, bare_run_id, unit_name)
+    rc, _out, err = launch_pipeline(argv)
+    if rc != 0:
+        log.error("%s: launch_failed: %s", job.name, err.strip())
+        return 1
+    return 0
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:

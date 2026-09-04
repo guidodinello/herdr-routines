@@ -616,3 +616,86 @@ def test_repo_url_validate_skips_existence(
     assert len(problems) == 0
     assert len(warnings) == 1
     assert "not yet cloned" in warnings[0]
+
+
+# -- kind: pipeline `run --run-id` (issue 026 AC #11) --------------------------------
+
+
+def _write_pipeline_job_config(tmp_path: Path, repo: Path) -> Path:
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\n"
+        f"jobs:\n"
+        f"  - name: nightly-pipeline\n"
+        f"    cron: '0 2 * * *'\n"
+        f"    repo: {repo}\n"
+        f"    kind: pipeline\n"
+        f"    prompt_file: docs/pipeline/orchestrator-prompt.md\n"
+        f"    deadline_ms: 25200000\n"
+    )
+    return config_path
+
+
+def test_cmd_run_pipeline_dry_run_prints_systemd_argv(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "docs" / "pipeline").mkdir(parents=True)
+    (repo / "docs" / "pipeline" / "orchestrator-prompt.md").write_text("do it\n")
+    config_path = _write_pipeline_job_config(tmp_path, repo)
+    monkeypatch.setattr(cli, "default_config_path", lambda: config_path)
+
+    assert cli.main(["run", "nightly-pipeline", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "systemd-run" in out
+    assert "rt-nightly-pipeline" in out
+    argv = out.split()
+    assert "--wait" not in argv  # tick must never block on the orchestrator
+
+
+def test_cmd_run_pipeline_resume_uses_distinct_unit_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed run (--run-id given) must not collide with a still-registered prior
+    attempt's transient unit name."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "docs" / "pipeline").mkdir(parents=True)
+    (repo / "docs" / "pipeline" / "orchestrator-prompt.md").write_text("do it\n")
+    config_path = _write_pipeline_job_config(tmp_path, repo)
+    monkeypatch.setattr(cli, "default_config_path", lambda: config_path)
+
+    assert (
+        cli.main(
+            ["run", "nightly-pipeline", "--run-id", "20260904T020000Z", "--dry-run"]
+        )
+        == 0
+    )
+    out = capsys.readouterr().out
+    assert "--unit=herdr-pipeline-20260904T020000Z-r" in out
+    assert "--run-id 20260904T020000Z" in out
+
+
+def test_cmd_run_pipeline_never_calls_execute_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "docs" / "pipeline").mkdir(parents=True)
+    (repo / "docs" / "pipeline" / "orchestrator-prompt.md").write_text("do it\n")
+    config_path = _write_pipeline_job_config(tmp_path, repo)
+    monkeypatch.setattr(cli, "default_config_path", lambda: config_path)
+
+    def fail_execute_run(*a, **kw):
+        raise AssertionError("execute_run must never be called for kind: pipeline")
+
+    monkeypatch.setattr(cli, "execute_run", fail_execute_run)
+
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        cli, "launch_pipeline", lambda argv, **kw: launched.append(argv) or (0, "", "")
+    )
+
+    assert cli.main(["run", "nightly-pipeline"]) == 0
+    assert len(launched) == 1
