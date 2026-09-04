@@ -54,6 +54,12 @@ DEFAULT_FAILURE_MARKERS: tuple[str, ...] = ("Free usage exceeded",)
 # tests can adjust it, same style as READY_POLL_INTERVAL_S.
 WATCHDOG_POLL_INTERVAL_S = 30.0
 
+# Bound for the one-shot no_report nudge (issue 032): a settled idle/done agent that wrote no
+# (or an empty) $ROUTINE_REPORT is nudged once, on the same still-open agent, to write it. This
+# is a small top-up prompt, not another full run — job.timeout_ms is already spent by the time
+# this fires — so it gets its own short, fixed budget. Module-level so tests can adjust it.
+NUDGE_TIMEOUT_MS = 120_000
+
 
 def _error_body_code(e: HerdrCliError) -> str | None:
     """The parsed error body's error.code when it is a string, else None. Never raises: both
@@ -244,6 +250,25 @@ def _capture_session_id(client: HerdrClient, target: str) -> str | None:
         return None
 
 
+def _attempt_report_nudge(
+    client: HerdrClient, *, target: str, report_path: Path
+) -> None:
+    """One bounded, non-looping follow-up prompt to the same still-open agent for a settled
+    idle/done run that produced no (or an empty) $ROUTINE_REPORT — issue 032. Real Pi history
+    showed this is usually a free-tier model that did the real work but dropped the prompt's
+    final "write the summary" step, not a job misconfiguration; retrying the whole job (issue
+    008) isn't safe here because it risks duplicate side effects (e.g. a second review
+    comment), so this asks only for the missing report and never repeats the job's original
+    (possibly side-effecting) instructions. Raises HerdrCliError/OSError on failure or timeout
+    exactly like the initial prompt send — the caller never retries this call; any exception
+    here falls straight through to the existing no_report failure path."""
+    prompt = (
+        f"You appear to have finished without writing a summary to {report_path}. "
+        "Write one now describing what you did."
+    )
+    client.agent_prompt_wait(target=target, text=prompt, timeout_ms=NUDGE_TIMEOUT_MS)
+
+
 def default_reports_dir() -> Path:
     import os
 
@@ -314,6 +339,7 @@ class RunOutcome:
     report_path: str | None = None
     duration_seconds: float | None = None
     session_id: str | None = None
+    nudged: bool = False  # issue 032: a no_report settle got one follow-up prompt
 
 
 def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
@@ -626,12 +652,38 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             state="failed", reason=f"unsettled_status_{settled_status}", **common
         )
 
-    # Both remaining outcomes are a settled idle/done agent — pane-lifecycle v2: close our own
-    # pane now instead of leaving it for the next run's stale-pane reap (root-mode jobs share
-    # the ambient workspace and are never auto-closed, same guard as the pre-run reap above;
-    # skip capturing a session id too, since there's nothing to resume-and-inspect for a pane
-    # that's never closed). Session id is captured before closing since a closed pane's agent
-    # record won't answer `agent get` afterwards.
+    # Both remaining outcomes are a settled idle/done agent. Before closing our pane (issue
+    # 032): a settle with no report, or an empty one, gets exactly one bounded follow-up
+    # prompt to the same still-open agent asking it to write the summary it skipped — real Pi
+    # history showed this is usually a free-tier model dropping the prompt's last step, not a
+    # job failure. This must happen before _close_run_pane below (worktree mode) or the agent
+    # would no longer be reachable; root-mode jobs never close their pane either way, so the
+    # nudge applies identically there.
+    nudged = False
+    if not report_written or report_bytes == 0:
+        nudged = True
+        try:
+            _attempt_report_nudge(
+                client, target=job.agent_name, report_path=report_path
+            )
+        except (HerdrCliError, OSError) as e:
+            # Never loop: any nudge failure/timeout falls straight through to the existing
+            # no_report path below, exactly as if the nudge had never been attempted.
+            log.warning("%s: no_report nudge failed: %s", job.name, e)
+        report_written = report_path.exists()
+        report_bytes = report_path.stat().st_size if report_written else 0
+        common["report_written"] = report_written
+        common["report_bytes"] = report_bytes
+        common["report_path"] = str(report_path) if report_written else None
+        # The nudge can itself take real wall-clock time (up to NUDGE_TIMEOUT_MS); reflect it
+        # in the recorded duration rather than the pre-nudge snapshot taken above.
+        common["duration_seconds"] = (datetime.now(UTC) - started_at).total_seconds()
+
+    # Pane-lifecycle v2: close our own pane now instead of leaving it for the next run's
+    # stale-pane reap (root-mode jobs share the ambient workspace and are never auto-closed,
+    # same guard as the pre-run reap above; skip capturing a session id too, since there's
+    # nothing to resume-and-inspect for a pane that's never closed). Session id is captured
+    # before closing since a closed pane's agent record won't answer `agent get` afterwards.
     session_id: str | None = None
     if job.workspace != "root":
         session_id = _capture_session_id(client, job.agent_name)
@@ -640,9 +692,13 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     if not report_written or report_bytes == 0:
         # Direct response to the research repo's standing pattern that unattended scheduled
         # runs fail silently and plausibly (docs/plan-v1.md §6): a clean settle with no report,
-        # or an empty one, is not "done".
+        # or an empty one, is not "done" — even after the one-shot nudge above.
         return RunOutcome(
-            state="failed", reason="no_report", session_id=session_id, **common
+            state="failed",
+            reason="no_report",
+            session_id=session_id,
+            nudged=nudged,
+            **common,
         )
 
-    return RunOutcome(state="done", session_id=session_id, **common)
+    return RunOutcome(state="done", session_id=session_id, nudged=nudged, **common)

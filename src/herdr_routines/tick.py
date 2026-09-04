@@ -1109,6 +1109,8 @@ def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
         extra["reason"] = outcome.reason
     if outcome.error:
         extra["error"] = outcome.error
+    if outcome.nudged:
+        extra["nudged"] = True
     return extra
 
 

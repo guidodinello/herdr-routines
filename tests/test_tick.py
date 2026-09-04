@@ -371,6 +371,54 @@ def test_fallback_model_retried_once_after_quota_exhausted(
     assert fallback_done.run_id == fallback_running.run_id != primary_run.run_id
 
 
+class NudgeWritesReportClient(FakeClient):
+    """The job's own prompt settles idle/done without writing a report; the issue-032
+    no_report nudge (the second agent_prompt_wait call) is what actually writes it. Verifies
+    the nudge's `RunOutcome.nudged` flag reaches the terminal history record via
+    `_outcome_extra`, not just the in-process RunOutcome."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._prompt_calls = 0
+        self._report_path: Path | None = None
+
+    def agent_prompt_wait(self, *, target, text, timeout_ms):
+        self._maybe_raise("agent_prompt_wait")
+        self._prompt_calls += 1
+        if self._prompt_calls == 1:
+            # The job's own prompt has $ROUTINE_REPORT already substituted to a real path
+            # (see runner.execute_run); capture it, but don't write it yet. The nudge prompt
+            # (the second call) references the same path in prose, not as its last token, so
+            # it can't be re-derived from `text` the way the first call's can.
+            self._report_path = Path(text.rsplit(maxsplit=1)[-1])
+        elif self._prompt_calls >= 2 and self._report_path is not None:
+            self._report_path.write_text("# ok\n")
+        return self.settle_status
+
+
+def test_history_records_a_nudged_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance (issue 032): when the one-shot no_report nudge is what produces the report,
+    the run's terminal history record distinguishes it from a first-try success."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = NudgeWritesReportClient(settle_status="idle")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    records = read_job(history_path, job.name)
+    done_record = next(r for r in records if r.state == "done")
+    assert done_record.extra is not None
+    assert done_record.extra["nudged"] is True
+
+
 def test_fallback_retry_uses_a_distinct_branch_in_worktree_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -266,6 +266,10 @@ def test_execute_run_success_writes_report(
     # pane-lifecycle v2: a successful run closes its own pane immediately rather than leaving
     # it for the next run's stale-pane reap.
     assert client.closed_panes == ["w1:p1"]
+    # A first-try report means the no_report nudge (issue 032) is never sent: exactly one
+    # agent_prompt_wait call above, and outcome.nudged stays False.
+    assert client.calls.count("agent_prompt_wait") == 1
+    assert outcome.nudged is False
 
 
 def test_execute_run_done_status_also_succeeds(
@@ -281,7 +285,8 @@ def test_execute_run_done_status_also_succeeds(
 
 def test_execute_run_missing_report_is_failed_not_done(tmp_path: Path) -> None:
     """Direct test of the post-run verification in docs/plan-v1.md §6: a clean settle with no
-    report file must not be recorded as done."""
+    report file must not be recorded as done, even after the issue-032 nudge also produces
+    nothing."""
     job = make_job(tmp_path)
     client = ScriptedClient(agent_status="idle", write_report_at=None)
     outcome = execute_run(job, client, run_id="a-run3")  # type: ignore[arg-type]
@@ -290,6 +295,107 @@ def test_execute_run_missing_report_is_failed_not_done(tmp_path: Path) -> None:
     # A no-report settle is still an idle/done agent — pane-lifecycle v2 closes it too.
     assert outcome.session_id == "ses_fake123"
     assert client.closed_panes == ["w1:p1"]
+    # The nudge was attempted (one extra agent_prompt_wait beyond the original prompt) but
+    # produced no report, so the run still fails exactly as before this nudge existed.
+    assert outcome.nudged is True
+    assert client.calls.count("agent_prompt_wait") == 2
+
+
+class NudgeWritesReportClient(ScriptedClient):
+    """Settles idle/done without writing a report on the job's own prompt (the first
+    agent_prompt_wait call); the issue-032 no_report nudge (the second call) is what actually
+    writes it — modeling the free-tier model that did the real work but dropped the final
+    "write the summary" step until asked again."""
+
+    def __init__(self, *, report_path: Path, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._report_path = report_path
+        self._prompt_calls = 0
+
+    def agent_prompt_wait(self, *, target, text, timeout_ms):
+        self.calls.append("agent_prompt_wait")
+        self._prompt_calls += 1
+        if self._prompt_calls >= 2:
+            self._report_path.parent.mkdir(parents=True, exist_ok=True)
+            self._report_path.write_text("# Nudged report\n\nDid the thing.\n")
+        return self.agent_status
+
+
+def test_execute_run_nudge_success_ends_done_and_records_nudged(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Acceptance: if the one-shot nudge produces a non-empty report, the run ends `done` (not
+    `no_report`), and the outcome records that a nudge was needed."""
+    job = make_job(tmp_path)
+    run_id = "a-run-nudge-ok"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = NudgeWritesReportClient(agent_status="idle", report_path=report_path)
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert outcome.reason is None
+    assert outcome.report_written is True
+    assert outcome.report_bytes > 0
+    assert outcome.nudged is True
+    # Pins the nudge strictly before the pane close (worktree mode): the second
+    # agent_prompt_wait call must land between the diagnostic tail read and pane_close, or the
+    # still-open agent would no longer be reachable.
+    assert client.calls == [
+        "settled_agent_pane",
+        "worktree_create",
+        "agent_start",
+        "agent_interactive_ready",
+        "agent_prompt_wait",
+        "agent_read",
+        "agent_prompt_wait",
+        "agent_session_id",
+        "pane_close",
+    ]
+
+
+class NudgeErrorsClient(ScriptedClient):
+    """The job's own prompt settles idle/done with no report; the issue-032 nudge (the second
+    agent_prompt_wait call) itself errors — the nudge must never be retried, and the run must
+    fall through to today's exact no_report failure."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._prompt_calls = 0
+
+    def agent_prompt_wait(self, *, target, text, timeout_ms):
+        self.calls.append("agent_prompt_wait")
+        self._prompt_calls += 1
+        if self._prompt_calls >= 2:
+            raise HerdrCliError("nudge boom", exit_code=1)
+        return self.agent_status
+
+
+def test_execute_run_nudge_error_falls_through_to_no_report(tmp_path: Path) -> None:
+    job = make_job(tmp_path)
+    client = NudgeErrorsClient(agent_status="idle", write_report_at=None)
+    outcome = execute_run(job, client, run_id="a-run-nudge-err")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "no_report"
+    assert outcome.nudged is True
+    assert client.calls.count("agent_prompt_wait") == 2
+    # Never loops: exactly one nudge attempt even though it errored.
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_execute_run_nudge_applies_in_root_mode(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Root-mode jobs never close a pane, but the nudge must still fire and still be able to
+    turn a no_report settle into `done`."""
+    job = make_job(tmp_path, workspace="root")
+    run_id = "a-run-nudge-root"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = NudgeWritesReportClient(agent_status="idle", report_path=report_path)
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert outcome.nudged is True
+    assert client.calls.count("agent_prompt_wait") == 2
+    assert "pane_close" not in client.calls
+    assert outcome.session_id is None
 
 
 def test_execute_run_blocked_status_is_failed_with_reason(
