@@ -693,9 +693,12 @@ def test_cmd_run_pipeline_never_calls_execute_run(
     monkeypatch.setattr(cli, "execute_run", fail_execute_run)
 
     launched: list[list[str]] = []
-    monkeypatch.setattr(
-        cli, "launch_pipeline", lambda argv, **kw: launched.append(argv) or (0, "", "")
-    )
+
+    def fake_launch(argv, **kw):
+        launched.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "launch_pipeline", fake_launch)
 
     assert cli.main(["run", "nightly-pipeline"]) == 0
     assert len(launched) == 1
