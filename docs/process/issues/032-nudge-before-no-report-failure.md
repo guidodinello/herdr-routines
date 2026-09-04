@@ -1,7 +1,7 @@
 ---
 id: "032"
 title: "One-shot nudge before declaring no_report failure"
-status: open
+status: done
 priority: medium
 area: runner
 ---
