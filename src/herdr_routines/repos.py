@@ -39,7 +39,7 @@ def default_repos_dir() -> Path:
     return base / "repos"
 
 
-def ensure_repo(job: Job, *, repos_dir: Path | None = None) -> Path:
+def ensure_repo(job: Job) -> Path:
     """Ensure the job's checkout exists and is up-to-date.
 
     For ``repository:`` jobs:
@@ -50,9 +50,9 @@ def ensure_repo(job: Job, *, repos_dir: Path | None = None) -> Path:
     must already exist, it is never cloned): fetch + fast-forward on every
     run, same as ``repository:`` jobs.
 
-    ``repos_dir`` is accepted for callers that pre-resolve the managed repos
-    base dir (e.g. via ``default_repos_dir``); ``job.repo`` is already the
-    resolved checkout path, so it is not otherwise used here.
+    ``job.repo`` is already the resolved checkout path (``config.py`` resolves
+    it against ``default_repos_dir()`` for ``repository:`` jobs at load time),
+    so no separate ``repos_dir`` parameter is needed here.
 
     Returns the checkout path on success.  Raises ``RuntimeError`` on
     clone/sync failure so callers can map it to a terminal ``RunOutcome``.

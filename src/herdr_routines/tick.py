@@ -1260,13 +1260,10 @@ def _process_job(
             job.name,
             job.fallback_model,
         )
-        # `now` (wall-clock), not `result.occurrence`: build_branch_name derives the branch
-        # suffix from run_id's own trailing timestamp, keyed on job.name alone (not run_id's
-        # prefix) — reusing `result.occurrence` here would produce byte-identical branch names
-        # for the primary and fallback attempts, so `worktree_create` collides with the
-        # primary's still-existing branch/worktree for every workspace:worktree job (the
-        # default, and what fitted-pr-review* uses). Confirmed by two independent code reviews
-        # on PR #65.
+        # `now` (wall-clock) rather than `result.occurrence` for the fallback's own run_id
+        # (both are fine now that `build_branch_name` is injective in run_id — see its
+        # docstring — but keeping `now` preserves the original PR #65 intent of the fallback
+        # attempt recording when it actually ran, not the primary's scheduled occurrence).
         fallback_run_id = make_run_id(f"{job.name}-fallback", now)
         append(
             history_path,

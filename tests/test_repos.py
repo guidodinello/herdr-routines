@@ -105,7 +105,7 @@ def test_repo_url_clone_if_missing(tmp_path: Path) -> None:
     repos_dir = tmp_path / "repos"
     checkout = repos_dir / "a"
     job = make_job(tmp_path, repository=f"file://{bare}", repo=checkout, base=base)
-    result = ensure_repo(job, repos_dir=repos_dir)
+    result = ensure_repo(job)
     assert result == checkout
     assert (checkout / ".git").exists()
 
@@ -123,7 +123,7 @@ def test_repo_url_fetch_fast_forward(tmp_path: Path) -> None:
     checkout = repos_dir / "a"
     job = make_job(tmp_path, repository=f"file://{bare}", repo=checkout, base=base)
     # First run: clone
-    ensure_repo(job, repos_dir=repos_dir)
+    ensure_repo(job)
 
     # Push a new commit to bare
     tmp_work = tmp_path / "work"
@@ -163,7 +163,7 @@ def test_repo_url_fetch_fast_forward(tmp_path: Path) -> None:
     )
 
     # Second run: fetch + fast-forward
-    ensure_repo(job, repos_dir=repos_dir)
+    ensure_repo(job)
     assert (checkout / "NEW.md").exists()
 
 
@@ -251,7 +251,7 @@ def test_repo_url_clone_failed_clean(tmp_path: Path) -> None:
         repo=checkout,
     )
     with pytest.raises(RuntimeError):
-        ensure_repo(job, repos_dir=repos_dir)
+        ensure_repo(job)
     # No partial checkout left behind
     assert not checkout.exists()
     # No tmp dirs left behind
@@ -272,7 +272,7 @@ def test_repo_url_repo_sync_failed_non_fast_forward(tmp_path: Path) -> None:
     checkout = repos_dir / "a"
     job = make_job(tmp_path, repository=f"file://{bare}", repo=checkout, base=base)
     # Clone
-    ensure_repo(job, repos_dir=repos_dir)
+    ensure_repo(job)
 
     # Create a local commit on main (diverged from bare)
     subprocess.run(
@@ -340,7 +340,7 @@ def test_repo_url_repo_sync_failed_non_fast_forward(tmp_path: Path) -> None:
 
     # Fetch + merge should fail (non-fast-forward or unrelated histories)
     with pytest.raises(RuntimeError):
-        ensure_repo(job, repos_dir=repos_dir)
+        ensure_repo(job)
 
     # Local checkout left untouched (LOCAL.md still there, REMOTE.md not added)
     assert (checkout / "LOCAL.md").exists()

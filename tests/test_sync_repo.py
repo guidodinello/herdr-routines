@@ -7,6 +7,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from herdr_routines import cli
 
 
@@ -122,8 +124,6 @@ def test_sync_repo_fails_loudly_on_non_fast_forward(tmp_path: Path) -> None:
     assert not (checkout / "REMOTE.md").exists()
 
 
-def test_sync_repo_requires_path(tmp_path: Path) -> None:
-    import pytest
-
+def test_sync_repo_requires_path() -> None:
     with pytest.raises(SystemExit):
         cli.main(["sync-repo", "--base", "main"])

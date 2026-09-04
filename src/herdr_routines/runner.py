@@ -261,8 +261,15 @@ def make_run_id(job_name: str, scheduled_for: datetime) -> str:
 
 
 def build_branch_name(job_name: str, run_id: str) -> str:
-    # run_id already encodes the timestamp, so re-use it rather than duplicating a clock read.
-    return f"auto/{job_name}-{run_id.rsplit('-', 1)[-1]}"
+    # Keep everything past "<job_name>-" (not just the trailing "-"-segment via rsplit):
+    # a fallback retry's run_id is "<job_name>-fallback-<timestamp>", and truncating to the
+    # last segment collapsed it to the same timestamp suffix as the primary attempt whenever
+    # the primary and fallback shared the same second (near-certain in production, since the
+    # timer fires on :00 boundaries — see test_fallback_retry_uses_a_distinct_branch_in_worktree_mode).
+    # Keeping the full remainder makes the branch name injective in run_id instead of relying
+    # on the clock to differ.
+    suffix = run_id.removeprefix(f"{job_name}-")
+    return f"auto/{job_name}-{suffix}"
 
 
 def substitute_prompt(
