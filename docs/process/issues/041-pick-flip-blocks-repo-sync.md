@@ -1,7 +1,7 @@
 ---
 id: "041"
 title: "pick-feature's in-progress flip is an uncommitted edit to a file the merge also touches, so it wedges sync-repo"
-status: open
+status: done
 priority: high
 area: pipeline
 ---

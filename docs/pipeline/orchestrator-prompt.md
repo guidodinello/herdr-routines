@@ -12,16 +12,22 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
   one yourself from the curated backlog instead of asking and waiting (2026-08-25, see
   `ROADMAP.md` § "Autonomous task selection for the pipeline" for why this is scoped narrowly):
   run `herdr-routines pick-feature --issues-dir docs/process/issues --mark-in-progress` in
-  `$REPO_PARENT` and use its stdout verbatim as `FEATURE_IDEA`. Record which issue you picked in
-  `state.json` (`"feature_source": "docs/process/issues/<file>"`) so the report and a human
-  reviewing in the morning can trace the run back to its issue. If the command exits 1 (`no open
-  issues`), **stop and write a report saying so** — do not fabricate a feature idea. This only
-  covers picking *which* Now-horizon item to build; it does not make the pipeline
-  self-scheduling — a human (or `systemd-run --on-calendar`, launcher-side) still decides *when*
-  a run happens. **The implementing PR carries the issue's `status: done` flip** (stage 3
-  commits `status: in-progress` or `open` → `done` on the issue file, so it lands on `main`
-  atomically exactly when the PR merges — merging the PR *is* what closes the issue; this is
-  the only place the flip happens, never a separate manual post-merge step).
+  `$REPO_PARENT` and use its stdout verbatim as `FEATURE_IDEA`. `--mark-in-progress` records the
+  claim out-of-tree (issue 041: it used to write `status: in-progress` into the issue file as an
+  uncommitted edit, which collided with the implementing PR's own edit to the same line and
+  wedged `sync-repo`/`ensure_repo` for every job on that repo path once the PR merged) — so
+  `$REPO_PARENT` stays a clean mirror of `origin/main` after the pick, exactly what `sync-repo`
+  and `ensure_repo` assume. Record which issue you picked in `state.json`
+  (`"feature_source": "docs/process/issues/<file>"`) so the report and a human reviewing in the
+  morning can trace the run back to its issue. If the command exits 1 (`no open issues`), **stop
+  and write a report saying so** — do not fabricate a feature idea. This only covers picking
+  *which* Now-horizon item to build; it does not make the pipeline self-scheduling — a human (or
+  `systemd-run --on-calendar`, launcher-side) still decides *when* a run happens. **The
+  implementing PR carries the issue's `status: done` flip** (stage 3 commits `status: open` →
+  `done` on the issue file — the issue file itself was never touched by the pick, so this is the
+  first edit to it — and it lands on `main` atomically exactly when the PR merges; merging the PR
+  *is* what closes the issue, this is the only place the flip happens, never a separate manual
+  post-merge step).
 - `RUN_ID`: e.g. `20260824T020000Z` (UTC). If not provided, derive `date -u +%Y%m%dT%H%M%SZ`.
 - `REPO_PARENT`: parent clone path, e.g. `~/.local/state/herdr-routines/repos/herdr-routines`
 - `$PIPELINE_REPORT`: path for your final report, e.g. `~/.local/state/herdr-routines/reports/<run_id>.md`
