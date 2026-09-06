@@ -47,6 +47,10 @@ def _no_gh_or_inflight_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     /tmp diagnosis). Individual tests override these to exercise the retained cases."""
     monkeypatch.setattr(gc, "check_open_pr", lambda repo, branch: False)
     monkeypatch.setattr(gc, "check_inflight", lambda branch, **kwargs: False)
+    # Issue 042: is_merged's batched gh lookup gets the same hermetic default — no test
+    # here should shell out to a real `gh` just because it created an auto/* branch.
+    # Tests exercising squash-merge detection override this explicitly.
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo: set())
 
 
 def _gc(repo: Path, capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
@@ -175,6 +179,102 @@ def test_gc_non_pipeline_branches_unaffected(
     assert _rows(out)[real] == ("no", "yes")
     assert "1 branch(es) listed" in out
     assert checked == []
+
+
+# ---------------------------------------------------------------------------
+# Issue 042: squash-merge detection via gh, not ancestry alone
+# ---------------------------------------------------------------------------
+
+
+def _squash_merge(repo: Path, branch: str, filename: str) -> None:
+    """Build the one topology this repo actually produces: `branch` gets its own
+    commit(s), then `base` gets a *new* commit carrying the same content — landed the
+    way a squash-merged PR lands, not by merging or fast-forwarding `branch` into it.
+    `branch`'s own commit is deliberately never made reachable from `base`, so
+    `git merge-base --is-ancestor branch base` stays false — the exact gap issue 042
+    reports."""
+    _git(repo, "checkout", "-b", branch)
+    (repo / filename).write_text("squashed content\n")
+    _git(repo, "add", filename)
+    _git(repo, "commit", "-m", f"work on {branch}")
+    _git(repo, "checkout", "main")
+    _git(repo, "merge", "--squash", branch)
+    _git(repo, "commit", "-m", f"squash-merge {branch} (#1)")
+
+
+def test_gc_detects_squash_merged_branch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 1: a squash-merged auto/* branch — never an ancestor of base, because
+    it lands as a brand-new commit on base with no second parent — is reported merged
+    once GitHub's PR record says so."""
+    branch = "auto/fix-thing-20260901T000000Z"
+    _squash_merge(repo, branch, "thing.txt")
+    assert not gc.is_merged(branch, "main", repo, set()), (
+        "test setup bug: branch must NOT be an ancestor of base for this to test "
+        "squash-merge detection rather than ordinary ancestry"
+    )
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {branch})
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert _rows(out)[branch] == ("no", "yes")
+
+
+def test_gc_lists_squash_merged_pipeline_branch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 2: a squash-merged auto/pipeline-* branch with no open PR is listed
+    as eligible — same as any other merged auto/* branch (issue 039's retention only
+    kicks in for a still-unmerged, still-open, or still-in-flight pipeline branch)."""
+    pipeline = "auto/pipeline-nightly-20260901T000000Z"
+    _squash_merge(repo, pipeline, "pipeline.txt")
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {pipeline})
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert _rows(out)[pipeline] == ("no", "yes")
+
+
+def test_gc_open_pr_branch_not_merged(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 3: a branch with an open PR (never merged, so `gh pr list --state
+    merged` never names it) is not reported merged — an open PR alone can't spuriously
+    flip the merged column."""
+    branch = "auto/wip-thing-20260901T000000Z"
+    wt = repo.parent / "wt-wip-open-pr"
+    _git(repo, "worktree", "add", str(wt), "-b", branch)
+    (wt / "wip.txt").write_text("in review\n")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-m", f"work on {branch}")
+    monkeypatch.setattr(gc, "check_open_pr", lambda repo_, b: b == branch)
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert _rows(out)[branch] == ("yes", "no")
+
+
+def test_gc_unmerged_branch_not_reported_merged(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 4: a genuinely unmerged branch — no PR at all, merged or open — is
+    not reported merged. Guards against is_merged's gh-authority addition producing a
+    false positive when gh legitimately has nothing to say about the branch."""
+    branch = "auto/unmerged-thing-20260901T000000Z"
+    wt = repo.parent / "wt-unmerged"
+    _git(repo, "worktree", "add", str(wt), "-b", branch)
+    (wt / "wip.txt").write_text("still in progress\n")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-m", "wip")
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert _rows(out)[branch] == ("yes", "no")
 
 
 _REAL_CHECK_INFLIGHT = gc.check_inflight
@@ -616,6 +716,26 @@ def test_gc_delete_is_exactly_dry_run_candidates(
     rows_dict = _rows(out)
     merged_branches = {name for name, (_, mg) in rows_dict.items() if mg == "yes"}
     assert deleted_no_force == merged_branches
+
+
+def test_gc_delete_removes_squash_merged_branch_without_force(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue 042 changes what merged_into_base means, not the delete gate itself: a
+    squash-merged non-pipeline branch is now truthfully merged, so (same as any other
+    merged branch, gate unchanged) it's a no-force delete candidate."""
+    branch = "auto/fix-thing-20260901T000000Z"
+    _squash_merge(repo, branch, "thing.txt")
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {branch})
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" in out
+    remaining = _git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
+    ).stdout
+    assert branch not in remaining
 
 
 def test_gc_delete_excludes_pipeline(
