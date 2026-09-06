@@ -20,6 +20,24 @@ BRANCH  WORKTREE-EXISTS  MERGED-INTO-BASE
 
 Still zero, with 23 stale worktrees (2.4 GB) on disk.
 
+> **Correction (2026-09-06, after this issue shipped as PR #92):** the command
+> above was run from `~/projects/herdr-routines` — the *runner* checkout, which
+> holds **0** `auto/*` branches. `gc --repo` defaults to the current directory, and
+> the 21 stale branches live in the *work-target* clone at
+> `~/.local/state/herdr-routines/repos/herdr-routines`. `0 branch(es) listed` was
+> the correct answer to a question about the wrong repository, so **this was not
+> valid evidence that issue 039 had failed.**
+>
+> The reasoning in this issue stands on its own without it: `merge-base
+> --is-ancestor` genuinely cannot detect a squash merge, which is how every PR in
+> this repo lands, and 039's implementing agent flagged the gap independently.
+> But the empirical claim was wrong and is corrected here rather than quietly left
+> in the record.
+>
+> Pointed at the right clone after #92 shipped, `gc --dry-run` lists **20 branches,
+> 20 merged**. Whether #90 alone would have produced that table was never
+> established — it would need a revert to find out.
+
 The cause is the merge check itself. `is_merged` uses
 `git merge-base --is-ancestor <branch> <base>`, which answers *"are this branch's
 commits reachable from base?"* **This repository squash-merges** — every PR lands
