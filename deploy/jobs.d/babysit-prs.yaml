@@ -17,7 +17,7 @@ base: main
 max_workers_per_tick: 3 # one fix worker per flagged PR, <=3/tick
 max_attempts_per_target: 3 # retry budget, keyed per PR
 checks:
-  - pr_health # builtin: CI red OR review threads unresolved; polls gh, never spawns
+  - pr_health: null # builtin: CI red OR review threads unresolved; polls gh, never spawns
 agent_kind: opencode
 model: null
 prompt: "" # empty = pipeline-injected fix prompt template (seeded with the flagged PR's output)

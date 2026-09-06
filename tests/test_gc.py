@@ -12,7 +12,7 @@ import os
 import shutil
 import socket
 import subprocess
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -1298,3 +1298,242 @@ def test_gc_delete_review_tiers_present() -> None:
         assert "confidence:" in lower, (
             f"missing confidence: in acceptance line: {line[:80]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue 047: the age gate must not be defeated by a branch that never commits
+# ---------------------------------------------------------------------------
+
+
+def test_branch_age_prefers_run_stamp_over_base_tip(repo: Path) -> None:
+    """Acceptance 1: a branch cut from an old base and never committed to takes its age
+    from the RUN_ID stamp in its name, not from the base commit it happens to point at.
+
+    This is the shape that broke issue 044 in production: a review job branches, posts a
+    review, commits nothing — so the tip IS the base, and the tip date describes when the
+    *base* was written.
+    """
+    _git_with_date(
+        repo, "2026-08-21T19:11:06-03:00", "commit", "--allow-empty", "-m", "old base"
+    )
+    branch = "auto/fitted-pr-review-20260903T120000Z"
+    _git(repo, "branch", branch, "HEAD")
+
+    now = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
+    age = gc.branch_age_days(repo, branch, None, now=now)
+
+    # 2026-09-03T12:00Z -> 2026-09-06T12:00Z is 3 days; the base tip is ~16.
+    assert 2.9 < age < 3.1, f"took the base tip date instead of the run stamp: {age}"
+
+
+def test_branch_ages_differ_for_same_base_commit(repo: Path) -> None:
+    """Acceptance 2: two branches cut from the same commit on different days report
+    different ages. Measured on the Pi, 43 of 47 branches shared one identical age."""
+    _git_with_date(
+        repo,
+        "2026-08-21T19:11:06-03:00",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "shared base",
+    )
+    older = "auto/fitted-pr-review-20260824T090000Z"
+    newer = "auto/fitted-pr-review-20260903T120000Z"
+    _git(repo, "branch", older, "HEAD")
+    _git(repo, "branch", newer, "HEAD")
+    assert (
+        _git(repo, "rev-parse", older).stdout == _git(repo, "rev-parse", newer).stdout
+    )
+
+    now = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
+    age_older = gc.branch_age_days(repo, older, None, now=now)
+    age_newer = gc.branch_age_days(repo, newer, None, now=now)
+
+    assert age_older > age_newer
+    assert age_older - age_newer > 9
+
+
+def test_recent_noncommit_branch_survives_age_threshold(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 3: the whole point — a recent no-commit branch is retained by the
+    default threshold instead of being collected on a fabricated age."""
+    _git_with_date(
+        repo, "2026-08-21T19:11:06-03:00", "commit", "--allow-empty", "-m", "old base"
+    )
+    recent = f"auto/fitted-pr-review-{datetime.now(UTC):%Y%m%dT%H%M%S}Z"
+    _git(repo, "branch", recent, "HEAD")
+
+    code = cli.main(
+        [
+            "gc",
+            "--delete",
+            "--yes",
+            "--force",
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--older-than",
+            "14",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert f"deleted: {recent}" not in out
+    assert (
+        recent
+        in _git(
+            repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
+        ).stdout
+    )
+
+
+def test_unknown_age_retains_branch(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 4: an unreadable age retains the branch. A destructive operation must
+    fail closed — previously an unknown age returned +inf, which cleared any threshold."""
+    _git(repo, "commit", "--allow-empty", "-m", "base")
+    branch = "auto/no-stamp-here"  # no RUN_ID to parse
+    _git(repo, "branch", branch, "HEAD")
+    monkey = gc._tip_committer_date
+    try:
+        gc._tip_committer_date = lambda repo_, branch_: None  # type: ignore[assignment]
+        age = gc.branch_age_days(repo, branch, None)
+        assert age == float("-inf")
+        row = gc.Row(
+            branch=branch, worktree_exists=False, merged_into_base=True, age_days=age
+        )
+        assert gc.collectible(row, 14) is False
+    finally:
+        gc._tip_committer_date = monkey  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Issue 048: the orphan scan must follow --repo, never a hardcoded project dir
+# ---------------------------------------------------------------------------
+
+
+def _repo_with_worktree(repo: Path, root: Path, name: str) -> Path:
+    """Register a worktree of *repo* under *root*, so root becomes its derived home."""
+    root.mkdir(parents=True, exist_ok=True)
+    wt = root / name
+    _git(repo, "worktree", "add", str(wt), "-b", f"auto/{name}")
+    return wt
+
+
+def test_gc_orphan_scan_follows_target_repo(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 1: the sweep scans the directory holding *this* repo's worktrees,
+    derived from its own registrations — not a constant."""
+    _git(repo, "commit", "--allow-empty", "-m", "base")
+    mine = tmp_path / "worktrees" / "myrepo"
+    _repo_with_worktree(repo, mine, "live-20260901T000000Z")
+    (mine / "auto-orphan-20260101T000000Z").symlink_to(tmp_path / "gone")
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert "auto-orphan-20260101T000000Z" in out
+    assert "dangling symlink" in out
+
+
+def test_gc_never_reports_other_repo_worktree_as_orphan(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance 2: a live worktree belonging to a different project is never listed.
+
+    Reproduces the production condition precisely: the hardcoded default is pointed at
+    the *other* project's directory, exactly as `_default_pipeline_worktrees_root()`
+    did for every repo that was not herdr-routines. Without pinning the default this
+    test passes for the wrong reason — the real default simply does not exist under
+    tmp_path — so it would not have caught the bug it is named for.
+    """
+    _git(repo, "commit", "--allow-empty", "-m", "base")
+    mine = tmp_path / "worktrees" / "myrepo"
+    _repo_with_worktree(repo, mine, "live-20260901T000000Z")
+
+    other = tmp_path / "worktrees" / "someone-else"
+    other.mkdir(parents=True)
+    # An empty dir and a dangling symlink are both *collectible* — under the bug these
+    # would not merely be listed, they would be deleted out of another project.
+    (other / "auto-pipeline-20260903t050016z").mkdir()
+    (other / "auto-pipeline-19990101T000000Z").symlink_to(tmp_path / "gone")
+    monkeypatch.setattr(gc, "_default_pipeline_worktrees_root", lambda: other)
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert "someone-else" not in out
+    assert "auto-pipeline-20260903t050016z" not in out
+    assert "auto-pipeline-19990101T000000Z" not in out
+    # And nothing in the other project was touched.
+    assert (other / "auto-pipeline-20260903t050016z").is_dir()
+    assert (other / "auto-pipeline-19990101T000000Z").is_symlink()
+
+
+def test_gc_skips_orphan_sweep_on_unrelated_root(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 3: a root holding none of this repo's worktrees is skipped with a
+    warning, not swept. Listing (or deleting) another project's entries is the bug."""
+    _git(repo, "commit", "--allow-empty", "-m", "base")
+    mine = tmp_path / "worktrees" / "myrepo"
+    _repo_with_worktree(repo, mine, "live-20260901T000000Z")
+
+    unrelated = tmp_path / "worktrees" / "unrelated"
+    unrelated.mkdir(parents=True)
+    (unrelated / "auto-victim-20260101T000000Z").symlink_to(tmp_path / "gone")
+
+    code = cli.main(
+        [
+            "gc",
+            "--dry-run",
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--worktrees-root",
+            str(unrelated),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "skipping orphan sweep" in captured.err
+    assert "auto-victim-20260101T000000Z" not in captured.out
+    assert (unrelated / "auto-victim-20260101T000000Z").is_symlink()
+
+
+def test_gc_worktrees_root_override_respected(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 4: an explicit --worktrees-root still wins when it does hold this
+    repo's worktrees — the override must survive the new derivation."""
+    _git(repo, "commit", "--allow-empty", "-m", "base")
+    mine = tmp_path / "worktrees" / "myrepo"
+    _repo_with_worktree(repo, mine, "live-20260901T000000Z")
+    (mine / "auto-orphan-20260101T000000Z").symlink_to(tmp_path / "gone")
+
+    code = cli.main(
+        [
+            "gc",
+            "--dry-run",
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--worktrees-root",
+            str(mine),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "auto-orphan-20260101T000000Z" in out
