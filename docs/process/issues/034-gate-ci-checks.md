@@ -1,7 +1,7 @@
 ---
 id: "034"
 title: "Pipeline never gates on CI: a red PR passes every stage"
-status: open
+status: done
 priority: high
 area: pipeline
 ---

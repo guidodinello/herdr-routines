@@ -1,7 +1,7 @@
 ---
 id: "035"
 title: "Gate 6 measures blocking-count, not reply coverage — unanswered threads pass"
-status: open
+status: done
 priority: high
 area: pipeline
 ---
