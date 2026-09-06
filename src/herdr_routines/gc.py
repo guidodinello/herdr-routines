@@ -447,11 +447,12 @@ def run_gc_delete(
         # (or reuses it) and the same dict drives removals below — no second scan (spec
         # "Execution ordering per branch" step 1).
         rows, listing_failed, worktrees = collect_rows(root, resolved_base)
-        # Issue 039 only restores an honest dry-run inventory; the delete half stays
-        # exactly as gated as before — every auto/pipeline-* branch is excluded
-        # unconditionally here, never just the ones pipeline_branch_retained() would
-        # flag. Nothing new becomes deletable by this change.
-        rows = [r for r in rows if not r.branch.startswith(PIPELINE_PREFIX)]
+        # Issue 043: the same predicate dry-run uses, so both halves of `gc` share one
+        # definition of "still needed" (they disagreed after 039, which scoped itself to
+        # the inventory). Applied to `rows` *before* `candidates` is derived, so a
+        # retained branch never reaches the `--force` path that skips the merged check:
+        # an unmerged or in-flight pipeline branch is still untouchable with --force.
+        rows = [r for r in rows if not pipeline_branch_retained(root, r)]
         candidates = [r for r in rows if r.stale]
 
         if listing_failed:
