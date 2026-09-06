@@ -29,6 +29,26 @@ In progress or ready to build; no real-run evidence required.
 
 - **Overnight feature-pipeline orchestrator (POC)** — `in-progress`, 4 real
   dogfood runs so far. → [`004-overnight-feature-pipeline-poc.md`](docs/process/issues/004-overnight-feature-pipeline-poc.md)
+- **Pipeline never gates on CI: a red PR passes every stage** — `open`,
+  `high`. Gate 3 only runs `pytest`; nothing calls `gh pr checks` or reads
+  `statusCheckRollup`, so a PR with failing `ruff format --check`/`ruff
+  check` still gets `## Outcome: ok` (hit on PR #81). →
+  [`034`](docs/process/issues/034-gate-ci-checks.md)
+- **Gate 6 measures blocking-count, not reply coverage — unanswered threads
+  pass** — `open`, `high`. Stage 6's contract is fix-and-reply-to-every-
+  thread; the gate only checks for a `[blocking]`-tagged thread, so an
+  unfixed, unanswered non-blocking thread still passes (PR #81). →
+  [`035`](docs/process/issues/035-gate6-reply-coverage.md)
+- **`babysit-prs` can never fix a pipeline PR: worktree collision on the
+  retained branch** — `open`, `high`. Its per-PR worktree checkout collides
+  with the orchestrator's deliberately-retained `auto/pipeline-*` worktree,
+  so it can't touch the 20+ PRs it exists to catch. →
+  [`036`](docs/process/issues/036-babysit-worktree-collision.md)
+- **`pipeline-launch.sh` never inspects settle status: a blocked
+  orchestrator looks like success for 8h** — `open`, `high`. `--wait` exits 0
+  for `blocked` same as `idle`/`done`, and the pane-close cleanup trap
+  destroys the diagnostic screen before anything captures it. →
+  [`037`](docs/process/issues/037-launcher-blocked-settle.md)
 
 Done (kept as `status: done` issue files for history): plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
@@ -66,12 +86,12 @@ gate is considered met). One-liner index; full detail in the issue file.
 - **Pane/session retention policy** — capture the transcript to the history
   log before closing the pane; document the retention window. `low`. →
   [`011`](docs/process/issues/011-pane-session-retention-policy.md)
-- **Worktree GC, delete half** — human-invoked `gc --delete` acting on the
-  dry-run's output; never unattended. `medium`. →
-  [`012`](docs/process/issues/012-worktree-gc-delete-half.md)
-- **Pi `/tmp` tmpfs hygiene** — age-based cleanup of leaked agent-runtime
-  `.so` + pytest artifacts that fill the 2 GB RAM-backed `/tmp` and stall agent
-  starts; distinguish disk-full from quota. `medium`. →
+- **Worktree GC, delete half** — `done` (PR #49). Human-invoked
+  `gc --delete`/`--prune` acting on the dry-run's own output; never
+  unattended. → [`012`](docs/process/issues/012-worktree-gc-delete-half.md)
+- **Pi `/tmp` tmpfs hygiene** — `done` (PR #81). Age-based cleanup of leaked
+  agent-runtime `.so` + pytest artifacts that filled the 2 GB RAM-backed
+  `/tmp` and stalled agent starts. →
   [`027`](docs/process/issues/027-tmp-hygiene.md)
 - **pick-feature: skip issues with an open pipeline PR** — so a later launch
   never re-picks the feature an in-flight run already has an open PR for
@@ -82,17 +102,13 @@ gate is considered met). One-liner index; full detail in the issue file.
   refinement vs the pipeline's implementation refinement), delivered as an
   open PR for the human to merge; nightly 22:00, `opencode` only. `medium`. →
   [`029`](docs/process/issues/029-issue-refinement-job.md)
-- **Fetch+fast-forward every job's repo before every run** — generalize
-  `ensure_repo` to sync `repo:` jobs too (not just `repository:`-managed
-  ones), and give the pipeline launcher the same guarantee instead of
-  running against a possibly-stale local clone (PR #69 branched 2 days / 6
-  PRs behind `main`). `high`. →
-  [`030`](docs/process/issues/030-sync-repo-before-every-run.md)
-- **Pipeline stall watchdog** — automate G-4's manual "morning checklist"
-  into a routine that detects a stalled/dead orchestrator past
-  `deadline_epoch` and kills the orphaned worker instead of it running
-  unnoticed for hours (run `20260903T050016Z`'s stage-6 worker ran 19.5h
-  past deadline before being found and killed by hand). `high`. →
+- **Fetch+fast-forward every job's repo before every run** — `done` (PR
+  #72). Generalized `ensure_repo` to sync plain `repo:` jobs too, not just
+  `repository:`-managed ones (PR #69 had branched 2 days / 6 PRs behind
+  `main`). → [`030`](docs/process/issues/030-sync-repo-before-every-run.md)
+- **Pipeline stall watchdog** — `done` (PR #73). Automates G-4's manual
+  "morning checklist" into a routine that detects a stalled/dead
+  orchestrator past `deadline_epoch` and kills the orphaned worker. →
   [`031`](docs/process/issues/031-pipeline-stall-watchdog.md)
 - **One-shot nudge before `no_report` failure** — give an agent that settled
   idle/done with no summary file one bounded follow-up prompt to write it,
@@ -101,9 +117,9 @@ gate is considered met). One-liner index; full detail in the issue file.
   re-running risks duplicate side effects. `medium`. `done`. →
   [`032`](docs/process/issues/032-nudge-before-no-report-failure.md)
 - **Capture a diagnostic tail on `blocked`, not just other failure paths** —
-  every other failure path in `execute_run` saves a screen tail for
-  post-mortem; `blocked` doesn't, so 3 real `blocked` failures left zero
-  diagnostic evidence. `medium`. →
+  `done` (PR #77). `blocked` settles now save a screen tail like every other
+  failure path in `execute_run` (3 real `blocked` failures had left zero
+  diagnostic evidence). →
   [`033`](docs/process/issues/033-capture-tail-on-blocked.md)
 
 ## Later
@@ -115,12 +131,23 @@ Curated into issue files 2026-08-27. Time-gated items were promoted to
 - **Autonomous task selection for the pipeline** — `done`. `pick-feature` +
   the `docs/process/issues/` structured layer shipped (PR #46); self-*scheduling*
   is out of scope. → [`013`](docs/process/issues/013-autonomous-task-selection.md)
-- **Auto-fix pull requests (standing job)** — `open`, `medium`. Watch CI +
-  review threads on `auto/*` PRs a routine opened, dispatch capped fix
+- **Auto-fix pull requests (standing job)** — `done` (PR #50). Watches CI +
+  review threads on `auto/*` PRs a routine opened, dispatches capped fix
   workers. → [`015`](docs/process/issues/015-auto-fix-pull-requests.md)
-- **`repository: <git-url>` job field** — `open`, `medium`. herdr-routines
-  owns the clone lifecycle (clone-if-missing, fast-forward each run). →
-  [`016`](docs/process/issues/016-repository-git-url-job-field.md)
+- **`repository: <git-url>` job field** — `done` (PR #68). herdr-routines
+  owns the clone lifecycle (clone-if-missing, fetch+fast-forward each run).
+  → [`016`](docs/process/issues/016-repository-git-url-job-field.md)
+- **Auto-fix standing job: checks + target (unified gate model)** — `done`
+  (PR #56). Generalizes the auto-fix job around one model — a job runs an
+  agent, `checks` optionally gate it, any failure spawns the fix agent — so
+  `babysit-prs` and a repo-hygiene lint/typecheck job are the same job
+  shape. →
+  [`025`](docs/process/issues/025-gate-trigger-standing-job.md)
+- **Unify routines + pipeline into one gated-workflow model** — `done` (PR
+  #79). First increment: the pipeline schedules as a dispatched job in
+  `tick` instead of its own detached `systemd-run` launcher; stages stay
+  prompt-hardcoded for now. →
+  [`026`](docs/process/issues/026-pipeline-as-routine.md)
 - **Model selection per job beyond claude/opencode** — `open`, `low`. Extend
   `model` to another `agent_kind` + a validate-time existence check. →
   [`018`](docs/process/issues/018-model-selection-per-job.md)
@@ -152,9 +179,9 @@ Anything else noticed while actually running jobs — add a bullet here, promote
 Now/Next/Later once it's clear it's worth designing properly. Curated into issue
 files 2026-08-27.
 
-- **Switch provider/model on quota exhaustion** — `open`, `medium`. Per-job
-  failover model list on a classified `quota_exhausted` settle; free-tier
-  OpenCode quota modals are the dominant real failure mode. →
+- **Switch provider/model on quota exhaustion** — `done` (PR #65). Per-job
+  `fallback_model` retried once on a classified `quota_exhausted` settle;
+  free-tier OpenCode quota modals are the dominant real failure mode. →
   [`022`](docs/process/issues/022-switch-model-on-quota-exhaustion.md)
 - **Replace the herdr-push Telegram plugin** — `done`. `cokekitten/herdr-telegram-bridge`
   installed + configured on the Pi (2026-08-25); `herdr.push` removed. Residual
