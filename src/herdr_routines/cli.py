@@ -17,11 +17,17 @@ from pathlib import Path
 from logger import get_logger, init_logging
 
 import herdr_routines
+from herdr_routines.auto_fix import RealGhClient
 from herdr_routines.config import (
     ConfigError,
     RoutinesConfig,
     default_config_path,
     load_config,
+)
+from herdr_routines.gates import (
+    remote_owner_and_repo,
+    run_ci_gate,
+    run_gate6,
 )
 from herdr_routines.gc import run_gc, run_gc_delete
 from herdr_routines.herdr import HerdrClient
@@ -207,6 +213,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="merge target for the merged-check (default: origin/HEAD, else main)",
     )
     p_gc.set_defaults(handler=_cmd_gc)
+
+    p_gate = sub.add_parser(
+        "gate",
+        help=(
+            "run a hard pipeline gate and read the result off its exit code "
+            "(issues 034/035: the CI gate and gate 6's reply coverage used to be "
+            "prose in the orchestrator prompt, now real code)"
+        ),
+    )
+    p_gate.add_argument(
+        "--stage",
+        required=True,
+        choices=["ci", "6"],
+        help="which gate to run: 'ci' polls PR checks, '6' checks reply coverage",
+    )
+    p_gate.add_argument("--pr", type=int, required=True, help="PR number to gate")
+    p_gate.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        help="git checkout to resolve the GitHub owner/repo from (default: cwd)",
+    )
+    p_gate.set_defaults(handler=_cmd_gate)
 
     p_pick = sub.add_parser(
         "pick-feature",
@@ -672,6 +701,33 @@ def _cmd_run_pipeline(job, args: argparse.Namespace, *, now: datetime) -> int:
         log.error("%s: launch_failed: %s", job.name, err.strip())
         return 1
     return 0
+
+
+def _cmd_gate(args: argparse.Namespace) -> int:
+    repo_path = args.repo or Path.cwd()
+    try:
+        owner, name = remote_owner_and_repo(repo_path)
+    except RuntimeError as e:
+        print(f"gate {args.stage}: could not resolve owner/repo: {e}", file=sys.stderr)
+        return 1
+
+    gh = RealGhClient()
+    try:
+        if args.stage == "ci":
+            verdict = run_ci_gate(gh, owner=owner, repo=name, pr=args.pr)
+        else:
+            verdict = run_gate6(gh, owner=owner, repo=name, pr=args.pr)
+    except RuntimeError as e:
+        print(f"gate {args.stage} failed: {e}", file=sys.stderr)
+        log.error("gate %s: fail (PR #%d): %s", args.stage, args.pr, e)
+        return 1
+
+    if verdict.passed:
+        log.info("gate %s: pass (PR #%d)", args.stage, args.pr)
+        return 0
+    print(f"gate {args.stage} failed: {verdict.reason}", file=sys.stderr)
+    log.error("gate %s: fail (PR #%d): %s", args.stage, args.pr, verdict.reason)
+    return 1
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
