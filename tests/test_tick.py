@@ -124,6 +124,7 @@ class FakeFullClient:
     def __init__(self, *, settle_status: str = "idle") -> None:
         self._settle_status = settle_status
         self._registered: dict[str, str] = {}
+        self.notifications: list[tuple[str, str | None, str]] = []
 
     def tab_create(self, *, cwd, label=None):
         return "w1:p1"
@@ -171,7 +172,7 @@ class FakeFullClient:
         return dict(self._registered)
 
     def notification_show(self, title, *, body=None, sound="none"):
-        pass
+        self.notifications.append((title, body, sound))
 
 
 def test_recurring_root_job_is_not_skipped_after_its_agent_settles(
@@ -225,6 +226,7 @@ class FakeClient:
         self.quota_exhausted_for_model = quota_exhausted_for_model
         self._last_model: str | None = None
         self._worktree_branches: set[str] = set()
+        self.notifications: list[tuple[str, str | None, str]] = []
 
     def _maybe_raise(self, call: str) -> None:
         if self.fail_at == call:
@@ -294,7 +296,7 @@ class FakeClient:
         return {}
 
     def notification_show(self, title, *, body=None, sound="none"):
-        pass
+        self.notifications.append((title, body, sound))
 
 
 def test_no_failure_when_nothing_is_due(
@@ -763,6 +765,416 @@ def test_auto_fix_tick_max_attempts_skip(
 
     # Verify the attempt count logic works
     assert count >= job.max_attempts_per_target
+
+
+# -- notify_policy (issue 009) --------------------------------------------------------
+#
+# Assert against notifications a fake client actually recorded across a realistic tick,
+# not against the gating predicate in isolation (`_notify_gate` is exercised only as a
+# byproduct here) — the risk this guards against is a call site nobody remembered to gate,
+# which a unit test of the predicate alone would never catch.
+
+
+class EligiblePrGhClient:
+    """gh client returning one PR (#42) eligible via a failing CI check, so the
+    pr-target dispatch loop actually reaches `_dispatch_fix_worker` instead of stopping
+    at an empty enumeration (see MockGhClient above, which returns none)."""
+
+    def api_user(self) -> str:
+        return "testuser"
+
+    def pr_list(self, *, owner, repo, state, limit):
+        return [
+            {
+                "number": 42,
+                "headRefName": "auto/fix-42",
+                "author": {"login": "testuser", "is_bot": False},
+                "url": "https://github.com/test/repo/pull/42",
+            }
+        ]
+
+    def pr_view(self, *, owner, repo, number):
+        return {"statusCheckRollup": [{"name": "ci", "state": "FAILURE"}]}
+
+    def graphql(self, query, **variables):
+        return {
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}
+        }
+
+
+class FakePrDispatchClient:
+    """Enough of HerdrClient to let `_dispatch_fix_worker` settle a fix worker to
+    "idle" without FakeFullClient's report-write trick, which assumes the prompt's last
+    whitespace token is the report path — true for a plain routine's default prompt, not
+    for `auto_fix.build_fix_prompt`'s multi-paragraph text."""
+
+    def __init__(self) -> None:
+        self._registered: dict[str, str] = {}
+        self.notifications: list[tuple[str, str | None, str]] = []
+
+    def tab_create(self, *, cwd, label=None):
+        return "w1:p1"
+
+    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+        self._registered[name] = "working"
+
+    def agent_interactive_ready(self, target):
+        return True
+
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        self._registered[target] = "idle"
+        return "idle"
+
+    def agent_read(self, target, *, lines=200):
+        return ""
+
+    def pane_close(self, pane_id):
+        pass
+
+    def agent_statuses(self) -> dict[str, str]:
+        return dict(self._registered)
+
+    def notification_show(self, title, *, body=None, sound="none"):
+        self.notifications.append((title, body, sound))
+
+
+def _register_and_run_auto_fix_job(
+    job: Job,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    gh_client: object,
+    client: object,
+) -> tuple[Path, Any]:
+    """Register on tick 1, dispatch on tick 2 — the shared shape every auto-fix tick
+    test in this section needs."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(jobs=(job,))
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh_client)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    return history_path, outcome
+
+
+def _register_then_populate_over_cap_pr(
+    job: Job, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Register the job on its own (gh-free) tick, then append 3 terminal attempt
+    records for PR 42 (>= max_attempts_per_target=3) directly to history — so the
+    *next* tick's dispatch loop hits the max_attempts_exceeded skip branch on its first
+    and only pass, rather than a second registration-era tick also reaching (and
+    double-counting notifications from) the dispatch loop."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(jobs=(job,))
+    t_register = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+    run_tick(config, history_path, client=FakeFullClient(), now=t_register)  # type: ignore[arg-type]
+    for i in range(3):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=t_register + timedelta(minutes=i + 1),
+                job=job.name,
+                state="done",
+                run_id=f"run-{i}",
+                extra={"pr_number": 42, "attempt": i},
+            ),
+        )
+    return history_path
+
+
+def test_notify_policy_default_notifies_clean_gate_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pr-target gate job that finds nothing eligible is a clean terminal "success" —
+    the default "terminal" policy still notifies once per run (issue 009's acceptance
+    criteria: "the final report ... or a failure", not silence on success); only
+    mid-run progress pings are new-to-suppress."""
+    job = make_auto_fix_job(tmp_path)
+    assert job.notify_policy == "terminal"
+    client = FakeFullClient()
+    _history_path, outcome = _register_and_run_auto_fix_job(
+        job, tmp_path, monkeypatch, gh_client=MockGhClient(), client=client
+    )
+    assert "enumerated=0" in outcome.summaries[0]
+    assert len(client.notifications) == 1
+    assert client.notifications[0][0] == "herdr-routines: auto-fix-prs done"
+
+
+def test_notify_policy_on_failure_suppresses_clean_gate_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same clean run, but the explicit on-failure policy — the strictest tier — stays
+    silent since nothing failed."""
+    job = make_auto_fix_job(tmp_path, notify_policy="on-failure")
+    client = FakeFullClient()
+    _history_path, outcome = _register_and_run_auto_fix_job(
+        job, tmp_path, monkeypatch, gh_client=MockGhClient(), client=client
+    )
+    assert "enumerated=0" in outcome.summaries[0]
+    assert client.notifications == []
+
+
+def test_notify_policy_default_suppresses_per_pr_skip_but_notifies_aggregate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single PR hitting max_attempts_exceeded mid-loop is "progress" noise — the
+    dispatcher keeps evaluating any other eligible PRs, and the job's own once-per-tick
+    aggregate notify (a clean "success" here, since nothing was dispatched) already
+    summarizes the tick. Under the default "terminal" policy, the mid-loop skip is
+    suppressed but the aggregate still fires exactly once."""
+    job = make_auto_fix_job(tmp_path)
+    history_path_dest = _register_then_populate_over_cap_pr(job, tmp_path, monkeypatch)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeFullClient()
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", EligiblePrGhClient)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+
+    t2 = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)
+    outcome = run_tick(config, history_path_dest, client=client, now=t2)  # type: ignore[arg-type]
+
+    assert "eligible=1" in outcome.summaries[0]
+    assert "skipped=1" in outcome.summaries[0]
+    assert len(client.notifications) == 1
+    assert client.notifications[0][0] == "herdr-routines: auto-fix-prs done"
+
+
+def test_notify_policy_on_failure_suppresses_per_pr_skip_and_aggregate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same over-cap PR as above, but the explicit on-failure policy stays fully
+    silent — neither the mid-loop skip nor the clean aggregate is a "failure"."""
+    job = make_auto_fix_job(tmp_path, notify_policy="on-failure")
+    history_path_dest = _register_then_populate_over_cap_pr(job, tmp_path, monkeypatch)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeFullClient()
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", EligiblePrGhClient)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+
+    t2 = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)
+    outcome = run_tick(config, history_path_dest, client=client, now=t2)  # type: ignore[arg-type]
+
+    assert "eligible=1" in outcome.summaries[0]
+    assert "skipped=1" in outcome.summaries[0]
+    assert client.notifications == []
+
+
+def test_notify_policy_always_shows_per_pr_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same over-cap PR again, but notify_policy: always must surface both the
+    per-PR skip and the job's own aggregate done notification — the one policy value
+    that restores full pre-issue-009 per-tick pinging."""
+    job = make_auto_fix_job(tmp_path, notify_policy="always")
+    history_path_dest = _register_then_populate_over_cap_pr(job, tmp_path, monkeypatch)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeFullClient()
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", EligiblePrGhClient)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+
+    t2 = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)
+    run_tick(config, history_path_dest, client=client, now=t2)  # type: ignore[arg-type]
+
+    titles = [n[0] for n in client.notifications]
+    assert "herdr-routines: auto-fix-prs PR #42 skipped" in titles
+    assert "herdr-routines: auto-fix-prs done" in titles
+
+
+def test_notify_policy_on_finding_surfaces_dispatched_fix_but_on_failure_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gate that actually finds and dispatches a fix for an eligible PR is a
+    "finding", not a plain "success" — on-finding surfaces this even though the job
+    itself didn't fail, while the stricter on-failure policy stays silent since nothing
+    failed. (The default "terminal" policy would also notify here, same as "on-finding"
+    — this test isolates the on-failure/on-finding boundary specifically.)"""
+    job_on_failure = make_auto_fix_job(
+        tmp_path, name="auto-fix-prs", notify_policy="on-failure"
+    )
+    client_on_failure = FakePrDispatchClient()
+    _hp, outcome_on_failure = _register_and_run_auto_fix_job(
+        job_on_failure,
+        tmp_path,
+        monkeypatch,
+        gh_client=EligiblePrGhClient(),
+        client=client_on_failure,
+    )
+    assert "dispatched=1" in outcome_on_failure.summaries[0]
+    assert client_on_failure.notifications == []
+
+    # Fresh tmp_path/history for the on-finding run so the two don't share state.
+    tmp_path2 = tmp_path / "on-finding"
+    tmp_path2.mkdir()
+    job_on_finding = make_auto_fix_job(
+        tmp_path2, name="auto-fix-prs", notify_policy="on-finding"
+    )
+    client_on_finding = FakePrDispatchClient()
+    _hp2, outcome_on_finding = _register_and_run_auto_fix_job(
+        job_on_finding,
+        tmp_path2,
+        monkeypatch,
+        gh_client=EligiblePrGhClient(),
+        client=client_on_finding,
+    )
+    assert "dispatched=1" in outcome_on_finding.summaries[0]
+    assert len(client_on_finding.notifications) == 1
+    assert client_on_finding.notifications[0][0] == "herdr-routines: auto-fix-prs done"
+
+
+def test_notify_policy_default_notifies_plain_routine_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plain routine job's clean "done" is exactly the one-notification-per-run
+    behavior issue 009's default must preserve — an unattended overnight run still gets
+    its final "done" ping, just no mid-run noise (there is none for a plain routine)."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    assert job.notify_policy == "terminal"
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(settle_status="idle")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    assert len(client.notifications) == 1
+    assert client.notifications[0] == ("herdr-routines: a done", None, "done")
+
+
+def test_notify_policy_on_failure_suppresses_plain_routine_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit on-failure policy is the one that goes further than the default and
+    stays silent on a clean success — useful for a frequently-run job (e.g.
+    babysit-prs's `*/10` cron) where even one ping per clean run is too much."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path, notify_policy="on-failure")
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(settle_status="idle")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert client.notifications == []
+
+
+def test_notify_policy_always_notifies_plain_routine_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path, notify_policy="always")
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(settle_status="idle")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert len(client.notifications) == 1
+    assert client.notifications[0] == ("herdr-routines: a done", None, "done")
+
+
+def test_notify_policy_on_failure_still_notifies_a_real_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The strictest policy's whole point is "still notify on failure" — only clean
+    successes are suppressed."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path, notify_policy="on-failure")
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(fail_at="agent_prompt_wait")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.any_job_failed is True
+    assert len(client.notifications) == 1
+    assert client.notifications[0][0] == "herdr-routines: a failed"
+
+
+def test_notify_policy_default_still_notifies_a_real_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as above, under the actual default ("terminal") — a real failure notifies
+    regardless of policy tier."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(fail_at="agent_prompt_wait")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.any_job_failed is True
+    assert len(client.notifications) == 1
+    assert client.notifications[0][0] == "herdr-routines: a failed"
+
+
+def test_notify_policy_on_finding_surfaces_fallback_retry_but_on_failure_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fallback_model retry (issue 022) means the primary model hit
+    quota_exhausted — notable even though the job ultimately finished "done". on-finding
+    surfaces it; the stricter on-failure policy stays silent since the job didn't fail.
+    (The default "terminal" policy would also notify here, same as "on-finding" — this
+    test isolates the on-failure/on-finding boundary specifically.)"""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(
+        tmp_path,
+        model="primary-model",
+        agent_kind="claude",
+        fallback_model="fallback-model",
+        notify_policy="on-failure",
+    )
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(settle_status="idle", quota_exhausted_for_model="primary-model")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    assert client.notifications == []  # on-failure stays silent
+
+    # Same scenario again under on-finding, fresh history — the fallback retry should
+    # now surface as a "done" notification with the fallback_model noted in its body.
+    history_path2 = tmp_path / "state" / "history2.jsonl"
+    job_on_finding = replace(job, notify_policy="on-finding")
+    config2 = RoutinesConfig(jobs=(job_on_finding,))
+    client2 = FakeClient(
+        settle_status="idle", quota_exhausted_for_model="primary-model"
+    )
+    run_tick(config2, history_path2, client=client2, now=t0)  # type: ignore[arg-type]
+    outcome2 = run_tick(config2, history_path2, client=client2, now=t1)  # type: ignore[arg-type]
+
+    assert outcome2.summaries == ("a: done",)
+    assert len(client2.notifications) == 1
+    title, body, _sound = client2.notifications[0]
+    assert title == "herdr-routines: a done"
+    assert body == "via fallback_model=fallback-model"
 
 
 # -- repository: <url> ensure_repo gate (issue 016) ------------------------------------

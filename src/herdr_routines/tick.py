@@ -287,12 +287,13 @@ def _process_pr_target(
                 extra={"reason": reason, "error": str(e)},
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body=reason,
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=reason,
+                sound="request",
+            )
         return f"{job.name}: failed ({reason})", True
 
     try:
@@ -317,12 +318,13 @@ def _process_pr_target(
                 extra={"reason": "repo_detection_failed", "error": str(e)},
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body="repo_detection_failed",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="repo_detection_failed",
+                sound="request",
+            )
         return f"{job.name}: failed (repo_detection_failed)", True
 
     try:
@@ -338,12 +340,13 @@ def _process_pr_target(
                 extra={"reason": "gh_auth_missing", "error": str(e)},
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body="gh_auth_missing",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="gh_auth_missing",
+                sound="request",
+            )
         return f"{job.name}: failed (gh_auth_missing)", True
 
     open_prs = list_open_prs(
@@ -379,12 +382,16 @@ def _process_pr_target(
                     },
                 ),
             )
-            _notify(
-                client,
-                f"herdr-routines: {job.name} PR #{elig_pr.pr.number} skipped",
-                body="max_attempts_exceeded",
-                sound="request",
-            )
+            # Per-PR mid-loop skip, not the job's own once-per-tick terminal notify (that
+            # follows below, at the aggregate done/failed notify) — "progress" kind, only
+            # surfaced under notify_policy: always.
+            if _notify_gate(job, "progress"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} PR #{elig_pr.pr.number} skipped",
+                    body="max_attempts_exceeded",
+                    sound="request",
+                )
             skipped_count += 1
             continue
 
@@ -502,15 +509,21 @@ def _process_pr_target(
     )
 
     if any_failed:
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body=f"{dispatched_count} dispatched, {skipped_count} skipped",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=f"{dispatched_count} dispatched, {skipped_count} skipped",
+                sound="request",
+            )
         return summary, True
 
-    _notify(client, f"herdr-routines: {job.name} done", sound="done")
+    # dispatched_count > 0 means the gate found eligible PRs and dispatched fix workers
+    # for them — worth a "finding"-tier notification even though the job itself didn't
+    # fail; a clean run with nothing eligible is "success"-tier (on-failure's default
+    # silence is exactly the "nothing to report" case issue 009 wants suppressed).
+    if _notify_gate(job, "finding" if dispatched_count > 0 else "success"):
+        _notify(client, f"herdr-routines: {job.name} done", sound="done")
     return summary, False
 
 
@@ -547,12 +560,13 @@ def _process_base_target(
                 },
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} skipped",
-            body="max_attempts_exceeded",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} skipped",
+                body="max_attempts_exceeded",
+                sound="request",
+            )
         return f"{job.name}: skipped (max_attempts_exceeded)", False
 
     # Ensure repo checkout before any worktree creation
@@ -577,12 +591,13 @@ def _process_base_target(
                 },
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body=reason,
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=reason,
+                sound="request",
+            )
         return f"{job.name}: failed ({reason})", True
 
     wt_path = Path(job.repo) / ".worktrees" / f"gate-{run_id}"
@@ -629,12 +644,13 @@ def _process_base_target(
                 },
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body="worktree_creation_failed",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="worktree_creation_failed",
+                sound="request",
+            )
         return f"{job.name}: failed (worktree_creation_failed)", True
 
     gate_outcome = run_checks(job.checks, cwd=str(wt_path))  # type: ignore[arg-type]
@@ -666,7 +682,8 @@ def _process_base_target(
                 },
             ),
         )
-        _notify(client, f"herdr-routines: {job.name} done", sound="done")
+        if _notify_gate(job, "success"):
+            _notify(client, f"herdr-routines: {job.name} done", sound="done")
         return f"{job.name}: done (gate passed)", False
 
     gate_output_path = default_reports_dir() / f"{run_id}-gate-output.txt"
@@ -906,15 +923,20 @@ def _process_base_target(
     )
 
     if state == "failed":
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body="agent_prompt_failed",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="agent_prompt_failed",
+                sound="request",
+            )
         return f"{job.name}: failed (agent_prompt_failed)", True
 
-    _notify(client, f"herdr-routines: {job.name} done", sound="done")
+    # Reaching here means the gate check failed above (gate_outcome.passed was False —
+    # otherwise this function already returned at the "gate passed" branch) and the fix
+    # agent then resolved it: a "finding", not a plain "success".
+    if _notify_gate(job, "finding"):
+        _notify(client, f"herdr-routines: {job.name} done", sound="done")
     return f"{job.name}: done", False
 
 
@@ -1396,17 +1418,22 @@ def _process_job(
         done_body = (
             f"via fallback_model={job.fallback_model}" if used_fallback else None
         )
-        _notify(
-            client, f"herdr-routines: {job.name} done", body=done_body, sound="done"
-        )
+        # A fallback retry means the primary model hit quota_exhausted — worth knowing
+        # about even though the job ultimately succeeded, so it's a "finding", not a
+        # plain "success".
+        if _notify_gate(job, "finding" if used_fallback else "success"):
+            _notify(
+                client, f"herdr-routines: {job.name} done", body=done_body, sound="done"
+            )
         return f"{job.name}: done", False
 
-    _notify(
-        client,
-        f"herdr-routines: {job.name} failed",
-        body=outcome.reason or "unknown",
-        sound="request",
-    )
+    if _notify_gate(job, "failure"):
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body=outcome.reason or "unknown",
+            sound="request",
+        )
     return f"{job.name}: failed ({outcome.reason})", True
 
 
@@ -1586,14 +1613,16 @@ def _process_pipeline_job(
                 ),
             )
             if state == "done":
-                _notify(client, f"herdr-routines: {job.name} done", sound="done")
+                if _notify_gate(job, "success"):
+                    _notify(client, f"herdr-routines: {job.name} done", sound="done")
                 return f"{job.name}: done", False
-            _notify(
-                client,
-                f"herdr-routines: {job.name} failed",
-                body=reason or "unknown",
-                sound="request",
-            )
+            if _notify_gate(job, "failure"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} failed",
+                    body=reason or "unknown",
+                    sound="request",
+                )
             return f"{job.name}: {state} ({reason})", True
 
         # No usable report yet. This is deliberately *not* "agent gone => failed": the
@@ -1621,12 +1650,13 @@ def _process_pipeline_job(
                 extra={"reason": "no_report", "pipeline_run_id": bare_run_id},
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body="no_report",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="no_report",
+                sound="request",
+            )
         return f"{job.name}: failed (no_report)", True
 
     if _live_agent_exists(client, job):
@@ -1703,12 +1733,13 @@ def _process_pipeline_job(
                 extra={"reason": "repo_sync_failed", "error": str(e)},
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body="repo_sync_failed",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="repo_sync_failed",
+                sound="request",
+            )
         return f"{job.name}: failed (repo_sync_failed)", True
 
     argv = _build_pipeline_launch_argv(
@@ -1733,12 +1764,13 @@ def _process_pipeline_job(
                 },
             ),
         )
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body="launch_failed",
-            sound="request",
-        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="launch_failed",
+                sound="request",
+            )
         return f"{job.name}: failed (launch_failed)", True
 
     append(
@@ -1769,6 +1801,44 @@ def _notify(
         client.notification_show(title, body=body, sound=sound)
     except HerdrCliError as e:
         log.warning("%s: notification failed: %s", title, e)
+
+
+def _notify_gate(job: Job, kind: str) -> bool:
+    """Whether a `job.notify_policy`-governed notification of *kind* should actually be
+    sent (issue 009). *kind* is one of:
+
+    - "failure": the job's own dispatch ended in a terminal failure this tick (setup
+      errors, a gate whose fix agent could not resolve it, a max-attempts cap reached).
+    - "finding": the job completed without a terminal failure but surfaced something
+      worth knowing about even so — a gated job's checks found something and the fix
+      agent resolved it, or a plain routine needed its `fallback_model` retry.
+    - "success": a clean terminal outcome with nothing notable (checks passed on the
+      first try, a plain routine finished with its primary model, a pr-target gate
+      enumerated nothing eligible).
+    - "progress": a sub-step inside a still-in-progress job (e.g. one PR skipped
+      mid-loop while a pr-target gate keeps dispatching others) — never the job's own
+      once-per-tick terminal notification.
+
+    The four policy values form a strict hierarchy, each a subset of the last:
+    "on-failure" (notify only on "failure") subset of "on-finding" (adds "finding")
+    subset of "terminal" (default — adds "success", i.e. every terminal outcome, which
+    is exactly the pre-issue-009 behavior: one notification per run, done or failed,
+    never a mid-run progress ping — see the issue's acceptance criteria: "defaulting to
+    a single terminal-state notification") subset of "always" (adds "progress" too —
+    the full pre-issue-009-job per-tick pinginess some jobs opted into but the issue
+    says an unattended overnight run should no longer get by default).
+
+    Deliberately excludes `on_missed`-triggered notifications: that is its own
+    pre-existing per-job opt-in (config.VALID_ON_MISSED) and stays orthogonal here so
+    existing jobs.d/ configs that already set `on_missed: notify` keep exactly their
+    current behavior regardless of `notify_policy`."""
+    if job.notify_policy == "always":
+        return True
+    if job.notify_policy == "terminal":
+        return kind != "progress"
+    if job.notify_policy == "on-finding":
+        return kind in ("failure", "finding")
+    return kind == "failure"  # "on-failure"
 
 
 def _live_agent_exists(client: HerdrClient, job: Job) -> bool:

@@ -65,6 +65,16 @@ AGENT_MODEL_FLAGS: dict[str, str] = {
 VALID_WORKSPACE_MODES = frozenset({"worktree", "root"})
 VALID_ON_MISSED = frozenset({"log", "notify"})
 
+# Per-job notification policy (issue 009). Governs the terminal-state `_notify()` calls
+# in tick.py — not `on_missed`, which is its own pre-existing opt-in and stays orthogonal
+# (see tick.py's `_notify_gate` docstring for the full four-tier semantics). "terminal"
+# is the default: it reproduces pre-issue-009 behavior exactly (one notification per
+# run's terminal outcome — done or failed — never a mid-run progress ping), which is
+# what "defaulting to a single terminal-state notification" in the issue's acceptance
+# criteria requires. "always" > "terminal" > "on-finding" > "on-failure" is a strict
+# hierarchy, each a subset of the last.
+VALID_NOTIFY_POLICIES = frozenset({"always", "terminal", "on-finding", "on-failure"})
+
 # Scheduling-only mode discriminator (issue 026). "routine" (default) is the existing plain
 # 1-agent job, dispatched synchronously by `execute_run`. "pipeline" is a detached,
 # deadline-bounded orchestrator dispatch, launched by `tick._process_pipeline_job` and never
@@ -101,6 +111,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
         "failure_markers",
         "fallback_model",
         "tmp_hygiene",
+        "notify_policy",
     }
 )
 
@@ -144,6 +155,7 @@ _JOB_DEFAULTS = {
     "catch_up_minutes": 120,
     "timezone": "UTC",
     "on_missed": "log",
+    "notify_policy": "terminal",
     "failure_markers": None,
     "fallback_model": None,
     "checks": None,
@@ -200,6 +212,10 @@ class Job:
     catch_up_minutes: int
     timezone: str
     on_missed: str  # "log" | "notify"
+    # Notification policy (issue 009): "always" | "terminal" (default) | "on-finding" |
+    # "on-failure". Governs tick.py's terminal-state `_notify()` calls; `on_missed` is
+    # unaffected — see tick._notify_gate.
+    notify_policy: str = "terminal"
     # Optional git URL for managed clone lifecycle.
     repository: str | None = None
     # Screen markers scanned after a failed prompt wait (docs/failure-reaping.md §3.2).
@@ -563,6 +579,12 @@ def _build_job(
             f"{label}: 'on_missed' must be one of {sorted(VALID_ON_MISSED)}"
         )
 
+    notify_policy = merged["notify_policy"]
+    if notify_policy not in VALID_NOTIFY_POLICIES:
+        raise ConfigError(
+            f"{label}: 'notify_policy' must be one of {sorted(VALID_NOTIFY_POLICIES)}"
+        )
+
     for int_key in ("timeout_ms", "start_timeout_ms", "catch_up_minutes"):
         value = merged[int_key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -827,6 +849,7 @@ def _build_job(
         catch_up_minutes=catch_up_minutes,
         timezone=timezone,
         on_missed=on_missed,
+        notify_policy=notify_policy,
         repository=repository,
         failure_markers=failure_markers,
         checks=checks,

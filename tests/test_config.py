@@ -40,6 +40,51 @@ def test_valid_minimal_config_applies_defaults(tmp_config_path: Path) -> None:
     assert job.repo == Path("/home/guido/projects/fitted")
 
 
+def test_valid_minimal_config_defaults_notify_policy_to_terminal(
+    tmp_config_path: Path,
+) -> None:
+    """Backward compatibility (issue 009): an existing job with no `notify_policy` key
+    must keep its pre-issue-009 behavior — every terminal `_notify()` call in tick.py
+    (done or failed) already fired every run; only mid-run progress pings (the one
+    example: a pr-target gate's per-PR max-attempts skip) are new-to-suppress. "terminal"
+    is the default that reproduces that exact behavior — see the issue's acceptance
+    criteria: "defaulting to a single terminal-state notification"."""
+    cfg = load_config(write(tmp_config_path, VALID_MINIMAL))
+    job = cfg.job("nightly-audit")
+    assert job is not None
+    assert job.notify_policy == "terminal"
+
+
+def test_notify_policy_settable_per_job(tmp_config_path: Path) -> None:
+    text = VALID_MINIMAL.rstrip() + "\n    notify_policy: always\n"
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("nightly-audit")
+    assert job is not None
+    assert job.notify_policy == "always"
+
+
+def test_notify_policy_settable_via_defaults(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+defaults:
+  notify_policy: on-finding
+jobs:
+  - name: nightly-audit
+    cron: "0 3 * * *"
+    repo: /home/guido/projects/fitted
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("nightly-audit")
+    assert job is not None
+    assert job.notify_policy == "on-finding"
+
+
+def test_invalid_notify_policy_raises(tmp_config_path: Path) -> None:
+    text = VALID_MINIMAL.rstrip() + "\n    notify_policy: sometimes\n"
+    with pytest.raises(ConfigError, match="notify_policy"):
+        load_config(write(tmp_config_path, text))
+
+
 def test_defaults_block_is_merged_and_overridable(tmp_config_path: Path) -> None:
     text = """
 version: 1

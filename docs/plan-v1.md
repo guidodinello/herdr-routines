@@ -199,6 +199,9 @@ jobs:
                               # cold Claude Code/OpenCode boot, esp. on a Pi
     catch_up_minutes: 120
     on_missed: log             # log | notify
+    notify_policy: terminal    # always | terminal (default) | on-finding | on-failure
+                               # (issue 009); governs the terminal `_notify()` calls
+                               # tick.py sends per run, independent of on_missed
     failure_markers: null      # post-v1 (docs/failure-reaping.md §3.4): list[str] of screen
                                # markers scanned after a failed prompt wait; null = built-in
                                # defaults ("Free usage exceeded"). Never put a marker phrase
