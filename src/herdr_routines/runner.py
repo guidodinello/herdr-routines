@@ -106,22 +106,20 @@ def diagnose_tmp() -> dict[str, str | bool]:
 def _dir_size_h(path: Path) -> str:
     """Total size of path (recursively, if a directory), formatted like `du -h`."""
     total = 0
-    if path.is_dir() and not path.is_symlink():
-        for p in path.rglob("*"):
-            try:
-                total += p.lstat().st_size
-            except OSError:
-                pass
-    else:
+    entries = (
+        path.rglob("*") if path.is_dir() and not path.is_symlink() else iter((path,))
+    )
+    for p in entries:
         try:
-            total += path.lstat().st_size
+            total += p.lstat().st_size
         except OSError:
             pass
+    size = float(total)
     for unit in ("B", "K", "M", "G"):
-        if total < 1024 or unit == "G":
-            return f"{total:.0f}{unit}" if unit == "B" else f"{total:.1f}{unit}"
-        total /= 1024
-    return f"{total:.1f}G"
+        if size < 1024 or unit == "G":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}G"
 
 
 def _error_body_code(e: HerdrCliError) -> str | None:
