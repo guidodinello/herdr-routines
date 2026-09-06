@@ -21,7 +21,57 @@ night's 02:00 auto-run would have re-picked its feature (**006**, still `open`
 on main because the PR was unmerged). Avoided manually by keeping
 `pipeline-nightly.timer` stopped — a structural guarantee it is not.
 
-## Design (proposal)
+## Re-scope (2026-09-06) — read this before the original design below
+
+Issues 041 and 040 shipped after this issue was written and **removed the mechanism
+it describes.** The paragraph above says "Both runs then mutate the same issue file
+(`--mark-in-progress` flips it in the parent clone)". That no longer happens:
+
+- **041** moved the claim out of the tracked issue file into
+  `src/herdr_routines/claims.py`. `pick-feature` no longer edits `$REPO_PARENT` at
+  all, and `status: in-progress` is never written in-tree.
+- **040** added lease expiry on top: `claimed_at` is the lease, `is_claimed` /
+  `release_claim` are the primitives, and a claim older than `LEASE_HOURS` (12) with
+  no open PR and no in-flight run is reclaimed automatically.
+
+So the *file-mutation* half of this issue is already fixed, and the
+`--skip-open-prs` design below would now introduce a **second source of truth**
+alongside `claims.py` — one that re-derives "which issue is claimed" by parsing PR
+bodies for a prose convention ("Closes issue NN — the `status: done` flip rides this
+PR"). Two mechanisms answering the same question, one of them by regexing English,
+is worse than the problem.
+
+### What is actually still open
+
+The real remaining gap is narrow: **`claims.py` knows about claims it made, and
+nothing else.** An issue whose claim was legitimately released — lease expired, or
+the claims file was lost — can still be re-picked while its PR sits open awaiting
+human review. 040's note calls this out directly: "if the claims file is lost, an
+in-flight issue becomes re-pickable immediately."
+
+### Re-scoped design
+
+Teach the **existing** claim check to consult open PRs, rather than adding a
+parallel flag and convention:
+
+- `is_claimed(issue_id)` (or the selection filter that calls it) additionally treats
+  an issue as claimed when an open `auto/pipeline-*` PR references it.
+- Derive the reference from the branch/run rather than PR prose where possible —
+  `state.json` already records `feature_source`, and the run id is in the branch
+  name. Fall back to the PR body convention only if nothing structural is available,
+  and say so in a comment.
+- **Fail-open is still right**, and the original issue argued it well: if
+  `gh`/remote resolution errors, warn to stderr and pick anyway. A transient GitHub
+  outage must never brick the nightly run.
+- Batch the `gh` call — `gc.py` already does exactly this
+  (`fetch_merged_pr_heads`); follow that shape rather than one call per issue.
+
+No new CLI flag. The behaviour should be unconditional: there is no scenario where
+re-picking an issue with a live PR is wanted.
+
+### Original design (superseded — kept for the reasoning, not the plan)
+
+## Design (proposal, superseded)
 
 `pick-feature --skip-open-prs`:
 
