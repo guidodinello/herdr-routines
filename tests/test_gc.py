@@ -665,9 +665,20 @@ def test_gc_delete_with_yes_succeeds_non_interactive(
 def test_gc_delete_is_exactly_dry_run_candidates(
     repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The delete set must equal the dry-run eligible set filtered by the merge guard."""
+    """The delete set must equal the dry-run eligible set filtered by the merge guard.
+
+    Issue 043 acceptance 4: this invariant is the clearest signal that the two halves
+    of `gc` share one definition of "collectable". A pipeline branch is included on
+    purpose — before 043 the delete half dropped every `auto/pipeline-*` row, so this
+    test held only because it never created one.
+    """
     merged = "auto/merged-20260821T000000Z"
     _git(repo, "branch", merged, "main")
+
+    # Merged, no open PR, nothing in flight (autouse fixture) — collectable, and the
+    # exact case the pre-043 delete half silently refused.
+    pipeline = "auto/pipeline-20260822T000000Z"
+    _git(repo, "branch", pipeline, "main")
 
     gone = "auto/gone-20260823T000000Z"
     wt_gone = tmp_path / "wt-gone"
@@ -738,26 +749,69 @@ def test_gc_delete_removes_squash_merged_branch_without_force(
     assert branch not in remaining
 
 
-def test_gc_delete_excludes_pipeline(
+def test_gc_delete_removes_unretained_pipeline_branch(
     repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """auto/pipeline-* branches are never deleted, even with --force --yes."""
+    """Acceptance 1 (issue 043): a merged pipeline branch with no open PR and nothing
+    in flight is deleted like any other merged auto/* branch. Before 043 the delete
+    half dropped every `auto/pipeline-*` row outright, so dry-run listed branches
+    `--delete` then silently refused to touch."""
     pipeline = "auto/pipeline-nightly-20260824T010000Z"
     real = "auto/real-job-20260820T000000Z"
     _git(repo, "branch", pipeline, "main")
     _git(repo, "branch", real, "main")
 
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {pipeline}" in out
+    assert f"deleted: {real}" in out
+    remaining = _git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
+    ).stdout
+    assert pipeline not in remaining
+    assert real not in remaining
+
+
+def test_gc_delete_force_retains_unmerged_pipeline_branch(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 2: --force skips the merged requirement, so this is the case that
+    must not regress. `pipeline_branch_retained()` filters rows *before* candidates are
+    derived, so an unmerged pipeline branch never reaches the force path."""
+    pipeline = "auto/pipeline-nightly-20260824T020000Z"
+    _git(repo, "checkout", "-b", pipeline)
+    (repo / "unmerged.txt").write_text("not on main\n")
+    _git(repo, "add", "unmerged.txt")
+    _git(repo, "commit", "-m", "work not on main")
+    _git(repo, "checkout", "main")
+
     code, out, _ = _gc_delete(repo, capsys, "--force")
 
     assert code == 0
-    assert pipeline not in out
-    assert f"deleted: {real}" in out
-    # Pipeline branch survives
+    assert f"deleted: {pipeline}" not in out
     remaining = _git(
         repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
     ).stdout
     assert pipeline in remaining
-    assert real not in remaining
+
+
+def test_gc_delete_retains_pipeline_branch_with_open_pr(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 3: merged, but a human still has its PR open — retained."""
+    pipeline = "auto/pipeline-nightly-20260824T030000Z"
+    _git(repo, "branch", pipeline, "main")
+    monkeypatch.setattr(gc, "check_open_pr", lambda repo_, branch: branch == pipeline)
+
+    code, out, _ = _gc_delete(repo, capsys, "--force")
+
+    assert code == 0
+    assert f"deleted: {pipeline}" not in out
+    remaining = _git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
+    ).stdout
+    assert pipeline in remaining
 
 
 def test_gc_delete_needs_no_server(
