@@ -1,7 +1,7 @@
 ---
 id: "044"
 title: "gc --delete has no age threshold: a branch merged minutes ago is immediately collectable"
-status: open
+status: done
 priority: medium
 area: cli
 ---

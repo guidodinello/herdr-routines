@@ -1,7 +1,7 @@
 ---
 id: "045"
 title: "gc removes registered worktrees but leaves orphaned directories and dangling symlinks behind"
-status: open
+status: done
 priority: low
 area: cli
 ---

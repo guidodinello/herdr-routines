@@ -12,6 +12,7 @@ import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
@@ -19,6 +20,14 @@ BRANCH_PATTERN = "refs/heads/auto/*"
 PIPELINE_PREFIX = "auto/pipeline-"
 GIT_TIMEOUT_SECONDS = 30
 GH_TIMEOUT_SECONDS = 30
+DEFAULT_OLDER_THAN_DAYS = 14
+
+# Issue 045: debris left in the worktree parent dir once `gc` removes a registered
+# worktree — orphaned directories and the case-variant symlink herdr creates alongside
+# each pipeline worktree. Deliberately broader than PIPELINE_WORKTREE_GLOB (which only
+# ever matched pipeline runs): any auto-* entry `git worktree list` doesn't know about
+# is debris worth reporting, pipeline-originated or not.
+ORPHAN_GLOB = "auto-*"
 
 # Mirrors pipeline_watchdog.py's own layout constants (issue 031): the shared worktree
 # an in-flight orchestrator checkpoints into, and the terminal-report convention that
@@ -35,11 +44,83 @@ class Row:
     branch: str
     worktree_exists: bool
     merged_into_base: bool
+    age_days: float
 
     @property
     def stale(self) -> bool:
         """Eligible for cleanup: merged (see is_merged) OR worktree dir gone."""
         return self.merged_into_base or not self.worktree_exists
+
+
+def collectible(row: Row, older_than_days: int) -> bool:
+    """``row.stale`` narrowed by the age gate (issue 044).
+
+    The gate only tightens the *merged* path: a merged branch younger than the
+    threshold is withheld regardless of how stale it otherwise looks. It never adds a
+    new restriction to the unmerged-but-worktree-gone path — that one is already
+    withheld from a no-force delete and only reachable via ``--force``, which is an
+    orthogonal safety valve to this one. ``older_than_days <= 0`` disables the gate
+    entirely, preserving pre-044 behaviour for a human who has read the table.
+    """
+    if not row.stale:
+        return False
+    return not (
+        row.merged_into_base and older_than_days > 0 and row.age_days < older_than_days
+    )
+
+
+@dataclass(frozen=True)
+class Orphan:
+    """A worktree-parent-dir entry `git worktree list` doesn't know about (issue 045).
+
+    ``kind`` is one of "dangling-symlink" (herdr's case-variant alias, left behind once
+    its target worktree is removed), "empty-dir" (a worktree directory with nothing
+    left in it), or "nonempty-dir" (an unregistered directory that still has content —
+    could be a manual checkout or a worktree whose registration was lost, so it is
+    reported, never touched).
+    """
+
+    path: Path
+    kind: str
+
+    @property
+    def collectible(self) -> bool:
+        """Provably inert: safe to remove without risking someone's data."""
+        return self.kind in ("dangling-symlink", "empty-dir")
+
+
+def find_orphans(worktrees_root: Path, registered: Sequence[Path]) -> list[Orphan]:
+    """``auto-*`` entries under ``worktrees_root`` that no registered worktree path
+    accounts for.
+
+    A symlink is orphaned only when its target no longer exists — a live alias
+    (case-variant name pointing at a still-registered worktree, or anything else that
+    still resolves) is left alone entirely: not reported, not touched, per issue 045's
+    "never remove a symlink whose target is still live". A directory is orphaned when
+    it isn't one of the registered worktree paths; it is collectible only when
+    completely empty (no ``.git``, no content of any kind) — any content at all means
+    report-only, since recursively deleting someone's manual checkout or a worktree
+    whose registration was lost is unrecoverable.
+    """
+    if not worktrees_root.exists():
+        return []
+    registered_resolved = {p.resolve() for p in registered}
+    orphans: list[Orphan] = []
+    for entry in sorted(worktrees_root.glob(ORPHAN_GLOB)):
+        if entry.is_symlink():
+            if entry.resolve().exists():
+                continue  # live alias — not debris
+            orphans.append(Orphan(path=entry, kind="dangling-symlink"))
+            continue
+        if not entry.is_dir():
+            continue  # neither a symlink nor a directory — not our concern
+        if entry.resolve() in registered_resolved:
+            continue  # the real, registered worktree itself
+        if any(entry.iterdir()):
+            orphans.append(Orphan(path=entry, kind="nonempty-dir"))
+        else:
+            orphans.append(Orphan(path=entry, kind="empty-dir"))
+    return orphans
 
 
 def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -215,8 +296,9 @@ def detect_base(repo: Path) -> str:
 GH_MERGED_PR_LIMIT = 500
 
 
-def fetch_merged_pr_heads(repo: Path) -> set[str]:
-    """``headRefName`` of every merged PR, via a single batched ``gh pr list`` call.
+def fetch_merged_pr_heads(repo: Path) -> dict[str, str | None]:
+    """``headRefName`` -> ``mergedAt`` of every merged PR, via a single batched
+    ``gh pr list`` call.
 
     Ancestry (``git merge-base --is-ancestor``) only proves a merge when the branch's
     own commits land on base — never true for a squash merge, where the PR lands as one
@@ -225,8 +307,12 @@ def fetch_merged_pr_heads(repo: Path) -> set[str]:
     than one ``gh pr list --head`` per branch, as ``check_open_pr`` already does for the
     open-PR check) keeps the network cost flat as the branch count grows.
 
+    ``mergedAt`` rides along on the same call (issue 044) so the age threshold doesn't
+    need a second network round-trip per branch — callers needing merge dates just read
+    the value already carried on this dict rather than querying `gh` again.
+
     Any ``gh`` failure (not installed, not authenticated, no configured remote) warns and
-    returns an empty set rather than raising: callers fall back to the ancestry check
+    returns an empty dict rather than raising: callers fall back to the ancestry check
     alone, same "degrade to the old, safe answer" direction as ``check_open_pr``.
     """
     try:
@@ -240,7 +326,7 @@ def fetch_merged_pr_heads(repo: Path) -> set[str]:
                 "--limit",
                 str(GH_MERGED_PR_LIMIT),
                 "--json",
-                "headRefName",
+                "headRefName,mergedAt",
             ],
             cwd=repo,
             capture_output=True,
@@ -250,24 +336,65 @@ def fetch_merged_pr_heads(repo: Path) -> set[str]:
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         _warn(f"gh pr list --state merged failed: {e}")
-        return set()
+        return {}
     if proc.returncode != 0:
         _warn(f"gh pr list --state merged failed: {proc.stderr.strip()}")
-        return set()
+        return {}
     try:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        return set()
+        return {}
     if not isinstance(data, list):
-        return set()
+        return {}
     return {
-        item["headRefName"]
+        item["headRefName"]: item.get("mergedAt")
         for item in data
         if isinstance(item, dict) and isinstance(item.get("headRefName"), str)
     }
 
 
-def is_merged(branch: str, base: str, repo: Path, merged_pr_heads: set[str]) -> bool:
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _tip_committer_date(repo: Path, branch: str) -> datetime | None:
+    proc = run_git(repo, "log", "-1", "--format=%cI", branch)
+    if proc.returncode != 0:
+        return None
+    return _parse_iso_datetime(proc.stdout.strip())
+
+
+def branch_age_days(
+    repo: Path,
+    branch: str,
+    merged_at: str | None,
+    *,
+    now: datetime | None = None,
+) -> float:
+    """Days since ``branch`` merged, or since its tip commit when no PR record exists
+    (issue 044). The PR's ``mergedAt`` always wins when present — it is the more honest
+    signal for *when the branch stopped being needed*, since a branch's tip commit can
+    predate its merge by any amount and its committer date only stands in as a fallback.
+    ``float("inf")`` when neither source is readable, so an unreadable age can never
+    itself block a threshold-gated delete.
+    """
+    if now is None:
+        now = datetime.now(UTC)
+    merged_dt = _parse_iso_datetime(merged_at)
+    dt = merged_dt if merged_dt is not None else _tip_committer_date(repo, branch)
+    if dt is None:
+        return float("inf")
+    return (now - dt).total_seconds() / 86400
+
+
+def is_merged(
+    branch: str, base: str, repo: Path, merged_pr_heads: dict[str, str | None]
+) -> bool:
     """True when the branch is merged into base — by ancestry (a fast-forward or
     non-squash merge) OR because GitHub records its PR as merged (issue 042: the only
     check that also catches a squash merge, where the branch's commits are never
@@ -282,50 +409,54 @@ def is_merged(branch: str, base: str, repo: Path, merged_pr_heads: set[str]) -> 
     return False
 
 
-def branch_worktrees(repo: Path) -> dict[str, Path]:
-    """Map each branch checked out in a linked worktree to that worktree's path.
+def branch_worktrees(repo: Path) -> tuple[dict[str, Path], set[Path]]:
+    """Map each branch checked out in a linked worktree to that worktree's path, and
+    separately the path of *every* worktree entry — including a detached-HEAD one,
+    which emits no ``branch`` line and so would otherwise never appear anywhere
+    (issue 045: a detached-HEAD worktree is registered and live, but a naive
+    branch->path mapping alone can't say so, misreporting it as orphan debris).
 
     Tolerant of ordering differences across git versions: each ``branch`` line is paired
     with the most recent preceding ``worktree`` line, no strict layout assumed.
     """
     proc = run_git(repo, "worktree", "list", "--porcelain")
     mapping: dict[str, Path] = {}
+    all_paths: set[Path] = set()
     if proc.returncode != 0:
         # Same as list_auto_branches: degrade to "no worktrees" but say so on stderr,
         # so a plumbing failure can't silently mark every branch worktree_exists=no.
         _warn(f"could not list worktrees: {proc.stderr.strip()}")
-        return mapping
+        return mapping, all_paths
     current: Path | None = None
     for line in proc.stdout.splitlines():
         if line.startswith("worktree "):
             current = Path(line.removeprefix("worktree "))
+            all_paths.add(current)
         elif line.startswith("branch refs/heads/"):
             name = line.removeprefix("branch refs/heads/")
             if current is not None and name not in mapping:
                 mapping[name] = current
-    return mapping
+    return mapping, all_paths
 
 
 def collect_rows(
     repo: Path,
     base: str,
-    worktrees: dict[str, Path] | None = None,
-) -> tuple[list[Row], bool, dict[str, Path]]:
-    """Inventory rows plus the single worktree mapping used to build them.
+) -> tuple[list[Row], bool, dict[str, Path], set[Path]]:
+    """Inventory rows plus the single worktree listing used to build them.
 
-    Returns ``(rows, listing_failed, worktrees)``. ``worktrees`` is resolved exactly
-    once per invocation (or reused if the caller passes it) and is meant to be reused
-    for removals — no second ``git worktree list`` race (spec "Execution ordering per
-    branch" step 1). ``listing_failed`` distinguishes an empty listing (nothing to
-    delete) from a plumbing failure so delete mode can abort (spec Risks).
+    Returns ``(rows, listing_failed, worktrees, all_worktree_paths)``. The listing is
+    resolved exactly once per invocation and is meant to be reused for removals — no
+    second ``git worktree list`` race (spec "Execution ordering per branch" step 1).
+    ``listing_failed`` distinguishes an empty listing (nothing to delete) from a
+    plumbing failure so delete mode can abort (spec Risks).
     """
-    if worktrees is None:
-        worktrees = branch_worktrees(repo)
+    worktrees, all_worktree_paths = branch_worktrees(repo)
     names = list_auto_branches(repo)
     if names is None:
-        return [], True, worktrees
+        return [], True, worktrees, all_worktree_paths
     # One batched gh call for the whole inventory (issue 042), not one per branch.
-    merged_pr_heads = fetch_merged_pr_heads(repo) if names else set()
+    merged_pr_heads = fetch_merged_pr_heads(repo) if names else {}
     rows: list[Row] = []
     for branch in names:
         path = worktrees.get(branch)
@@ -334,28 +465,38 @@ def collect_rows(
                 branch=branch,
                 worktree_exists=path is not None and path.exists(),
                 merged_into_base=is_merged(branch, base, repo, merged_pr_heads),
+                age_days=branch_age_days(repo, branch, merged_pr_heads.get(branch)),
             )
         )
-    return rows, False, worktrees
+    return rows, False, worktrees, all_worktree_paths
 
 
 def _yn(value: bool) -> str:
     return "yes" if value else "no"
 
 
-def format_table(rows: Sequence[Row]) -> str:
+def _age_str(age_days: float) -> str:
+    return "n/a" if age_days == float("inf") else f"{age_days:.1f}"
+
+
+def format_table(
+    rows: Sequence[Row], older_than_days: int = DEFAULT_OLDER_THAN_DAYS
+) -> str:
     """Human-readable table with the summary count line last; stable yes/no tokens."""
     width = max([len("BRANCH"), *(len(row.branch) for row in rows)])
     # Renamed from MERGED-INTO-BASE (issue 042) — see is_merged's docstring for what
     # this column actually checks now.
-    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED"]
+    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED  AGE-DAYS"]
     lines.extend(
-        f"{row.branch:<{width}}  {_yn(row.worktree_exists):<16} {_yn(row.merged_into_base)}"
+        f"{row.branch:<{width}}  {_yn(row.worktree_exists):<16} "
+        f"{_yn(row.merged_into_base):<7} {_age_str(row.age_days)}"
         for row in rows
     )
     merged = sum(row.merged_into_base for row in rows)
     missing_wt = sum(not row.worktree_exists for row in rows)
-    eligible = sum(row.stale for row in rows)
+    # Issue 044: "eligible" now means *would actually be collected*, not just stale —
+    # a merged-but-too-young row stays visible above but no longer counts here.
+    eligible = sum(collectible(row, older_than_days) for row in rows)
     lines.append(
         f"{len(rows)} branch(es) listed (dry-run, nothing deleted; "
         f"eligible: {eligible}, merged: {merged}, missing worktree: {missing_wt})"
@@ -363,7 +504,31 @@ def format_table(rows: Sequence[Row]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_gc(repo: Path, base: str | None = None, out: TextIO | None = None) -> int:
+def format_orphans(orphans: Sequence[Orphan]) -> str:
+    """Read-only inventory of worktree-parent-dir debris `git worktree list` doesn't
+    know about (issue 045) — a distinct section so the dry-run table tells the whole
+    truth about what's on disk, not just what git tracks."""
+    if not orphans:
+        return ""
+    kind_label = {
+        "dangling-symlink": "dangling symlink",
+        "empty-dir": "empty directory",
+        "nonempty-dir": "non-empty directory (unregistered; left alone)",
+    }
+    lines = ["", "ORPHANS (present on disk, absent from `git worktree list`):"]
+    lines.extend(f"  {kind_label[o.kind]:<45} {o.path}" for o in orphans)
+    collectible_count = sum(o.collectible for o in orphans)
+    lines.append(f"{len(orphans)} orphan(s) found ({collectible_count} collectible)")
+    return "\n".join(lines) + "\n"
+
+
+def run_gc(
+    repo: Path,
+    base: str | None = None,
+    out: TextIO | None = None,
+    older_than_days: int = DEFAULT_OLDER_THAN_DAYS,
+    worktrees_root: Path | None = None,
+) -> int:
     """Entry point behind ``gc --dry-run``: print the table, write and delete nothing."""
     if out is None:
         # Resolved lazily so callers that swap sys.stdout (pytest capsys) are honored.
@@ -374,9 +539,14 @@ def run_gc(repo: Path, base: str | None = None, out: TextIO | None = None) -> in
             print(f"error: not a git repository: {repo}", file=sys.stderr)
             return 1
         resolved_base = base or detect_base(root)
-        rows, _, _ = collect_rows(root, resolved_base)
+        rows, _, _, all_worktree_paths = collect_rows(root, resolved_base)
         visible_rows = [r for r in rows if not pipeline_branch_retained(root, r)]
-        out.write(format_table(visible_rows))
+        out.write(format_table(visible_rows, older_than_days))
+        orphans = find_orphans(
+            worktrees_root or _default_pipeline_worktrees_root(),
+            list(all_worktree_paths),
+        )
+        out.write(format_orphans(orphans))
     except subprocess.TimeoutExpired:
         # run_git's 30s cap must fail cleanly (stderr + exit), never as a traceback.
         print(
@@ -409,19 +579,53 @@ def _delete_branch(repo: Path, row: Row) -> bool:
     return True
 
 
-def format_delete_table(rows: Sequence[Row]) -> str:
+def format_delete_table(
+    rows: Sequence[Row], older_than_days: int = DEFAULT_OLDER_THAN_DAYS
+) -> str:
     """Table for delete mode — same columns as dry-run, different summary line."""
     width = max([len("BRANCH"), *(len(row.branch) for row in rows)])
     # Renamed from MERGED-INTO-BASE (issue 042) — see is_merged's docstring for what
     # this column actually checks now.
-    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED"]
+    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED  AGE-DAYS"]
     lines.extend(
-        f"{row.branch:<{width}}  {_yn(row.worktree_exists):<16} {_yn(row.merged_into_base)}"
+        f"{row.branch:<{width}}  {_yn(row.worktree_exists):<16} "
+        f"{_yn(row.merged_into_base):<7} {_age_str(row.age_days)}"
         for row in rows
     )
-    eligible = sum(row.stale for row in rows)
+    eligible = sum(collectible(row, older_than_days) for row in rows)
     lines.append(f"{len(rows)} branch(es) listed (eligible: {eligible})")
     return "\n".join(lines) + "\n"
+
+
+def _sweep_orphans(
+    worktrees_root: Path, registered: Sequence[Path], out: TextIO
+) -> int:
+    """Remove every collectible orphan (issue 045), reporting each decision. Returns
+    the count of removals that failed, so the caller can fold it into the exit code."""
+    orphans = find_orphans(worktrees_root, registered)
+    failed = 0
+    removed = 0
+    for orphan in orphans:
+        if not orphan.collectible:
+            out.write(f"orphan left alone (unregistered, non-empty): {orphan.path}\n")
+            continue
+        try:
+            if orphan.kind == "dangling-symlink":
+                orphan.path.unlink()
+            else:
+                orphan.path.rmdir()
+        except OSError as e:
+            failed += 1
+            out.write(f"failed: orphan {orphan.path} ({e})\n")
+            continue
+        removed += 1
+        out.write(f"deleted orphan: {orphan.path} ({orphan.kind})\n")
+    if orphans:
+        left_alone = sum(not o.collectible for o in orphans)
+        out.write(
+            f"orphans: {removed} removed, {left_alone} left alone, {failed} failed\n"
+        )
+    return failed
 
 
 def run_gc_delete(
@@ -431,6 +635,8 @@ def run_gc_delete(
     assume_yes: bool = False,
     out: TextIO | None = None,
     err: TextIO | None = None,
+    older_than_days: int = DEFAULT_OLDER_THAN_DAYS,
+    worktrees_root: Path | None = None,
 ) -> int:
     """Entry point behind ``gc --delete``: remove stale auto/* branches."""
     if out is None:
@@ -446,14 +652,19 @@ def run_gc_delete(
         # Single worktree list per invocation: collect_rows resolves the mapping once
         # (or reuses it) and the same dict drives removals below — no second scan (spec
         # "Execution ordering per branch" step 1).
-        rows, listing_failed, worktrees = collect_rows(root, resolved_base)
+        rows, listing_failed, worktrees, all_worktree_paths = collect_rows(
+            root, resolved_base
+        )
         # Issue 043: the same predicate dry-run uses, so both halves of `gc` share one
         # definition of "still needed" (they disagreed after 039, which scoped itself to
         # the inventory). Applied to `rows` *before* `candidates` is derived, so a
         # retained branch never reaches the `--force` path that skips the merged check:
         # an unmerged or in-flight pipeline branch is still untouchable with --force.
         rows = [r for r in rows if not pipeline_branch_retained(root, r)]
-        candidates = [r for r in rows if r.stale]
+        # Issue 044: age-gated the same way dry-run's "eligible" count is — a merged
+        # branch younger than the threshold never becomes a candidate at all, --force
+        # included (the gate is orthogonal to --force, see collectible's docstring).
+        candidates = [r for r in rows if collectible(r, older_than_days)]
 
         if listing_failed:
             # Spec Risks: a failing for-each-ref must not read as "nothing to delete"
@@ -465,10 +676,15 @@ def run_gc_delete(
             )
             return 1
 
+        resolved_worktrees_root = worktrees_root or _default_pipeline_worktrees_root()
+
         if not candidates:
-            out.write(format_delete_table(rows))
+            out.write(format_delete_table(rows, older_than_days))
             out.write("0 deletion(s) needed.\n")
-            return 0
+            orphan_failures = _sweep_orphans(
+                resolved_worktrees_root, list(all_worktree_paths), out
+            )
+            return 1 if orphan_failures else 0
 
         if not force:
             to_delete = [r for r in candidates if r.merged_into_base]
@@ -485,15 +701,19 @@ def run_gc_delete(
             )
             return 2
 
-        out.write(format_delete_table(rows))
+        out.write(format_delete_table(rows, older_than_days))
 
         deleted: list[str] = []
         failed: list[str] = []
+        removed_worktree_paths: set[Path] = set()
 
         for row in to_delete:
             if not _remove_worktree(root, row, worktrees):
                 failed.append(f"{row.branch} (worktree remove)")
                 continue
+            path = worktrees.get(row.branch)
+            if path is not None:
+                removed_worktree_paths.add(path)
             if not _delete_branch(root, row):
                 failed.append(row.branch)
                 continue
@@ -513,7 +733,18 @@ def run_gc_delete(
             f"failed: {len(failed)}"
         )
         out.write(f"{summary}\n")
-        return 1 if failed else 0
+
+        # Issue 045: sweep after removals so a symlink the loop above just made dangling
+        # (its worktree target deleted this run) is caught in the same invocation, not
+        # left for the next one. Derived from the full worktree listing already in hand
+        # (detached-HEAD entries included) minus what was just removed — no second
+        # `git worktree list` (spec "Execution ordering per branch" step 1, same
+        # invariant issue 043's tests already pin).
+        still_registered = [
+            p for p in all_worktree_paths if p not in removed_worktree_paths
+        ]
+        orphan_failures = _sweep_orphans(resolved_worktrees_root, still_registered, out)
+        return 1 if failed or orphan_failures else 0
 
     except subprocess.TimeoutExpired:
         print(

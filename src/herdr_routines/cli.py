@@ -18,6 +18,7 @@ from pathlib import Path
 from logger import get_logger, init_logging
 
 import herdr_routines
+from herdr_routines import gc
 from herdr_routines.auto_fix import RealGhClient
 from herdr_routines.config import (
     ConfigError,
@@ -212,6 +213,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "--base",
         default=None,
         help="merge target for the merged-check (default: origin/HEAD, else main)",
+    )
+    p_gc.add_argument(
+        "--older-than",
+        type=int,
+        default=gc.DEFAULT_OLDER_THAN_DAYS,
+        dest="older_than_days",
+        help=(
+            "days since merge (PR mergedAt, else tip committer date) before a merged "
+            "branch is collectable; 0 disables the age gate (default: "
+            f"{gc.DEFAULT_OLDER_THAN_DAYS})"
+        ),
+    )
+    p_gc.add_argument(
+        "--worktrees-root",
+        type=Path,
+        default=None,
+        help=(
+            "worktree parent dir to scan for orphaned dirs/symlinks (issue 045); "
+            "default: ~/.herdr/worktrees/herdr-routines"
+        ),
     )
     p_gc.set_defaults(handler=_cmd_gc)
 
@@ -745,9 +766,19 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     repo = args.repo or Path.cwd()
     if args.delete:
         return run_gc_delete(
-            repo, base=args.base, force=args.force, assume_yes=args.yes
+            repo,
+            base=args.base,
+            force=args.force,
+            assume_yes=args.yes,
+            older_than_days=args.older_than_days,
+            worktrees_root=args.worktrees_root,
         )
-    return run_gc(repo, base=args.base)
+    return run_gc(
+        repo,
+        base=args.base,
+        older_than_days=args.older_than_days,
+        worktrees_root=args.worktrees_root,
+    )
 
 
 def _cmd_pick_feature(args: argparse.Namespace) -> int:
