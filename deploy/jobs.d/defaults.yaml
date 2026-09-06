@@ -17,3 +17,19 @@ timezone: America/Montevideo
 #                                          # exhausted pool doesn't stall every job using it.
 #                                          # Only valid for agent_kind in AGENT_MODEL_FLAGS
 #                                          # (claude, opencode).
+# notify_policy: terminal # optional (issue 009): always | terminal | on-finding |
+#                                          # on-failure. "terminal" (default) reproduces
+#                                          # pre-issue-009 behavior: one notification per
+#                                          # run's terminal outcome (done or failed),
+#                                          # never a mid-dispatch progress ping.
+#                                          # "on-finding" additionally suppresses a clean
+#                                          # success, but still surfaces a gate that found
+#                                          # (and fixed) something, or a fallback_model
+#                                          # retry. "on-failure" is the strictest — silent
+#                                          # unless the run actually failed; good for a
+#                                          # frequently-run job (e.g. babysit-prs's */10
+#                                          # cron) where even a clean-success ping is too
+#                                          # much. "always" restores every per-tick ping,
+#                                          # including progress notes mid-dispatch.
+#                                          # Independent of on_missed, which keeps its own
+#                                          # meaning.

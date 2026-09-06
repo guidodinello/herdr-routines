@@ -24,3 +24,9 @@ prompt: "" # empty = pipeline-injected fix prompt template (seeded with the flag
 timeout_ms: 1800000
 start_timeout_ms: 120000
 on_missed: log
+# issue 009: this job's */10 cron is exactly the noisy-ping case the default
+# "terminal" policy doesn't fully address on its own — a clean "nothing eligible"
+# tick every 10 minutes all night is still one ping too many. on-finding keeps the
+# useful signal (a PR was actually found and fixed) while staying silent on a
+# clean pass; a real failure still always notifies regardless of policy.
+notify_policy: on-finding
