@@ -69,6 +69,18 @@ parallel flag and convention:
 No new CLI flag. The behaviour should be unconditional: there is no scenario where
 re-picking an issue with a live PR is wanted.
 
+## Acceptance criteria
+
+**These describe the re-scoped design above.** Everything below the "Original design
+(superseded)" heading is kept for its reasoning only — do not implement it, and in
+particular do not add a `--skip-open-prs` flag or parse issue ids out of PR bodies.
+
+1. An issue with an open `auto/pipeline-*` PR is not picked, even when `claims.py` holds no claim for it. Test: `test_pick_feature_skips_issue_with_open_pipeline_pr`
+2. The exclusion is unconditional — no flag is required to enable it. Test: `test_open_pr_exclusion_needs_no_flag`
+3. A non-pipeline open PR never excludes an issue. Test: `test_non_pipeline_pr_does_not_exclude`
+4. A `gh` or git-remote failure warns and picks anyway (fail-open, exit 0). Test: `test_pick_feature_fails_open_on_gh_error`
+5. The open-PR lookup is a single batched call, not one per issue. Test: `test_open_pr_lookup_is_batched`
+
 ### Original design (superseded — kept for the reasoning, not the plan)
 
 ## Design (proposal, superseded)
@@ -90,7 +102,7 @@ Files: `src/herdr_routines/pick_feature.py`, `src/herdr_routines/cli.py` (flag
 wiring), `tests/test_pick_feature.py`, `docs/pipeline/orchestrator-prompt.md`
 (the self-select invocation gains `--skip-open-prs`).
 
-## Acceptance
+### Acceptance (superseded — belongs to the design above, not the re-scope)
 
 - With an open `auto/pipeline-*` PR whose body closes issue N, `pick-feature`
   returns the next eligible issue, not N.
