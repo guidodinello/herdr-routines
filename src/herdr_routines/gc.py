@@ -1,11 +1,13 @@
 """Inventory and optional deletion of ``auto/*`` branches (``herdr-routines gc``).
 
-Pure git + filesystem: no HerdrClient, no socket, no ``herdr`` binary — the command
-must stay usable with no Herdr server running (spec.md §No Herdr server required).
+Pure git + filesystem, plus ``gh`` for the pipeline open-PR check below: no
+HerdrClient, no socket — the command must stay usable with no Herdr server running
+(spec.md §No Herdr server required).
 """
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -16,6 +18,16 @@ from typing import TextIO
 BRANCH_PATTERN = "refs/heads/auto/*"
 PIPELINE_PREFIX = "auto/pipeline-"
 GIT_TIMEOUT_SECONDS = 30
+GH_TIMEOUT_SECONDS = 30
+
+# Mirrors pipeline_watchdog.py's own layout constants (issue 031): the shared worktree
+# an in-flight orchestrator checkpoints into, and the terminal-report convention that
+# marks a run as finished. Duplicated rather than imported so gc.py stays a leaf module
+# with no herdr_routines.herdr import (see module docstring) — this is a few lines of
+# pure filesystem convention, not shared behavior worth coupling two independently-scoped
+# modules over.
+PIPELINE_WORKTREE_GLOB = "auto-pipeline-*"
+PIPELINE_STATE_JSON_NAME = "state.json"
 
 
 @dataclass(frozen=True)
@@ -54,7 +66,12 @@ def resolve_repo_root(repo: Path) -> Path | None:
 
 
 def list_auto_branches(repo: Path) -> list[str] | None:
-    """Local ``auto/*`` branches minus ``auto/pipeline-*`` (G-14), sorted by name.
+    """Every local ``auto/*`` branch, sorted by name — including ``auto/pipeline-*``.
+
+    Filtering pipeline branches down to the ones still *needed* (issue 039: unmerged,
+    or an open PR, or an in-flight run) is a per-branch eligibility question that needs
+    the merge/PR/run-state checks below, so it happens after this listing rather than
+    inside it — this function's job is just an honest inventory of what exists.
 
     Returns ``None`` when the plumbing call itself fails, so delete mode can abort
     instead of reading a failure as an empty inventory (spec Risks). Dry-run callers
@@ -66,7 +83,124 @@ def list_auto_branches(repo: Path) -> list[str] | None:
         _warn(f"could not list auto/* branches: {proc.stderr.strip()}")
         return None
     names = (line.strip() for line in proc.stdout.splitlines())
-    return sorted(n for n in names if n and not n.startswith(PIPELINE_PREFIX))
+    return sorted(n for n in names if n)
+
+
+def check_open_pr(repo: Path, branch: str) -> bool:
+    """True when ``branch`` has an open PR upstream, via ``gh pr list --head``.
+
+    Any ``gh`` failure (not installed, not authenticated, no configured remote) warns
+    and reports False rather than raising. That is the "assume collectable" direction,
+    which is safe here because this only feeds the dry-run *listing* — issue 039 keeps
+    the delete half unconditionally excluding every ``auto/pipeline-*`` branch, so a
+    wrong False here can misreport an inventory row, never cause a deletion.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "number",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _warn(f"gh pr list failed for {branch}: {e}")
+        return False
+    if proc.returncode != 0:
+        _warn(f"gh pr list failed for {branch}: {proc.stderr.strip()}")
+        return False
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return False
+    return bool(data)
+
+
+def _default_pipeline_worktrees_root() -> Path:
+    return Path.home() / ".herdr" / "worktrees" / "herdr-routines"
+
+
+def _default_pipeline_reports_dir() -> Path:
+    import os
+
+    plugin_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    base = (
+        Path(plugin_dir)
+        if plugin_dir
+        else Path.home() / ".local" / "state" / "herdr-routines"
+    )
+    return base / "reports"
+
+
+def check_inflight(
+    branch: str,
+    *,
+    worktrees_root: Path | None = None,
+    reports_dir: Path | None = None,
+) -> bool:
+    """True when ``branch`` belongs to a currently in-flight pipeline run: a
+    ``state.json`` naming this branch exists under
+    ``~/.herdr/worktrees/herdr-routines/auto-pipeline-*/`` and no terminal report has
+    been written for its run yet (same "no terminal report" criterion
+    pipeline_watchdog.py uses to find in-flight runs).
+
+    Not a pipeline branch at all -> False without touching the filesystem.
+    """
+    if not branch.startswith(PIPELINE_PREFIX):
+        return False
+    if worktrees_root is None:
+        worktrees_root = _default_pipeline_worktrees_root()
+    if reports_dir is None:
+        reports_dir = _default_pipeline_reports_dir()
+    if not worktrees_root.exists():
+        return False
+    for state_path in worktrees_root.glob(
+        f"{PIPELINE_WORKTREE_GLOB}/{PIPELINE_STATE_JSON_NAME}"
+    ):
+        try:
+            raw = json.loads(state_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        run_id = raw.get("run_id")
+        state_branch = raw.get("branch")
+        if not isinstance(state_branch, str) or not state_branch:
+            if not isinstance(run_id, str) or not run_id:
+                continue
+            state_branch = f"{PIPELINE_PREFIX}{run_id}"
+        if state_branch != branch or not isinstance(run_id, str) or not run_id:
+            continue
+        report_path = reports_dir / f"pipeline-{run_id}.md"
+        if not report_path.exists():
+            return True
+    return False
+
+
+def pipeline_branch_retained(repo: Path, row: Row) -> bool:
+    """Issue 039: an ``auto/pipeline-*`` branch is still *needed* — and must not be
+    listed as collectable — when it is unmerged into base, OR has an open PR, OR
+    belongs to an in-flight run. Anything else (including every non-pipeline branch)
+    is not retained here; it is exactly as collectable as any other ``auto/*`` branch.
+    """
+    if not row.branch.startswith(PIPELINE_PREFIX):
+        return False
+    if not row.merged_into_base:
+        return True
+    if check_open_pr(repo, row.branch):
+        return True
+    return check_inflight(row.branch)
 
 
 def detect_base(repo: Path) -> str:
@@ -177,7 +311,8 @@ def run_gc(repo: Path, base: str | None = None, out: TextIO | None = None) -> in
             return 1
         resolved_base = base or detect_base(root)
         rows, _, _ = collect_rows(root, resolved_base)
-        out.write(format_table(rows))
+        visible_rows = [r for r in rows if not pipeline_branch_retained(root, r)]
+        out.write(format_table(visible_rows))
     except subprocess.TimeoutExpired:
         # run_git's 30s cap must fail cleanly (stderr + exit), never as a traceback.
         print(
@@ -246,6 +381,11 @@ def run_gc_delete(
         # (or reuses it) and the same dict drives removals below — no second scan (spec
         # "Execution ordering per branch" step 1).
         rows, listing_failed, worktrees = collect_rows(root, resolved_base)
+        # Issue 039 only restores an honest dry-run inventory; the delete half stays
+        # exactly as gated as before — every auto/pipeline-* branch is excluded
+        # unconditionally here, never just the ones pipeline_branch_retained() would
+        # flag. Nothing new becomes deletable by this change.
+        rows = [r for r in rows if not r.branch.startswith(PIPELINE_PREFIX)]
         candidates = [r for r in rows if r.stale]
 
         if listing_failed:
