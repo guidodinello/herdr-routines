@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import io
+import json
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from herdr_routines import pick_feature as pick_feature_module
 from herdr_routines.claims import claim_issue, load_claims
 from herdr_routines.pick_feature import (
     Issue,
     IssueParseError,
+    ReclaimedPick,
     load_issues,
     parse_issue,
     render_feature_idea,
@@ -249,3 +253,153 @@ def test_run_pick_feature_missing_dir_fails(tmp_path: Path) -> None:
     code = run_pick_feature(tmp_path / "nope", out=out)
     assert code == 1
     assert out.getvalue() == ""
+
+
+# --- Issue 040: stale-lease reclamation --------------------------------------------
+
+
+def _stale_now(claimed_at: datetime, *, lease_hours: float = 12.0) -> datetime:
+    """A `now` comfortably past `claimed_at + lease_hours`."""
+    return claimed_at + timedelta(hours=lease_hours, minutes=1)
+
+
+def test_pick_feature_reclaims_stale_in_progress(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 1: a claim past its lease with no open PR and no
+    in-flight run is released, and the issue is picked again."""
+    _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
+    claims_path = tmp_path / "claims.json"
+    claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
+    claim_issue(claims_path, "001", now=claimed_at)
+    monkeypatch.setattr(
+        pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
+    )
+
+    out = io.StringIO()
+    code = run_pick_feature(
+        issues_dir,
+        mark=True,
+        out=out,
+        claims_path=claims_path,
+        repo=tmp_path,
+        worktrees_root=tmp_path / "worktrees",
+        now=_stale_now(claimed_at),
+    )
+    assert code == 0
+    assert "Foo" in out.getvalue()
+    # Reclaimed then immediately re-claimed by this same pick.
+    assert load_claims(claims_path).keys() == {"001"}
+
+
+def test_pick_feature_skips_in_progress_with_open_pr(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 2: a claim past its lease is NOT released while an open
+    PR still references its issue."""
+    _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
+    _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
+    claims_path = tmp_path / "claims.json"
+    claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
+    claim_issue(claims_path, "001", now=claimed_at)
+    monkeypatch.setattr(
+        pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset({1})
+    )
+
+    out = io.StringIO()
+    code = run_pick_feature(
+        issues_dir,
+        mark=True,
+        out=out,
+        claims_path=claims_path,
+        repo=tmp_path,
+        worktrees_root=tmp_path / "worktrees",
+        now=_stale_now(claimed_at),
+    )
+    assert code == 0
+    assert "Bar" in out.getvalue()
+    assert "Foo" not in out.getvalue()
+    assert load_claims(claims_path).keys() == {"001", "002"}
+
+
+def test_pick_feature_skips_in_progress_inflight_run(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 3: a claim past its lease is NOT released while its issue
+    belongs to an in-flight pipeline run (a `state.json` with no terminal report)."""
+    _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
+    _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
+    claims_path = tmp_path / "claims.json"
+    claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
+    claim_issue(claims_path, "001", now=claimed_at)
+    monkeypatch.setattr(
+        pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
+    )
+
+    worktrees_root = tmp_path / "worktrees"
+    run_dir = worktrees_root / "auto-pipeline-20260901T000000Z"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "20260901T000000Z",
+                "feature_source": "docs/process/issues/001-foo.md",
+                "branch": "auto/pipeline-20260901T000000Z",
+            }
+        )
+    )
+    reports_dir = tmp_path / "reports"
+
+    out = io.StringIO()
+    code = run_pick_feature(
+        issues_dir,
+        mark=True,
+        out=out,
+        claims_path=claims_path,
+        repo=tmp_path,
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        now=_stale_now(claimed_at),
+    )
+    assert code == 0
+    assert "Bar" in out.getvalue()
+    assert "Foo" not in out.getvalue()
+    assert load_claims(claims_path).keys() == {"001", "002"}
+
+
+def test_reclaimed_pick_is_surfaced(
+    issues_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Acceptance criterion 4: releasing a stale claim is reported on stderr and
+    handed to an injected notifier — never silent."""
+    _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
+    claims_path = tmp_path / "claims.json"
+    claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
+    claim_issue(claims_path, "001", now=claimed_at)
+    monkeypatch.setattr(
+        pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
+    )
+
+    notified: list[ReclaimedPick] = []
+    out = io.StringIO()
+    code = run_pick_feature(
+        issues_dir,
+        mark=True,
+        out=out,
+        claims_path=claims_path,
+        repo=tmp_path,
+        worktrees_root=tmp_path / "worktrees",
+        now=_stale_now(claimed_at),
+        notify=notified.append,
+    )
+    assert code == 0
+    assert len(notified) == 1
+    assert notified[0].issue_id == "001"
+    assert notified[0].claimed_at == claimed_at
+
+    err = capsys.readouterr().err
+    assert "reclaimed stale claim: issue 001" in err
+    assert "no open PR, no in-flight run" in err

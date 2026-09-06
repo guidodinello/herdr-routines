@@ -1,7 +1,7 @@
 ---
 id: "040"
 title: "A run that dies before opening a PR permanently orphans the issue it picked"
-status: open
+status: done
 priority: high
 area: pipeline
 ---

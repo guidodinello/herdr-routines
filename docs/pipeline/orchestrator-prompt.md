@@ -20,7 +20,11 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
   and `ensure_repo` assume. Record which issue you picked in `state.json`
   (`"feature_source": "docs/process/issues/<file>"`) so the report and a human reviewing in the
   morning can trace the run back to its issue. If the command exits 1 (`no open issues`), **stop
-  and write a report saying so** — do not fabricate a feature idea. This only covers picking
+  and write a report saying so** — do not fabricate a feature idea. `--mark-in-progress` also
+  reclaims any stale claim past its lease (issue 040: a prior run that died before opening a PR
+  must not orphan the issue it picked forever) — carry any `reclaimed stale claim: ...` line it
+  writes to stderr into `$PIPELINE_REPORT` verbatim, so a human reviewing in the morning sees that
+  an issue went back in the pool. This only covers picking
   *which* Now-horizon item to build; it does not make the pipeline self-scheduling — a human (or
   `systemd-run --on-calendar`, launcher-side) still decides *when* a run happens. **The
   implementing PR carries the issue's `status: done` flip** (stage 3 commits `status: open` →

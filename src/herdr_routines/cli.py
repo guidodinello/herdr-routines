@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -30,14 +31,14 @@ from herdr_routines.gates import (
     run_gate6,
 )
 from herdr_routines.gc import run_gc, run_gc_delete
-from herdr_routines.herdr import HerdrClient
+from herdr_routines.herdr import HerdrClient, HerdrCliError
 from herdr_routines.history import (
     default_history_path,
     first_seen_at,
     last_terminal_run,
     read_job,
 )
-from herdr_routines.pick_feature import run_pick_feature
+from herdr_routines.pick_feature import ReclaimedPick, run_pick_feature
 from herdr_routines.pipeline_watchdog import (
     default_heartbeat_dir,
     default_worktrees_root,
@@ -251,6 +252,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--mark-in-progress",
         action="store_true",
         help="flip the picked issue's status to in-progress before printing it",
+    )
+    p_pick.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        help=(
+            "git checkout to run `gh pr list` from, for stale-claim reclamation "
+            "(default: cwd; only used with --mark-in-progress)"
+        ),
     )
     p_pick.set_defaults(handler=_cmd_pick_feature)
 
@@ -741,8 +751,36 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
 
 def _cmd_pick_feature(args: argparse.Namespace) -> int:
-    # No HerdrClient — pure filesystem, same posture as gc (docs/process/README.md).
-    return run_pick_feature(args.issues_dir, mark=args.mark_in_progress)
+    # No HerdrClient unless a claim actually gets reclaimed below — same "no Herdr
+    # server required" posture as gc (docs/process/README.md), just not absolute:
+    # pipeline_watchdog.py already proves a bare `HerdrClient()` notification works
+    # fine with no workspace/pane, from its own cron-driven sweep.
+    def _notify_reclaim(reclaimed: ReclaimedPick) -> None:
+        try:
+            HerdrClient().notification_show(
+                f"herdr-routines: issue {reclaimed.issue_id} reclaimed",
+                body=(
+                    f"stale claim from {reclaimed.claimed_at.isoformat()} "
+                    "released — no open PR, no in-flight run"
+                ),
+                sound="request",
+            )
+        except HerdrCliError as e:
+            log.warning(
+                "pick-feature: reclaim notification failed for issue %s: %s",
+                reclaimed.issue_id,
+                e,
+            )
+
+    notify: Callable[[ReclaimedPick], None] | None = (
+        _notify_reclaim if args.mark_in_progress else None
+    )
+    return run_pick_feature(
+        args.issues_dir,
+        mark=args.mark_in_progress,
+        repo=args.repo,
+        notify=notify,
+    )
 
 
 def _cmd_tmp_hygiene(args: argparse.Namespace) -> int:
