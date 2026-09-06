@@ -1,7 +1,7 @@
 ---
 id: "028"
 title: "pick-feature: skip issues with an open pipeline PR"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
