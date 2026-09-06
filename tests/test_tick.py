@@ -1367,3 +1367,48 @@ def test_live_agent_guard_matches_dispatch_name(tmp_path: Path) -> None:
         {build_worker_agent_name(job_name, 99, run_id): "working"}
     )
     assert _pr_worker_is_live(other_pr_client, job_name, pr_number) is False  # type: ignore[arg-type]
+
+
+def test_tick_reconciles_launcher_failure_stub(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 037: pipeline-launch.sh now writes a `## Outcome: failed` stub report itself
+    when the orchestrator settles blocked/unknown, instead of leaving no report at all.
+    A stub report reconciles exactly like the orchestrator's or the watchdog's own report
+    would — on the very next tick, minutes after dispatch — rather than tick waiting out
+    the full deadline+grace `no_report` bound (the 8h incident this issue documents)."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        "# Pipeline run "
+        f"{bare_run_id} — launcher stub report\n\n"
+        "## Outcome: failed\n\n"
+        "settle_status: blocked\n"
+        f"tail: {report_path.parent}/{bare_run_id}.tail.txt\n"
+    )
+
+    # Only a couple of minutes after dispatch — nowhere near deadline_ms (25_200_000ms)
+    # plus PIPELINE_RECONCILE_GRACE_MS. The report alone must be enough to reconcile.
+    t2 = t1 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: failed (orchestrator_failed)",)
+    assert outcome.any_job_failed is True
+    records = read_job(history_path, job.name)
+    assert [r.state for r in records[-1:]] == ["failed"]
+    assert client.notifications  # a failure must notify
