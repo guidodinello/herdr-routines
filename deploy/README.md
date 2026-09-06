@@ -13,6 +13,7 @@ copying the unit to a host with a different checkout path or `uv` install locati
 mkdir -p ~/.config/systemd/user
 cp systemd/herdr-server.service systemd/herdr-routines.timer systemd/herdr-routines.service \
    systemd/herdr-routines-watchdog.timer systemd/herdr-routines-watchdog.service \
+   systemd/herdr-routines-digest.timer systemd/herdr-routines-digest.service \
    ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
@@ -23,6 +24,13 @@ systemctl --user daemon-reload
 agent prompt per job; the pipeline stall watchdog (issue 031) spawns no agent and issues no
 prompt, so it gets its own timer the same way `tick` itself does, rather than being forced
 into a job shape it doesn't fit.
+
+`herdr-routines-digest.{timer,service}` is a fourth, independent unit pair for the same
+reason (issue 010): the daily digest reads existing `history.jsonl` + the reports dir and
+posts one summary notification — it spawns no agent, dispatches no job, and needs no new
+per-job config field, so it gets its own once-a-morning timer rather than a `jobs.d/` entry.
+Edit `--timezone` in the unit's `ExecStart` (default in the example is
+`America/Montevideo`) to your own; drop `--notify` to only print to the service log.
 
 **On a fresh Pi (not needed on this laptop — `Linger` is already `yes` here):**
 
@@ -56,6 +64,7 @@ uv run herdr-routines tmp-hygiene --dry-run  # optional: preview /tmp cleanup
 systemctl --user enable --now herdr-server.service
 systemctl --user enable --now herdr-routines.timer
 systemctl --user enable --now herdr-routines-watchdog.timer
+systemctl --user enable --now herdr-routines-digest.timer
 ```
 
 **Note on /tmp hygiene (issue 027):** `tick` now runs an age-based `/tmp` reap
