@@ -403,3 +403,201 @@ def test_reclaimed_pick_is_surfaced(
     err = capsys.readouterr().err
     assert "reclaimed stale claim: issue 001" in err
     assert "no open PR, no in-flight run" in err
+
+
+# --- Issue 028: pipeline open-PR exclusion (re-scoped) -----------------------
+
+
+def test_pick_feature_skips_issue_with_open_pipeline_pr(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An issue with an open auto/pipeline-* PR is not picked, even when claims.py holds no claim."""
+    _write_issue(
+        issues_dir,
+        "028-foo.md",
+        id="028",
+        title="Foo",
+        status="open",
+        priority="medium",
+    )
+    _write_issue(
+        issues_dir,
+        "029-bar.md",
+        id="029",
+        title="Bar",
+        status="open",
+        priority="medium",
+    )
+    claims_path = tmp_path / "claims.json"
+    monkeypatch.setattr(
+        pick_feature_module,
+        "pipeline_open_pr_issue_ids",
+        lambda repo, worktrees_root=None, reports_dir=None: frozenset({28}),
+    )
+    out = io.StringIO()
+    code = run_pick_feature(issues_dir, out=out, claims_path=claims_path, repo=tmp_path)
+    assert code == 0
+    assert "Bar" in out.getvalue()
+    assert "Foo" not in out.getvalue()
+
+
+def test_open_pr_exclusion_needs_no_flag(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The exclusion is unconditional — no flag is required to enable it."""
+    _write_issue(
+        issues_dir,
+        "028-foo.md",
+        id="028",
+        title="Foo",
+        status="open",
+        priority="medium",
+    )
+    _write_issue(
+        issues_dir, "029-bar.md", id="029", title="Bar", status="open", priority="low"
+    )
+    claims_path = tmp_path / "claims.json"
+    monkeypatch.setattr(
+        pick_feature_module,
+        "pipeline_open_pr_issue_ids",
+        lambda repo, worktrees_root=None, reports_dir=None: frozenset({28}),
+    )
+    out = io.StringIO()
+    code = run_pick_feature(issues_dir, out=out, claims_path=claims_path, repo=tmp_path)
+    assert code == 0
+    assert "Bar" in out.getvalue()
+    assert "Foo" not in out.getvalue()
+
+
+def test_non_pipeline_pr_does_not_exclude(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-pipeline open PR never excludes an issue."""
+    _write_issue(issues_dir, "028-foo.md", id="028", title="Foo", status="open")
+    claims_path = tmp_path / "claims.json"
+    monkeypatch.setattr(
+        pick_feature_module,
+        "pipeline_open_pr_issue_ids",
+        lambda repo, worktrees_root=None, reports_dir=None: frozenset(),
+    )
+    out = io.StringIO()
+    code = run_pick_feature(issues_dir, out=out, claims_path=claims_path, repo=tmp_path)
+    assert code == 0
+    assert "Foo" in out.getvalue()
+
+
+def test_pick_feature_fails_open_on_gh_error(
+    issues_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A gh or git-remote failure warns and picks anyway (fail-open, exit 0)."""
+    _write_issue(issues_dir, "028-foo.md", id="028", title="Foo", status="open")
+    claims_path = tmp_path / "claims.json"
+
+    def fake_fail(*args, **kwargs):
+        print(
+            "warning: gh pr list failed: simulated failure",
+            file=__import__("sys").stderr,
+        )
+
+    monkeypatch.setattr(pick_feature_module, "pipeline_open_pr_issue_ids", fake_fail)
+    out = io.StringIO()
+    code = run_pick_feature(issues_dir, out=out, claims_path=claims_path, repo=tmp_path)
+    assert code == 0
+    assert "Foo" in out.getvalue()
+    err = capsys.readouterr().err
+    assert "warning" in err.lower()
+
+
+def test_open_pr_lookup_is_batched(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The open-PR lookup is a single batched call, not one per issue."""
+    for i in range(5):
+        _write_issue(
+            issues_dir,
+            f"0{i + 1:02d}-x.md",
+            id=f"0{i + 1:02d}",
+            title=f"T{i}",
+            status="open",
+        )
+    claims_path = tmp_path / "claims.json"
+    call_count = 0
+
+    def counting(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return frozenset()
+
+    monkeypatch.setattr(pick_feature_module, "pipeline_open_pr_issue_ids", counting)
+    out = io.StringIO()
+    code = run_pick_feature(issues_dir, out=out, claims_path=claims_path, repo=tmp_path)
+    assert code == 0
+    assert call_count == 1
+
+
+def test_select_next_with_pipeline_ids(issues_dir: Path) -> None:
+    """select_next correctly excludes pipeline PR ids alongside claimed ids."""
+    _write_issue(issues_dir, "028-foo.md", id="028", priority="medium")
+    _write_issue(issues_dir, "029-bar.md", id="029", priority="medium")
+    issues = load_issues(issues_dir)
+    picked = select_next(issues, frozenset(), frozenset({28}))
+    assert picked is not None
+    assert picked.id == "029"
+
+
+def test_pipeline_structural_derivation(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pipeline PR with state.json feature_source derives issue id structurally even with empty body."""
+    _write_issue(issues_dir, "028-foo.md", id="028", title="Foo", status="open")
+    _write_issue(issues_dir, "029-bar.md", id="029", title="Bar", status="open")
+    claims_path = tmp_path / "claims.json"
+    worktrees_root = tmp_path / "worktrees"
+    run_id = "20260906T050000Z"
+    state_dir = worktrees_root / f"auto-pipeline-{run_id.lower()}"
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "feature_source": "docs/process/issues/028-foo.md",
+                "branch": f"auto/pipeline-{run_id}",
+            }
+        )
+    )
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    fake_prs = [
+        {
+            "headRefName": f"auto/pipeline-{run_id}",
+            "number": 1,
+            "title": "feat",
+            "body": "",
+        }
+    ]
+    # Let the real pipeline_open_pr_issue_ids run against the fake gh output by mocking subprocess.run
+    original_run = subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        if "pr" in cmd and "list" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=json.dumps(fake_prs), stderr=""
+            )
+        return original_run(cmd, **kwargs)
+
+    monkeypatch.setattr(pick_feature_module.subprocess, "run", fake_run)
+    out = io.StringIO()
+    code = run_pick_feature(
+        issues_dir,
+        out=out,
+        claims_path=claims_path,
+        repo=tmp_path,
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+    )
+    assert code == 0
+    assert "Bar" in out.getvalue()
+    assert "Foo" not in out.getvalue()
