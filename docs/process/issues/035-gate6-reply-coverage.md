@@ -45,7 +45,27 @@ The stricter regex is arguably the sane reading of intent. Both are wrong for th
 same underlying reason: neither counts replies. Fix the metric, and pick one
 regex deliberately rather than leaving the orchestrator to improvise.
 
-## Design (proposal)
+## Design
+
+**Decided 2026-09-06: extract the gate into code rather than reword the prompt.**
+
+The prompt's literal `test("blocking")` matches `"non-blocking"` by substring, so
+it *would* have flagged PR #81's thread. The orchestrator silently substituted a
+stricter `\[blocking\]` regex that did not, and nothing detected the swap. That is
+the real lesson: **a gate written as prose is advisory.** An agent told "run this
+jq" can run a different jq and still report the gate passed. Rewording it produces
+a better sentence with the same enforcement properties — none.
+
+So gate 6 becomes `herdr-routines gate --stage 6 --pr <n>`, backed by
+`src/herdr_routines/gates.py` and pinned by `tests/test_gates.py`. The orchestrator
+can run it and read the exit code; it cannot rewrite it.
+
+**Scope is deliberately two gates, not six.** Only this gate and 034's CI gate move
+to code now. The rest stay as prose. That keeps the change to one reviewable PR and
+proves the pattern before committing to a 192-line prompt rewrite. The cost,
+accepted knowingly: gate logic lives in two places during the transition.
+
+**This issue and 034 are one PR** — both create `gates.py`.
 
 Redefine gate 6 as **reply coverage**, with the blocking-fix check as an
 additional condition rather than the only one:

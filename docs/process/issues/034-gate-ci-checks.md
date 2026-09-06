@@ -38,7 +38,11 @@ pytest, which on this repo means both ruff invocations and the typechecker.
 Note that `.github/workflows/ci.yml` runs **both** `ruff format --check .` **and**
 `ruff check .`. A local `pytest`-only gate cannot stand in for CI.
 
-## Design (proposal)
+## Design
+
+**Decided 2026-09-06: the gate moves into code** (see issue 035 for the shared
+rationale). Both this issue and 035 create `src/herdr_routines/gates.py` and are
+therefore **one PR, not two** — they are no longer independently parallelizable.
 
 Two changes, cheapest first:
 
@@ -67,6 +71,14 @@ Two changes, cheapest first:
 Bound the poll (CI on this repo finishes in well under 2 minutes; a 10-minute cap
 with a `SKIPPED`/`NEUTRAL`-tolerant filter is plenty) so a stuck check can't eat
 the orchestrator's deadline.
+
+### Where the logic lives
+
+The CI gate ships as `herdr-routines gate --stage ci --pr <n>` backed by
+`gates.py`, and the prompt calls it rather than inlining jq. The acceptance
+criteria below are only implementable that way: `test_ci_gate_tolerates_skipped_checks`
+needs something to import. Gate 3's lint widening stays as prompt text — it is a
+command the implementer runs, not a verdict the orchestrator computes.
 
 ## Acceptance criteria
 
