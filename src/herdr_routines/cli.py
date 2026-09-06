@@ -25,7 +25,6 @@ from herdr_routines.config import (
 )
 from herdr_routines.gc import run_gc, run_gc_delete
 from herdr_routines.herdr import HerdrClient
-from herdr_routines.tmp_hygiene import reap_tmp
 from herdr_routines.history import (
     default_history_path,
     first_seen_at,
@@ -56,6 +55,7 @@ from herdr_routines.tick import (
     run_tick,
     tick_lock,
 )
+from herdr_routines.tmp_hygiene import reap_tmp
 
 log = get_logger(__name__)
 
@@ -691,17 +691,26 @@ def _cmd_pick_feature(args: argparse.Namespace) -> int:
 
 def _cmd_tmp_hygiene(args: argparse.Namespace) -> int:
     result = reap_tmp(
-        tmp_dir=args.tmp_dir, max_age_s=args.max_age, dry_run=args.dry_run,
+        tmp_dir=args.tmp_dir,
+        max_age_s=args.max_age,
+        dry_run=args.dry_run,
     )
     label = "would remove" if args.dry_run else "removed"
     log.info(
         "tmp-hygiene: %s %d file(s), skipped %d fresh, %d errors",
-        label, result.removed, result.skipped_fresh, result.errors,
+        label,
+        result.removed,
+        result.skipped_fresh,
+        result.errors,
     )
     if args.dry_run:
-        print(f"{label}: {result.removed}, fresh (skipped): {result.skipped_fresh}, errors: {result.errors}")
+        print(
+            f"{label}: {result.removed}, fresh (skipped): {result.skipped_fresh}, errors: {result.errors}"
+        )
     else:
-        print(f"removed: {result.removed}, fresh (skipped): {result.skipped_fresh}, errors: {result.errors}")
+        print(
+            f"removed: {result.removed}, fresh (skipped): {result.skipped_fresh}, errors: {result.errors}"
+        )
     return 0
 
 

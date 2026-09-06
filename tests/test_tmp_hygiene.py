@@ -20,16 +20,14 @@ from unittest.mock import patch
 import pytest
 
 from herdr_routines.config import (
-    TmphgieneConfig,
     load_config,
-    load_config_dir,
 )
-from herdr_routines.tmp_hygiene import DEFAULT_MAX_AGE_S, ReapResult, reap_tmp
-
+from herdr_routines.tmp_hygiene import reap_tmp
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_old_file(tmp_dir: Path, name: str) -> Path:
     """Create a file with mtime well in the past."""
@@ -63,6 +61,7 @@ def _make_old_dir(tmp_dir: Path, name: str) -> Path:
 # 1. Age-based cleanup removes leaked patterns older than max_age_s
 # ---------------------------------------------------------------------------
 
+
 def test_tmp_hygiene_age_based_cleanup(tmp_path: Path) -> None:
     """Old .3cdc*.so files, pytest-of-* dirs, and opencode dirs are removed when
     older than max_age_s; fresh files are skipped."""
@@ -94,6 +93,7 @@ def test_tmp_hygiene_age_based_cleanup(tmp_path: Path) -> None:
 # 2. Safe against live runs: fresh mtime files never removed
 # ---------------------------------------------------------------------------
 
+
 def test_tmp_hygiene_safe_against_live_run(tmp_path: Path) -> None:
     """An in-flight agent's .so (mtime within max_age_s) is never removed mid-spawn."""
     tmp_dir = tmp_path / "tmp"
@@ -120,6 +120,7 @@ def test_tmp_hygiene_safe_against_live_run(tmp_path: Path) -> None:
 # 3. Keeps /tmp under threshold: reap is idempotent and bounded
 # ---------------------------------------------------------------------------
 
+
 def test_tmp_hygiene_keeps_tmp_under_threshold(tmp_path: Path) -> None:
     """Running reap_tmp multiple times is idempotent — second run removes nothing
     and returns removed=0. Bounded filesystem ops."""
@@ -141,6 +142,7 @@ def test_tmp_hygiene_keeps_tmp_under_threshold(tmp_path: Path) -> None:
 # 4. Diagnosis distinguishes disk-full from quota/blocked
 # ---------------------------------------------------------------------------
 
+
 def test_tmp_hygiene_diagnosis_distinguishes_disk_full(tmp_path: Path) -> None:
     """diagnose_tmp returns tmp_full=True when df shows >=95% Use%."""
     from herdr_routines.runner import diagnose_tmp
@@ -155,6 +157,7 @@ def test_tmp_hygiene_diagnosis_distinguishes_disk_full(tmp_path: Path) -> None:
         class FakeProc:
             returncode = 0
             stdout = ""
+
         p = FakeProc()
         if cmd[0] == "df":
             p.stdout = fake_df_output
@@ -176,6 +179,7 @@ def test_tmp_hygiene_diagnosis_distinguishes_disk_full(tmp_path: Path) -> None:
         class FakeProc:
             returncode = 0
             stdout = ""
+
         p = FakeProc()
         if cmd[0] == "df":
             p.stdout = low_usage_output
@@ -190,6 +194,7 @@ def test_tmp_hygiene_diagnosis_distinguishes_disk_full(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # 5. Narrow patterns: only anchored top-level globs, no broad sweep
 # ---------------------------------------------------------------------------
+
 
 def test_tmp_hygiene_narrow_patterns(tmp_path: Path) -> None:
     """Only specific patterns are reaped; unrelated files/dirs are untouched.
@@ -220,6 +225,7 @@ def test_tmp_hygiene_narrow_patterns(tmp_path: Path) -> None:
 # 6. Dry run and tick preamble behavior
 # ---------------------------------------------------------------------------
 
+
 def test_tmp_hygiene_dry_run_and_tick_preamble(tmp_path: Path) -> None:
     """dry_run reports what would be removed without mutating. Tick preamble reap
     is best-effort and never fails the tick."""
@@ -248,7 +254,6 @@ def test_tmp_hygiene_dry_run_and_tick_preamble(tmp_path: Path) -> None:
     # We don't need a real config/client for this; the preamble fires before jobs.
     # Just verify the import works and the try/except is in place by calling the
     # function directly — the test_tick.py suite covers the full integration.
-    from herdr_routines.tmp_hygiene import reap_tmp as real_reap_tmp
 
     # Restore for the assertion below
     monkeypatch.undo()
@@ -261,6 +266,7 @@ def test_tmp_hygiene_dry_run_and_tick_preamble(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # 7. Config and docs: tmp_hygiene block validated
 # ---------------------------------------------------------------------------
+
 
 def test_tmp_hygiene_config_and_docs(tmp_config_path: Path) -> None:
     """tmp_hygiene config block is validated: positive max_age_s, non-empty tmp_dir,
@@ -334,10 +340,18 @@ jobs:
 # This is a meta-test verifying the spec's own formatting.
 # ---------------------------------------------------------------------------
 
+
 def test_tmp_hygiene_review_tiers_present() -> None:
     """Verify the spec acceptance criteria contain both blocking and non-blocking tiers
     and confidence annotations."""
-    spec_path = Path(__file__).parents[1] / "docs" / "pipeline" / "runs" / "20260904T050000Z" / "spec.md"
+    spec_path = (
+        Path(__file__).parents[1]
+        / "docs"
+        / "pipeline"
+        / "runs"
+        / "20260904T050000Z"
+        / "spec.md"
+    )
     if not spec_path.exists():
         pytest.skip("spec.md not found (not in repo root)")
     text = spec_path.read_text()
@@ -346,6 +360,8 @@ def test_tmp_hygiene_review_tiers_present() -> None:
     assert "confidence:" in text
     # Each acceptance line ends with a Test: name
     for line in text.splitlines():
-        if line.strip().startswith(("1.", "2.", "3.", "4.", "5.", "6.", "7.")):
-            if "Test:" in line:
-                assert line.rstrip().endswith(line.rstrip().split("Test:")[-1].strip())
+        if (
+            line.strip().startswith(("1.", "2.", "3.", "4.", "5.", "6.", "7."))
+            and "Test:" in line
+        ):
+            assert line.rstrip().endswith(line.rstrip().split("Test:")[-1].strip())

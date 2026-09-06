@@ -6,7 +6,6 @@ contract and the post-run verification rationale.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -65,13 +64,16 @@ NUDGE_TIMEOUT_MS = 120_000
 
 def diagnose_tmp() -> dict[str, str | bool]:
     """Best-effort /tmp disk diagnosis for agent start failures (issue 027).
-    Returns dict with df_tmp, du_tmp, tmp_full keys. Never raises — all subprocess
-    calls are bounded by 5s timeout."""
+    Returns dict with df_tmp, du_tmp, tmp_full keys. Never raises — the df call is
+    bounded by a 5s timeout and the size tally is a bounded filesystem walk."""
     diagnosis: dict[str, str | bool] = {"tmp_full": False}
     try:
         proc = subprocess.run(
             ["df", "-h", "/tmp"],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
         )
         diagnosis["df_tmp"] = proc.stdout.strip()
         # Parse Use% from df output (second line, 4th column is Use%)
@@ -86,15 +88,40 @@ def diagnose_tmp() -> dict[str, str | bool]:
                     pass
     except (OSError, subprocess.TimeoutExpired):
         diagnosis["df_tmp"] = "(unavailable)"
+    # Size breakdown of the known /tmp offenders. Done with an iterdir tally rather
+    # than `du` in a subprocess: the glob patterns would never expand without a
+    # shell, so `du` would just receive literal paths and return nothing.
     try:
-        proc = subprocess.run(
-            ["du", "-sh", "/tmp/.3cdc*", "/tmp/pytest-of-*", "/tmp/opencode"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        diagnosis["du_tmp"] = proc.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
+        tmp = Path("/tmp")
+        lines: list[str] = []
+        for pattern in (".3cdc*", "pytest-of-*", "opencode"):
+            for entry in sorted(tmp.glob(pattern)):
+                lines.append(f"{_dir_size_h(entry)}\t{entry}")
+        diagnosis["du_tmp"] = "\n".join(lines)
+    except OSError:
         diagnosis["du_tmp"] = "(unavailable)"
     return diagnosis
+
+
+def _dir_size_h(path: Path) -> str:
+    """Total size of path (recursively, if a directory), formatted like `du -h`."""
+    total = 0
+    if path.is_dir() and not path.is_symlink():
+        for p in path.rglob("*"):
+            try:
+                total += p.lstat().st_size
+            except OSError:
+                pass
+    else:
+        try:
+            total += path.lstat().st_size
+        except OSError:
+            pass
+    for unit in ("B", "K", "M", "G"):
+        if total < 1024 or unit == "G":
+            return f"{total:.0f}{unit}" if unit == "B" else f"{total:.1f}{unit}"
+        total /= 1024
+    return f"{total:.1f}G"
 
 
 def _error_body_code(e: HerdrCliError) -> str | None:
@@ -343,7 +370,9 @@ def substitute_prompt(
     )
 
 
-def _best_effort_tmp_diagnosis(reports_dir: Path, run_id: str) -> dict[str, str | bool] | None:
+def _best_effort_tmp_diagnosis(
+    reports_dir: Path, run_id: str
+) -> dict[str, str | bool] | None:
     """Best-effort /tmp diagnosis appended to the tail file. Returns None on total failure
     so RunOutcome.diagnosis stays clean."""
     try:
@@ -353,7 +382,7 @@ def _best_effort_tmp_diagnosis(reports_dir: Path, run_id: str) -> dict[str, str 
         try:
             reports_dir.mkdir(parents=True, exist_ok=True)
             with tail_path.open("a") as f:
-                f.write(f"\n--- /tmp diagnosis ---\n")
+                f.write("\n--- /tmp diagnosis ---\n")
                 f.write(f"tmp_full: {diagnosis.get('tmp_full', False)}\n")
                 if diagnosis.get("df_tmp"):
                     f.write(f"df -h /tmp:\n{diagnosis['df_tmp']}\n")
@@ -571,7 +600,9 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         return RunOutcome(
             state="failed",
             run_id=run_id,
-            reason="tmp_full" if diagnosis and diagnosis.get("tmp_full") else "agent_start_failed",
+            reason="tmp_full"
+            if diagnosis and diagnosis.get("tmp_full")
+            else "agent_start_failed",
             error=str(e),
             pane_id=pane_id,
             branch=branch,
@@ -599,7 +630,9 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         return RunOutcome(
             state="failed",
             run_id=run_id,
-            reason="tmp_full" if diagnosis and diagnosis.get("tmp_full") else "agent_not_interactive",
+            reason="tmp_full"
+            if diagnosis and diagnosis.get("tmp_full")
+            else "agent_not_interactive",
             error=error,
             agent_name=job.agent_name,
             pane_id=pane_id,

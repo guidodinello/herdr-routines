@@ -794,7 +794,11 @@ def _build_job(
         if not isinstance(th_enabled, bool):
             raise ConfigError(f"{label}: 'tmp_hygiene.enabled' must be a boolean")
         th_max_age_s = tmp_hygiene_raw.get("max_age_s", DEFAULT_MAX_AGE_S)
-        if not isinstance(th_max_age_s, int) or isinstance(th_max_age_s, bool) or th_max_age_s <= 0:
+        if (
+            not isinstance(th_max_age_s, int)
+            or isinstance(th_max_age_s, bool)
+            or th_max_age_s <= 0
+        ):
             raise ConfigError(
                 f"{label}: 'tmp_hygiene.max_age_s' must be a positive integer"
             )
