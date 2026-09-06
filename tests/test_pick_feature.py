@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import io
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from herdr_routines.claims import claim_issue, load_claims
 from herdr_routines.pick_feature import (
     Issue,
     IssueParseError,
     load_issues,
-    mark_in_progress,
     parse_issue,
     render_feature_idea,
     run_pick_feature,
@@ -154,25 +155,6 @@ def test_render_feature_idea_includes_title_id_path_and_body(issues_dir: Path) -
     assert "Fix the foo bug." in text
 
 
-def test_mark_in_progress_flips_status_atomically(issues_dir: Path) -> None:
-    path = _write_issue(issues_dir, "001-foo.md", id="001", status="open")
-    issue = parse_issue(path)
-    mark_in_progress(issue)
-    reparsed = parse_issue(path)
-    assert reparsed.status == "in-progress"
-    # No leftover tmp file after the atomic rename.
-    assert not path.with_suffix(".md.tmp").exists()
-
-
-def test_mark_in_progress_ambiguous_status_line_raises(issues_dir: Path) -> None:
-    path = _write_issue(issues_dir, "001-foo.md", id="001", status="open")
-    # Sneak in a second identical status line inside the body to force ambiguity.
-    path.write_text(path.read_text() + "\nstatus: open\n")
-    issue = parse_issue(path)
-    with pytest.raises(IssueParseError, match="expected exactly one"):
-        mark_in_progress(issue)
-
-
 def test_run_pick_feature_writes_feature_idea_for_open_issue(issues_dir: Path) -> None:
     _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
     out = io.StringIO()
@@ -181,12 +163,77 @@ def test_run_pick_feature_writes_feature_idea_for_open_issue(issues_dir: Path) -
     assert "Foo" in out.getvalue()
 
 
-def test_run_pick_feature_mark_in_progress_updates_file(issues_dir: Path) -> None:
-    path = _write_issue(issues_dir, "001-foo.md", id="001", status="open")
+def test_pick_feature_leaves_parent_clone_clean(tmp_path: Path) -> None:
+    """Acceptance criterion 1 (issue 041): `--mark-in-progress` must not write to
+    the issue file — that edit collided with the implementing PR's own edit to
+    the same line and wedged `sync-repo`. The claim goes to an out-of-tree store
+    instead, so a real git checkout of `docs/process/issues/` has no uncommitted
+    changes after the pick (a byte-equality check on the file alone would miss an
+    untracked leftover, e.g. a stray tmp file or an in-repo claims file)."""
+    repo = tmp_path / "repo"
+    issues_dir = repo / "docs" / "process" / "issues"
+    issues_dir.mkdir(parents=True)
+    _write_issue(issues_dir, "001-foo.md", id="001", status="open")
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"], cwd=repo, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=repo, capture_output=True, check=True
+    )
+
     out = io.StringIO()
-    code = run_pick_feature(issues_dir, mark=True, out=out)
+    claims_path = tmp_path / "state" / "claims.json"
+    code = run_pick_feature(issues_dir, mark=True, out=out, claims_path=claims_path)
     assert code == 0
-    assert parse_issue(path).status == "in-progress"
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert status.stdout == ""
+    assert parse_issue(issues_dir / "001-foo.md").status == "open"
+
+
+def test_claimed_issue_not_repicked(issues_dir: Path, tmp_path: Path) -> None:
+    """Acceptance criterion 3: a claim (recorded out-of-tree, not as a status
+    change) still keeps the next pick from re-selecting the same issue."""
+    _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
+    _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
+    claims_path = tmp_path / "claims.json"
+
+    first = io.StringIO()
+    code = run_pick_feature(issues_dir, mark=True, out=first, claims_path=claims_path)
+    assert code == 0
+    assert "Foo" in first.getvalue()
+
+    second = io.StringIO()
+    code = run_pick_feature(issues_dir, mark=True, out=second, claims_path=claims_path)
+    assert code == 0
+    assert "Bar" in second.getvalue()
+    assert "Foo" not in second.getvalue()
+
+
+def test_claimed_issue_skipped_without_marking_again(
+    issues_dir: Path, tmp_path: Path
+) -> None:
+    """A pre-existing claim (e.g. from a previous run) is honored even on an
+    unmarked pick, not just immediately after the claiming call."""
+    _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
+    _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
+    claims_path = tmp_path / "claims.json"
+    claim_issue(claims_path, "001")
+
+    out = io.StringIO()
+    code = run_pick_feature(issues_dir, out=out, claims_path=claims_path)
+    assert code == 0
+    assert "Bar" in out.getvalue()
+    assert load_claims(claims_path).keys() == {"001"}
 
 
 def test_run_pick_feature_no_open_issues_fails(issues_dir: Path) -> None:
