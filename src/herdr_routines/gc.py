@@ -8,6 +8,8 @@ HerdrClient, no socket — the command must stay usable with no Herdr server run
 from __future__ import annotations
 
 import json
+import math
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -209,7 +211,39 @@ def check_open_pr(repo: Path, branch: str) -> bool:
 
 
 def _default_pipeline_worktrees_root() -> Path:
+    """herdr-routines' own worktree dir.
+
+    Deliberately repo-independent: its only caller is ``check_inflight``, and an
+    in-flight *pipeline* run only ever exists for herdr-routines. Do NOT reuse this
+    for the orphan sweep — doing so is issue 048, where a scan rooted here was
+    compared against another repo's registrations and reported that repo's every
+    entry, including a live one, as an orphan.
+    """
     return Path.home() / ".herdr" / "worktrees" / "herdr-routines"
+
+
+def derive_worktrees_root(repo: Path, registered: Sequence[Path]) -> Path | None:
+    """Where *this* repo's worktrees live, from its own registrations (issue 048).
+
+    The common parent of the registered worktree paths, ignoring the repo's own
+    checkout (which is registered but is not under the worktrees dir). Falls back to
+    ``~/.herdr/worktrees/<repo-name>`` when nothing else is registered, and returns
+    ``None`` when even that does not exist — the caller then skips the sweep rather
+    than scanning a directory belonging to some other project.
+    """
+    parents = {p.parent for p in registered if p.resolve() != repo.resolve()}
+    if len(parents) == 1:
+        return parents.pop()
+    if parents:
+        # More than one location: pick the one holding the most worktrees rather than
+        # guessing, and let the caller's containment check reject it if it is wrong.
+        counts: dict[Path, int] = {}
+        for p in registered:
+            if p.resolve() != repo.resolve():
+                counts[p.parent] = counts.get(p.parent, 0) + 1
+        return max(counts, key=lambda k: counts[k])
+    fallback = Path.home() / ".herdr" / "worktrees" / repo.name
+    return fallback if fallback.exists() else None
 
 
 def _default_pipeline_reports_dir() -> Path:
@@ -369,6 +403,25 @@ def _tip_committer_date(repo: Path, branch: str) -> datetime | None:
     return _parse_iso_datetime(proc.stdout.strip())
 
 
+# Every branch gc may touch is `auto/<job>-<RUN_ID>` with RUN_ID a UTC stamp. That
+# stamp is the branch's creation time *by construction* — no git call, no network,
+# and correct for the branch shape that broke issue 044: a review job cuts a branch,
+# posts a review, and commits nothing, so its tip IS the base commit it came from and
+# the tip date says when the *base* was written (issue 047 — measured: 43 of 47
+# branches in one repo reporting an identical age, one of them three days old).
+_RUN_STAMP_RE = re.compile(r"-(\d{8}T\d{6}Z)$")
+
+
+def _run_stamp_date(branch: str) -> datetime | None:
+    m = _RUN_STAMP_RE.search(branch)
+    if m is None:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def branch_age_days(
     repo: Path,
     branch: str,
@@ -376,19 +429,29 @@ def branch_age_days(
     *,
     now: datetime | None = None,
 ) -> float:
-    """Days since ``branch`` merged, or since its tip commit when no PR record exists
-    (issue 044). The PR's ``mergedAt`` always wins when present — it is the more honest
-    signal for *when the branch stopped being needed*, since a branch's tip commit can
-    predate its merge by any amount and its committer date only stands in as a fallback.
-    ``float("inf")`` when neither source is readable, so an unreadable age can never
-    itself block a threshold-gated delete.
+    """Days since ``branch`` stopped being needed, best source first (issues 044, 047):
+
+    1. the PR's ``mergedAt`` — the most honest signal when present;
+    2. the ``RUN_ID`` stamp in the branch name — the creation time by construction,
+       and the only one of the three that is right for a branch which never commits;
+    3. the tip committer date — last resort, and wrong for a no-commit branch, whose
+       tip is the base commit it was cut from.
+
+    Returns ``float("-inf")`` when none is readable, so an unknown age *retains* the
+    branch: failing open on a destructive operation is the wrong direction.
     """
     if now is None:
         now = datetime.now(UTC)
-    merged_dt = _parse_iso_datetime(merged_at)
-    dt = merged_dt if merged_dt is not None else _tip_committer_date(repo, branch)
+    dt = (
+        _parse_iso_datetime(merged_at)
+        or _run_stamp_date(branch)
+        or _tip_committer_date(repo, branch)
+    )
     if dt is None:
-        return float("inf")
+        # Fail CLOSED: an unknown age must retain the branch, never license a
+        # threshold-gated delete (issue 047). `-inf` reads as "younger than any
+        # threshold" to the `age_days < older_than_days` retention check.
+        return float("-inf")
     return (now - dt).total_seconds() / 86400
 
 
@@ -476,7 +539,8 @@ def _yn(value: bool) -> str:
 
 
 def _age_str(age_days: float) -> str:
-    return "n/a" if age_days == float("inf") else f"{age_days:.1f}"
+    # Both infinities mean "unknown"; -inf is the fail-closed sentinel (issue 047).
+    return "n/a" if math.isinf(age_days) else f"{age_days:.1f}"
 
 
 def format_table(
@@ -542,11 +606,13 @@ def run_gc(
         rows, _, _, all_worktree_paths = collect_rows(root, resolved_base)
         visible_rows = [r for r in rows if not pipeline_branch_retained(root, r)]
         out.write(format_table(visible_rows, older_than_days))
-        orphans = find_orphans(
-            worktrees_root or _default_pipeline_worktrees_root(),
-            list(all_worktree_paths),
+        orphan_root = resolve_orphan_root(
+            root, list(all_worktree_paths), worktrees_root, sys.stderr
         )
-        out.write(format_orphans(orphans))
+        if orphan_root is not None:
+            out.write(
+                format_orphans(find_orphans(orphan_root, list(all_worktree_paths)))
+            )
     except subprocess.TimeoutExpired:
         # run_git's 30s cap must fail cleanly (stderr + exit), never as a traceback.
         print(
@@ -595,6 +661,33 @@ def format_delete_table(
     eligible = sum(collectible(row, older_than_days) for row in rows)
     lines.append(f"{len(rows)} branch(es) listed (eligible: {eligible})")
     return "\n".join(lines) + "\n"
+
+
+def resolve_orphan_root(
+    repo: Path,
+    registered: Sequence[Path],
+    override: Path | None,
+    err: TextIO,
+) -> Path | None:
+    """The directory to sweep for orphans, or ``None`` to skip the sweep entirely.
+
+    Refuses any root that holds none of *this* repo's registered worktrees. A root
+    matching nothing registered is a misconfiguration, and reporting every entry in
+    it as an orphan is exactly the cross-repo behaviour issue 048 was filed for — so
+    warn and skip rather than list (or delete) another project's worktrees.
+    """
+    root = override or derive_worktrees_root(repo, registered)
+    if root is None or not root.exists():
+        return None
+    others = [p for p in registered if p.resolve() != repo.resolve()]
+    if others and not any(p.parent.resolve() == root.resolve() for p in others):
+        print(
+            f"warning: {root} holds no registered worktree of {repo}; "
+            "skipping orphan sweep (issue 048)",
+            file=err,
+        )
+        return None
+    return root
 
 
 def _sweep_orphans(
@@ -676,13 +769,19 @@ def run_gc_delete(
             )
             return 1
 
-        resolved_worktrees_root = worktrees_root or _default_pipeline_worktrees_root()
+        resolved_worktrees_root = resolve_orphan_root(
+            root, list(all_worktree_paths), worktrees_root, err
+        )
 
         if not candidates:
             out.write(format_delete_table(rows, older_than_days))
             out.write("0 deletion(s) needed.\n")
-            orphan_failures = _sweep_orphans(
-                resolved_worktrees_root, list(all_worktree_paths), out
+            orphan_failures = (
+                0
+                if resolved_worktrees_root is None
+                else _sweep_orphans(
+                    resolved_worktrees_root, list(all_worktree_paths), out
+                )
             )
             return 1 if orphan_failures else 0
 
@@ -743,7 +842,11 @@ def run_gc_delete(
         still_registered = [
             p for p in all_worktree_paths if p not in removed_worktree_paths
         ]
-        orphan_failures = _sweep_orphans(resolved_worktrees_root, still_registered, out)
+        orphan_failures = (
+            0
+            if resolved_worktrees_root is None
+            else _sweep_orphans(resolved_worktrees_root, still_registered, out)
+        )
         return 1 if failed or orphan_failures else 0
 
     except subprocess.TimeoutExpired:
