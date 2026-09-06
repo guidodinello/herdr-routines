@@ -126,12 +126,19 @@ def select_next(
     no claim for them. Compared as ints so "028" and 28 agree.
     """
     pipeline_set: frozenset[int] = pipeline_pr_ids or frozenset()
+
+    def _excluded_by_pipeline(issue: Issue) -> bool:
+        try:
+            return int(issue.id) in pipeline_set
+        except ValueError:
+            return False  # non-numeric id can't match a pipeline PR's issue ref
+
     open_issues = [
         issue
         for issue in issues
         if issue.status == OPEN_STATUS
         and issue.id not in claimed_ids
-        and int(issue.id) not in pipeline_set
+        and not _excluded_by_pipeline(issue)
     ]
     if not open_issues:
         return None
@@ -209,7 +216,6 @@ def pipeline_open_pr_issue_ids(
     repo: Path,
     *,
     worktrees_root: Path | None = None,
-    reports_dir: Path | None = None,
 ) -> frozenset[int] | None:
     """Issue ids referenced by open `auto/pipeline-*` PRs, via a single batched
     `gh pr list` call (issue 028, re-scoped).
@@ -482,7 +488,6 @@ def run_pick_feature(
         pipeline_pr_ids = pipeline_open_pr_issue_ids(
             repo if repo is not None else Path.cwd(),
             worktrees_root=worktrees_root,
-            reports_dir=reports_dir,
         )
     except (
         OSError,
