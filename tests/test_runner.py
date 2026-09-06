@@ -1296,3 +1296,59 @@ def test_watchdog_kill_never_retries_prompt(
     # Structurally barred too: the kill carries no parseable retry-whitelist body.
     kill = PromptWatchdogKilled("killed", marker="m", screen_text="s")
     assert _is_retryable_prompt_error(kill) is False
+
+
+# ---------------------------------------------------------------------------
+# Issue 038: execute_run's failure reason must come from the injected diagnosis,
+# never from the disk of whatever machine happens to be running pytest.
+# ---------------------------------------------------------------------------
+
+
+def test_execute_run_failure_reason_is_not_host_disk_dependent(tmp_path: Path) -> None:
+    """The autouse conftest stub — not the host — supplies the /tmp diagnosis.
+
+    Six tests used to pass on CI (runners have free disk) and fail on a laptop at
+    >=95%, because `execute_run` consults a real `df`. Asserting the diagnosis came
+    from the stub is what makes that regression visible instead of environmental.
+    """
+    from tests.conftest import NOT_FULL_DIAGNOSIS
+
+    job = make_job(tmp_path)
+    client = ScriptedClient(raise_on="agent_start")
+    outcome = execute_run(job, client, run_id="a-run-038a")  # type: ignore[arg-type]
+    assert outcome.reason == "agent_start_failed"
+    assert outcome.diagnosis == NOT_FULL_DIAGNOSIS
+
+
+def test_execute_run_maps_full_disk_to_tmp_full_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full disk overrides the underlying reason (issue 027's actual contract).
+
+    Only `diagnose_tmp()` in isolation was covered before; this asserts the mapping
+    that ships — and, by injecting the diagnosis, does so without touching the host.
+    """
+    monkeypatch.setattr(
+        "herdr_routines.runner._best_effort_tmp_diagnosis",
+        lambda *_a, **_k: {"tmp_full": True, "df_tmp": "98%", "du_tmp": ""},
+    )
+    job = make_job(tmp_path)
+    client = ScriptedClient(raise_on="agent_start")
+    outcome = execute_run(job, client, run_id="a-run-038b")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "tmp_full"
+
+
+def test_execute_run_keeps_underlying_reason_when_disk_not_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A healthy disk must not mask the real failure — the other half of the mapping."""
+    monkeypatch.setattr(
+        "herdr_routines.runner._best_effort_tmp_diagnosis",
+        lambda *_a, **_k: {"tmp_full": False, "df_tmp": "10%", "du_tmp": ""},
+    )
+    job = make_job(tmp_path)
+    client = ScriptedClient(raise_on="agent_interactive_ready")
+    outcome = execute_run(job, client, run_id="a-run-038c")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_not_interactive"
