@@ -8,9 +8,11 @@ and blocks sockets/HerdrClient to prove the command is pure git + filesystem.
 
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,25 @@ from herdr_routines import cli, gc
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     proc = subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, f"git {args} failed: {proc.stderr}"
+    return proc
+
+
+def _git_with_date(
+    repo: Path, date_iso: str, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Same as `_git`, but with both commit dates pinned — issue 044's age gate reads
+    the tip's *committer* date, which `git commit --date` alone never sets."""
+    env = os.environ.copy()
+    env["GIT_AUTHOR_DATE"] = date_iso
+    env["GIT_COMMITTER_DATE"] = date_iso
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
     )
     assert proc.returncode == 0, f"git {args} failed: {proc.stderr}"
     return proc
@@ -40,7 +61,9 @@ def repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _no_gh_or_inflight_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_gh_or_inflight_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Every test gets a hermetic "no open PR, nothing in flight" default so dry-run
     tests that happen to create an `auto/pipeline-*` branch never shell out to a real
     `gh` or touch `~/.herdr` (issue 039; same hermeticity concern issue 038 fixed for
@@ -50,22 +73,59 @@ def _no_gh_or_inflight_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     # Issue 042: is_merged's batched gh lookup gets the same hermetic default — no test
     # here should shell out to a real `gh` just because it created an auto/* branch.
     # Tests exercising squash-merge detection override this explicitly.
-    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo: set())
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo: {})
+    # Issue 045: every `gc` invocation that doesn't pass --worktrees-root falls back to
+    # ~/.herdr/worktrees/herdr-routines for its orphan sweep — under --delete that sweep
+    # unlinks/rmdir's what it finds there. Point the default at a tmp_path sandbox so no
+    # test can ever touch (let alone delete from) the real directory on this machine; the
+    # five orphan tests below pass --worktrees-root explicitly and are unaffected.
+    monkeypatch.setattr(
+        gc, "_default_pipeline_worktrees_root", lambda: tmp_path / "no-worktrees-root"
+    )
 
 
-def _gc(repo: Path, capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
-    code = cli.main(["gc", "--dry-run", "--repo", str(repo), "--base", "main"])
+def _gc(
+    repo: Path, capsys: pytest.CaptureFixture[str], *extra_args: str
+) -> tuple[int, str, str]:
+    # --older-than 0 disables issue 044's age gate by default so pre-044 tests, which
+    # build branches with no committer-date fixture and expect immediate eligibility,
+    # keep testing exactly what they tested before. Age-specific tests override this
+    # via extra_args (last --older-than wins — argparse's normal repeated-flag rule).
+    code = cli.main(
+        [
+            "gc",
+            "--dry-run",
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--older-than",
+            "0",
+            *extra_args,
+        ]
+    )
     captured = capsys.readouterr()
     return code, captured.out, captured.err
 
 
 def _rows(out: str) -> dict[str, tuple[str, str]]:
-    """Parse table body into {branch: (worktree-exists, merged-into-base)}."""
+    """Parse table body into {branch: (worktree-exists, merged-into-base)}.
+
+    Looks up column positions by header name (rather than assuming the last two
+    tokens) so issue 044's AGE-DAYS column, appended after MERGED, doesn't shift what
+    used to be the last two tokens on each row."""
+    lines = out.splitlines()
+    header = lines[0].split() if lines else []
+    try:
+        wt_idx = header.index("WORKTREE-EXISTS")
+        merged_idx = header.index("MERGED")
+    except ValueError:
+        wt_idx, merged_idx = 1, 2
     result: dict[str, tuple[str, str]] = {}
-    for line in out.splitlines():
+    for line in lines[1:]:
         parts = line.split()
         if parts and parts[0].startswith("auto/"):
-            result[parts[0]] = (parts[-2], parts[-1])
+            result[parts[0]] = (parts[wt_idx], parts[merged_idx])
     return result
 
 
@@ -210,11 +270,11 @@ def test_gc_detects_squash_merged_branch(
     once GitHub's PR record says so."""
     branch = "auto/fix-thing-20260901T000000Z"
     _squash_merge(repo, branch, "thing.txt")
-    assert not gc.is_merged(branch, "main", repo, set()), (
+    assert not gc.is_merged(branch, "main", repo, {}), (
         "test setup bug: branch must NOT be an ancestor of base for this to test "
         "squash-merge detection rather than ordinary ancestry"
     )
-    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {branch})
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {branch: None})
 
     code, out, _ = _gc(repo, capsys)
 
@@ -230,7 +290,7 @@ def test_gc_lists_squash_merged_pipeline_branch(
     kicks in for a still-unmerged, still-open, or still-in-flight pipeline branch)."""
     pipeline = "auto/pipeline-nightly-20260901T000000Z"
     _squash_merge(repo, pipeline, "pipeline.txt")
-    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {pipeline})
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {pipeline: None})
 
     code, out, _ = _gc(repo, capsys)
 
@@ -529,8 +589,20 @@ def _gc_delete(
     capsys: pytest.CaptureFixture[str],
     *extra_args: str,
 ) -> tuple[int, str, str]:
+    # --older-than 0 disables issue 044's age gate by default; see _gc's comment above.
     code = cli.main(
-        ["gc", "--delete", "--yes", "--repo", str(repo), "--base", "main", *extra_args]
+        [
+            "gc",
+            "--delete",
+            "--yes",
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--older-than",
+            "0",
+            *extra_args,
+        ]
     )
     captured = capsys.readouterr()
     return code, captured.out, captured.err
@@ -606,7 +678,18 @@ def test_gc_delete_refuses_without_yes(
     branch = "auto/merged-20260821T000000Z"
     _git(repo, "branch", branch, "main")
 
-    code = cli.main(["gc", "--delete", "--repo", str(repo), "--base", "main"])
+    code = cli.main(
+        [
+            "gc",
+            "--delete",
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--older-than",
+            "0",
+        ]
+    )
     captured = capsys.readouterr()
 
     assert code == 2
@@ -628,7 +711,18 @@ def test_gc_delete_refuses_interactive_without_yes(
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
 
-    code = cli.main(["gc", "--delete", "--repo", str(repo), "--base", "main"])
+    code = cli.main(
+        [
+            "gc",
+            "--delete",
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--older-than",
+            "0",
+        ]
+    )
     captured = capsys.readouterr()
 
     assert code == 2
@@ -737,7 +831,7 @@ def test_gc_delete_removes_squash_merged_branch_without_force(
     merged branch, gate unchanged) it's a no-force delete candidate."""
     branch = "auto/fix-thing-20260901T000000Z"
     _squash_merge(repo, branch, "thing.txt")
-    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {branch})
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {branch: None})
 
     code, out, _ = _gc_delete(repo, capsys)
 
@@ -941,6 +1035,237 @@ def test_gc_delete_lists_worktrees_once(
     assert code == 0
     assert worktree_list_count == 1
     assert f"deleted: {merged}" in out
+
+
+# ---------------------------------------------------------------------------
+# Issue 044: --older-than age threshold on the merged path
+# ---------------------------------------------------------------------------
+
+
+def test_gc_delete_retains_recently_merged_branch(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 1: a branch merged moments ago (tip commit dated "now", no PR record)
+    is withheld under the default 14-day threshold — called with no --older-than
+    override, so the CLI's own default gate is what's under test."""
+    branch = "auto/merged-just-now-20260906T000000Z"
+    _git(repo, "branch", branch, "main")  # tip == main's seed commit, dated "now"
+
+    code = cli.main(["gc", "--delete", "--yes", "--repo", str(repo), "--base", "main"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert f"deleted: {branch}" not in out
+    assert "0 deletion(s) needed." in out
+    remaining = _git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
+    ).stdout
+    assert branch in remaining
+
+    # Design requirement (not a separate named acceptance test): the withheld branch
+    # stays visible in dry-run with its real age shown, rather than silently vanishing.
+    dry_code, dry_out, _ = _gc(repo, capsys, "--older-than", "14")
+    assert dry_code == 0
+    assert branch in dry_out
+    assert "eligible: 0" in dry_out
+    row_line = next(line for line in dry_out.splitlines() if line.startswith(branch))
+    age_shown = float(row_line.split()[-1])
+    assert age_shown < 1
+
+
+def test_gc_delete_collects_branch_past_age_threshold(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 2: a branch whose tip commit is well past the default 14-day
+    threshold, fast-forward merged into main, is collected."""
+    branch = "auto/merged-old-20260801T000000Z"
+    old_date = "2026-08-01T00:00:00+00:00"
+    _git(repo, "checkout", "-b", branch)
+    (repo / "old.txt").write_text("old\n")
+    _git(repo, "add", "old.txt")
+    _git_with_date(repo, old_date, "commit", "-m", "old work")
+    _git(repo, "checkout", "main")
+    _git(repo, "merge", "--ff-only", branch)
+
+    code = cli.main(["gc", "--delete", "--yes", "--repo", str(repo), "--base", "main"])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert f"deleted: {branch}" in out
+    remaining = _git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/"
+    ).stdout
+    assert branch not in remaining
+
+
+def test_gc_delete_age_threshold_zero_disables(
+    repo: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 3: --older-than 0 collects a just-merged branch regardless of age,
+    preserving pre-044 behaviour for a human who has read the table."""
+    branch = "auto/merged-just-now-20260906T000000Z"
+    _git(repo, "branch", branch, "main")
+
+    code = cli.main(
+        [
+            "gc",
+            "--delete",
+            "--yes",
+            "--repo",
+            str(repo),
+            "--base",
+            "main",
+            "--older-than",
+            "0",
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert f"deleted: {branch}" in out
+
+
+def test_gc_age_prefers_merged_at_over_commit_date(repo: Path) -> None:
+    """Acceptance 4: branch_age_days reads the PR's mergedAt when given one, and only
+    falls back to the tip's committer date when merged_at is absent — proven by giving
+    the same branch an old committer date and a recent mergedAt, and showing the two
+    sources disagree by an order of magnitude."""
+    branch = "auto/old-commit-recent-merge-20260801T000000Z"
+    old_date = "2026-08-01T00:00:00+00:00"
+    _git(repo, "checkout", "-b", branch)
+    (repo / "f.txt").write_text("x\n")
+    _git(repo, "add", "f.txt")
+    _git_with_date(repo, old_date, "commit", "-m", "old work")
+
+    recent_merged_at = "2026-09-05T00:00:00Z"
+    now = datetime.fromisoformat(recent_merged_at)
+
+    age_with_pr_record = gc.branch_age_days(repo, branch, recent_merged_at, now=now)
+    age_without_pr_record = gc.branch_age_days(repo, branch, None, now=now)
+
+    assert age_with_pr_record < 1
+    assert age_without_pr_record > 20
+
+
+# ---------------------------------------------------------------------------
+# Issue 045: orphaned worktree directories and dangling case-variant symlinks
+# ---------------------------------------------------------------------------
+
+
+def test_gc_dry_run_reports_dangling_symlink(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 1: a dangling symlink under the worktree parent dir is reported by
+    dry-run, and dry-run touches nothing."""
+    worktrees_root = tmp_path / "worktrees"
+    worktrees_root.mkdir()
+    dangling = worktrees_root / "auto-pipeline-20260902T050021Z"
+    dangling.symlink_to(
+        worktrees_root / "auto-pipeline-20260902t050021z"
+    )  # gone target
+
+    code, out, _ = _gc(repo, capsys, "--worktrees-root", str(worktrees_root))
+
+    assert code == 0
+    assert "dangling symlink" in out
+    assert str(dangling) in out
+    assert dangling.is_symlink()
+
+
+def test_gc_delete_removes_dangling_symlink(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 2: --delete removes a dangling symlink."""
+    worktrees_root = tmp_path / "worktrees"
+    worktrees_root.mkdir()
+    dangling = worktrees_root / "auto-pipeline-20260902T050021Z"
+    dangling.symlink_to(worktrees_root / "auto-pipeline-20260902t050021z")
+
+    code, out, _ = _gc_delete(repo, capsys, "--worktrees-root", str(worktrees_root))
+
+    assert code == 0
+    assert "deleted orphan" in out
+    assert not dangling.is_symlink()
+    assert not dangling.exists()
+
+
+def test_gc_delete_removes_empty_orphan_dir(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 3: --delete removes an empty, unregistered auto-* directory."""
+    worktrees_root = tmp_path / "worktrees"
+    worktrees_root.mkdir()
+    orphan_dir = worktrees_root / "auto-pipeline-20260826T031438Z"
+    orphan_dir.mkdir()
+
+    code, out, _ = _gc_delete(repo, capsys, "--worktrees-root", str(worktrees_root))
+
+    assert code == 0
+    assert "deleted orphan" in out
+    assert not orphan_dir.exists()
+
+
+def test_gc_delete_never_removes_nonempty_orphan(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 4: a non-empty unregistered directory is reported but never deleted
+    — could be someone's manual checkout or a worktree whose registration was lost."""
+    worktrees_root = tmp_path / "worktrees"
+    worktrees_root.mkdir()
+    orphan_dir = worktrees_root / "auto-pipeline-20260826T031438Z"
+    orphan_dir.mkdir()
+    (orphan_dir / "somebody-elses-work.txt").write_text("do not eat\n")
+
+    code, out, _ = _gc_delete(repo, capsys, "--worktrees-root", str(worktrees_root))
+
+    assert code == 0
+    assert "left alone" in out
+    assert orphan_dir.exists()
+    assert (orphan_dir / "somebody-elses-work.txt").exists()
+
+
+def test_gc_preserves_live_worktree_alias(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 5: a case-variant symlink whose target is still a registered worktree
+    is left completely untouched — not reported, not removed."""
+    worktrees_root = tmp_path / "worktrees"
+    worktrees_root.mkdir()
+    branch = "auto/pipeline-20260903T050016Z"
+    real_dir = worktrees_root / "auto-pipeline-20260903t050016z"
+    _git(repo, "worktree", "add", str(real_dir), "-b", branch)
+    (real_dir / "wip.txt").write_text("wip\n")
+    _git(real_dir, "add", ".")
+    _git(
+        real_dir, "commit", "-m", "wip on branch"
+    )  # unmerged -> retained, stays registered
+    alias = worktrees_root / "auto-pipeline-20260903T050016Z"
+    alias.symlink_to(real_dir)
+
+    code, out, _ = _gc_delete(repo, capsys, "--worktrees-root", str(worktrees_root))
+
+    assert code == 0
+    assert alias.is_symlink()
+    assert alias.resolve() == real_dir.resolve()
+    assert "orphan" not in out.lower()
+
+
+def test_gc_delete_leaves_detached_worktree_alone(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A detached-HEAD worktree emits no `branch` line in `git worktree list
+    --porcelain`, so a branch->path mapping alone can't account for it. It is still a
+    registered, live worktree — the orphan sweep must not report or touch it."""
+    worktrees_root = tmp_path / "worktrees"
+    worktrees_root.mkdir()
+    detached = worktrees_root / "auto-pipeline-20260904t010101z"
+    _git(repo, "worktree", "add", "--detach", str(detached), "main")
+
+    code, out, _ = _gc_delete(repo, capsys, "--worktrees-root", str(worktrees_root))
+
+    assert code == 0
+    assert detached.exists()
+    assert "orphan" not in out.lower()
 
 
 def test_gc_delete_review_tiers_present() -> None:
