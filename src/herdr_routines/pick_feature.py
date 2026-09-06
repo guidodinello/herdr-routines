@@ -113,15 +113,25 @@ def load_issues(issues_dir: Path) -> list[Issue]:
 
 
 def select_next(
-    issues: list[Issue], claimed_ids: frozenset[str] = frozenset()
+    issues: list[Issue],
+    claimed_ids: frozenset[str] = frozenset(),
+    pipeline_pr_ids: frozenset[int] | None = None,
 ) -> Issue | None:
     """Highest-priority, lowest-id issue with status == 'open' and not already
     claimed (issue 041: a claim no longer changes `status`, so it must be
-    checked separately here); None if nothing open and unclaimed."""
+    checked separately here); None if nothing open and unclaimed.
+
+    `pipeline_pr_ids` (issue 028, re-scoped): issue ids already referenced by an
+    open `auto/pipeline-*` PR — treated as claimed even when `claims.py` holds
+    no claim for them. Compared as ints so "028" and 28 agree.
+    """
+    pipeline_set: frozenset[int] = pipeline_pr_ids or frozenset()
     open_issues = [
         issue
         for issue in issues
-        if issue.status == OPEN_STATUS and issue.id not in claimed_ids
+        if issue.status == OPEN_STATUS
+        and issue.id not in claimed_ids
+        and int(issue.id) not in pipeline_set
     ]
     if not open_issues:
         return None
@@ -190,6 +200,112 @@ def open_pr_issue_ids(repo: Path) -> frozenset[int] | None:
     for item in data:
         if not isinstance(item, dict):
             continue
+        text = f"{item.get('title', '')}\n{item.get('body', '')}"
+        refs.update(int(m.group(1)) for m in _ISSUE_REF_PATTERN.finditer(text))
+    return frozenset(refs)
+
+
+def pipeline_open_pr_issue_ids(
+    repo: Path,
+    *,
+    worktrees_root: Path | None = None,
+    reports_dir: Path | None = None,
+) -> frozenset[int] | None:
+    """Issue ids referenced by open `auto/pipeline-*` PRs, via a single batched
+    `gh pr list` call (issue 028, re-scoped).
+
+    The exclusion is unconditional and fail-open: a `gh` failure warns to stderr
+    and returns ``None`` so the caller can pick anyway, rather than bricking the
+    nightly run on a transient GitHub outage.
+
+    Structural derivation is preferred where possible (``state.json`` already
+    records ``feature_source`` for the run id embedded in the branch name), with
+    PR title/body parsing as a fallback when no structural record exists — the
+    PR body convention ("Closes issue NN — the `status: done` flip rides this PR")
+    is prose and less reliable than the branch/run record, so it is only the
+    fallback, not the primary. The header comment on the fallback branch says so.
+    When neither structural nor prose yields an id, the PR is ignored (no guess).
+
+    Any `gh` failure returns ``None`` (unknown), not an empty set.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--json",
+                "headRefName,number,title,body",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: gh pr list failed: {exc}", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(f"warning: gh pr list failed: {proc.stderr.strip()}", file=sys.stderr)
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        print("warning: gh pr list returned invalid JSON", file=sys.stderr)
+        return None
+    if not isinstance(data, list):
+        print("warning: gh pr list returned unexpected shape", file=sys.stderr)
+        return None
+
+    resolved_worktrees_root = worktrees_root or _default_pipeline_worktrees_root()
+
+    refs: set[int] = set()
+    pipeline_prefix = "auto/pipeline-"
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        head = item.get("headRefName")
+        if not isinstance(head, str) or not head.startswith(pipeline_prefix):
+            continue  # non-pipeline open PR never excludes (028 criterion 3)
+
+        # Structural path: headRefName -> run_id -> state.json -> feature_source -> issue id
+        run_id = head.removeprefix(pipeline_prefix)
+        structural_id: str | None = None
+        # Try both case variants of the worktree dir (herdr lowercases the path)
+        for candidate in (
+            resolved_worktrees_root / f"auto-pipeline-{run_id.lower()}",
+            resolved_worktrees_root / f"auto-pipeline-{run_id}",
+        ):
+            state_path = candidate / PIPELINE_STATE_JSON_NAME
+            if not state_path.exists():
+                continue
+            try:
+                raw = json.loads(state_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            # If a terminal report already exists, the run is not in-flight and the
+            # branch is only retained because the PR is still open — but the PR itself
+            # is the signal we are already handling, so we still derive the id. The
+            # "no terminal report" check only matters for the inflight set, not here.
+            feature_source = raw.get("feature_source")
+            if isinstance(feature_source, str) and feature_source:
+                structural_id = _issue_id_from_feature_source(feature_source)
+                if structural_id is not None:
+                    break
+        if structural_id is not None:
+            try:
+                refs.add(int(structural_id))
+            except ValueError:
+                pass
+            continue
+
+        # Fallback: PR title/body prose convention — less reliable, so only when
+        # no structural record exists (see docstring).
         text = f"{item.get('title', '')}\n{item.get('body', '')}"
         refs.update(int(m.group(1)) for m in _ISSUE_REF_PATTERN.finditer(text))
     return frozenset(refs)
@@ -358,7 +474,34 @@ def run_pick_feature(
             if notify is not None:
                 notify(reclaimed)
     claimed_ids = frozenset(load_claims(resolved_claims_path))
-    picked = select_next(issues, claimed_ids)
+    # Issue 028 re-scoped: an issue with an open auto/pipeline-* PR is treated as
+    # claimed even when claims.py holds no claim for it. Unconditional, batched,
+    # fail-open (warn and pick anyway on gh failure).
+    pipeline_pr_ids: frozenset[int] | None
+    try:
+        pipeline_pr_ids = pipeline_open_pr_issue_ids(
+            repo if repo is not None else Path.cwd(),
+            worktrees_root=worktrees_root,
+            reports_dir=reports_dir,
+        )
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as exc:  # defensive: never let a PR lookup brick the pick
+        print(f"warning: pipeline PR lookup failed: {exc}", file=sys.stderr)
+        pipeline_pr_ids = None
+    if pipeline_pr_ids is None:
+        # gh failure already warned inside pipeline_open_pr_issue_ids; for any
+        # other None path (e.g. no repo), ensure at least one warning so the
+        # fail-open is visible. If we already warned, this is harmless noise.
+        # We only warn once: check if stderr already got a warning in this call
+        # is fragile, so just treat None as "unknown — pick anyway" without an
+        # extra warning when the helper already warned. The helper always warns
+        # on None, except when called with a non-existent repo path that still
+        # returns a real gh failure shape. So here: no extra warning.
+        pipeline_pr_ids = frozenset()
+    picked = select_next(issues, claimed_ids, pipeline_pr_ids)
     if picked is None:
         print("no open issues", file=sys.stderr)
         return 1
