@@ -1,0 +1,10 @@
+[Unit]
+Description=Post the daily herdr-routines digest each morning
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

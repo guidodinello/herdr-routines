@@ -26,6 +26,7 @@ from herdr_routines.config import (
     default_config_path,
     load_config,
 )
+from herdr_routines.digest import digest_now
 from herdr_routines.gates import (
     remote_owner_and_repo,
     run_ci_gate,
@@ -320,6 +321,25 @@ def _build_parser() -> argparse.ArgumentParser:
         "--base", default="main", help="branch to fast-forward to (default: main)"
     )
     p_sync_repo.set_defaults(handler=_cmd_sync_repo)
+
+    p_digest = sub.add_parser(
+        "digest",
+        help=(
+            "one morning summary of every job's last terminal state and report "
+            "link, read from existing history (issue 010)"
+        ),
+    )
+    p_digest.add_argument(
+        "--timezone",
+        default="UTC",
+        help="timezone to render timestamps in (default: UTC)",
+    )
+    p_digest.add_argument(
+        "--notify",
+        action="store_true",
+        help="also post the digest as a Herdr notification (default: print only)",
+    )
+    p_digest.set_defaults(handler=_cmd_digest)
 
     p_watchdog = sub.add_parser(
         "pipeline-watchdog",
@@ -879,6 +899,23 @@ def _cmd_pipeline_watchdog(args: argparse.Namespace) -> int:
             )
     if not actions:
         log.info("pipeline-watchdog: no stalled runs")
+    return 0
+
+
+def _cmd_digest(args: argparse.Namespace) -> int:
+    config = _load_config_or_exit(args)
+    text = digest_now(
+        config,
+        default_history_path(),
+        default_reports_dir(),
+        timezone=args.timezone,
+    )
+    print(text)
+    if args.notify:
+        try:
+            HerdrClient().notification_show("herdr-routines: daily digest", body=text)
+        except HerdrCliError as e:
+            log.warning("digest: notification failed: %s", e)
     return 0
 
 

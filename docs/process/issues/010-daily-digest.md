@@ -1,7 +1,7 @@
 ---
 id: "010"
 title: "Daily digest"
-status: open
+status: done
 priority: low
 area: infra
 ---
