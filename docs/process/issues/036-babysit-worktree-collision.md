@@ -1,7 +1,7 @@
 ---
 id: "036"
 title: "babysit-prs can never fix a pipeline PR: worktree collision on the retained branch"
-status: open
+status: done
 priority: high
 area: infra
 ---

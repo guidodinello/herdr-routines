@@ -15,6 +15,7 @@ from herdr_routines.auto_fix import (
     PRInfo,
     attempt_count_for_pr,
     build_fix_prompt,
+    build_pr_agent_name,
     build_worker_agent_name,
     is_eligible,
     list_open_prs,
@@ -777,6 +778,26 @@ def test_auto_fix_worker_dispatch() -> None:
     assert "auto/fix-42" in prompt
     assert "lint: RUF001" in prompt
     assert "test/repo" in prompt
+
+
+def test_worker_agent_name_unique_per_attempt() -> None:
+    """Acceptance criterion 3 (issue 036c): two attempts at the same PR under distinct
+    run_ids (the normal case — `babysit-prs` retrying PR #81 across ticks) must not
+    collide on one agent name. Before the fix, `raw[:32]` truncation dropped the whole
+    timestamp because `run_id` already repeats the job name (`make_run_id` builds it as
+    "<job>-<ts>"), so `rt-babysit-prs-pr81-babysit-prs-...` always sliced to the same
+    32 chars regardless of which attempt it was."""
+    name1 = build_worker_agent_name("babysit-prs", 81, "babysit-prs-20260904T053000Z")
+    name2 = build_worker_agent_name("babysit-prs", 81, "babysit-prs-20260904T054000Z")
+
+    assert name1 != name2
+    assert len(name1) <= 32
+    assert len(name2) <= 32
+    # The stable per-PR prefix must survive intact — it's what the liveness guard
+    # matches against (criterion 4).
+    prefix = build_pr_agent_name("babysit-prs", 81)
+    assert name1.startswith(prefix)
+    assert name2.startswith(prefix)
 
 
 # ---------------------------------------------------------------------------

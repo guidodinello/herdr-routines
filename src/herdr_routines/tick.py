@@ -388,12 +388,7 @@ def _process_pr_target(
             skipped_count += 1
             continue
 
-        pr_agent_name = build_pr_agent_name(job.name, elig_pr.pr.number)
-        try:
-            status = client.agent_statuses().get(pr_agent_name)
-        except HerdrCliError:
-            status = None
-        if status in LIVE_AGENT_STATUSES:
+        if _pr_worker_is_live(client, job.name, elig_pr.pr.number):
             continue
 
         failing_checks = fetch_failing_checks(
@@ -429,6 +424,18 @@ def _process_pr_target(
             "final_agent_status": worker_outcome.get("final_agent_status"),
             "target": "pr",
         }
+        if worker_outcome.get("reason") is not None:
+            extra_record["reason"] = worker_outcome["reason"]
+        if worker_outcome.get("error") is not None:
+            extra_record["error"] = worker_outcome["error"]
+        if worker_outcome.get("state") in ("failed", "interrupted_unknown"):
+            log.warning(
+                "%s: PR #%d dispatch failed: reason=%s error=%s",
+                job.name,
+                elig_pr.pr.number,
+                worker_outcome.get("reason"),
+                worker_outcome.get("error"),
+            )
 
         append(
             history_path,
@@ -911,6 +918,53 @@ def _process_base_target(
     return f"{job.name}: done", False
 
 
+def _find_existing_worktree(repo: Path, branch: str) -> Path | None:
+    """Return the path of a worktree that already has *branch* checked out, or None.
+    Parses `git worktree list --porcelain` (issue 036: the pipeline orchestrator
+    deliberately retains its worktree on the PR branch after a run — see
+    docs/pipeline/orchestrator-prompt.md G-10 — so a second `git worktree add` on
+    that same branch always fails with "already used by worktree at ...")."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    target = f"refs/heads/{branch}"
+    current_path: str | None = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree ") :]
+        elif (
+            line.startswith("branch ")
+            and current_path is not None
+            and line[len("branch ") :] == target
+        ):
+            return Path(current_path)
+    return None
+
+
+def _worktree_reuse_check(wt_path: Path) -> tuple[bool, str]:
+    """Before pointing a fix worker at a worktree we didn't create ourselves, verify
+    it has no uncommitted changes — an in-progress edit there (e.g. a still-running
+    orchestrator) must not be clobbered by a fix worker starting concurrently."""
+    status = subprocess.run(
+        ["git", "-C", str(wt_path), "status", "--porcelain=v1"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if status.returncode != 0:
+        return False, f"git status failed: {status.stderr.strip()}"
+    if status.stdout.strip():
+        return False, "worktree has uncommitted changes"
+    return True, ""
+
+
 def _cleanup_worktree(repo: Path, wt_path: Path) -> None:
     try:
         subprocess.run(
@@ -990,32 +1044,62 @@ def _dispatch_fix_worker(
         prompt_text, report_path=report_path, job_name=job.name, run_id=pr_run_id
     )
 
-    # Create worktree pinned to PR head branch (review finding B)
-    wt_path = Path(job.repo) / ".worktrees" / f"autofix-pr{pr.number}"
-    try:
-        # Remove stale worktree if it exists from a prior attempt
-        subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "remove", "--force", str(wt_path)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        proc = subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "add", str(wt_path), pr.head_ref],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
-    except Exception as e:  # noqa: BLE001  # noqa: BLE001 — any worktree failure marks the PR failed
-        return {
-            "state": "failed",
-            "reason": "worktree_creation_failed",
-            "error": str(e),
-        }
+    # Reuse an existing checkout of the PR's head branch instead of forcing a second
+    # `worktree add` on it (issue 036), which git refuses whenever the orchestrator's
+    # retained worktree (or a prior autofix attempt's) already holds that branch.
+    existing_wt = _find_existing_worktree(job.repo, pr.head_ref)
+    if existing_wt is not None:
+        ok, detail = _worktree_reuse_check(existing_wt)
+        if not ok:
+            return {
+                "state": "failed",
+                "reason": "worktree_reuse_not_clean",
+                "error": f"existing worktree {existing_wt} for {pr.head_ref}: {detail}",
+            }
+        wt_path = existing_wt
+    else:
+        # Create worktree pinned to PR head branch (review finding B)
+        wt_path = Path(job.repo) / ".worktrees" / f"autofix-pr{pr.number}"
+        try:
+            # Remove stale worktree if it exists from a prior attempt
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(job.repo),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(wt_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            proc = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(job.repo),
+                    "worktree",
+                    "add",
+                    str(wt_path),
+                    pr.head_ref,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
+        except Exception as e:  # noqa: BLE001  # noqa: BLE001 — any worktree failure marks the PR failed
+            return {
+                "state": "failed",
+                "reason": "worktree_creation_failed",
+                "error": str(e),
+            }
 
     # Start agent in the worktree (review finding B)
     pane_id: str | None = None
@@ -1701,3 +1785,26 @@ def _live_agent_exists(client: HerdrClient, job: Job) -> bool:
         log.warning("%s: could not query live agents, proceeding: %s", job.name, e)
         return False
     return status in LIVE_AGENT_STATUSES
+
+
+def _pr_worker_is_live(client: HerdrClient, job_name: str, pr_number: int) -> bool:
+    """Double-dispatch guard for the pr-target dispatch loop (review finding E): a PR
+    still eligible on the next tick must not get a second fix worker while its first
+    is still running. The dispatcher never creates a bare `build_pr_agent_name(...)`
+    agent — every worker's real name also carries a run_id tail (issue 036c) — so this
+    matches by prefix against every live agent instead of an exact name lookup, which
+    could never find anything. Fails open on a HerdrCliError, same as
+    `_live_agent_exists`."""
+    prefix = build_pr_agent_name(job_name, pr_number)
+    try:
+        statuses = client.agent_statuses()
+    except HerdrCliError as e:
+        log.warning(
+            "%s: could not query live agents for PR #%d: %s", job_name, pr_number, e
+        )
+        return False
+    return any(
+        status in LIVE_AGENT_STATUSES
+        for name, status in statuses.items()
+        if name.startswith(prefix)
+    )

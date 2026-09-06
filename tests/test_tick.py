@@ -3,6 +3,7 @@ TickOutcome.any_job_failed — what `_cmd_tick` (cli.py) maps to the process exi
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1151,3 +1152,218 @@ def test_pipeline_skipped_while_agent_live(
     t2 = t1 + timedelta(minutes=1)
     outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
     assert outcome.summaries == ("nightly-pipeline: skipped (already running)",)
+
+
+# ---------------------------------------------------------------------------
+# Issue 036: worktree collision, dropped reason/error, agent-name builders
+# ---------------------------------------------------------------------------
+
+
+def _git(*args: str, cwd: Path) -> None:
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+class FakeFixWorkerClient:
+    """Enough of HerdrClient for `_dispatch_fix_worker` to run end-to-end. Records the
+    cwd of the pane it created so tests can assert which worktree the fix worker actually
+    ran in."""
+
+    def __init__(self, *, settle_status: str = "idle") -> None:
+        self.settle_status = settle_status
+        self.tab_create_cwd: str | None = None
+
+    def tab_create(self, *, cwd, label=None):
+        self.tab_create_cwd = cwd
+        return "w1:p1"
+
+    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+        pass
+
+    def agent_interactive_ready(self, target):
+        return True
+
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        return self.settle_status
+
+    def agent_read(self, target, *, lines=200):
+        return ""
+
+    def agent_read_visible(self, target, *, lines=200):
+        return ""
+
+    def pane_close(self, pane_id):
+        pass
+
+    def agent_statuses(self) -> dict[str, str]:
+        return {}
+
+
+def make_fix_worker_job(tmp_path: Path, **overrides: Any) -> Job:
+    job = Job(
+        name="auto-fix-prs",
+        enabled=True,
+        cron="* * * * *",
+        repo=tmp_path / "repo",
+        workspace="worktree",
+        base="main",
+        agent_kind="claude",
+        model=None,
+        prompt="fix it. report to $ROUTINE_REPORT",
+        timeout_ms=5_000,
+        start_timeout_ms=30_000,
+        catch_up_minutes=120,
+        timezone="UTC",
+        on_missed="log",
+    )
+    return replace(job, **overrides)
+
+
+def _init_repo_with_branch(tmp_path: Path, *, branch: str) -> Path:
+    """A minimal local repo with a second branch, mirroring what the pipeline
+    orchestrator produces: `main` plus `branch`, both with at least one commit."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("hello\n")
+    _git("add", "README.md", cwd=repo)
+    _git("commit", "-m", "initial", cwd=repo)
+    _git("checkout", "-b", branch, cwd=repo)
+    (repo / "fix.txt").write_text("fix\n")
+    _git("add", "fix.txt", cwd=repo)
+    _git("commit", "-m", "pr commit", cwd=repo)
+    _git("checkout", "main", cwd=repo)
+    return repo
+
+
+def test_dispatch_reuses_existing_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 1 (issue 036): a PR whose head branch is already checked
+    out in another worktree — exactly what happens for every pipeline-authored PR,
+    since the orchestrator deliberately retains its worktree — dispatches successfully
+    by reusing that worktree instead of failing on a second `git worktree add`."""
+    from herdr_routines.auto_fix import PRInfo
+    from herdr_routines.tick import _dispatch_fix_worker
+
+    branch = "auto/pipeline-20260904T050000Z"
+    repo = _init_repo_with_branch(tmp_path, branch=branch)
+
+    # Simulate the orchestrator's retained worktree: a second checkout of `branch`
+    # living elsewhere, exactly as `git worktree add` would leave it.
+    other_wt = tmp_path / "orchestrator-worktree"
+    _git("worktree", "add", str(other_wt), branch, cwd=repo)
+
+    job = make_fix_worker_job(tmp_path, repo=repo)
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+
+    client = FakeFixWorkerClient(settle_status="idle")
+    pr = PRInfo(
+        number=81, head_ref=branch, author="bot", url="https://example.invalid/81"
+    )
+
+    outcome = _dispatch_fix_worker(
+        job=job,
+        pr=pr,
+        reason="unresolved_threads",
+        run_id="auto-fix-prs-20260904T053000Z",
+        attempt=0,
+        owner="acme",
+        repo="widgets",
+        client=client,  # type: ignore[arg-type]
+        failing_checks="",
+        thread_bodies="",
+    )
+
+    assert outcome["state"] == "done"
+    assert outcome.get("reason") is None
+    # It must have run the agent in the orchestrator's existing worktree, not tried
+    # (and failed) to create a second one at .worktrees/autofix-pr81.
+    assert client.tab_create_cwd == str(other_wt)
+    autofix_wt = repo / ".worktrees" / "autofix-pr81"
+    assert not autofix_wt.exists()
+
+
+def test_dispatch_failure_records_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 2 (issue 036): a dispatch failure's `reason` (and `error`)
+    reach the terminal history record instead of being silently dropped (36b — the
+    tick-level log used to print `done (...)` regardless of per-PR outcome, making any
+    dispatch failure un-triageable from history.jsonl alone)."""
+    from herdr_routines.auto_fix import EligiblePR, PRInfo
+
+    history_path = tmp_path / "state" / "history.jsonl"
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+    job = make_auto_fix_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeFullClient()
+
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", MockGhClient)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+
+    pr = PRInfo(
+        number=81, head_ref="auto/pipeline-20260904T050000Z", author="bot", url=""
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick.list_open_prs",
+        lambda gh, *, owner, repo, branch_prefix, author: [pr],
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick.is_eligible",
+        lambda gh, *, owner, repo, pr: EligiblePR(pr=pr, reason="unresolved_threads"),
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick._dispatch_fix_worker",
+        lambda **kwargs: {
+            "state": "failed",
+            "reason": "worktree_creation_failed",
+            "error": "boom: something specific",
+        },
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    records = read_job(history_path, job.name)
+    dispatched = next(r for r in records if r.extra and r.extra.get("pr_number") == 81)
+    assert dispatched.state == "failed"
+    assert dispatched.extra is not None
+    assert dispatched.extra["reason"] == "worktree_creation_failed"
+    assert dispatched.extra["error"] == "boom: something specific"
+
+
+def test_live_agent_guard_matches_dispatch_name(tmp_path: Path) -> None:
+    """Acceptance criterion 4 (issue 036c): the double-dispatch guard must recognize a
+    live fix-worker agent under the *actual* name the dispatcher creates
+    (`build_worker_agent_name`, which always carries a run_id tail), not the bare
+    `build_pr_agent_name` name that the dispatcher never creates."""
+    from herdr_routines.auto_fix import build_pr_agent_name, build_worker_agent_name
+    from herdr_routines.tick import _pr_worker_is_live
+
+    job_name = "auto-fix-prs"
+    pr_number = 81
+    run_id = "auto-fix-prs-20260904T053000Z"
+    real_name = build_worker_agent_name(job_name, pr_number, run_id)
+
+    assert real_name != build_pr_agent_name(job_name, pr_number)
+
+    client = FakeStatusClient({real_name: "working"})
+    assert _pr_worker_is_live(client, job_name, pr_number) is True  # type: ignore[arg-type]
+
+    idle_client = FakeStatusClient({real_name: "idle"})
+    assert _pr_worker_is_live(idle_client, job_name, pr_number) is False  # type: ignore[arg-type]
+
+    other_pr_client = FakeStatusClient(
+        {build_worker_agent_name(job_name, 99, run_id): "working"}
+    )
+    assert _pr_worker_is_live(other_pr_client, job_name, pr_number) is False  # type: ignore[arg-type]

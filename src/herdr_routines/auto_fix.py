@@ -7,6 +7,7 @@ frozen now and fixture history. See docs/pipeline/runs/20260829T050025Z/spec.md.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import shlex
@@ -443,18 +444,37 @@ def build_fix_prompt(
     """)
 
 
-def build_worker_agent_name(job_name: str, pr_number: int, run_id: str) -> str:
-    """Build the agent name for a fix worker: rt-<job>-pr<n>-<run_id> truncated to
-    32 chars. Follows NAME_RE from config.py (rt- prefix + name)."""
-    raw = f"rt-{job_name}-pr{pr_number}-{run_id}"
-    return raw[:32]
-
-
 def build_pr_agent_name(job_name: str, pr_number: int) -> str:
-    """Build a run_id-less agent name for live-agent checks across ticks.
-    Two ticks 5 min apart must not double-dispatch the same PR (review finding E)."""
+    """Build the stable per-PR agent-name prefix: rt-<job>-pr<n>, truncated to
+    32 chars. Used for live-agent checks across ticks (two ticks 5 min apart must
+    not double-dispatch the same PR, review finding E) — and, since
+    build_worker_agent_name always keeps this as a true prefix of the full name it
+    creates, callers can match live agents by prefix instead of exact equality
+    (issue 036c: the previous exact-match guard could never match anything because
+    the dispatcher never created a name without the run_id)."""
     raw = f"rt-{job_name}-pr{pr_number}"
     return raw[:32]
+
+
+def build_worker_agent_name(job_name: str, pr_number: int, run_id: str) -> str:
+    """Build the agent name for a fix worker: rt-<job>-pr<n>-<tail>, truncated to
+    NAME_RE's 32-char cap (config.py). `run_id` is itself "<job_name>-<timestamp>"
+    (see runner.make_run_id), so the job name is stripped from it here before use —
+    otherwise it appears twice in `raw` and the naive 32-char slice used to swallow
+    the whole timestamp, the only part distinguishing one attempt from the next
+    (issue 036c). The `build_pr_agent_name` prefix is always kept intact; only the
+    distinguishing tail is shortened (via a hash, to stay a fixed size regardless of
+    the timestamp's length) when there isn't room for it verbatim."""
+    prefix = build_pr_agent_name(job_name, pr_number)
+    job_prefix = f"{job_name}-"
+    tail = run_id.removeprefix(job_prefix)
+
+    budget = 32 - len(prefix) - 1  # -1 for the separating "-"
+    if budget <= 0:
+        return prefix[:32]
+    if len(tail) > budget:
+        tail = hashlib.sha1(run_id.encode()).hexdigest()[:budget]
+    return f"{prefix}-{tail}"
 
 
 # ---------------------------------------------------------------------------
