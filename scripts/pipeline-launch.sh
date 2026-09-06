@@ -121,3 +121,48 @@ PROMPT_FILE_TMP="/tmp/full_prompt_${RUN_ID}.md"
 herdr agent prompt "$AGENT_NAME" "$(cat "$PROMPT_FILE_TMP")" --wait --timeout "$WAIT_TIMEOUT_MS"
 PROMPT_STATUS=$?
 echo "=== prompted (wait exited status=$PROMPT_STATUS), run_id=$RUN_ID ws=$WS_PANE report=$REPORT ==="
+
+# `--wait` exits 0 for a `blocked` settle exactly as it does for `idle`/`done` (issue 037) —
+# the exit code alone can't tell success from a stuck orchestrator. Read the actual settle
+# status instead, and on anything but idle/done capture the visible screen (033's fix,
+# never reached this launcher path) and stub a failed report *before* the `cleanup` trap
+# below closes the pane and destroys the only evidence of what it was stuck on.
+SETTLE_JSON=$(herdr agent get "$AGENT_NAME" 2>&1)
+SETTLE_STATUS=$(printf '%s' "$SETTLE_JSON" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+[ -z "$SETTLE_STATUS" ] && SETTLE_STATUS="unknown"
+echo "=== settle status: $SETTLE_STATUS ==="
+
+if [ "$SETTLE_STATUS" != "idle" ] && [ "$SETTLE_STATUS" != "done" ]; then
+  # --source visible, not the default read: the plain read is rejected while unsettled
+  # (agent_not_idle), which is precisely the blocked/unknown case here — same reasoning as
+  # runner._capture_visible_tail (issue 033).
+  TAIL_FILE="$(dirname "$REPORT")/${RUN_ID}.tail.txt"
+  TAIL_TEXT=$(herdr agent read "$AGENT_NAME" --source visible --lines 200 2>&1)
+  echo "=== captured visible tail for $AGENT_NAME (settle=$SETTLE_STATUS) ==="
+  echo "$TAIL_TEXT"
+  if [ -n "$TAIL_TEXT" ]; then
+    printf '%s\n' "$TAIL_TEXT" > "$TAIL_FILE"
+  fi
+
+  # Only stub the report if the orchestrator hasn't already written one itself — a report
+  # with real content always wins over this best-effort marker.
+  if [ ! -s "$REPORT" ]; then
+    {
+      echo "# Pipeline run $RUN_ID — launcher stub report"
+      echo
+      echo "## Outcome: failed"
+      echo
+      echo "settle_status: $SETTLE_STATUS"
+      echo "tail: $TAIL_FILE"
+      echo
+      echo "pipeline-launch.sh wrote this stub: the orchestrator settled '$SETTLE_STATUS'" \
+        "instead of idle/done, so \`herdr agent prompt --wait\` returned without a real" \
+        "report. Written before the pane was closed so tick reconciles on the next tick" \
+        "instead of waiting out the full deadline (issue 037). See the tail file above" \
+        "for what the orchestrator was stuck on."
+    } > "$REPORT"
+    echo "=== wrote failed-outcome stub report to $REPORT ==="
+  fi
+
+  herdr notification show --sound request >/dev/null 2>&1 || true
+fi

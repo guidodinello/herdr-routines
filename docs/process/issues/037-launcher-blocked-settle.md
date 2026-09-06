@@ -1,7 +1,7 @@
 ---
 id: "037"
 title: "pipeline-launch.sh never inspects settle status: a blocked orchestrator looks like success for 8h"
-status: open
+status: done
 priority: high
 area: pipeline
 ---
