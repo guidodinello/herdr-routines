@@ -38,7 +38,7 @@ class Row:
 
     @property
     def stale(self) -> bool:
-        """Eligible for cleanup: fully merged into base OR worktree dir gone."""
+        """Eligible for cleanup: merged (see is_merged) OR worktree dir gone."""
         return self.merged_into_base or not self.worktree_exists
 
 
@@ -212,8 +212,68 @@ def detect_base(repo: Path) -> str:
     return "main"
 
 
-def is_merged(branch: str, base: str, repo: Path) -> bool:
-    """True when the branch tip is reachable from base; unknown-ref failures warn, not raise."""
+GH_MERGED_PR_LIMIT = 500
+
+
+def fetch_merged_pr_heads(repo: Path) -> set[str]:
+    """``headRefName`` of every merged PR, via a single batched ``gh pr list`` call.
+
+    Ancestry (``git merge-base --is-ancestor``) only proves a merge when the branch's
+    own commits land on base — never true for a squash merge, where the PR lands as one
+    new commit on base with no second parent (issue 042). GitHub's PR state is the
+    authority that works regardless of merge topology, and one batched call here (rather
+    than one ``gh pr list --head`` per branch, as ``check_open_pr`` already does for the
+    open-PR check) keeps the network cost flat as the branch count grows.
+
+    Any ``gh`` failure (not installed, not authenticated, no configured remote) warns and
+    returns an empty set rather than raising: callers fall back to the ancestry check
+    alone, same "degrade to the old, safe answer" direction as ``check_open_pr``.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "merged",
+                "--limit",
+                str(GH_MERGED_PR_LIMIT),
+                "--json",
+                "headRefName",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _warn(f"gh pr list --state merged failed: {e}")
+        return set()
+    if proc.returncode != 0:
+        _warn(f"gh pr list --state merged failed: {proc.stderr.strip()}")
+        return set()
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {
+        item["headRefName"]
+        for item in data
+        if isinstance(item, dict) and isinstance(item.get("headRefName"), str)
+    }
+
+
+def is_merged(branch: str, base: str, repo: Path, merged_pr_heads: set[str]) -> bool:
+    """True when the branch is merged into base — by ancestry (a fast-forward or
+    non-squash merge) OR because GitHub records its PR as merged (issue 042: the only
+    check that also catches a squash merge, where the branch's commits are never
+    ancestors of base). Unknown-ref ancestry failures warn, not raise."""
+    if branch in merged_pr_heads:
+        return True
     proc = run_git(repo, "merge-base", "--is-ancestor", branch, base)
     if proc.returncode == 0:
         return True
@@ -264,6 +324,8 @@ def collect_rows(
     names = list_auto_branches(repo)
     if names is None:
         return [], True, worktrees
+    # One batched gh call for the whole inventory (issue 042), not one per branch.
+    merged_pr_heads = fetch_merged_pr_heads(repo) if names else set()
     rows: list[Row] = []
     for branch in names:
         path = worktrees.get(branch)
@@ -271,7 +333,7 @@ def collect_rows(
             Row(
                 branch=branch,
                 worktree_exists=path is not None and path.exists(),
-                merged_into_base=is_merged(branch, base, repo),
+                merged_into_base=is_merged(branch, base, repo, merged_pr_heads),
             )
         )
     return rows, False, worktrees
@@ -284,7 +346,9 @@ def _yn(value: bool) -> str:
 def format_table(rows: Sequence[Row]) -> str:
     """Human-readable table with the summary count line last; stable yes/no tokens."""
     width = max([len("BRANCH"), *(len(row.branch) for row in rows)])
-    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED-INTO-BASE"]
+    # Renamed from MERGED-INTO-BASE (issue 042) — see is_merged's docstring for what
+    # this column actually checks now.
+    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED"]
     lines.extend(
         f"{row.branch:<{width}}  {_yn(row.worktree_exists):<16} {_yn(row.merged_into_base)}"
         for row in rows
@@ -348,7 +412,9 @@ def _delete_branch(repo: Path, row: Row) -> bool:
 def format_delete_table(rows: Sequence[Row]) -> str:
     """Table for delete mode — same columns as dry-run, different summary line."""
     width = max([len("BRANCH"), *(len(row.branch) for row in rows)])
-    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED-INTO-BASE"]
+    # Renamed from MERGED-INTO-BASE (issue 042) — see is_merged's docstring for what
+    # this column actually checks now.
+    lines = [f"{'BRANCH':<{width}}  WORKTREE-EXISTS  MERGED"]
     lines.extend(
         f"{row.branch:<{width}}  {_yn(row.worktree_exists):<16} {_yn(row.merged_into_base)}"
         for row in rows

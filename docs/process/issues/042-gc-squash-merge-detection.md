@@ -1,7 +1,7 @@
 ---
 id: "042"
 title: "gc's merge check uses ancestry, so squash-merged branches never look merged"
-status: open
+status: done
 priority: medium
 area: cli
 ---
