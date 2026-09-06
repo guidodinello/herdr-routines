@@ -56,6 +56,7 @@ from herdr_routines.runner import (
     make_run_id,
 )
 from herdr_routines.schedule import Decision, decide
+from herdr_routines.tmp_hygiene import reap_tmp
 
 log = get_logger(__name__)
 
@@ -117,6 +118,14 @@ def run_tick(
     """Process every enabled job once. Does not raise for individual job failures; each is
     captured in its own history record so one bad job cannot prevent the rest from being
     evaluated."""
+    # /tmp hygiene preamble (issue 027): best-effort reap under tick.lock, never fails
+    # the tick. Runs before job dispatch so leaked agent .so files and pytest artifacts
+    # are cleaned before any new agent spawn.
+    try:
+        reap_tmp()
+    except Exception as e:  # noqa: BLE001
+        log.warning("tmp hygiene reap failed (continuing): %s", e)
+
     summaries: list[str] = []
     any_job_failed = False
     for job in config.jobs:
