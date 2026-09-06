@@ -39,6 +39,16 @@ def repo(tmp_path: Path) -> Path:
     return target
 
 
+@pytest.fixture(autouse=True)
+def _no_gh_or_inflight_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test gets a hermetic "no open PR, nothing in flight" default so dry-run
+    tests that happen to create an `auto/pipeline-*` branch never shell out to a real
+    `gh` or touch `~/.herdr` (issue 039; same hermeticity concern issue 038 fixed for
+    /tmp diagnosis). Individual tests override these to exercise the retained cases."""
+    monkeypatch.setattr(gc, "check_open_pr", lambda repo, branch: False)
+    monkeypatch.setattr(gc, "check_inflight", lambda branch, **kwargs: False)
+
+
 def _gc(repo: Path, capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
     code = cli.main(["gc", "--dry-run", "--repo", str(repo), "--base", "main"])
     captured = capsys.readouterr()
@@ -89,9 +99,12 @@ def test_gc_dry_run_lists_gone_worktrees(
     assert _rows(out)[branch] == ("no", "no")
 
 
-def test_gc_dry_run_excludes_pipeline_branches(
+def test_gc_lists_merged_pipeline_branch(
     repo: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Issue 039 acceptance 1: a merged auto/pipeline-* branch with no open PR and no
+    in-flight run is no longer structurally excluded — it's listed exactly like any
+    other merged auto/* branch."""
     pipeline = "auto/pipeline-nightly-20260824T010000Z"
     real = "auto/real-job-20260820T000000Z"
     _git(repo, "branch", pipeline, "main")
@@ -100,10 +113,110 @@ def test_gc_dry_run_excludes_pipeline_branches(
     code, out, err = _gc(repo, capsys)
 
     assert code == 0
-    assert pipeline not in out
+    assert _rows(out)[pipeline] == ("no", "yes")
     assert real in out
-    assert "1 branch(es) listed" in out
+    assert "2 branch(es) listed" in out
     assert "warning" not in err
+
+
+def test_gc_retains_unmerged_pipeline_branch(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue 039 acceptance 2: an unmerged auto/pipeline-* branch is retained (the
+    orchestrator's PR is presumably still open/unmerged) and stays out of the listing."""
+    pipeline = "auto/pipeline-nightly-20260824T010000Z"
+    wt = tmp_path / "wt-pipeline"
+    _git(repo, "worktree", "add", str(wt), "-b", pipeline)
+    (wt / "spec.md").write_text("wip\n")
+    _git(wt, "add", ".")
+    _git(wt, "commit", "-m", "wip")
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert pipeline not in out
+    assert "0 branch(es) listed" in out
+
+
+def test_gc_retains_pipeline_branch_with_open_pr(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue 039 acceptance 3: a merged auto/pipeline-* branch with an open PR is still
+    retained — merged-into-base alone isn't enough once a PR is open against it."""
+    pipeline = "auto/pipeline-nightly-20260824T010000Z"
+    _git(repo, "branch", pipeline, "main")
+    monkeypatch.setattr(gc, "check_open_pr", lambda repo_, branch: branch == pipeline)
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert pipeline not in out
+    assert "0 branch(es) listed" in out
+
+
+def test_gc_non_pipeline_branches_unaffected(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue 039 acceptance 4: non-pipeline auto/* behaviour is unchanged — merged, no
+    open-PR/in-flight check ever runs against it."""
+    real = "auto/real-job-20260820T000000Z"
+    _git(repo, "branch", real, "main")
+    checked: list[str] = []
+
+    def spy_open_pr(repo_: Path, branch: str) -> bool:
+        checked.append(branch)
+        return False
+
+    monkeypatch.setattr(gc, "check_open_pr", spy_open_pr)
+
+    code, out, _ = _gc(repo, capsys)
+
+    assert code == 0
+    assert _rows(out)[real] == ("no", "yes")
+    assert "1 branch(es) listed" in out
+    assert checked == []
+
+
+_REAL_CHECK_INFLIGHT = gc.check_inflight
+
+
+def test_gc_check_inflight_retains_merged_branch_with_no_terminal_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """check_inflight (issue 039's third OR-clause) reads state.json's own `branch`
+    field under worktrees_root/auto-pipeline-*/, exactly as the orchestrator writes it
+    (docs/pipeline/orchestrator-prompt.md), and treats a run as in-flight until its
+    terminal report shows up — same criterion pipeline_watchdog.py uses.
+
+    This tests the real function directly, undoing the autouse stub above."""
+    monkeypatch.setattr(gc, "check_inflight", _REAL_CHECK_INFLIGHT)
+    branch = "auto/pipeline-20260824T010000Z"
+    worktrees_root = tmp_path / "worktrees"
+    run_dir = worktrees_root / "auto-pipeline-20260824T010000Z"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text(
+        f'{{"run_id": "20260824T010000Z", "branch": "{branch}"}}'
+    )
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+
+    assert gc.check_inflight(
+        branch, worktrees_root=worktrees_root, reports_dir=reports_dir
+    )
+
+    (reports_dir / "pipeline-20260824T010000Z.md").write_text("## Outcome: ok\n")
+    assert not gc.check_inflight(
+        branch, worktrees_root=worktrees_root, reports_dir=reports_dir
+    )
+
+
+def test_gc_check_inflight_false_for_non_pipeline_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gc, "check_inflight", _REAL_CHECK_INFLIGHT)
+    assert not gc.check_inflight(
+        "auto/real-job-20260820T000000Z", worktrees_root=tmp_path
+    )
 
 
 def test_gc_dry_run_deletes_nothing(
@@ -150,10 +263,13 @@ def test_gc_dry_run_deletes_nothing(
 
     assert code == 0
     assert before == after
-    # 3 listed: merged + diverged + gone (pipeline excluded from the count too).
-    assert "3 branch(es) listed" in out
+    # 4 listed: merged + diverged + gone + the merged pipeline branch (issue 039: a
+    # merged auto/pipeline-* branch with no open PR/in-flight run is now listed like
+    # any other auto/* branch — it just never becomes a delete candidate, see the
+    # delete-half tests below).
+    assert "4 branch(es) listed" in out
     assert "nothing deleted" in out
-    assert "eligible: 2, merged: 1, missing worktree: 1" in out
+    assert "eligible: 3, merged: 2, missing worktree: 2" in out
     assert _rows(out)[diverged] == ("yes", "no")
 
 

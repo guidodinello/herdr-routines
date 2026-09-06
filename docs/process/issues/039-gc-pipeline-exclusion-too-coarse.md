@@ -1,7 +1,7 @@
 ---
 id: "039"
 title: "gc excludes every auto/pipeline-* branch, so 23 merged worktrees are uncollectable"
-status: open
+status: done
 priority: low
 area: cli
 ---
