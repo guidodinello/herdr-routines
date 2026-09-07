@@ -1070,7 +1070,7 @@ def test_gc_delete_retains_recently_merged_branch(
     assert "eligible: 0" in dry_out
     row_line = next(line for line in dry_out.splitlines() if line.startswith(branch))
     age_shown = float(row_line.split()[-1])
-    assert age_shown < 2
+    assert age_shown < 1
 
 
 def test_gc_delete_collects_branch_past_age_threshold(
