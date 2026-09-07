@@ -1,0 +1,27 @@
+# Issue refinement job — Parking Lot → refined issue PR (issue 029).
+#
+# Product refinement vs pipeline's implementation refinement. Nightly 22:00,
+# opencode only (no Claude), bounded author→reviewer loop cap 3.
+# Output is a PR with docs/process/issues/NNN-*.md + ROADMAP bullet,
+# head auto/issue-refinement-* (not auto/pipeline-).
+
+enabled: true
+cron: "0 22 * * *"
+repo: /home/guido/.local/state/herdr-routines/repos/herdr-routines
+workspace: worktree
+base: main
+agent_kind: opencode
+model: opencode/big-pickle
+prompt: |
+  You are the issue-refinement worker (029). Select the oldest Parking Lot bullet
+  from ROADMAP.md not already covered by docs/process/issues/*.md (skip blocked
+  unless you derive the decision), then run author→reviewer loop cap 3:
+  author drafts refined issue + ROADMAP bullet, reviewer (fresh session
+  opencode/muse-spark-1.2-contributor-free) audits, consensus when reviewer says
+  confidence: high. Open PR head auto/issue-refinement-<timestamp> with the new
+  issue file and ROADMAP entry for human merge. See docs/process/issues/029-*.md
+  and src/herdr_routines/issue_refinement.py for helpers.
+timeout_ms: 3600000
+start_timeout_ms: 120000
+on_missed: log
+notify_policy: terminal
