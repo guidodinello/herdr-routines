@@ -1,4 +1,4 @@
-# One file per job.  Filename stem (``nightly-pipeline``) is the canonical name.
+# One file per job.  Filename stem (``feature-pipeline``) is the canonical name.
 # The ``name:`` key inside is optional — if present it must equal the stem.
 #
 # Copy this directory to the path resolved by
