@@ -1,7 +1,7 @@
 ---
 id: "029"
 title: "Issue refinement job: Parking Lot → refined issue PR"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
