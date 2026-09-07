@@ -9,6 +9,7 @@ Pure helpers here — no Herdr, no gh, no clock — so tests stay fast.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 # Cap per spec: 3 iterations max.
@@ -115,7 +116,7 @@ def loop_should_continue(iteration: int, reviewer_confidence: str) -> bool:
     return iteration < MAX_ITERATIONS
 
 
-def validate_issue_frontmatter(frontmatter: dict[str, object]) -> list[str]:
+def validate_issue_frontmatter(frontmatter: Mapping[str, object]) -> list[str]:
     """Return list of missing/invalid required fields; empty means valid."""
     required = ("id", "title", "status", "priority", "area")
     missing: list[str] = []
