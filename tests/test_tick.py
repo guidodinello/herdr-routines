@@ -3,6 +3,8 @@ TickOutcome.any_job_failed — what `_cmd_tick` (cli.py) maps to the process exi
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1537,6 +1539,131 @@ def test_pipeline_partial_deadline_report_is_tolerated_but_failed(
     outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
     assert outcome.summaries == ("nightly-pipeline: failed (partial_deadline)",)
     assert outcome.any_job_failed is True
+
+
+def _dispatch_pipeline_and_get_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, Any, Any, str, Path]:
+    """Dispatch a pipeline job to the `running` state and return
+    (config, client, history_path, bare_run_id, worktrees_root)."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+    worktrees_root = tmp_path / "worktrees"
+    monkeypatch.setattr(
+        "herdr_routines.tick.default_worktrees_root", lambda: worktrees_root
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    run_tick(config, history_path, client=client, now=t0 + timedelta(minutes=1))  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    return config, client, history_path, bare_run_id, worktrees_root
+
+
+def _write_state_json(
+    worktrees_root: Path,
+    bare_run_id: str,
+    stage_sessions: dict,
+    *,
+    mtime: float | None = None,
+) -> Path:
+    d = worktrees_root / f"auto-pipeline-{bare_run_id}"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "state.json"
+    p.write_text(
+        json.dumps(
+            {
+                "run_id": bare_run_id,
+                "current_stage": 6,
+                "stage_sessions": stage_sessions,
+            }
+        )
+    )
+    if mtime is not None:
+        os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_pipeline_done_report_downgraded_when_stage_sessions_faked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, client, history_path, bare_run_id, wt = _dispatch_pipeline_and_get_run_id(
+        tmp_path, monkeypatch
+    )
+    report = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("## Outcome: ok\n")
+    _write_state_json(
+        wt,
+        bare_run_id,
+        {
+            "1": "ses_f87fc2c5_fake1",
+            "2": "ses_f87fc2c5_fake2",
+            "3": "ses_f87fc2c5_fake3",
+        },
+    )
+
+    t = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=2)
+    outcome = run_tick(config, history_path, client=client, now=t)  # type: ignore[arg-type]
+    assert outcome.summaries == (
+        "nightly-pipeline: failed (stage_independence_unverified)",
+    )
+    assert outcome.any_job_failed is True
+    assert read_job(history_path, "nightly-pipeline")[-1].state == "failed"
+
+
+def test_pipeline_done_report_trusted_when_state_json_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A human may gc the orchestrator worktree — no state.json must not turn a clean
+    'ok' report red."""
+    config, client, history_path, bare_run_id, _wt = _dispatch_pipeline_and_get_run_id(
+        tmp_path, monkeypatch
+    )
+    report = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("## Outcome: ok\n")
+
+    t = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=2)
+    outcome = run_tick(config, history_path, client=client, now=t)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: done",)
+
+
+def test_pipeline_fails_fast_on_host_reboot_before_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No report, deadline hours away — but the host booted after the orchestrator's
+    last state.json write, so tick fails the run now instead of 'in flight'."""
+    config, client, history_path, bare_run_id, wt = _dispatch_pipeline_and_get_run_id(
+        tmp_path, monkeypatch
+    )
+    now = datetime.now(UTC).replace(microsecond=0)
+    _write_state_json(
+        wt,
+        bare_run_id,
+        {"1": "ses_a1b2c3d4e5f6a1b2c3d4e5f6a1"},
+        mtime=now.timestamp() - 1800,
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick.system_boot_epoch", lambda: now.timestamp() - 300
+    )
+
+    outcome = run_tick(
+        config, history_path, client=client, now=now + timedelta(minutes=3)
+    )  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: failed (host_rebooted)",)
+    assert outcome.any_job_failed is True
+    last = read_job(history_path, "nightly-pipeline")[-1]
+    assert last.state == "failed"
+    assert last.extra is not None and last.extra["reason"] == "host_rebooted"
 
 
 def test_pipeline_skipped_while_agent_live(

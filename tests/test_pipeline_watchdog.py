@@ -19,6 +19,8 @@ from herdr_routines.pipeline_watchdog import (
     find_inflight_runs,
     is_stalled,
     run_watchdog,
+    system_boot_epoch,
+    validate_stage_sessions,
 )
 
 RUN_ID = "20260903T050016Z"
@@ -357,3 +359,133 @@ def test_run_watchdog_never_touches_run_with_existing_report(tmp_path: Path) -> 
 
     assert actions == []
     assert client.closed_panes == []
+
+
+# -- system_boot_epoch ------------------------------------------------------------------
+
+
+def test_system_boot_epoch_parses_proc_stat(tmp_path: Path) -> None:
+    stat = tmp_path / "stat"
+    stat.write_text("cpu  1 2 3\nbtime 1788779818\nprocesses 42\n")
+    assert system_boot_epoch(stat) == 1788779818.0
+
+
+def test_system_boot_epoch_none_when_unreadable(tmp_path: Path) -> None:
+    assert system_boot_epoch(tmp_path / "missing") is None
+    no_btime = tmp_path / "stat2"
+    no_btime.write_text("cpu 1 2 3\nprocesses 42\n")
+    assert system_boot_epoch(no_btime) is None
+
+
+# -- validate_stage_sessions (design.md G-17 gate) -------------------------------------
+
+
+def test_validate_stage_sessions_accepts_distinct_real_ids() -> None:
+    ok = {
+        "current_stage": 6,
+        "stage_sessions": {
+            "1": "ses_f9f8186e3ffeY07GblyzaVJP01",
+            "2": "ses_f9f7ee0e7ffeEXZ9pkSIMNPhmC",
+            "3": "ses_f9a578e4effegxE5jPbimAei1R",
+            "4": "ses_f9a446f22ffe4EQX3KWOAwetPz",
+            "5": "ses_a1b2c3d4e5f6a1b2c3d4e5f6a1",
+            "6": "ses_b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        },
+    }
+    assert validate_stage_sessions(ok) is None
+
+
+def test_validate_stage_sessions_flags_placeholders() -> None:
+    # Real 2026-09-06 / 2026-09-07 fabrications.
+    faked = {
+        "current_stage": 3,
+        "stage_sessions": {
+            "1": "ses_f87fc2c5_fake1",
+            "2": "ses_f87fc2c5_fake2",
+            "3": "ses_f87fc2c5_fake3",
+        },
+    }
+    issue = validate_stage_sessions(faked)
+    assert issue is not None and "placeholder" in issue
+
+
+def test_validate_stage_sessions_flags_reused_session() -> None:
+    reused = {
+        "current_stage": 2,
+        "stage_sessions": {
+            "1": "ses_f9f8186e3ffeY07GblyzaVJP01",
+            "2": "ses_f9f8186e3ffeY07GblyzaVJP01",
+        },
+    }
+    issue = validate_stage_sessions(reused)
+    assert issue is not None and "reuses" in issue
+
+
+def test_validate_stage_sessions_flags_missing_entries() -> None:
+    incomplete = {
+        "current_stage": 6,
+        "stage_sessions": {
+            "1": "ses_f9f8186e3ffeY07GblyzaVJP01",
+            "2": "ses_f9f7ee0e7ffeEXZ9pkSIMNPhmC",
+        },
+    }
+    issue = validate_stage_sessions(incomplete)
+    assert issue is not None and "unverified" in issue
+
+
+def test_validate_stage_sessions_flags_missing_field() -> None:
+    assert validate_stage_sessions({"current_stage": 3}) is not None
+
+
+# -- is_stalled / run_watchdog: host reboot fast-fail ----------------------------------
+
+
+def test_is_stalled_true_when_host_rebooted_after_state_write(tmp_path: Path) -> None:
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "tmp"
+    heartbeat_dir.mkdir()
+    # deadline is far in the future — the old path would say "not stalled".
+    state_path = write_state_json(
+        worktrees_root, deadline_epoch=int(NOW.timestamp()) + 6 * 3600
+    )
+    os.utime(state_path, (NOW.timestamp() - 600, NOW.timestamp() - 600))
+    (run,) = find_inflight_runs(worktrees_root, reports_dir)
+
+    # Booted 5 min ago, i.e. well after the state write 10 min ago.
+    assert is_stalled(
+        run,
+        now=NOW,
+        heartbeat_dir=heartbeat_dir,
+        boot_epoch=NOW.timestamp() - 300,
+    )
+    # No boot_epoch (can't read /proc/stat) => falls back to the deadline path => not stalled.
+    assert not is_stalled(run, now=NOW, heartbeat_dir=heartbeat_dir)
+
+
+def test_run_watchdog_fails_fast_on_host_reboot(tmp_path: Path) -> None:
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "tmp"
+    heartbeat_dir.mkdir()
+    state_path = write_state_json(
+        worktrees_root, deadline_epoch=int(NOW.timestamp()) + 6 * 3600
+    )
+    os.utime(state_path, (NOW.timestamp() - 1800, NOW.timestamp() - 1800))
+    client = FakeWatchdogClient()
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        now=NOW,
+        boot_epoch=NOW.timestamp() - 300,
+    )
+
+    assert len(actions) == 1
+    report = (reports_dir / f"pipeline-{RUN_ID}.md").read_text()
+    assert "## Outcome: failed (watchdog: host rebooted mid-run)" in report
+    assert "host_rebooted_mid_run: true" in report
+    title, _body, _sound = client.notifications[0]
+    assert "host rebooted mid-run" in title
