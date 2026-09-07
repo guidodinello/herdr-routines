@@ -23,3 +23,18 @@ Create a `jobs.d/` routine `issue-refinement` running nightly 22:00 (`cron: "0 2
 - Overlap with pipeline backlog: head prefix avoids `auto/pipeline-*` guard; verified.
 - Model quota exhaustion during loop; fallback to next night via cap.
 
+
+## Acceptance criteria
+
+1. [blocking] Selection picks oldest Parking Lot bullet not covered by existing issue, skipping `blocked` unless derived; marks picked so later run never re-refines same idea. Test: test_issue_refinement_selection_picks_oldest_uncovered confidence: high
+2. [blocking] Author→reviewer loop terminates at consensus or cap 3; reviewer is fresh session (not author re-reading own draft) with at least one reviewer pass. Test: test_issue_refinement_loop_caps_at_three confidence: high
+3. [blocking] Output PR contains valid `docs/process/issues/NNN-*.md` with frontmatter (id, title, status open, priority, area) and ROADMAP bullet, head `auto/issue-refinement-*` not `auto/pipeline-*`. Test: test_issue_refinement_pr_contains_valid_issue_file confidence: high
+4. [non-blocking] Job definition is `opencode` only, no `agent_kind: claude`, cron `0 22 * * *`. Test: test_issue_refinement_job_is_opencode_only confidence: medium
+5. [non-blocking] Refined issue not visible to `pick-feature` until PR merged; head avoids open-PR guard. Test: test_issue_refinement_no_pipeline_overlap confidence: medium
+
+## Changelog v1→v2
+
+- Added Acceptance criteria with 5 numbered items each ending `Test: <name>` and `confidence:` tier.
+- Added `blocking`/`non-blocking` labels per criteria (tiers present for gate).
+- Clarified head prefix and opencode-only constraint per acceptance.
+
