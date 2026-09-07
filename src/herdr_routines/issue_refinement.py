@@ -16,11 +16,14 @@ The "already refined" guard (issue 029 Design): a bullet with an open
 ``auto/issue-refinement-*`` PR is treated as covered. The documented mechanism
 ("mark it picked in ROADMAP") was never buildable — the job opens a PR and never
 writes to ``main`` — so the open-PR check stands in for it, the same substitution
-``pick_feature`` makes for pipeline picks (issue 028). Correlation is structural:
-the selector emits a stable ``Refines-Parking-Lot: <slug>`` marker that the job
-copies verbatim into the PR body, and the guard matches that marker (PR-title
-substring only as a fallback). Any ``gh`` failure fails *safe* — no pick that
-night — never fail-open into a duplicate PR every night of a GitHub outage.
+``pick_feature`` makes for pipeline picks (issue 028). The correlation key is a
+``Refines-Parking-Lot: <slug>`` marker the selector prints and the job is told to
+copy verbatim into the PR body; the guard matches that marker. The title-slug
+fallback (for a PR missing the marker) rarely fires — the job titles its PRs
+``docs: refine issue NNN — <title>``, which does not slugify to the bullet slug —
+so in practice the marker *is* the mechanism, and a marker-less refinement PR can
+be re-refined. Any ``gh`` failure fails *safe* — no pick that run — never
+fail-open into a duplicate PR every night of a GitHub outage.
 """
 
 from __future__ import annotations
@@ -48,8 +51,11 @@ PIPELINE_HEAD_PREFIX = "auto/pipeline-"
 # ROADMAP Parking Lot header — bullets under this header are candidates.
 PARKING_LOT_HEADER = "## Parking lot"
 
-# A bullet is gated ("blocked") when it names an unmet gate or says so outright.
-_BLOCKED_RE = re.compile(r"\bGate:|\bblocked\b", re.IGNORECASE)
+# A bullet is gated when it carries a structural marker: "Gate: <what>" (the
+# ROADMAP Parking Lot convention) or a leading "blocked: <what>". Matched as
+# markers, not as the bare word "blocked" — a bullet's folded multi-line body
+# routinely mentions blocked panes/agents/calls in passing.
+_BLOCKED_RE = re.compile(r"\bGate:|\bblocked:", re.IGNORECASE)
 # A bullet is already promoted when it links a docs/process/issues/ file.
 _PROMOTED_RE = re.compile(r"docs/process/issues/")
 

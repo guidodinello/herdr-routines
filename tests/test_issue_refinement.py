@@ -8,6 +8,7 @@ the job file through the real config validator, and pipeline independence.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,7 @@ from herdr_routines.issue_refinement import (
     job_is_opencode_only,
     loop_should_continue,
     parse_parking_lot_bullets,
+    refinement_open_pr_slugs,
     run_refine_issue,
     select_next_bullet,
     validate_issue_frontmatter,
@@ -138,6 +140,56 @@ def test_issue_refinement_job_is_opencode_only() -> None:
         )
 
 
+class _FakeProc:
+    def __init__(self, stdout: str, returncode: int = 0, stderr: str = "") -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def test_refinement_open_pr_slugs_filters_to_refinement_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prs = [
+        # A pipeline PR carrying the marker MUST NOT count (029: zero pipeline
+        # interaction — the head filter is what keeps it out).
+        {
+            "headRefName": "auto/pipeline-20260907T050000Z",
+            "title": "feat: unify routines + pipeline",
+            "body": f"{PR_MARKER_PREFIX} unify-routines-pipeline",
+        },
+        # A refinement PR with the marker → slug taken from the marker.
+        {
+            "headRefName": "auto/issue-refinement-20260908T220000Z",
+            "title": "docs: refine issue 050 — audit skills",
+            "body": f"body\n{PR_MARKER_PREFIX} audit-skills-as-gate-jobs\n",
+        },
+        # A refinement PR with no marker → slug falls back to the title.
+        {
+            "headRefName": "auto/issue-refinement-20260909T220000Z",
+            "title": "review me prs across repos",
+            "body": "no marker here",
+        },
+        # A human PR is ignored outright.
+        {"headRefName": "docs/hand-written", "title": "x", "body": "x"},
+    ]
+    monkeypatch.setattr(
+        "herdr_routines.issue_refinement.subprocess.run",
+        lambda *a, **k: _FakeProc(json.dumps(prs)),
+    )
+    slugs = refinement_open_pr_slugs(Path("/repo"))
+    assert slugs == frozenset(
+        {"audit-skills-as-gate-jobs", "review-me-prs-across-repos"}
+    )
+
+    # Any gh failure → None (caller fails safe), never an empty set.
+    monkeypatch.setattr(
+        "herdr_routines.issue_refinement.subprocess.run",
+        lambda *a, **k: _FakeProc("", returncode=1, stderr="boom"),
+    )
+    assert refinement_open_pr_slugs(Path("/repo")) is None
+
+
 def test_issue_refinement_no_pipeline_overlap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -147,9 +199,7 @@ def test_issue_refinement_no_pipeline_overlap(
 
     import herdr_routines.issue_refinement as mod
 
-    # refinement_open_pr_slugs already filters to auto/issue-refinement-* heads, so
-    # an open auto/pipeline-* PR for the same slug simply never reaches the guard
-    # (029 acceptance: zero pipeline interaction). Model that as "no slugs".
+    # No open refinement PRs → the oldest eligible bullet is picked, with its marker.
     monkeypatch.setattr(mod, "refinement_open_pr_slugs", lambda *_a: frozenset())
     rc = run_refine_issue(repo)
     out = capsys.readouterr().out
