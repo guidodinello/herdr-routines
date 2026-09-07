@@ -78,3 +78,9 @@ same as `~/projects/PENDING.md`); the full narrative — description, update
 log, links to design docs — lives in the issue file. This split exists so the
 automated selector (`herdr-routines pick-feature`, issue `013`) has a flat,
 frontmatter-queryable list to pick from instead of parsing prose.
+
+The reverse direction — promoting a raw `## Parking lot` bullet into an issue
+file — is automated by the nightly issue-refinement job (`herdr-routines
+refine-issue` for selection, issue `029`), which opens a PR for a human to
+merge. A bullet that links an issue file, or already has an open
+`auto/issue-refinement-*` PR, is skipped.

@@ -40,6 +40,7 @@ from herdr_routines.history import (
     last_terminal_run,
     read_job,
 )
+from herdr_routines.issue_refinement import run_refine_issue
 from herdr_routines.pick_feature import ReclaimedPick, run_pick_feature
 from herdr_routines.pipeline_watchdog import (
     default_heartbeat_dir,
@@ -321,6 +322,40 @@ def _build_parser() -> argparse.ArgumentParser:
         "--base", default="main", help="branch to fast-forward to (default: main)"
     )
     p_sync_repo.set_defaults(handler=_cmd_sync_repo)
+
+    p_refine = sub.add_parser(
+        "refine-issue",
+        help=(
+            "pick the next ROADMAP Parking Lot idea to refine into an issue file "
+            "(issue 029, stage 0 of the issue-refinement job)"
+        ),
+    )
+    p_refine.add_argument(
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="git checkout to read ROADMAP.md/issues from and run `gh pr list` in "
+        "(default: cwd)",
+    )
+    p_refine.add_argument(
+        "--issues-dir",
+        type=Path,
+        default=None,
+        help="issue-file directory (default: <repo>/docs/process/issues)",
+    )
+    p_refine.add_argument(
+        "--roadmap",
+        type=Path,
+        default=None,
+        help="ROADMAP file (default: <repo>/ROADMAP.md)",
+    )
+    p_refine.add_argument(
+        "--allow-blocked",
+        action="store_true",
+        help="also consider bullets that name an unmet gate (the job must then "
+        "derive the missing decision itself)",
+    )
+    p_refine.set_defaults(handler=_cmd_refine_issue)
 
     p_digest = sub.add_parser(
         "digest",
@@ -870,6 +905,17 @@ def _cmd_sync_repo(args: argparse.Namespace) -> int:
         return 1
     log.info("sync-repo: %s up to date with origin/%s", args.path, args.base)
     return 0
+
+
+def _cmd_refine_issue(args: argparse.Namespace) -> int:
+    # Pure filesystem + one `gh pr list` — no HerdrClient, same posture as
+    # pick-feature: this runs as the job's first step, before any reviewer session.
+    return run_refine_issue(
+        args.repo,
+        issues_dir=args.issues_dir,
+        roadmap_path=args.roadmap,
+        allow_blocked=args.allow_blocked,
+    )
 
 
 def _cmd_pipeline_watchdog(args: argparse.Namespace) -> int:
