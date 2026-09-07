@@ -243,6 +243,11 @@ files 2026-08-27.
   enforces, not a prompt instruction. Gate: works when the pipeline (or its
   stages) move out of prompt-hardcoded form — either issue 013's
   `workflows/pipeline.yaml`, or per-stage gate fields. 2026-08-30 brainstorm.
+  First slice landed 2026-09-07 (PR #109): `tick` reconcile now enforces the
+  G-17 stage-independence gate in code — a run reporting `ok` with fabricated /
+  reused / missing `stage_sessions` is overridden to `failed`
+  (`validate_stage_sessions`). The rest (declarative per-stage `checks:`) is
+  still open.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives

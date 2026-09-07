@@ -5,6 +5,7 @@ them, write history. This is what `herdr-routines tick` calls. See docs/plan-v1.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import subprocess
@@ -47,6 +48,13 @@ from herdr_routines.history import (
     is_currently_running,
     last_terminal_run,
     read_job,
+)
+from herdr_routines.pipeline_watchdog import (
+    default_worktrees_root,
+    host_rebooted_after_state_write,
+    pipeline_state_json_path,
+    system_boot_epoch,
+    validate_stage_sessions,
 )
 from herdr_routines.repos import ensure_repo
 from herdr_routines.runner import (
@@ -1478,6 +1486,32 @@ def _bare_pipeline_run_id(job_name: str, run_id: str) -> str:
     return run_id.removeprefix(f"{job_name}-")
 
 
+def _pipeline_stage_independence_issue(bare_run_id: str) -> str | None:
+    """design.md G-17 gate: reason string if this run's `state.json` `stage_sessions`
+    show the 6-fresh-session contract was faked, else None. None also when state.json is
+    gone/unreadable — a human may gc that worktree (G-14), and "can't check" must not
+    turn a clean run red."""
+    state_path = pipeline_state_json_path(default_worktrees_root(), bare_run_id)
+    if state_path is None:
+        return None
+    try:
+        raw = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return validate_stage_sessions(raw) if isinstance(raw, dict) else None
+
+
+def _pipeline_host_rebooted_mid_run(bare_run_id: str) -> bool:
+    """True when the host booted after the orchestrator's last state.json write — proof
+    the orchestrator (and its `systemd-run` launcher unit) is dead, so tick can fail the
+    run now rather than waiting out `deadline_ms + grace`. False whenever it can't tell
+    (no state.json, no /proc/stat)."""
+    state_path = pipeline_state_json_path(default_worktrees_root(), bare_run_id)
+    if state_path is None:
+        return False
+    return host_rebooted_after_state_write(state_path, boot_epoch=system_boot_epoch())
+
+
 def _classify_pipeline_outcome(report_text: str) -> tuple[str, str | None]:
     """(history_state, reason) from a terminal report's first `## Outcome:` line.
 
@@ -1596,6 +1630,20 @@ def _process_pipeline_job(
 
         if report_text.strip():
             state, reason = _classify_pipeline_outcome(report_text)
+            # design.md G-17: a report that says "done" is only trusted if the run
+            # actually ran its stages in independent sessions. A faked/incomplete
+            # `stage_sessions` downgrades it to failed — the PR (if any) is
+            # single-session work and needs a human, not a green checkmark.
+            if state == "done":
+                independence_issue = _pipeline_stage_independence_issue(bare_run_id)
+                if independence_issue is not None:
+                    state, reason = "failed", "stage_independence_unverified"
+                    log.warning(
+                        "%s: run %s reported done but %s",
+                        job.name,
+                        bare_run_id,
+                        independence_issue,
+                    )
             extra: dict[str, Any] = {
                 "pipeline_run_id": bare_run_id,
                 "report": str(report_path),
@@ -1629,8 +1677,28 @@ def _process_pipeline_job(
         # window between systemd-run returning and the launcher script's `herdr agent
         # start` landing (workspace create + a settle sleep) looks identical from here —
         # a naive check would kill a perfectly healthy run's history record on the very
-        # next tick. Only a report (handled above) or a genuinely stale deadline
-        # (handled below) is allowed to close this run out.
+        # next tick. Only a report (handled above), a host reboot (handled here), or a
+        # genuinely stale deadline (handled below) is allowed to close this run out.
+        if _pipeline_host_rebooted_mid_run(bare_run_id):
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="failed",
+                    run_id=open_run.run_id,
+                    extra={"reason": "host_rebooted", "pipeline_run_id": bare_run_id},
+                ),
+            )
+            if _notify_gate(job, "failure"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} failed",
+                    body="host rebooted mid-run",
+                    sound="request",
+                )
+            return f"{job.name}: failed (host_rebooted)", True
+
         stale = find_stale_running(
             history_path,
             job.name,

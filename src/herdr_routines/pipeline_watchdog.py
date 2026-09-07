@@ -8,9 +8,15 @@ Design notes (see the issue for the full incident writeup):
   `~/.herdr/worktrees/herdr-routines/auto-pipeline-*/` (the shared worktree the
   orchestrator creates, `orchestrator-prompt.md` Prerequisite 1) that have no terminal
   report yet.
-- A run is only ever touched when **both** hold: `now > deadline_epoch + grace` (30 min
-  grace so this never races a live orchestrator that is itself draining an in-flight
-  `--wait` and about to write its own partial report at deadline,
+- A run is failed immediately, no deadline wait, when the host booted after the
+  orchestrator's last `state.json` write (`system_boot_epoch` vs the file's mtime): a
+  reboot kills the orchestrator *and* its `systemd-run` launcher unit outright, so the
+  run is definitively over — waiting out its 7h deadline just delays the failure
+  notification (real incident: 2026-09-07 run, host rebooted 16 min in, watchdog only
+  reaped it 7.5h later).
+- Otherwise a run is only touched when **both** hold: `now > deadline_epoch + grace`
+  (30 min grace so this never races a live orchestrator that is itself draining an
+  in-flight `--wait` and about to write its own partial report at deadline,
   `orchestrator-prompt.md` "Pipeline deadline, quota, resume, cleanup"), **and** its
   heartbeat log (`/tmp/pipeline_resume_<run_id>.log`) has not been touched recently
   either. Stage 3's own worker timeout is 90 minutes and the orchestrator is documented
@@ -18,6 +24,10 @@ Design notes (see the issue for the full incident writeup):
   passed — deadline overrun alone is not evidence of a *dead* orchestrator, a stale
   heartbeat is. A missing heartbeat file counts as stale (never as healthy): `/tmp`
   clears across a reboot, which is exactly the kind of silent death this exists to catch.
+- Every terminal report also carries the design.md G-17 stage-independence verdict
+  (`validate_stage_sessions`): a run whose `state.json` `stage_sessions` are fabricated
+  placeholders, reused across stages, or missing entries did not run its stages in
+  independent sessions, and any PR it produced is single-session work.
 - On a stall: kill any live `pl-<N>-<run_id>` agent (`herdr pane close` on its pane —
   verified empirically 2026-09-03 against a live `herdr` server: closing a pane running
   a foreground child kills that child's process group, not just the UI — see the issue
@@ -38,6 +48,8 @@ subcommand" shape `herdr-routines.timer` already uses for `tick`.
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +73,92 @@ HEARTBEAT_STALE_SECONDS = 20 * 60
 WORKTREE_GLOB = "auto-pipeline-*"
 STATE_JSON_NAME = "state.json"
 
+# A reboot is unambiguous proof the orchestrator is dead: nothing survives it. When the
+# host booted *after* state.json was last written (its mtime = the orchestrator's last
+# sign of life — it rewrites it atomically at every stage handoff), the run is over,
+# regardless of how far its 7h deadline still is. The slop absorbs clock skew and the
+# write-then-boot edge.
+BOOT_SLOP_SECONDS = 60
+
+# Real opencode session ids are `ses_` + 20+ alphanumerics, all distinct across stages
+# (each stage is its own fresh session — design.md G-17). Anything shorter, containing a
+# separator, matching a placeholder word, or duplicated means the 6-session independence
+# contract was faked (observed: `ses_..._fake1`, `ses_fake_1_<run_id>` — 2026-09-06/07).
+_SESSION_ID_RE = re.compile(r"^ses_[A-Za-z0-9]{20,}$")
+_FABRICATED_MARKERS = (
+    "fake",
+    "placeholder",
+    "dummy",
+    "stub",
+    "todo",
+    "example",
+    "sample",
+    "mock",
+)
+_MAX_PIPELINE_STAGE = 6
+
+
+def system_boot_epoch(proc_stat: Path = Path("/proc/stat")) -> float | None:
+    """Unix time the host last booted, from `/proc/stat`'s `btime` line. None if it
+    can't be read (non-Linux, unreadable) — callers treat None as "can't tell, skip
+    the reboot check", never as "did not reboot"."""
+    try:
+        for line in proc_stat.read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def validate_stage_sessions(raw_state: Mapping[str, object]) -> str | None:
+    """Reason string if `state.json`'s `stage_sessions` shows the 6-fresh-session
+    contract (design.md G-17) was not honored; None if it looks genuine.
+
+    A legitimate run records one distinct real session id per stage it reached. A run
+    that reused one session across stages, wrote placeholder ids, or simply didn't
+    record a stage cannot be shown to have run that stage independently — and
+    "unverifiable" is treated as "failed" here on purpose (the whole point of the gate)."""
+    sessions = raw_state.get("stage_sessions")
+    if not isinstance(sessions, dict) or not sessions:
+        return "stage_sessions is missing or empty"
+    values = [v for v in sessions.values() if isinstance(v, str)]
+    if len(values) != len(sessions):
+        return "stage_sessions has non-string entries"
+    for value in values:
+        low = value.lower()
+        if any(marker in low for marker in _FABRICATED_MARKERS):
+            return f"stage_sessions contains a placeholder id ({value!r})"
+    for value in values:
+        if not _SESSION_ID_RE.match(value):
+            return f"stage_sessions entry is not a real session id ({value!r})"
+    if len(set(values)) != len(values):
+        return (
+            "stage_sessions reuses one session across stages (stages not independent)"
+        )
+    current_stage = raw_state.get("current_stage")
+    if isinstance(current_stage, int) and not isinstance(current_stage, bool):
+        expected = min(current_stage, _MAX_PIPELINE_STAGE)
+        if len(values) < expected:
+            return (
+                f"stage_sessions records {len(values)} session(s) but the run reached "
+                f"stage {current_stage} — {expected - len(values)} stage(s) unverified"
+            )
+    return None
+
+
+def pipeline_state_json_path(worktrees_root: Path, run_id: str) -> Path | None:
+    """The `state.json` for `run_id`, trying both casings of the worktree dir (`herdr
+    worktree create` lowercases the branch into the path, but callers pass the original
+    `RUN_ID`). None if neither exists."""
+    for candidate in (
+        worktrees_root / f"auto-pipeline-{run_id}" / STATE_JSON_NAME,
+        worktrees_root / f"auto-pipeline-{run_id.lower()}" / STATE_JSON_NAME,
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
 
 @dataclass(frozen=True, slots=True)
 class InflightRun:
@@ -71,6 +169,9 @@ class InflightRun:
     state_path: Path
     deadline_epoch: int
     current_stage: int | None
+    # design.md G-17 gate: reason string if this run's stage_sessions look fabricated
+    # / not independent, else None. Surfaced in the watchdog's report.
+    stage_sessions_issue: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +254,7 @@ def _parse_state_json(state_path: Path, reports_dir: Path) -> InflightRun | None
         state_path=state_path,
         deadline_epoch=deadline_epoch,
         current_stage=stage,
+        stage_sessions_issue=validate_stage_sessions(raw),
     )
 
 
@@ -192,18 +294,46 @@ def _heartbeat_is_stale(
     return (now.timestamp() - mtime) > stale_seconds
 
 
+def host_rebooted_after_state_write(
+    state_path: Path, *, boot_epoch: float | None
+) -> bool:
+    """True when the host booted after `state_path` was last written — the orchestrator
+    (and its whole `systemd-run` launcher unit) cannot have survived that, so the run
+    is dead now, no matter how far off its deadline still is. `boot_epoch` None (can't
+    read /proc/stat) disables the check rather than guessing; an unreadable state.json
+    likewise returns False (can't tell)."""
+    if boot_epoch is None:
+        return False
+    try:
+        state_mtime = state_path.stat().st_mtime
+    except OSError:
+        return False
+    return boot_epoch > state_mtime + BOOT_SLOP_SECONDS
+
+
+def _host_rebooted_after_last_state_write(
+    run: InflightRun, *, boot_epoch: float | None
+) -> bool:
+    return host_rebooted_after_state_write(run.state_path, boot_epoch=boot_epoch)
+
+
 def is_stalled(
     run: InflightRun,
     *,
     now: datetime,
     heartbeat_dir: Path,
+    boot_epoch: float | None = None,
     grace_seconds: int = DEADLINE_GRACE_SECONDS,
     heartbeat_stale_seconds: int = HEARTBEAT_STALE_SECONDS,
 ) -> bool:
-    """Both must hold: deadline (plus grace) has passed, and the heartbeat has gone
-    quiet. Deadline overrun alone is not evidence of a dead orchestrator — one is
-    documented to legitimately wait out an in-flight `--wait` before it can even
-    notice its own deadline passed (see module docstring)."""
+    """A run is stalled when the host has rebooted since the orchestrator's last
+    state.json write (unambiguous — fail fast, skip the deadline wait), OR when both
+    the deadline (plus grace) has passed and the heartbeat has gone quiet. Deadline
+    overrun alone is not evidence of a dead orchestrator — one is documented to
+    legitimately wait out an in-flight `--wait` before it can even notice its own
+    deadline passed (see module docstring)."""
+    if _host_rebooted_after_last_state_write(run, boot_epoch=boot_epoch):
+        return True
     deadline_passed = now.timestamp() > run.deadline_epoch + grace_seconds
     if not deadline_passed:
         return False
@@ -231,6 +361,7 @@ def _write_report(
     killed_agents: dict[str, str],
     heartbeat_last_line: str | None,
     now: datetime,
+    host_rebooted: bool = False,
 ) -> Path:
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"pipeline-{run.run_id}.md"
@@ -244,26 +375,37 @@ def _write_report(
     # regardless of whether the orchestrator itself or this watchdog wrote the terminal
     # report (docs/pipeline/orchestrator-prompt.md "Final report"). Always "failed" here —
     # a watchdog-authored report is definitionally not a clean completion.
-    outcome_marker = (
-        "## Outcome: failed (watchdog killed)"
-        if killed
-        else "## Outcome: failed (watchdog: no live worker found)"
-    )
+    if host_rebooted:
+        outcome_marker = "## Outcome: failed (watchdog: host rebooted mid-run)"
+    elif killed:
+        outcome_marker = "## Outcome: failed (watchdog killed)"
+    else:
+        outcome_marker = "## Outcome: failed (watchdog: no live worker found)"
     lines = [
         f"# Pipeline run {run.run_id} — watchdog report",
         "",
         outcome_marker,
         "",
         f"watchdog_killed: {'true' if killed else 'false'}",
+        f"host_rebooted_mid_run: {'true' if host_rebooted else 'false'}",
         f"stage_killed: {stages_killed[0] if stages_killed else 'none'}",
         f"last_known_stage: {run.current_stage if run.current_stage is not None else 'unknown'}",
+        f"stage_sessions_issue: {run.stage_sessions_issue or 'none'}",
         f"deadline_epoch: {run.deadline_epoch}",
         f"checked_at: {now.isoformat()}",
         f"killed_agents: {', '.join(sorted(killed_agents)) or 'none'}",
         f"heartbeat_last_line: {heartbeat_last_line or 'none found'}",
         "",
     ]
-    if killed:
+    if host_rebooted:
+        lines.append(
+            "The host rebooted after this run's orchestrator last wrote state.json — the "
+            "orchestrator and its `systemd-run` launcher unit did not survive it. Failing "
+            "the run now instead of waiting out its 7h deadline. This run was not resumed "
+            "— a human should look at the PR (if any) and the shared worktree, and check "
+            "why the host restarted mid-run."
+        )
+    elif killed:
         lines.append(
             "The orchestrator for this run appears to have died silently (heartbeat "
             "stopped advancing, deadline exceeded) leaving the above worker(s) running "
@@ -277,6 +419,12 @@ def _write_report(
             "stopped advancing, deadline exceeded) but no live pl-<N>-<run_id> worker "
             "was found to kill — it may have already exited on its own. Writing this "
             "report so the run is not rechecked forever."
+        )
+    if run.stage_sessions_issue is not None:
+        lines.append("")
+        lines.append(
+            f"Stage-independence gate (design.md G-17): {run.stage_sessions_issue}. "
+            "Any PR from this run is single-session work at best — review it as such."
         )
     report_path.write_text("\n".join(lines) + "\n")
     return report_path
@@ -297,16 +445,24 @@ def run_watchdog(
     reports_dir: Path,
     heartbeat_dir: Path,
     now: datetime | None = None,
+    boot_epoch: float | None = None,
 ) -> list[WatchdogAction]:
     """One watchdog sweep: find every stalled in-flight run, kill any live worker it
     left running, write its terminal report, and notify. Never raises — a single run's
     `herdr` failure is logged and the sweep continues with the rest (fail-open, same
     posture as `ps.py`/`gc.py`)."""
     now = now or datetime.now(UTC)
+    if boot_epoch is None:
+        boot_epoch = system_boot_epoch()
     actions: list[WatchdogAction] = []
     for run in find_inflight_runs(worktrees_root, reports_dir):
-        if not is_stalled(run, now=now, heartbeat_dir=heartbeat_dir):
+        if not is_stalled(
+            run, now=now, heartbeat_dir=heartbeat_dir, boot_epoch=boot_epoch
+        ):
             continue
+        host_rebooted = _host_rebooted_after_last_state_write(
+            run, boot_epoch=boot_epoch
+        )
         killed_agents: dict[str, str] = {}
         try:
             panes = client.live_pipeline_agent_panes(run.run_id)
@@ -336,6 +492,7 @@ def run_watchdog(
             killed_agents=killed_agents,
             heartbeat_last_line=heartbeat_last_line,
             now=now,
+            host_rebooted=host_rebooted,
         )
         stage_killed = next(
             (
@@ -351,6 +508,13 @@ def run_watchdog(
                 f"herdr-routines: pipeline {run.run_id} stalled, worker killed",
                 body=f"stage {stage_killed} agent(s) {', '.join(sorted(killed_agents))} "
                 f"killed past deadline; see {report_path}",
+            )
+        elif host_rebooted:
+            _notify(
+                client,
+                f"herdr-routines: pipeline {run.run_id} failed, host rebooted mid-run",
+                body=f"host booted after the orchestrator's last state write; "
+                f"failed early instead of waiting the deadline. See {report_path}",
             )
         else:
             _notify(
