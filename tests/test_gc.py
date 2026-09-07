@@ -1048,7 +1048,7 @@ def test_gc_delete_retains_recently_merged_branch(
     """Acceptance 1: a branch merged moments ago (tip commit dated "now", no PR record)
     is withheld under the default 14-day threshold — called with no --older-than
     override, so the CLI's own default gate is what's under test."""
-    branch = "auto/merged-just-now-20260906T000000Z"
+    branch = f"auto/merged-just-now-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     _git(repo, "branch", branch, "main")  # tip == main's seed commit, dated "now"
 
     code = cli.main(["gc", "--delete", "--yes", "--repo", str(repo), "--base", "main"])
@@ -1103,7 +1103,7 @@ def test_gc_delete_age_threshold_zero_disables(
 ) -> None:
     """Acceptance 3: --older-than 0 collects a just-merged branch regardless of age,
     preserving pre-044 behaviour for a human who has read the table."""
-    branch = "auto/merged-just-now-20260906T000000Z"
+    branch = f"auto/merged-just-now-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
     _git(repo, "branch", branch, "main")
 
     code = cli.main(

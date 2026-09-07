@@ -1,0 +1,83 @@
+# Issue refinement job — ROADMAP Parking Lot idea → refined-issue PR (issue 029).
+#
+# Product refinement (what/why/should-we from a raw idea), distinct from the
+# overnight pipeline's implementation refinement (how to build a formed issue).
+# Nightly 22:00 — clear of the morning cluster (05:00-08:00) and the pipeline's
+# 02:00 launch. opencode only, no Claude.
+#
+# Stage 0 (selection + "already refined" guard) is `herdr-routines refine-issue`
+# (src/herdr_routines/issue_refinement.py). The author→reviewer loop is
+# prompt-driven inside this job's session — same architecture as the pipeline
+# orchestrator (there is no Python stage/spawn loop in this repo).
+#
+# Output is a PR on head `auto/issue-refinement-<run_id>` (built from `name` by
+# runner.build_branch_name — NOT `auto/pipeline-*`, so issue 028's open-PR guard
+# leaves it alone) for a human to merge. The refined issue only reaches
+# `pick-feature` after that merge lands on `main`.
+
+enabled: true
+cron: "0 22 * * *"
+repo: /home/guido/.local/state/herdr-routines/repos/herdr-routines # PARENT clone;
+    # synced to origin/main before the run, then a fresh worktree is branched off it.
+workspace: worktree
+base: main
+agent_kind: opencode
+model: opencode/big-pickle # author model; the reviewer session uses
+    # opencode/muse-spark-1.2-contributor-free (spawned from the prompt).
+timeout_ms: 3600000 # 1h — a 3-pass author→reviewer loop plus PR creation.
+start_timeout_ms: 120000
+on_missed: log
+notify_policy: terminal
+prompt: |
+  You are the issue-refinement worker (issue 029). Promote exactly ONE ROADMAP
+  Parking Lot idea into a buildable issue file, delivered as a PR for a human to
+  merge. opencode only. Your cwd is a fresh worktree on branch
+  auto/issue-refinement-<run_id>; base is main. $ROUTINE_REPORT is your report.
+
+  PARENT is the parent clone at
+  /home/guido/.local/state/herdr-routines/repos/herdr-routines (already synced to
+  origin/main by the runner).
+
+  1. SELECT. Run, from PARENT:
+       herdr-routines refine-issue --repo "$PARENT" --issues-dir docs/process/issues
+     stdout is the Parking Lot bullet to refine, then a blank line, then a
+     `Refines-Parking-Lot: <slug>` line — keep both. Exit 1 means nothing is
+     eligible OR the open-PR guard could not run: write that reason to
+     $ROUTINE_REPORT and STOP. Never invent an idea.
+
+  2. AUTHOR (you). In your worktree, create docs/process/issues/NNN-<slug>.md
+     (NNN = highest existing issue number + 1) with frontmatter — id: "NNN",
+     title, status: open, priority (high|medium|low), area — then ## Description,
+     ## Design, ## Acceptance sections that make it buildable by one worker.
+     Follow the shape of a recent issue file. Add a one-line ROADMAP.md Parking
+     Lot pointer for the idea ending `→ [`NNN`](docs/process/issues/NNN-<slug>.md)`.
+
+  3. REVIEW LOOP — at most 3 passes. Each pass:
+       a. Spawn a FRESH reviewer session (independence is the point — do not
+          review your own draft):
+            PANE=$(herdr workspace get "$HERDR_WORKSPACE_ID" | jq -r '.result.root_pane.pane_id')
+            herdr agent start rt-issue-refinement-reviewer --kind opencode \
+              --pane "$PANE" --timeout 120000 -- -m opencode/muse-spark-1.2-contributor-free
+       b. herdr agent prompt rt-issue-refinement-reviewer "<ask it to audit the
+          draft issue file against docs/process/issues for convention + buildability,
+          and reply with a line `confidence: high|medium|low` plus concrete gaps>"
+          --wait --timeout 1200000
+       c. If the reviewer replies `confidence: high` → consensus, leave the loop.
+          Otherwise apply its notes to the draft and run another pass.
+       d. After 3 passes without `confidence: high`, stop and carry the reviewer's
+          remaining notes into the PR body under "## Open review notes".
+
+  4. OPEN THE PR (never commit to main):
+       git add -A && git commit -m "docs: refine issue NNN — <title> (issue 029)"
+       git push -u origin HEAD
+       gh pr create --base main --title "docs: refine issue NNN — <title>" --body "$(cat <<'EOF'
+       Promotes a ROADMAP Parking Lot idea to a buildable issue (issue 029).
+
+       Refines-Parking-Lot: <slug>
+
+       Review loop: <N> pass(es); reviewer consensus: <reached | capped at 3>.
+       EOF
+       )"
+
+  5. REPORT. Write to $ROUTINE_REPORT: the bullet picked, the new issue number,
+     the PR URL, loop pass count, and whether consensus was reached.
