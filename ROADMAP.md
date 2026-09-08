@@ -233,6 +233,7 @@ files 2026-08-27.
   **gated workflow** (routine = single-agent gated [has `checks`]; pipeline =
   multi-agent gated [has `stages`, each with a gate]). → folds into the
   "Code-level pipeline gates" item below. 2026-08-30 investigation.
+  → [`049`](docs/process/issues/049-unify-routines-pipeline-as-one-gated-workflow-engine.md)
 - **Code-level pipeline gates (prompt → enforcement)** — idea, not designed.
   Today pipeline stage gates live only in the orchestrator prompt (stages are
   hardcoded there; there's no `workflows/pipeline.yaml` parser yet), so they're
