@@ -1,7 +1,7 @@
 ---
 id: "046"
 title: "Digest reports disabled jobs' stale terminal states, so a switched-off job looks broken forever"
-status: open
+status: done
 priority: medium
 area: infra
 ---
