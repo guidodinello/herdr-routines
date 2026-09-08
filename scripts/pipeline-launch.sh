@@ -32,7 +32,7 @@ Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-n
                       top of this one
   --agent-kind       herdr agent kind (default: opencode)
   --model            native model flag value passed after `--` to `herdr agent start`
-                      (default: opencode/muse-spark-1.2-contributor-free)
+                      for the orchestrator (default: opencode/big-pickle)
   --prompt-file      orchestrator prompt source, relative to repo-parent
                       (default: docs/pipeline/orchestrator-prompt.md)
   --wait-timeout-ms  --wait timeout passed to `herdr agent prompt` (default: 25200000,
@@ -42,7 +42,7 @@ EOF
 }
 
 AGENT_KIND="opencode"
-MODEL="opencode/muse-spark-1.2-contributor-free"
+MODEL="opencode/big-pickle"  # orchestrator model; tick passes job.model via --model
 PROMPT_FILE="docs/pipeline/orchestrator-prompt.md"
 WAIT_TIMEOUT_MS="25200000"
 RUN_ID=""

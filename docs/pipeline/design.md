@@ -25,7 +25,7 @@ enforcement in code for v1 — define the workflow, let the orchestrator supervi
  human idea (one paragraph)
        │
        ▼
- orchestrator herdr session (opencode/muse-spark-1.2-contributor-free, lean)
+ orchestrator herdr session (opencode/big-pickle, lean)
        │  spawns via herdr CLI, detached --wait, writes state.json + $PIPELINE_REPORT
        ├─→ stage 1 plan/spec  (muse-spark)
        ├─→ stage 2 spec review (muse-spark fresh session — independence via sessions, not model family)
@@ -125,9 +125,14 @@ fresh worktree does not show another worktree's untracked files.
 ## Orchestrator session
 
 - **Kind:** lean `herdr` session (`herdr workspace create --cwd <repo-parent>`,
-  `herdr agent start --kind opencode --model muse-spark-1.2-contributor-free --pane <id>`), so it is
+  `herdr agent start --kind opencode --model big-pickle --pane <id>`), so it is
   watchable in the TUI. Bare `opencode` is the fallback, but herdr session is
-  preferred for visibility. Orchestrator model pinned to `muse-spark` per pi-2 e2e (`opencode-e2e:15` — muse excels at spec/arch reasoning; was `big-pickle` — keep as fallback if truncation/quota).
+  preferred for visibility. Orchestrator model is `opencode/big-pickle`: the
+  orchestrator only shells out (`bash`/`gh`/`jq`/`herdr`) and checks gates — it
+  needs instruction fidelity, not spec/arch reasoning (that's stage 1's worker).
+  `muse-spark-1.2-contributor-free` was tried per pi-2 e2e (`opencode-e2e:15`) and
+  regressed to self-authoring stages instead of spawning them under any friction
+  (G-17 below; runs `20260825T021919Z`, `20260906`/`20260907`) — reverted 2026-09-07.
 - **Env & unattended allowlist (audit gap 3):** `HERDR_ENV=1` must be set or
   the orchestrator cannot drive `herdr` at all — inject via
   `herdr workspace create --cwd <parent> --label pipeline-orchestrator --env HERDR_ENV=1`
@@ -241,7 +246,10 @@ the orchestrator (`muse-spark-1.2-contributor-free`, free tier) skipped
 spawning `pl-1`/`pl-2` entirely and wrote both spec versions itself in its own
 session — Gates 1 and 2 both passed anyway, because a content-shape check
 cannot distinguish "an independent reviewer wrote this" from "the same author
-reviewed its own work." Stage 2 exists specifically for the latter
+reviewed its own work." (This recurred on 2026-09-06/07 with fabricated
+`stage_sessions` ids; two mitigations followed — the orchestrator model reverted
+to `big-pickle`, and `tick`/watchdog now enforce the G-17 verdict in code via
+`validate_stage_sessions`, PR #109.) Stage 2 exists specifically for the latter
 independence (`orchestrator-prompt.md` stage 2 harness note: "fresh session
 ... independence via sessions not model family"); collapsing it into stage 1
 quietly defeats that, with no
@@ -286,11 +294,11 @@ WS=$(herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> \
   --label pipeline-poc-20260824 --env HERDR_ENV=1 | jq -r '.result.root_pane.pane_id')
 systemd-run --user --on-calendar="2026-08-24 02:00:00" --timer-property=AccuracySec=30s \
   --unit=pipeline-poc-20260824 \
-  bash -c "herdr agent start pipeline-orchestrator --kind opencode --pane \$WS --timeout 120000 -- -m opencode/muse-spark-1.2-contributor-free && herdr agent prompt pipeline-orchestrator \"\$(cat docs/pipeline/orchestrator-prompt.md)\" --wait --until idle --timeout 25200000"
+  bash -c "herdr agent start pipeline-orchestrator --kind opencode --pane \$WS --timeout 120000 -- -m opencode/big-pickle && herdr agent prompt pipeline-orchestrator \"\$(cat docs/pipeline/orchestrator-prompt.md)\" --wait --until idle --timeout 25200000"
 
 # B — manual one-liner from an existing herdr pane (simplest for first run)
 WS=$(herdr workspace create --cwd ~/.local/state/herdr-routines/repos/<target> --label pipeline-poc --env HERDR_ENV=1 | jq -r '.result.root_pane.pane_id')
-herdr agent start pipeline-orchestrator --kind opencode --pane "$WS" --timeout 120000 -- -m opencode/muse-spark-1.2-contributor-free
+herdr agent start pipeline-orchestrator --kind opencode --pane "$WS" --timeout 120000 -- -m opencode/big-pickle
 herdr agent prompt pipeline-orchestrator "$(cat docs/pipeline/orchestrator-prompt.md)" --wait --until idle --timeout 25200000
 ```
 
@@ -326,7 +334,11 @@ prompt is green.
   `3 ox-alpha-free` (`opencode/x-preview-f-free` on Zen = `opencode-go/ox-alpha-free` `opencode-e2e:17`, 1M ctx, coding best) /
   `5 big-pickle` primary single reviewer v1 (measured 1/7 `pr4:106`), fan-out `hy3-free` + `x-preview-f-free` 2-tie is v2 (`opencode-e2e:19`, dedup `pr4:45` not yet built) /
   `6 ox` fixes + `muse` GH ops (`commit/push/reply` pattern #1040 `opencode-e2e:20`).
-  Orchestrator itself: `muse-spark` (spec-like reasoning, not coding; was `big-pickle` — pi-2 suggests muse for planning) or `big-pickle` fallback if muse quota/truncation (`opencode-e2e:15` chunk prompts) — pin `muse` for first manual run.
+  Orchestrator itself: `big-pickle` — it only shells out and checks gates, so
+  instruction fidelity matters, not planning skill. `muse-spark` was pinned here
+  per pi-2 ("muse for planning") but that conflated the orchestrator role with
+  stage 1's; under friction it self-authored stages instead of spawning them
+  (G-17) — reverted 2026-09-07.
 - **Workspace:** orchestrator owns the parent clone
   (`~/.local/state/herdr-routines/repos/<name>`) and creates the single shared
   worktree+branch `auto/pipeline-<run_id>` before stage 1 (see Handoff contract).
