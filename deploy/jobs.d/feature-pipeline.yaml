@@ -29,9 +29,15 @@ deadline_ms: 25200000 # 7h orchestrator wall budget. Feeds the generated systemd
     # orchestrator's own deadline check and lets it write a partial report first).
 start_timeout_ms: 120000
 agent_kind: opencode
-model: opencode/muse-spark-1.2-contributor-free # native model flag; null = agent
-    # default. See docs/pipeline/opencode-e2e-workflow-recommendations.md for the
-    # per-stage model table this launches with.
+model: opencode/big-pickle # the ORCHESTRATOR's model only — `pipeline-launch.sh`
+    # passes it to `herdr agent start rt-<name>`. The per-stage worker models are
+    # pinned in docs/pipeline/orchestrator-prompt.md's Stage Details, not here.
+    # Was `opencode/muse-spark-1.2-contributor-free`: too weak for the orchestrator
+    # role — on a transient `herdr agent start` error it stopped spawning workers,
+    # ran every stage in its own session, and fabricated `state.json:stage_sessions`
+    # (`ses_fake_*`) to pass the shape gates (runs 2026-09-06/07). The orchestrator
+    # only shells out (bash / gh / jq / herdr) and checks gates — it needs an
+    # instruction-faithful model, not a strong reasoner.
 on_missed: notify # a starved night (tick busy dispatching other jobs past
     # PIPELINE_CATCH_UP_MINUTES) is rare but worth surfacing, unlike a routine job's
     # every-5-minutes retry.
