@@ -374,6 +374,12 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also post the digest as a Herdr notification (default: print only)",
     )
+    p_digest.add_argument(
+        "--include-disabled",
+        action="store_true",
+        default=False,
+        help="include disabled jobs in the digest output (default: omit them)",
+    )
     p_digest.set_defaults(handler=_cmd_digest)
 
     p_watchdog = sub.add_parser(
@@ -955,6 +961,7 @@ def _cmd_digest(args: argparse.Namespace) -> int:
         default_history_path(),
         default_reports_dir(),
         timezone=args.timezone,
+        include_disabled=args.include_disabled,
     )
     print(text)
     if args.notify:
