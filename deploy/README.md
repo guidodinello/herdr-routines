@@ -48,7 +48,9 @@ local to whichever machine runs the jobs (see plan §3) — so it is not committ
 
 **The overnight feature-pipeline is one of these jobs, not a separate launcher** (issue
 026): copy [`jobs.d/feature-pipeline.yaml`](jobs.d/feature-pipeline.yaml) alongside your
-other `jobs.d/` entries. `tick` dispatches a `kind: pipeline` job as a detached
+other `jobs.d/` entries. Its opencode agents also need the permission allowlist in
+[`opencode.pipeline.json`](opencode.pipeline.json) merged into the host's
+`~/.config/opencode/opencode.json` — see [`../docs/pipeline/setup.md`](../docs/pipeline/setup.md) §4. `tick` dispatches a `kind: pipeline` job as a detached
 `systemd-run --user` unit (`scripts/pipeline-launch.sh`) and returns immediately — it does
 **not** need its own timer the way the pre-026 launcher did. Migrating an existing
 standalone `pipeline-nightly.timer`/`.service` pair: disable and remove them

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "//": "Tracked source of truth for the opencode permission surface the overnight feature-pipeline needs (docs/pipeline/setup.md §4, docs/pipeline/design.md). Merge the `permission` block into each pipeline host's ~/.config/opencode/opencode.json — do NOT symlink this file over it, the host file also carries provider/plugin/model config that is deliberately host-local and out of git. Keeping the allowlist here means the Pi and hp-server transcribe from one place instead of drifting (they already did: ~/.cache/uv/** was live on the Pi and absent from the docs).",
+  "permission": {
+    "external_directory": {
+      "/tmp/**": "allow",
+      "~/.claude/rules/**": "allow",
+      "~/.config/opencode/**": "allow",
+      "~/.config/herdr/**": "allow",
+      "~/.herdr/worktrees/**": "allow",
+      "~/.local/state/herdr/**": "allow",
+      "~/.local/state/herdr-routines/**": "allow",
+      "~/.cache/uv/**": "allow"
+    },
+    "tool": "allow"
+  }
+}

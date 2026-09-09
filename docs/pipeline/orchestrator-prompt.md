@@ -11,8 +11,8 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
 - `FEATURE_IDEA`: one paragraph from the human (the feature to build). **If not provided**, pick
   one yourself from the curated backlog instead of asking and waiting (2026-08-25, see
   `ROADMAP.md` § "Autonomous task selection for the pipeline" for why this is scoped narrowly):
-  run `herdr-routines pick-feature --issues-dir docs/process/issues --mark-in-progress` in
-  `$REPO_PARENT` and use its stdout verbatim as `FEATURE_IDEA`. `--mark-in-progress` records the
+  run `uv run herdr-routines pick-feature --issues-dir docs/process/issues --mark-in-progress`
+  in `$REPO_PARENT` and use its stdout verbatim as `FEATURE_IDEA`. `--mark-in-progress` records the
   claim out-of-tree (issue 041: it used to write `status: in-progress` into the issue file as an
   uncommitted edit, which collided with the implementing PR's own edit to the same line and
   wedged `sync-repo`/`ensure_repo` for every job on that repo path once the PR merged) — so
@@ -39,6 +39,13 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
 
 ## Prerequisite (do once, before stage 1)
 
+**Invoke `herdr-routines` as `uv run herdr-routines` everywhere below.** It is not
+installed as a standalone binary on the pipeline hosts (no `uv tool install`, not on
+`PATH`) — it is the project in `$REPO_PARENT`/`$WT`, run exactly the way the systemd
+units do (`deploy/systemd/*.service`: `uv run herdr-routines …`). A bare `herdr-routines`
+call fails with command-not-found, and the orchestrator then wanders off probing
+`~/.local/bin` for a launcher and wedges on a permission prompt (issue 050).
+
 1. Sync `$REPO_PARENT` to `origin/main` before branching off it (issue 030: a stale local
    checkout here previously produced a run that branched days behind `origin/main` and
    duplicated already-merged work). Use the same fetch+fast-forward primitive
@@ -46,7 +53,7 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
    bespoke `git fetch` here:
 
 ```sh
-herdr-routines sync-repo --path "$REPO_PARENT" --base main
+uv run herdr-routines sync-repo --path "$REPO_PARENT" --base main
 # non-zero exit ⇒ stop and write a report saying so; never branch off a stale/diverged
 # $REPO_PARENT (mirrors ensure_repo's fail-loud behavior in repos.py)
 ```
@@ -157,7 +164,7 @@ Execute sequentially. After each stage, run its **gate commands** (design:205) a
 - **Gate 4:** the PR exists **and** the implementing branch carries the issue-close commit (orchestrator verifies — the flip is done by the implementer in stage 3, but whether it's actually committed is enforced here, since "merging closes the issue" only becomes real once the PR is open):
   - `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-'$RUN_ID'"'` (PR exists on the right branch)
   - `git -C "$WT" status --porcelain docs/process/issues/<file>` is empty (flip committed, nothing dangling) **and** `git -C "$WT" show HEAD:docs/process/issues/<file> | rg -q '^status: done$'` (issue file committed as `done` on the branch)
-- **Gate CI (issue 034):** once the PR is open, run `herdr-routines gate --stage ci --pr <n>` from `$WT`. This is the authoritative CI check — Gate 3 only proved the implementer's local tree was clean, not that CI agrees. The command polls `gh pr view --json statusCheckRollup` until every check is non-pending (bounded to ~10 minutes so a stuck check can't eat the deadline), fails on any `FAILURE` conclusion, and tolerates `SKIPPED`/`NEUTRAL`. Exit 0 = pass. **Do not** inline the `gh`/`jq` equivalent yourselves — this gate is code (`src/herdr_routines/gates.py`), not a filter you reproduce, precisely so it can't be silently substituted (see Gate 6's history below). On failure, do **not** abort the pipeline — carry the failure into stage 6 as a must-fix item alongside the review threads, since a lint slip is exactly what stage 6 exists to clean up.
+- **Gate CI (issue 034):** once the PR is open, run `uv run herdr-routines gate --stage ci --pr <n>` from `$WT`. This is the authoritative CI check — Gate 3 only proved the implementer's local tree was clean, not that CI agrees. The command polls `gh pr view --json statusCheckRollup` until every check is non-pending (bounded to ~10 minutes so a stuck check can't eat the deadline), fails on any `FAILURE` conclusion, and tolerates `SKIPPED`/`NEUTRAL`. Exit 0 = pass. **Do not** inline the `gh`/`jq` equivalent yourselves — this gate is code (`src/herdr_routines/gates.py`), not a filter you reproduce, precisely so it can't be silently substituted (see Gate 6's history below). On failure, do **not** abort the pipeline — carry the failure into stage 6 as a must-fix item alongside the review threads, since a lint slip is exactly what stage 6 exists to clean up.
 
 ### Stage 5 — Code review (quality gate)
 - **Harness:** `opencode/big-pickle` **single primary reviewer v1** (measured 1/7, 5 high-sev uniques `pr4:106`); fan-out `hy3-free` + `x-preview-f-free` 2-tie is **v2** (`opencode-e2e:19`, dedup `pr4:45` not yet built, so keep single)
@@ -169,7 +176,7 @@ Execute sequentially. After each stage, run its **gate commands** (design:205) a
 - **Harness:** **reuse stage-3 session via close-then-resume (G-16)** via `herdr agent start pl-6-$RUN_ID --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` where `<session_id>` is `pl-3`'s `agent_session.value` already captured in `state.json`/history (verified 2026-08-25 `-s <session_id>` true resume, not a fork; `agent_session.value` on resumed agent matched original). **Do not** use `herdr agent prompt pl-3-$RUN_ID ...` against a pane held open since stage 3 — that pane was closed after stage 4's gate per G-16 per-stage pane close; reopen against a fresh pane with `-s <session_id>` instead of holding open idle from stage 3 through stage 6. Alternative fresh `pl-6-$RUN_ID` seeded with `git diff main...HEAD` + `gh pr view --comments` remains fallback if `-s` resume fails or context burn.
 - **Input:** review findings (`gh pr view <n> --json comments,reviews`)
 - **Prompt:** "Run the `address-pr-comments` skill against PR `<n>`. The skill fetches all unresolved inline review threads, assesses their validity, fixes valid ones, commits and pushes, then replies to every thread with the outcome. Cap 2 iterations, plus 60-min wait-for-comments polling (see below)."
-- **Gate 6 (issue 035):** run `herdr-routines gate --stage 6 --pr <n>` from `$WT`. **Do not** hand-roll the `gh api graphql`/`jq` equivalent — that is exactly what went wrong on PR #81: the prose gate's literal `test("blocking")` filter matches `"non-blocking"` by substring, the orchestrator silently substituted a stricter `\[blocking\]` regex instead of flagging the bug, and nothing detected the swap. The gate is now real code (`src/herdr_routines/gates.py`), invoked by exit code, not reproduced. It measures **reply coverage** — every unresolved review thread must carry at least one reply (`comments.totalCount >= 2`) — as an independent check alongside "no unresolved thread is tagged `[blocking]`" (matched on the literal bracketed form, so `[non-blocking]` can never satisfy it by substring). Exit 0 = pass.
+- **Gate 6 (issue 035):** run `uv run herdr-routines gate --stage 6 --pr <n>` from `$WT`. **Do not** hand-roll the `gh api graphql`/`jq` equivalent — that is exactly what went wrong on PR #81: the prose gate's literal `test("blocking")` filter matches `"non-blocking"` by substring, the orchestrator silently substituted a stricter `\[blocking\]` regex instead of flagging the bug, and nothing detected the swap. The gate is now real code (`src/herdr_routines/gates.py`), invoked by exit code, not reproduced. It measures **reply coverage** — every unresolved review thread must carry at least one reply (`comments.totalCount >= 2`) — as an independent check alongside "no unresolved thread is tagged `[blocking]`" (matched on the literal bracketed form, so `[non-blocking]` can never satisfy it by substring). Exit 0 = pass.
 - **Wait-for-comments:** poll `gh pr view --json comments` (or `reviews`) every **5 min** for 60 min after stage 5 settles; gate on review's `blocking` findings, not arbitrary human comments later; after 60 min with no review, abort with partial report (G-12). Spec leakage: `docs/pipeline/runs/$RUN_ID/spec.md` commits ride the PR — prefix spec commits `spec:` so reviewers can filter.
 
 ## Pipeline deadline, quota, resume, cleanup
@@ -197,7 +204,7 @@ Put the line near the top of the report, right after the title, so it is trivial
 
 ## First manual run checklist (before overnight)
 
-1. Ensure `~/.config/opencode/opencode.json` allowlist + `GH_TOKEN` valid on Pi (dry-run one stage, confirm no `blocked`).
+1. Ensure `~/.config/opencode/opencode.json` allowlist (transcribed from `deploy/opencode.pipeline.json` — the tracked source of truth, per [`setup.md`](setup.md) §4) + `GH_TOKEN` valid on Pi (dry-run one stage, confirm no `blocked`).
 2. Empirically verify on Pi opencode: (a) `nohup herdr agent prompt --wait &` persists across bash calls (G-8), (b) GraphQL `reviewThreads` query shape for gate 6 (G-1).
 3. Keep feature trivial (e.g. add a `--version` flag) to bound blast radius (`design:257`) — dogfood is `herdr-routines` itself.
 
