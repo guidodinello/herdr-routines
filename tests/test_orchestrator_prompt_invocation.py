@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PROMPT = REPO_ROOT / "docs" / "pipeline" / "orchestrator-prompt.md"
 SETUP = REPO_ROOT / "docs" / "pipeline" / "setup.md"
 PERMISSION_FILE = REPO_ROOT / "deploy" / "opencode.pipeline.json"
+ISSUE_REFINEMENT_JOB = REPO_ROOT / "deploy" / "jobs.d" / "issue-refinement.yaml"
 
 # Subcommands the prompt tells the orchestrator to run.
 HERDR_ROUTINES_SUBCOMMANDS = ("sync-repo", "pick-feature", "gate")
@@ -45,6 +46,16 @@ def test_prompt_notes_herdr_routines_not_a_binary() -> None:
     assert "uv run herdr-routines" in text
     assert "not installed as a standalone binary" in text
     assert "issue 050" in text
+
+
+def test_issue_refinement_job_invokes_herdr_routines_via_uv_run() -> None:
+    """The issue-refinement job prompt (`refine-issue`) has the same not-a-binary bug — same fix."""
+    text = _read(ISSUE_REFINEMENT_JOB)
+    bare = re.findall(r"(?<!uv run )herdr-routines refine-issue\b", text)
+    assert not bare, (
+        f"bare `herdr-routines refine-issue` in issue-refinement.yaml: {bare}"
+    )
+    assert "uv run herdr-routines refine-issue" in text
 
 
 def test_opencode_pipeline_permission_file() -> None:
