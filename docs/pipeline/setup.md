@@ -65,31 +65,30 @@ gh auth status   # must show logged in; gh auth login if not
 Missing tools don't just fail gates — the orchestrator will try to *fix* them
 (`sudo apt-get install`), which wedges as a permission prompt at 03:00.
 
+Also **remove any superseded standalone launcher scripts** left in `~/.local/bin`
+from before issue 026 (`pipeline-launch-nightly.sh`, `-gc.sh`, `-plugin.sh`,
+`-panelifecycle.sh`, `-statuscli.sh`, …). The pipeline runs from the in-repo
+`scripts/pipeline-launch.sh` now; the old copies are dead code that the
+orchestrator stumbles into while probing `~/.local/bin` — reading one triggered
+the blocked prompt that killed the 20260909 run (issue 050).
+
 ## 4. opencode allowlist (per host)
 
 `~/.config/opencode/opencode.json` needs `permission.external_directory` entries
 for everything the pipeline touches outside its cwd (each gap = a human tap on a
-blocked prompt mid-run):
+blocked prompt mid-run), plus `permission.tool: "allow"`.
 
-```json
-{
-  "permission": {
-    "external_directory": {
-      "/tmp/**": "allow",
-      "~/.claude/rules/**": "allow",
-      "~/.config/opencode/**": "allow",
-      "~/.config/herdr/**": "allow",
-      "~/.herdr/worktrees/**": "allow",
-      "~/.local/state/herdr/**": "allow",
-      "~/.local/state/herdr-routines/**": "allow",
-      "~/.local/state/herdr-routines/reports/**": "allow"
-    }
-  }
-}
-```
+The tracked source of truth is [`../../deploy/opencode.pipeline.json`](../../deploy/opencode.pipeline.json).
+Merge its `permission` block into this host's `~/.config/opencode/opencode.json`
+(that host file also carries provider/plugin/model config that is host-local and
+stays out of git, so merge — don't symlink). Keeping the list in one committed
+file is what stops the Pi and hp-server drifting apart, as they already had.
 
 Keep `/etc` out unless something genuinely needs it — its only appearance so far
-was the orchestrator probing a missing binary (fixed by step 3).
+was the orchestrator probing a missing binary (fixed by step 3). Do **not** add
+`~/.local/bin/**`: `external_directory` has no read-only mode, and a pipeline that
+edits its own code should not also be able to overwrite `herdr`/`gh`/`uv`. Step 3
+(remove the stale launchers) removes the reason the orchestrator looked there.
 
 ## 5. HERDR_ENV
 
