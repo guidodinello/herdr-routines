@@ -5,8 +5,9 @@
 # Nightly 22:00 — clear of the morning cluster (05:00-08:00) and the pipeline's
 # 02:00 launch. opencode only, no Claude.
 #
-# Stage 0 (selection + "already refined" guard) is `herdr-routines refine-issue`
-# (src/herdr_routines/issue_refinement.py). The author→reviewer loop runs inside
+# Stage 0 (selection + "already refined" guard) is `uv run herdr-routines refine-issue`
+# (src/herdr_routines/issue_refinement.py) — not a standalone binary on the hosts,
+# same as every systemd unit (issue 050). The author→reviewer loop runs inside
 # this one job session: the job agent authors, then invokes a fresh independent
 # `opencode run` (different model) as the reviewer — no nested `herdr agent`
 # spawn, so this needs none of the pipeline's HERDR_ENV workspace plumbing.
@@ -35,8 +36,8 @@ prompt: |
   merge. opencode only. Your cwd is a fresh git worktree on branch
   auto/issue-refinement-<run_id>; base is main. $ROUTINE_REPORT is your report path.
 
-  1. SELECT. From your cwd, run:
-       herdr-routines refine-issue
+  1. SELECT. From your cwd, run (it is not a standalone binary — always via `uv run`):
+       uv run herdr-routines refine-issue
      stdout is the Parking Lot bullet to refine, a blank line, then a
      `Refines-Parking-Lot: <slug>` line — keep both. A non-zero exit means
      nothing is eligible OR the "already refined" guard could not run (e.g. gh
