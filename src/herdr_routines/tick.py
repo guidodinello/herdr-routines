@@ -1242,6 +1242,8 @@ def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
         extra["error"] = outcome.error
     if outcome.nudged:
         extra["nudged"] = True
+    if outcome.reaped_stale_agent:
+        extra["reaped_stale_agent"] = True
     return extra
 
 
@@ -1423,13 +1425,18 @@ def _process_job(
     )
 
     if outcome.state == "done":
-        done_body = (
-            f"via fallback_model={job.fallback_model}" if used_fallback else None
-        )
-        # A fallback retry means the primary model hit quota_exhausted — worth knowing
-        # about even though the job ultimately succeeded, so it's a "finding", not a
-        # plain "success".
-        if _notify_gate(job, "finding" if used_fallback else "success"):
+        # Both of these mean the job ultimately succeeded but something a human should know
+        # about happened on the way — surface as a "finding", not a plain "success":
+        #  - fallback retry ⇒ the primary model hit quota_exhausted
+        #  - reaped_stale_agent ⇒ a prior run's blocked agent was force-closed (issue 051)
+        notes = []
+        if used_fallback:
+            notes.append(f"via fallback_model={job.fallback_model}")
+        if outcome.reaped_stale_agent:
+            notes.append("force-closed a prior run's blocked agent (issue 051)")
+        done_body = "; ".join(notes) or None
+        gate = "finding" if (used_fallback or outcome.reaped_stale_agent) else "success"
+        if _notify_gate(job, gate):
             _notify(
                 client, f"herdr-routines: {job.name} done", body=done_body, sound="done"
             )

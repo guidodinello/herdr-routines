@@ -10,6 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TypedDict
 
@@ -408,6 +409,7 @@ class _CommonOutcomeFields(TypedDict):
     report_bytes: int
     report_path: str | None
     duration_seconds: float | None
+    reaped_stale_agent: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,6 +429,9 @@ class RunOutcome:
     session_id: str | None = None
     nudged: bool = False  # issue 032: a no_report settle got one follow-up prompt
     diagnosis: dict[str, str | bool] | None = None  # issue 027: /tmp disk diagnosis
+    reaped_stale_agent: bool = (
+        False  # issue 051: force-closed a prior run's blocked agent
+    )
 
 
 def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
@@ -498,6 +503,63 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
         ]
     )
     return argv
+
+
+def _is_agent_name_taken(error: Exception) -> bool:
+    """The `herdr agent start` failure that means a prior run's agent still holds this
+    recurring name (issue 051). Matched on the server error body's `code` first, with a
+    message-substring fallback for a body-less shape."""
+    if not isinstance(error, HerdrCliError):
+        return False
+    if _error_body_code(error) == "agent_name_taken":
+        return True
+    return "is already used" in str(error)
+
+
+def _start_agent_reaping_stale_collision(
+    client: HerdrClient,
+    job: Job,
+    *,
+    pane_id: str,
+) -> bool:
+    """Start `job.agent_name` on `pane_id`. If the start fails because a prior run's
+    blocked/unknown agent still holds the name (issue 051 — nothing answers a cron job's
+    blocked prompt, so it wedges every subsequent run), force-close that agent's pane and
+    retry the start exactly once. Returns True iff a stale agent was reaped. Propagates
+    the start error unchanged when the collision is not reapable (agent still working, or
+    the retry also failed) — the caller's existing failure handling takes it from there."""
+    start = partial(
+        client.agent_start,
+        name=job.agent_name,
+        kind=job.agent_kind,
+        pane_id=pane_id,
+        start_timeout_ms=job.start_timeout_ms,
+        model=job.model,
+    )
+    try:
+        start()
+        return False
+    except (HerdrCliError, OSError, ValueError) as first_error:
+        if not _is_agent_name_taken(first_error):
+            raise
+        try:
+            stale = client.sticky_agent_pane(job.agent_name)
+        except (HerdrCliError, OSError):
+            stale = None
+        if stale is None:
+            raise
+        stale_pane, stale_status = stale
+        log.warning(
+            "%s: agent name %s is held by a %s agent (pane %s) from a prior run — "
+            "force-closing it and retrying start once (issue 051)",
+            job.name,
+            job.agent_name,
+            stale_status,
+            stale_pane,
+        )
+        client.pane_close(stale_pane)
+        start()  # a second collision here is a real failure — let it propagate
+        return True
 
 
 def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
@@ -580,12 +642,8 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         )
 
     try:
-        client.agent_start(
-            name=job.agent_name,
-            kind=job.agent_kind,
-            pane_id=pane_id,
-            start_timeout_ms=job.start_timeout_ms,
-            model=job.model,
+        reaped_stale_agent = _start_agent_reaping_stale_collision(
+            client, job, pane_id=pane_id
         )
     except (HerdrCliError, OSError, ValueError) as e:
         # Our pane, dead run: leave nothing behind to wedge later ticks on agent_name_live
@@ -636,6 +694,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             pane_id=pane_id,
             branch=branch,
             diagnosis=diagnosis,
+            reaped_stale_agent=reaped_stale_agent,
         )
 
     # `is not None`, not truthiness: an explicit empty failure_markers list is valid config
@@ -677,6 +736,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             agent_name=job.agent_name,
             pane_id=pane_id,
             branch=branch,
+            reaped_stale_agent=reaped_stale_agent,
         )
     except (HerdrCliError, OSError) as e:
         # The wedge case: the prompt was delivered but the agent never settled (e.g. an
@@ -698,6 +758,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             agent_name=job.agent_name,
             pane_id=pane_id,
             branch=branch,
+            reaped_stale_agent=reaped_stale_agent,
         )
 
     # Best-effort diagnostic tail — never allowed to fail the run (docs/plan-v1.md §6 layer 2).
@@ -721,6 +782,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         "report_bytes": report_bytes,
         "report_path": str(report_path) if report_written else None,
         "duration_seconds": (datetime.now(UTC) - started_at).total_seconds(),
+        "reaped_stale_agent": reaped_stale_agent,
     }
 
     if settled_status == "blocked":

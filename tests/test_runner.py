@@ -66,6 +66,8 @@ class ScriptedClient:
         raise_on: str | None = None,
         visible_screen: str = "",
         session_id: str | None = "ses_fake123",
+        sticky_pane: tuple[str, str] | None = None,
+        agent_start_collides_once: bool = False,
     ) -> None:
         self.pane_id = pane_id
         self.agent_status = agent_status
@@ -80,6 +82,8 @@ class ScriptedClient:
         self.raise_on = raise_on
         self.visible_screen = visible_screen
         self.session_id = session_id
+        self.sticky_pane = sticky_pane
+        self.agent_start_collides_once = agent_start_collides_once
         self.calls: list[str] = []
         self.closed_workspaces: list[str] = []
         self.closed_panes: list[str] = []
@@ -122,6 +126,20 @@ class ScriptedClient:
         self.started_with_model = model
         if self.raise_on == "agent_start":
             raise HerdrCliError("boom", exit_code=1)
+        if self.agent_start_collides_once and self.calls.count("agent_start") == 1:
+            raise HerdrCliError(
+                f"herdr server error running agent start {name}: "
+                f'{{"error":{{"code":"agent_name_taken","message":"agent name {name} '
+                'is already used"}}}',
+                exit_code=1,
+                error_body={"error": {"code": "agent_name_taken"}},
+            )
+
+    def sticky_agent_pane(self, name):
+        self.calls.append("sticky_agent_pane")
+        if self.raise_on == "sticky_agent_pane":
+            raise HerdrCliError("boom", exit_code=1)
+        return self.sticky_pane
 
     def agent_interactive_ready(self, target):
         self.calls.append("agent_interactive_ready")
@@ -525,6 +543,48 @@ def test_execute_run_ready_polling_survives_cli_errors(
     assert outcome.state == "failed"
     assert outcome.reason == "agent_not_interactive"
     assert "HerdrCliError: boom" in (outcome.error or "")
+
+
+def test_execute_run_reaps_blocked_agent_on_name_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue 051: a prior run that ended `blocked` leaves its agent registered under the
+    recurring name. `agent start` then fails `agent_name_taken` every run until a human
+    intervenes. The runner now force-closes that parked pane and retries the start once."""
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    job = make_job(tmp_path)
+    report_path = tmp_path / "state" / "reports" / "a-run-c1.md"
+    client = ScriptedClient(
+        agent_start_collides_once=True,
+        sticky_pane=("w9:p1", "blocked"),
+        write_report_at=report_path,
+    )
+    outcome = execute_run(job, client, run_id="a-run-c1")  # type: ignore[arg-type]
+
+    assert outcome.state == "done"
+    assert outcome.reaped_stale_agent is True
+    assert client.closed_panes.count("w9:p1") == 1
+    # start attempted, failed, sticky pane looked up + closed, start retried
+    assert client.calls.count("agent_start") == 2
+    assert client.calls.index("sticky_agent_pane") < client.calls.index("pane_close")
+
+
+def test_execute_run_does_not_reap_a_working_agent_on_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name collision with a genuinely `working` agent (sticky_agent_pane returns None)
+    must NOT be force-closed — fall straight through to agent_start_failed."""
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    job = make_job(tmp_path)
+    client = ScriptedClient(agent_start_collides_once=True, sticky_pane=None)
+    outcome = execute_run(job, client, run_id="a-run-c2")  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "agent_start_failed"
+    assert outcome.reaped_stale_agent is False
+    assert client.calls.count("agent_start") == 1  # no retry
+    # only the run's own dead pane is cleaned up — nothing was force-reaped
+    assert client.closed_panes == ["w1:p1"]
 
 
 class MissingBinaryPollClient(ScriptedClient):
