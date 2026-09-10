@@ -1,7 +1,7 @@
 ---
 id: "049"
 title: "Unify routines + pipeline as one gated-workflow engine — kind becomes the single dispatch key"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
