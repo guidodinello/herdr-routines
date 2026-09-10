@@ -114,6 +114,7 @@ def test_auto_fix_job_counts_max_prs_per_tick_worst_case(tmp_path: Path) -> None
         checks=(GateCheck(kind="pr_health"),),
         target="pr",
         max_workers_per_tick=3,
+        kind="gated",
     )
     config = RoutinesConfig(jobs=(af_job,))
     # pr-target: 30s start + 60s gate_slop + 120s pr_health timeout + 3*60s workers
@@ -493,6 +494,7 @@ def test_validate_gated_job_with_empty_prompt_stays_silent(
         f"    cron: '*/10 * * * *'\n"
         f"    repo: {repo}\n"
         f"    workspace: worktree\n"
+        f"    kind: gated\n"
         f"    checks:\n"
         f"      - pr_health:\n"
         f"    max_workers_per_tick: 3\n"

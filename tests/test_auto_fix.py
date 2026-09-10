@@ -496,6 +496,7 @@ jobs:
   - name: auto-fix-prs
     cron: "*/5 * * * *"
     repo: /repo/test
+    kind: gated
     checks:
       - pr_health:
 """
@@ -516,6 +517,7 @@ jobs:
   - name: auto-fix-prs
     cron: "*/5 * * * *"
     repo: /repo/test
+    kind: gated
     checks:
       - pr_health:
       - command: uv run ruff check .
@@ -562,6 +564,7 @@ jobs:
   - name: auto-fix-prs
     cron: "*/5 * * * *"
     repo: /repo/test
+    kind: gated
     checks:
       - command: uv run ruff check .
         timeout_ms: 60000
@@ -611,6 +614,7 @@ def test_auto_fix_tick_integration(
         target="pr",
         max_workers_per_tick=3,
         max_attempts_per_target=3,
+        kind="gated",
     )
     config = RoutinesConfig(jobs=(job,))
 
@@ -1037,6 +1041,7 @@ jobs:
   - name: c
     cron: "0 3 * * *"
     repo: /repo/c
+    kind: gated
     target: base
     checks:
       - pr_health:
@@ -1051,6 +1056,7 @@ jobs:
   - name: d
     cron: "0 3 * * *"
     repo: /repo/d
+    kind: gated
     checks:
       - pr_health:
       - command: uv run ruff check .
@@ -1065,6 +1071,7 @@ jobs:
   - name: e
     cron: "0 3 * * *"
     repo: /repo/e
+    kind: gated
     checks:
       - command: ruff check .
         timeout_ms: 0
@@ -1143,6 +1150,7 @@ def test_auto_fix_gate_systemd_timeout_budget(tmp_path: Path) -> None:
             GateCheck(kind="command", command="mypy", timeout_ms=60_000),
         ),
         target="base",
+        kind="gated",
     )
     config = RoutinesConfig(jobs=(base_job,))
     # base: 30 + 60 + 120 + 100 = 310 + 300 = 610
@@ -1156,6 +1164,7 @@ def test_auto_fix_gate_systemd_timeout_budget(tmp_path: Path) -> None:
         checks=(GateCheck(kind="command", command="ruff", timeout_ms=60_000),),
         target="pr",
         max_workers_per_tick=2,
+        kind="gated",
     )
     config2 = RoutinesConfig(jobs=(pr_job,))
     # pr: 30 + 60 + 60 + 2*100 + 2*60 = 470 + 300 = 770

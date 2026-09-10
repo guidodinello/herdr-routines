@@ -504,6 +504,7 @@ jobs:
   - name: babysit-prs
     cron: "*/5 * * * *"
     repo: /repo/test
+    kind: gated
     checks:
       - pr_health:
 """
@@ -524,6 +525,7 @@ jobs:
     cron: "0 13 * * *"
     repo: /repo/test
     base: main
+    kind: gated
     checks:
       - command: uv run ruff check .
         timeout_ms: 120000
@@ -589,6 +591,7 @@ jobs:
   - name: bad
     cron: "0 3 * * *"
     repo: /repo/test
+    kind: gated
     target: base
     checks:
       - pr_health:
