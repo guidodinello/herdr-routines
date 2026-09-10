@@ -627,7 +627,9 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                 problems.append(
                     f"{job.name}: prompt_file does not exist: {job.repo / job.prompt_file}"
                 )
-        elif job.enabled and job.checks is None and "$ROUTINE_REPORT" not in job.prompt:
+        elif (
+            job.enabled and job.kind != "gated" and "$ROUTINE_REPORT" not in job.prompt
+        ):
             # A run only settles as "done" when the report file exists and is non-empty (see
             # runner.execute_run's no_report check); the agent only writes it if the prompt
             # asks. A prompt that never mentions the placeholder can never succeed. Empty
@@ -707,7 +709,8 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
         # would otherwise silently inflate the required TimeoutStartSec by ~30 min.
         if job.kind == "pipeline":
             continue
-        if job.checks is not None and job.target is not None:
+        if job.kind == "gated" and job.target is not None:
+            assert job.checks is not None  # guaranteed by config validation
             gate_time_s = sum(c.timeout_ms for c in job.checks) / 1000
             if job.target == "base":
                 total_job_seconds += (

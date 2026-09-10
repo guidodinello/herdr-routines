@@ -703,6 +703,7 @@ def make_auto_fix_job(tmp_path: Path, **overrides: Any) -> Job:
         target="pr",
         max_workers_per_tick=3,
         max_attempts_per_target=3,
+        kind="gated",
     )
     return replace(job, **overrides)
 
