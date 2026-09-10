@@ -424,6 +424,60 @@ def test_history_records_a_nudged_run(
     assert done_record.extra["nudged"] is True
 
 
+class ReapsStaleAgentClient(FakeClient):
+    """First `agent start` fails `agent_name_taken` (a prior run left a blocked agent under
+    the recurring name); `sticky_agent_pane` finds it, the runner force-closes it and the
+    retry succeeds (issue 051)."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._starts = 0
+        self.closed_panes: list[str] = []
+
+    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+        self._starts += 1
+        if self._starts == 1:
+            raise HerdrCliError(
+                f"herdr server error running agent start {name}: name is already used",
+                exit_code=1,
+                error_body={"error": {"code": "agent_name_taken"}},
+            )
+        self._last_model = model
+
+    def sticky_agent_pane(self, name):
+        return ("w7:p9", "blocked")
+
+    def pane_close(self, pane_id):
+        self.closed_panes.append(pane_id)
+
+
+def test_history_and_notification_surface_a_reaped_stale_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance (issue 051): a run that only started because the runner force-closed a
+    prior run's parked blocked agent is not a silent success — the terminal history record
+    carries `reaped_stale_agent` and the notification is a 'done' finding, not plain success."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = ReapsStaleAgentClient(settle_status="idle")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    assert client.closed_panes == ["w7:p9"]
+    done_record = next(r for r in read_job(history_path, job.name) if r.state == "done")
+    assert done_record.extra is not None
+    assert done_record.extra["reaped_stale_agent"] is True
+    title, body, _sound = client.notifications[-1]
+    assert title == "herdr-routines: a done"
+    assert body is not None and "issue 051" in body
+
+
 def test_fallback_retry_uses_a_distinct_branch_in_worktree_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

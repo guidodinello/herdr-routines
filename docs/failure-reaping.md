@@ -20,6 +20,12 @@ in an API-retry loop — it never settles. Consequences, in order:
    `agent_status == "working"` ∈ LIVE_AGENT_STATUSES → `skipped (agent_name_live)`
    (tick.py). Nothing self-heals: the start-of-run stale-pane reap only touches *settled*
    agents (SETTLED_AGENT_STATUSES), by design.
+
+   (Issue 051 later added a narrower self-heal for the sibling wedge where a prior run
+   ended `blocked`/`unknown` and its still-registered agent makes `agent start` fail
+   `agent_name_taken` every run: on that specific error, `runner` force-closes the
+   parked pane via `herdr.sticky_agent_pane` and retries the start once, recording
+   `RunOutcome.reaped_stale_agent`. The pre-start reap above is still settled-only.)
 5. No diagnostic tail is written on any failure path (the `.tail.txt` write lives after the
    settle-success check), so postmortem requires manual `herdr agent read` against a pane that
    the wedge itself encourages you to delete.

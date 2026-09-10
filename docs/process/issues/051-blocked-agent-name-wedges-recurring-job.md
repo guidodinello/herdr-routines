@@ -1,7 +1,7 @@
 ---
 id: "051"
 title: "a blocked agent from a prior run permanently wedges its recurring job (agent_name_taken); issue-refinement also calls a bare herdr-routines"
-status: open
+status: done
 priority: high
 area: routines
 ---
@@ -49,25 +49,36 @@ not-a-standalone-binary bug fixed for the orchestrator prompt in issue 050 / PR
 PR** (`uv run herdr-routines refine-issue`). The blocked-agent wedge above is
 *not* fixed here — it needs a product decision (below).
 
-## Design (open — pick one)
+## Design (chosen: A + B)
 
 The no-reap-blocked rule and "recurring job must be able to start" are in tension.
+Options considered: **A** reap on `agent_name_taken` + retry once; **B** keep
+no-reap but surface the lost run loudly; **C** age-gate the reap. **A + B** shipped
+— self-heal so the job keeps running, *and* still flag that a run was force-recovered,
+since a blocked settle right after a successful PR (as here) often means a real
+opencode "doesn't settle after done" bug worth a human look. C's age-gate is
+unnecessary once the reap is scoped to an actual name collision.
 
-- **A. Reap a blocked agent's pane on `agent_name_taken`, retry start once.** The
-  prior run is already recorded `failed` and its tail is on disk. Simple, keeps
-  the job self-healing. Loses the live pane a human might have wanted to resume.
-- **B. Keep no-reap; surface it loudly.** Digest (issue 010) / watchdog (issue
-  031) reports "job X has a blocked agent parked since <ts>, N runs skipped" so a
-  human clears it within a day instead of discovering it a week later.
-- **C. Age-gate.** Reap a blocked agent's pane only once it is older than one
-  cron interval (it is not coming back on its own by then).
+Implementation:
 
-Recommendation: **A + B** — self-heal so the job keeps running, *and* still
-report that a run was lost, since a blocked settle after a successful PR (as here)
-often means a real bug worth a human look.
+- **A.** `herdr.sticky_agent_pane(name)` — the inverse filter of `settled_agent_pane`,
+  returns `(pane_id, status)` only for a `blocked`/`unknown` registered agent.
+  `runner._start_agent_reaping_stale_collision` calls it **only** when `agent start`
+  fails `agent_name_taken` (matched on the error body's `code`), force-closes that
+  pane, and retries the start exactly once. A collision with a genuinely `working`
+  agent (`sticky_agent_pane` → `None`) is left alone and falls through to
+  `agent_start_failed` as before. The pre-start best-effort reap
+  (`settled_agent_pane`, idle/done only) is unchanged — the evidence pane for a
+  clean-exit prior run still survives; only a name **collision** triggers the
+  force-close, and by then the prior run is already recorded `failed` with its
+  `.tail.txt` on disk.
+- **B.** `RunOutcome.reaped_stale_agent` flows to the terminal history record
+  (`_outcome_extra` → `extra["reaped_stale_agent"]`) and flips the terminal
+  notification from `success` to `finding` (same treatment as a `fallback_model`
+  retry), body: "force-closed a prior run's blocked agent (issue 051)".
 
 ## Acceptance criteria
 
 1. `issue-refinement.yaml` invokes `herdr-routines` only via `uv run`. Test: `test_issue_refinement_job_invokes_herdr_routines_via_uv_run`
-2. A blocked agent left by a prior run no longer permanently wedges the next run of a recurring job. Test: `test_blocked_agent_does_not_wedge_recurring_job`
-3. A run lost to a pre-existing blocked agent is still surfaced (digest or watchdog), not silently skipped. Test: `test_lost_run_from_blocked_agent_is_reported`
+2. A blocked agent left by a prior run no longer permanently wedges the next run; the runner force-closes it and retries once. Test: `test_execute_run_reaps_blocked_agent_on_name_collision` (+ `test_execute_run_does_not_reap_a_working_agent_on_collision`)
+3. A run that only started because a stale agent was reaped is surfaced (history flag + `finding` notification), not a silent success. Test: `test_history_and_notification_surface_a_reaped_stale_agent`

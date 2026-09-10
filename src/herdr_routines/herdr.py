@@ -58,6 +58,13 @@ LIVE_AGENT_STATUSES = frozenset({AGENT_STATUS_WORKING})
 # answerable from bed via herdr-push per plan-v1 §2) and unknown must never be reaped.
 SETTLED_AGENT_STATUSES = frozenset({AGENT_STATUS_IDLE, AGENT_STATUS_DONE})
 
+# The "sticky under cron" statuses (issue 051): a prior run that ended blocked/unknown and
+# whose agent is still registered holds the recurring name hostage — `agent start` then
+# fails `agent_name_taken` every subsequent run. The pre-start reap deliberately leaves
+# these alone (evidence pane, issue 033), so the runner only force-closes one on an actual
+# name collision, when the prior run is already recorded failed and its tail is on disk.
+STICKY_AGENT_STATUSES = frozenset({AGENT_STATUS_BLOCKED, AGENT_STATUS_UNKNOWN})
+
 
 class HerdrCliError(Exception):
     """A `herdr` invocation exited non-zero. Carries the parsed JSON error body when there was
@@ -520,6 +527,40 @@ class HerdrClient:
                 return None
         pane_id = matched[0].get("pane_id")
         return pane_id if isinstance(pane_id, str) and pane_id else None
+
+    def sticky_agent_pane(self, name: str) -> tuple[str, str] | None:
+        """`(pane_id, status)` for a registered agent `name` whose status is blocked or
+        unknown — the "sticky under cron" states `settled_agent_pane` deliberately refuses
+        to reap. None when the name is absent, still working, settled (idle/done), or its
+        pane/status is unreadable. The inverse filter of `settled_agent_pane`: the runner
+        calls this ONLY after `agent start` fails with `agent_name_taken`, to force-close a
+        prior run's parked agent that would otherwise wedge every future run (issue 051).
+        Raises HerdrCliError on an unexpected response shape, like its `settled_agent_*`
+        siblings."""
+        body = self._call(["agent", "list"], timeout_s=10)
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        agents = result.get("agents")
+        if not isinstance(agents, list):
+            raise HerdrCliError(
+                f"unexpected herdr agent response shape: {body!r}", exit_code=0
+            )
+        for agent in agents:
+            if not isinstance(agent, dict) or agent.get("name") != name:
+                continue
+            status = agent.get("agent_status")
+            pane_id = agent.get("pane_id")
+            if (
+                isinstance(status, str)
+                and status in STICKY_AGENT_STATUSES
+                and isinstance(pane_id, str)
+                and pane_id
+            ):
+                return pane_id, status
+        return None
 
     def live_pipeline_agent_panes(self, run_id: str) -> dict[str, str]:
         """Every registered `pl-<N>-<run_id>` agent still reporting a LIVE_AGENT_STATUSES

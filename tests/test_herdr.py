@@ -431,6 +431,45 @@ def test_settled_agent_pane_missing_pane_id_returns_none() -> None:
     assert client.settled_agent_pane("rt-a") is None
 
 
+def _agent_list(status: str) -> dict[str, object]:
+    return {
+        "result": {
+            "agents": [
+                {
+                    "name": "rt-a",
+                    "agent_status": status,
+                    "pane_id": "w9:p1",
+                    "workspace_id": "w9",
+                }
+            ]
+        }
+    }
+
+
+def test_sticky_agent_pane_returns_pane_and_status_for_blocked() -> None:
+    """Issue 051: the inverse filter of settled_agent_pane — only blocked/unknown, and it
+    reports the status so the caller can log which state it force-closed."""
+    client = HerdrClient(runner=FakeRunner([ok(_agent_list("blocked"))]))
+    assert client.sticky_agent_pane("rt-a") == ("w9:p1", "blocked")
+
+
+def test_sticky_agent_pane_returns_pane_for_unknown() -> None:
+    client = HerdrClient(runner=FakeRunner([ok(_agent_list("unknown"))]))
+    assert client.sticky_agent_pane("rt-a") == ("w9:p1", "unknown")
+
+
+def test_sticky_agent_pane_none_for_settled_or_working() -> None:
+    for status in ("idle", "done", "working"):
+        client = HerdrClient(runner=FakeRunner([ok(_agent_list(status))]))
+        assert client.sticky_agent_pane("rt-a") is None
+
+
+def test_sticky_agent_pane_none_when_name_absent() -> None:
+    body = {"result": {"agents": [{"name": "rt-other", "agent_status": "blocked"}]}}
+    client = HerdrClient(runner=FakeRunner([ok(body)]))
+    assert client.sticky_agent_pane("rt-a") is None
+
+
 def test_settled_agent_pane_absent_name_returns_none() -> None:
     body = {
         "result": {
