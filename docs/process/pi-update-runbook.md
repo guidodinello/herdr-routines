@@ -72,6 +72,12 @@ checks:
   - pr_health:   # mapping form — a bare `- pr_health` string fails validation
 ```
 
+Example (issue 049): jobs with `checks:` now require `kind: gated` in the same
+job file. Add `kind: gated` to `~/.config/herdr-routines/jobs.d/babysit-prs.yaml`
+(or the equivalent entry in `jobs.yaml`) right after the `base:` key. Without
+this, `validate` / `tick` raise a ConfigError containing `kind: gated` and
+`checks`.
+
 ## Notes / gotchas
 
 - `ssh pi` (alias), not `guido@raspberrypi.local` (that returns publickey denied).

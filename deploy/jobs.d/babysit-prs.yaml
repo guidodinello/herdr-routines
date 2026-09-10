@@ -14,6 +14,7 @@ cron: "*/10 * * * *"
 repo: /home/guido/projects/herdr-routines
 workspace: worktree
 base: main
+kind: gated
 max_workers_per_tick: 3 # one fix worker per flagged PR, <=3/tick
 max_attempts_per_target: 3 # retry budget, keyed per PR
 checks:
