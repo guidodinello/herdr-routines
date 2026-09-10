@@ -17,6 +17,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -75,12 +76,11 @@ VALID_ON_MISSED = frozenset({"log", "notify"})
 # hierarchy, each a subset of the last.
 VALID_NOTIFY_POLICIES = frozenset({"always", "terminal", "on-finding", "on-failure"})
 
-# Scheduling-only mode discriminator (issue 026). "routine" (default) is the existing plain
-# 1-agent job, dispatched synchronously by `execute_run`. "pipeline" is a detached,
-# deadline-bounded orchestrator dispatch, launched by `tick._process_pipeline_job` and never
-# blocking the tick. Gate mode (`checks is not None`) is an orthogonal axis, unchanged by this
-# enum — see docs/process/issues/026-pipeline-as-routine.md "Mode discriminator".
-VALID_JOB_KINDS = frozenset({"routine", "pipeline"})
+# Single dispatch key (issue 049). "routine" (default) = plain unconditional execute_run;
+# "gated" = gate checks + fix dispatch (_process_gated_job); "pipeline" = detached
+# systemd-run launch (_process_pipeline_job). Gate mode is no longer an orthogonal axis
+# (the old `checks is not None` discriminator); kind is the exhaustive SSOT.
+VALID_JOB_KINDS = frozenset({"routine", "gated", "pipeline"})
 
 # A pipeline job's fixed catch_up_minutes. NOT 0: `schedule.decide()`'s grace window is a
 # strict `late <= grace`, and tick only samples every 5 minutes and evaluates jobs
@@ -233,8 +233,12 @@ class Job:
     max_workers_per_tick: int = 3
     # Retry budget keyed per target (per gate branch for base, per PR number for pr).
     max_attempts_per_target: int = 3
-    # Scheduling-only mode discriminator (issue 026): "routine" | "pipeline".
-    kind: str = "routine"
+    # Scheduling-only mode discriminator (issue 026, unified in 049):
+    # "routine" | "gated" | "pipeline". kind is the exhaustive single source of truth
+    # for how a job is dispatched; it never serializes into history.jsonl (records store
+    # job name / state / run_id / outcome extras; status/scheduled join live config +
+    # history by job name only — see cli.py:432-434 / cli.py:481).
+    kind: Literal["routine", "gated", "pipeline"] = "routine"
     # Prompt source file, read by the pipeline launcher script (not by `load_config`).
     # Required for kind: pipeline; a plain routine may also use it as an I/O convenience.
     prompt_file: str | None = None
@@ -707,36 +711,12 @@ def _build_job(
             checks = tuple(parsed_checks)
             inferred_target = "pr" if has_pr_health else "base"
 
-    target_raw = merged.get("target")
-    target: str | None = None
-    if target_raw is not None:
-        if not isinstance(target_raw, str) or target_raw not in VALID_TARGETS:
-            raise ConfigError(f"{label}: 'target' must be 'pr' or 'base' or null")
-        target = target_raw
-        if inferred_target is not None and target != inferred_target:
-            raise ConfigError(
-                f"{label}: explicit 'target: {target}' does not match inferred "
-                f"'target: {inferred_target}' from checks (not yet supported)"
-            )
-
-    if checks is not None and target is None:
-        target = inferred_target
-
-    if (
-        target == "base"
-        and checks is not None
-        and (not isinstance(base, str) or not base)
-    ):
-        raise ConfigError(
-            f"{label}: 'base' must be a non-empty string when target is 'base'"
-        )
-
     for int_key in ("max_workers_per_tick", "max_attempts_per_target"):
         value = merged[int_key]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ConfigError(f"{label}: '{int_key}' must be a non-negative integer")
 
-    # -- kind: pipeline (issue 026) ---------------------------------------------------
+    # -- kind (issue 049: kind is the exhaustive single dispatch key) ----------------
     #
     # Rules key off `raw_job`, never the merged value: a shared `defaults.yaml` (e.g. the
     # live Pi's `workspace: worktree` + `catch_up_minutes: 120`) must not retroactively
@@ -745,6 +725,17 @@ def _build_job(
     kind = merged["kind"]
     if kind not in VALID_JOB_KINDS:
         raise ConfigError(f"{label}: 'kind' must be one of {sorted(VALID_JOB_KINDS)}")
+
+    # -- kind: gated requires non-empty checks -------------------------------------------
+    if kind == "gated" and (checks is None or len(checks) == 0):
+        raise ConfigError(f"{label}: 'kind: gated' requires a non-empty 'checks' list")
+
+    # -- checks present but kind is not gated → must migrate -----------------------------
+    if checks is not None and kind != "gated":
+        raise ConfigError(
+            f"{label}: 'checks' requires kind: gated "
+            "(a job with checks is a gated workflow; add kind: gated)"
+        )
 
     if kind == "pipeline":
         if checks is not None:
@@ -800,6 +791,27 @@ def _build_job(
             raise ConfigError(
                 f"{label}: 'prompt_file' must be a non-empty string or null"
             )
+
+    # -- target inference (after kind is resolved) ------------------------------------
+    target_raw = merged.get("target")
+    target: str | None = None
+    if target_raw is not None:
+        if not isinstance(target_raw, str) or target_raw not in VALID_TARGETS:
+            raise ConfigError(f"{label}: 'target' must be 'pr' or 'base' or null")
+        target = target_raw
+        if inferred_target is not None and target != inferred_target:
+            raise ConfigError(
+                f"{label}: explicit 'target: {target}' does not match inferred "
+                f"'target: {inferred_target}' from checks (not yet supported)"
+            )
+
+    if kind == "gated" and target is None:
+        target = inferred_target
+
+    if target == "base" and kind == "gated" and (not isinstance(base, str) or not base):
+        raise ConfigError(
+            f"{label}: 'base' must be a non-empty string when target is 'base'"
+        )
 
     # -- tmp_hygiene (issue 027) ---------------------------------------------------
     tmp_hygiene_raw = merged.get("tmp_hygiene")

@@ -1258,8 +1258,8 @@ def _process_job(
         return _process_pipeline_job(job, history_path, client=client, now=now)
 
     # Gated jobs follow the same schedule guards but run gate checks + dispatch
-    # instead of execute_run when their cron fires.
-    if job.checks is not None:
+    # instead of execute_run when their cron fires (issue 049: kind is the SSOT).
+    if job.kind == "gated":
         return _process_gated_job(job, history_path, client=client, now=now)
 
     if not has_ever_been_seen(history_path, job.name):
