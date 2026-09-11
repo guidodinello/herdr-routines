@@ -61,6 +61,7 @@ from herdr_routines.runner import (
     RunOutcome,
     default_reports_dir,
     execute_run,
+    extract_prompt_excerpt,
     make_run_id,
 )
 from herdr_routines.schedule import Decision, decide
@@ -1443,12 +1444,32 @@ def _process_job(
         return f"{job.name}: done", False
 
     if _notify_gate(job, "failure"):
-        _notify(
-            client,
-            f"herdr-routines: {job.name} failed",
-            body=outcome.reason or "unknown",
-            sound="request",
-        )
+        if outcome.reason == "blocked":
+            excerpt = extract_prompt_excerpt(outcome.visible_tail or "")
+            body_lines = [
+                f"job={job.name}",
+                f"run={run_id}",
+                f"pane={outcome.pane_id or 'unknown'}",
+                f"agent={outcome.agent_name or 'unknown'}",
+            ]
+            if excerpt:
+                body_lines.append(f"prompt: {excerpt}")
+            body_lines.append(
+                'Reply to this message to approve — e.g. "yes" / "approve"'
+            )
+            _notify(
+                client,
+                f"herdr-routines: {job.name} blocked",
+                body="\n".join(body_lines),
+                sound="request",
+            )
+        else:
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=outcome.reason or "unknown",
+                sound="request",
+            )
     return f"{job.name}: failed ({outcome.reason})", True
 
 
