@@ -1412,3 +1412,59 @@ def test_execute_run_keeps_underlying_reason_when_disk_not_full(
     outcome = execute_run(job, client, run_id="a-run-038c")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "agent_not_interactive"
+
+
+# ---------------------------------------------------------------------------
+# Issue 007: Approval path for blocked runs
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_leaves_pane_open_and_writes_tail(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """AC 4: A blocked settle leaves the pane open (no pane_close) and writes the
+    visible tail to reports/<run_id>.tail.txt via agent_read_visible, preserving the
+    steer target for phone approval."""
+    job = make_job(tmp_path)
+    run_id = "a-blocked-pane"
+    client = ScriptedClient(
+        agent_status="blocked", visible_screen="Do you want to allow? [y/n]"
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "blocked"
+    assert outcome.pane_id == "w1:p1"
+    assert "pane_close" not in client.calls
+    assert "agent_read_visible" in client.calls
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.exists()
+    assert tail_path.read_text() == "Do you want to allow? [y/n]"
+
+
+def test_blocked_prompt_excerpt_is_truncated_and_best_effort() -> None:
+    """AC 5: Prompt excerpt extraction is truncated (<=300 chars), agent-agnostic,
+    and never fails the run — an empty or unparseable tail still produces a valid
+    excerpt."""
+    from herdr_routines.runner import extract_prompt_excerpt
+
+    # Empty tail
+    assert extract_prompt_excerpt("") == ""
+
+    # Keyword match — permission prompt
+    tail = "some noise\nDo you want to approve? [y/n]\nmore noise"
+    excerpt = extract_prompt_excerpt(tail)
+    assert "approve" in excerpt.lower()
+    assert excerpt == "Do you want to approve? [y/n]"
+
+    # Oversized line gets truncated to 300 chars
+    long_line = "approve " * 50  # 400 chars
+    excerpt = extract_prompt_excerpt(long_line)
+    assert len(excerpt) <= 300
+    assert excerpt.endswith("...")
+
+    # No keyword: returns last non-empty line
+    tail = "no keywords here\nlast line"
+    assert extract_prompt_excerpt(tail) == "last line"
+
+    # Pure whitespace — no keyword match, no non-empty line
+    assert extract_prompt_excerpt("   \n  \n  ") == ""
