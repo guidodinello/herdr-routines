@@ -283,6 +283,32 @@ def _capture_visible_tail(
     return tail
 
 
+def extract_prompt_excerpt(tail: str, *, max_chars: int = 300) -> str:
+    """Best-effort extraction of a permission-prompt excerpt from an agent's visible
+    screen tail for the blocked-notification body (issue 007). Agent-agnostic: scans
+    for common permission-prompt keywords rather than agent-specific markers. Returns
+    at most *max_chars* characters; returns "" when *tail* is empty or unparseable.
+    Never fails — callers always get a valid string."""
+    if not tail:
+        return ""
+    keywords = ("approve", "allow", "permission", "y/n", "[y/n]", "yes/no", "confirm")
+    for line in tail.splitlines():
+        lower = line.strip().lower()
+        if lower and any(kw in lower for kw in keywords):
+            excerpt = line.strip()
+            if len(excerpt) > max_chars:
+                excerpt = excerpt[: max_chars - 3] + "..."
+            return excerpt
+    # No keyword match: return the last non-empty line (best-effort context).
+    for line in reversed(tail.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            if len(stripped) > max_chars:
+                return stripped[: max_chars - 3] + "..."
+            return stripped
+    return ""
+
+
 def _close_run_pane(client: HerdrClient, *, job_name: str, pane_id: str) -> None:
     """Best-effort close of THIS run's pane. The pane was created by this very execute_run
     call, so closing it is ours to do — on a post-start failure, leaving it behind would wedge
@@ -431,6 +457,9 @@ class RunOutcome:
     diagnosis: dict[str, str | bool] | None = None  # issue 027: /tmp disk diagnosis
     reaped_stale_agent: bool = (
         False  # issue 051: force-closed a prior run's blocked agent
+    )
+    visible_tail: str | None = (
+        None  # issue 007: captured visible screen for blocked notification
     )
 
 
@@ -792,10 +821,10 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         # block above uses plain agent_read, which is rejected while unsettled/blocked; use
         # _capture_visible_tail's agent_read_visible instead, same as every other failure
         # path (issue 033).
-        _capture_visible_tail(
+        tail = _capture_visible_tail(
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
-        return RunOutcome(state="failed", reason="blocked", **common)
+        return RunOutcome(state="failed", reason="blocked", visible_tail=tail, **common)
 
     if settled_status == "unknown":
         # An unresolvable settle status maps to the same terminal state as a crashed/killed
