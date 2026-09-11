@@ -292,7 +292,7 @@ def extract_prompt_excerpt(tail: str, *, max_chars: int = 300) -> str:
     if not tail:
         return ""
     keywords = ("approve", "allow", "permission", "y/n", "[y/n]", "yes/no", "confirm")
-    for line in tail.splitlines():
+    for line in reversed(tail.splitlines()):
         lower = line.strip().lower()
         if lower and any(kw in lower for kw in keywords):
             excerpt = line.strip()

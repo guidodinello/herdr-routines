@@ -1245,8 +1245,6 @@ def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
         extra["nudged"] = True
     if outcome.reaped_stale_agent:
         extra["reaped_stale_agent"] = True
-    if outcome.visible_tail:
-        extra["visible_tail"] = outcome.visible_tail
     return extra
 
 
