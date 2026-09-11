@@ -5,6 +5,7 @@
     "external_directory": {
       "/tmp/**": "allow",
       "~/.claude/rules/**": "allow",
+      "~/.claude/guidelines/**": "allow",
       "~/.config/opencode/**": "allow",
       "~/.config/herdr/**": "allow",
       "~/.herdr/worktrees/**": "allow",
