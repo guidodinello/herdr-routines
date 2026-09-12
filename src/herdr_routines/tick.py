@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -1247,6 +1248,16 @@ def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
     return extra
 
 
+def _retry_eligible(outcome: RunOutcome, job: Job) -> bool:
+    """Check if this outcome is eligible for a retry attempt per the job's retry config."""
+    return (
+        outcome.state == "failed"
+        and outcome.reason is not None
+        and job.retry_on is not None
+        and outcome.reason in job.retry_on
+    )
+
+
 def _process_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
@@ -1370,6 +1381,7 @@ def _process_job(
 
     outcome = execute_run(job, client, run_id=run_id)
     used_fallback = False
+    attempt = 0  # 0 = first try
 
     if (
         outcome.state == "failed"
@@ -1413,6 +1425,62 @@ def _process_job(
             replace(job, model=job.fallback_model), client, run_id=run_id
         )
 
+    # Per-job retry loop (issue 008): bounded synchronous retries within the same
+    # tick, gated on retry_on whitelist. fallback_model quota retry (above) is
+    # orthogonal and does not consume retry_attempts.
+    base_run_id = run_id
+    while _retry_eligible(outcome, job) and attempt < job.retry_attempts:
+        # Log the failed attempt as a distinct history record with attempt metadata
+        extra = _outcome_extra(outcome)
+        extra["attempt"] = attempt
+        extra["retry_eligible_reason"] = outcome.reason
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state=outcome.state,
+                run_id=run_id,
+                extra=extra,
+            ),
+        )
+        attempt += 1
+        run_id = f"{base_run_id}-retry{attempt}"
+        log.info(
+            "%s: retry attempt %d/%d after %s",
+            job.name,
+            attempt,
+            job.retry_attempts,
+            outcome.reason,
+        )
+        # Brief backoff (reuses PROMPT_RETRY_DELAYS_S shape: 5s, 15s, ...)
+        backoff = (5.0, 15.0)[min(attempt - 1, 1)]
+        time.sleep(backoff)
+        # Append a running record for the retry attempt
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="running",
+                run_id=run_id,
+                extra={
+                    "attempt": attempt,
+                    "max_retries": job.retry_attempts,
+                    "retried_from_run_id": base_run_id
+                    if attempt == 1
+                    else f"{base_run_id}-retry{attempt - 1}",
+                },
+            ),
+        )
+        outcome = execute_run(job, client, run_id=run_id)
+
+    # Terminal record for final outcome (last retry or first attempt if no retries)
+    final_extra = _outcome_extra(outcome)
+    final_extra["attempt"] = attempt
+    final_extra["max_retries"] = job.retry_attempts
+    if attempt > 0:
+        final_extra["final_attempt"] = True
     append(
         history_path,
         HistoryRecord(
@@ -1420,7 +1488,7 @@ def _process_job(
             job=job.name,
             state=outcome.state,
             run_id=run_id,
-            extra=_outcome_extra(outcome),
+            extra=final_extra,
         ),
     )
 
