@@ -728,7 +728,12 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
                     + job.max_workers_per_tick * gate_time_s
                 )
         else:
-            total_job_seconds += (job.start_timeout_ms + job.timeout_ms) / 1000
+            # Scale by (1 + retry_attempts) so the validate check accounts for
+            # the worst-case tick time when a routine job retries transient failures
+            # (issue 008, spec risk 2: retry loop holds the tick lock).
+            total_job_seconds += (
+                (job.start_timeout_ms + job.timeout_ms) * (1 + job.retry_attempts)
+            ) / 1000
     required_s = total_job_seconds + SYSTEMD_TIMEOUT_MARGIN_SECONDS
     if unit_timeout_s < required_s:
         message = (
