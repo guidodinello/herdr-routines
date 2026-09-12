@@ -957,3 +957,36 @@ def test_real_process_wrapper_gives_up_after_sigkill_survivor() -> None:
 
     assert inner.events == ["term", "wait:5.0", "kill", "wait:5.0"]
     assert any("survived SIGKILL" in r.getMessage() for r in records)
+
+
+# ---------------------------------------------------------------------------
+# Issue 007: Approval path for blocked runs
+# ---------------------------------------------------------------------------
+
+
+def test_build_agent_start_args_never_emits_skip_permissions() -> None:
+    """AC 8: build_agent_start_args for any agent_kind never passes an auto-approve
+    bypass flag, regardless of config defaults or job overrides."""
+    from herdr_routines.herdr import build_agent_start_args
+
+    bypass_tokens = {
+        "dangerously",
+        "skip-permissions",
+        "permission_mode",
+        "allow_dangerous",
+    }
+    for kind in ("claude", "opencode", "codex", "gemini"):
+        # Only kinds with known model flags accept a model arg; others raise ValueError.
+        model = "opus" if kind in ("claude",) else None
+        args = build_agent_start_args(
+            name="rt-test",
+            kind=kind,
+            pane_id="w1:p1",
+            start_timeout_ms=120_000,
+            model=model,
+        )
+        args_lower = " ".join(args).lower()
+        for token in bypass_tokens:
+            assert token not in args_lower, (
+                f"build_agent_start_args(kind={kind!r}) must not contain {token!r}"
+            )

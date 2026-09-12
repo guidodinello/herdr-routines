@@ -2006,3 +2006,116 @@ def test_tick_reconciles_launcher_failure_stub(
     records = read_job(history_path, job.name)
     assert [r.state for r in records[-1:]] == ["failed"]
     assert client.notifications  # a failure must notify
+
+
+# ---------------------------------------------------------------------------
+# Issue 007: Approval path for blocked runs
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_emits_single_actionable_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 1: A blocked settle emits exactly one actionable notification whose body
+    identifies the job, run_id, pane_id and agent, and includes a permission prompt
+    excerpt (truncated, best-effort) plus an approval hint; title is
+    ``herdr-routines: <job> blocked`` and sound is ``request``."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(settle_status="blocked")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.any_job_failed is True
+    assert len(client.notifications) == 1
+    title, body, sound = client.notifications[0]
+    assert title == "herdr-routines: a blocked"
+    assert sound == "request"
+    assert body is not None
+    assert "job=a" in body
+    assert "run=" in body
+    assert "pane=" in body
+    assert "agent=" in body
+    assert "Reply to this message to approve" in body
+
+
+def test_blocked_notification_gated_as_failure_across_all_policies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 2: The blocked notification is gated as ``failure`` so it fires under every
+    ``notify_policy`` (always, terminal, on-finding, on-failure) and is never suppressed."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    for policy in ("always", "terminal", "on-finding", "on-failure"):
+        history_path = tmp_path / "state" / f"history-{policy}.jsonl"
+        job = make_job(tmp_path, notify_policy=policy)
+        config = RoutinesConfig(jobs=(job,))
+        client = FakeClient(settle_status="blocked")
+
+        t0 = datetime.now(UTC).replace(microsecond=0)
+        run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+        t1 = t0 + timedelta(minutes=1)
+        run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+        assert len(client.notifications) >= 1, (
+            f"blocked must notify under notify_policy={policy}"
+        )
+        last_title = client.notifications[-1][0]
+        assert last_title == "herdr-routines: a blocked", (
+            f"wrong title under notify_policy={policy}"
+        )
+        client.notifications.clear()
+
+
+def test_blocked_does_not_renotify_on_next_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 3: A blocked run_id is notified exactly once — a subsequent tick does not
+    re-notify for the same terminal failed/blocked record (last_terminal_run advances
+    past it)."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(settle_status="blocked")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type] # blocked
+
+    blocked_notifications = [
+        n for n in client.notifications if n[0] == "herdr-routines: a blocked"
+    ]
+    assert len(blocked_notifications) == 1
+    first_body = blocked_notifications[0][1]
+    assert first_body is not None
+
+    # Extract the run_id from the notification body to verify exact-once.
+    first_run_id = next(
+        line.split("=", 1)[1]
+        for line in first_body.splitlines()
+        if line.startswith("run=")
+    )
+
+    # A subsequent tick may start a *new* run (new cron occurrence) that also gets
+    # blocked — that's a fresh notification for a different run_id. The spec contract
+    # is that the *same* run_id is never re-notified.
+    t2 = t1 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+
+    all_blocked_bodies = [
+        n[1] for n in client.notifications if n[0] == "herdr-routines: a blocked"
+    ]
+    same_run_count = sum(
+        1
+        for body in all_blocked_bodies
+        if body is not None and f"run={first_run_id}" in body
+    )
+    assert same_run_count == 1, (
+        f"run_id {first_run_id!r} was notified {same_run_count} times (expected exactly 1)"
+    )

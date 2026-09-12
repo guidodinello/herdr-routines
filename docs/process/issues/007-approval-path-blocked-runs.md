@@ -1,7 +1,7 @@
 ---
 id: "007"
 title: "Approval path for blocked runs"
-status: open
+status: done
 priority: low
 area: pipeline
 ---
