@@ -98,8 +98,9 @@ VALID_RETRY_REASONS = frozenset(
         "blocked",
         "no_report",
         "quota_exhausted",
-        "unsettled_status_unknown",
-        "interrupted_unknown",
+        # Note: `interrupted_unknown` and `unsettled_status_unknown` are excluded —
+        # they are emitted with state="interrupted_unknown", not "failed", so
+        # _retry_eligible() (which requires state == "failed") can never match them.
     }
 )
 

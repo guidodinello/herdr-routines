@@ -2056,9 +2056,9 @@ def test_default_no_retry_unchanged(
     client = FakeClient(fail_at="agent_start")
 
     t0 = datetime.now(UTC).replace(microsecond=0)
-    run_tick(config, history_path, client=client, now=t0)  # registers
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]  # registers
     t1 = t0 + timedelta(minutes=1)
-    outcome = run_tick(config, history_path, client=client, now=t1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
 
     assert outcome.summaries == ("a: failed (agent_start_failed)",)
     records = read_job(history_path, job.name)
@@ -2089,9 +2089,9 @@ def test_retry_only_on_eligible_reason(
     client = FakeClient(fail_at="agent_prompt_wait")
 
     t0 = datetime.now(UTC).replace(microsecond=0)
-    run_tick(config, history_path, client=client, now=t0)  # registers
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]  # registers
     t1 = t0 + timedelta(minutes=1)
-    outcome = run_tick(config, history_path, client=client, now=t1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
 
     assert outcome.summaries == ("a: failed (agent_prompt_failed)",)
     records = read_job(history_path, job.name)
@@ -2106,6 +2106,7 @@ def test_retry_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Acceptance criterion 4: at most retry_attempts extra attempts are made
     synchronously, then the final failure is recorded and no further attempt occurs."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr("herdr_routines.tick.time.sleep", lambda s: None)
     history_path = tmp_path / "state" / "history.jsonl"
     # retry_attempts=2 means 2 extra attempts after the first failure = 3 total
     job = make_job(
@@ -2120,9 +2121,9 @@ def test_retry_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     t0 = datetime.now(UTC).replace(microsecond=0)
-    run_tick(config, history_path, client=client, now=t0)  # registers
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]  # registers
     t1 = t0 + timedelta(minutes=1)
-    outcome = run_tick(config, history_path, client=client, now=t1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
 
     assert outcome.summaries == ("a: failed (agent_start_failed)",)
     records = read_job(history_path, job.name)
@@ -2145,6 +2146,7 @@ def test_retry_history_distinct(
     """Acceptance criterion 5: each attempt is logged distinctly with attempt index,
     distinct run_id (-retryN suffix), and last_terminal_run returns the final attempt."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr("herdr_routines.tick.time.sleep", lambda s: None)
     history_path = tmp_path / "state" / "history.jsonl"
     job = make_job(
         tmp_path,
@@ -2156,9 +2158,9 @@ def test_retry_history_distinct(
     client = FailOnceThenSucceedClient(fail_at="agent_start", settle_status="idle")
 
     t0 = datetime.now(UTC).replace(microsecond=0)
-    run_tick(config, history_path, client=client, now=t0)  # registers
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]  # registers
     t1 = t0 + timedelta(minutes=1)
-    outcome = run_tick(config, history_path, client=client, now=t1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
 
     assert outcome.summaries == ("a: done",)
     records = read_job(history_path, job.name)
