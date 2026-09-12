@@ -43,16 +43,16 @@ append terminal record for final outcome
 ```
 
 - Eligibility: `outcome.state == "failed" and outcome.reason in set(job.retry_on or ())`. `interrupted_unknown` / `done` never retry; `blocked`, `no_report`, `quota_exhausted`, `unsettled_status_unknown` are not in the default eligible set and only retry if the job explicitly lists them (discouraged in docs; `quota_exhausted` already has its own `fallback_model` path `tick.py:1374` which stays separate and does not consume `retry_attempts`).
-- Idempotency guard: docs must state retry is only safe for idempotent jobs; config does not enforce it (cannot statically), but `validate` warns when `retry_attempts > 0` and prompt contains mutation verbs without worktree isolation? No — keep warning simple: `retry_attempts > 0` on a `workspace: root` job warns that retries duplicate in-place side effects.
+- Idempotency guard: docs must state retry is only safe for idempotent jobs; config does not enforce it (cannot statically), but `validate` warns when `retry_attempts > 0` on a `workspace: root` job that retries duplicate in-place side effects.
 - Tick lock still held; retries happen synchronously within the same tick invocation, not deferred to next cron occurrence. This avoids collapsing via `catch_up_minutes` and keeps `late_seconds` / `scheduled_for` tied to the original occurrence.
-- Existing `fallback_model` quota path stays orthogonal and runs inside each attempt before the eligibility check; it does not count toward `retry_attempts` and does not use retry history fields.
+- Existing `fallback_model` quota path stays orthogonal and runs inside each attempt before the eligibility check; it does not count toward `retry_attempts` and does not use retry history fields. A job that lists `quota_exhausted` in `retry_on` would double-retry (fallback first, then retry loop) — docs must discourage listing `quota_exhausted` in `retry_on`.
 
 ### 3. History logging (`src/herdr_routines/history.py` + `tick._outcome_extra`)
 
 Each attempt writes its own terminal `HistoryRecord` (append-only JSONL, `history.jsonl`). Distinctness required by acceptance criterion:
 
-- `run_id` for retries is suffixed (`{base_run_id}-retry1`, `-retry2` …) so `build_branch_name` (`runner.py:350`) yields a distinct `auto/<job>-<suffix>` branch and `default_reports_dir() / f"{run_id}.md"` a distinct report/tail file. Attempt 0 keeps the original `make_run_id(job.name, occurrence)` (`tick.py:1336`).
-- `extra` gains `attempt: int` (0-indexed) and `retry_attempt: int` alias or `attempt_of: int` + `max_retries: int`, plus `retried_reason: str` on retried terminal records and `final_attempt: bool` on the last record. Minimum contract: `attempt` number visible and `retry_on` eligibility filter auditable from JSONL alone without reading `jobs.yaml`.
+- `run_id` for retries is suffixed (`{base_run_id}-retry1`, `-retry2` …) so `build_branch_name` (`runner.py:350`) yields a distinct `auto/<job>-<suffix>` branch and `default_reports_dir() / f"{run_id}.md"` a distinct report/tail file. Attempt 0 keeps the original `make_run_id(job.name, occurrence)` (`tick.py:1336`). Injectivity via `build_branch_name` must hold: different `run_id` → different branch.
+- `extra` gains `attempt: int` (0-indexed) and `retry_attempt: int` alias or `attempt_of: int` + `max_retries: int`, plus `retried_reason: str` on retried terminal records and `final_attempt: bool` on the last record. Minimum contract: `attempt` number visible and `retry_on` eligibility filter auditable from JSONL alone without reading `jobs.yaml`. Each attempt's terminal record must also carry `reason` from the `RunOutcome`.
 - `last_terminal_run(history_path, job.name)` (`history.py`) continues to return the latest terminal state (the final retry's record) — `schedule.decide` (`schedule.py`) sees only the final outcome for due/missed logic. Intermediate retry failures do not create a new `last` that would suppress the next scheduled occurrence.
 
 ### 4. Validation and CLI
@@ -89,17 +89,28 @@ Not touched: `src/herdr_routines/schedule.py` (catch-up/missed logic), gated job
 
 ## Acceptance criteria
 
-1. [blocking] A job can declare `retry_attempts` (0..3, default 0) and `retry_on` (list of known `RunOutcome.reason` strings, default null/empty) — unlisted reasons never retry. — confidence: high — Test: test_retry_config_requires_explicit_eligible_reasons
-2. [blocking] Default is no retries: a job with no `retry_*` keys or `retry_attempts: 0` still fails once with no second `execute_run` call and one terminal history record. — confidence: high — Test: test_default_no_retry_unchanged
-3. [blocking] Retry fires only when `outcome.reason in retry_on` and `attempt < retry_attempts`; other reasons (bad prompt, `no_report`, `blocked`) never retry even with `retry_attempts > 0`. — confidence: high — Test: test_retry_only_on_eligible_reason
-4. [blocking] Retries are bounded: at most `retry_attempts` extra attempts, then the final failure is recorded. — confidence: high — Test: test_retry_bounded
-5. [blocking] Each attempt is logged distinctly in `history.jsonl` with `attempt` number visible and distinct `run_id` (`-retryN` suffix) / branch / report path; `last_terminal_run` returns the final attempt. — confidence: high — Test: test_retry_history_distinct
-6. [non-blocking] Validation rejects unknown `retry_on` strings, `retry_attempts` out of bounds, and `retry_attempts > 0` with empty `retry_on`; `retry_on` without `retry_attempts` warns but does not error. — confidence: medium — Test: test_retry_validation
+1. [blocking] A job can declare `retry_attempts` (int 0..3, default 0) and `retry_on` (list of known `RunOutcome.reason` strings, default null/empty) as per-job-only keys not inheritable via `defaults.yaml`; `retry_attempts > 0` without non-empty `retry_on` is rejected; unlisted reasons never retry — confidence: high — Test: test_retry_config_requires_explicit_eligible_reasons
+2. [blocking] Default is no retries: a job with no `retry_*` keys or `retry_attempts: 0` that fails still invokes `execute_run` exactly once and appends exactly one terminal history record with no second attempt — confidence: high — Test: test_default_no_retry_unchanged
+3. [blocking] Retry fires only when `outcome.state == "failed"` and `outcome.reason in retry_on` and `attempt < retry_attempts`; `done`/`interrupted_unknown` and unlisted reasons (`no_report`, `blocked`, `quota_exhausted` unless explicitly listed) never retry even with `retry_attempts > 0`; `fallback_model` quota retry remains orthogonal and does not consume `retry_attempts` — confidence: high — Test: test_retry_only_on_eligible_reason
+4. [blocking] Retries are bounded: at most `retry_attempts` extra attempts are made synchronously within the same tick (lock held, not deferred), then the final failure is recorded and no further attempt occurs — confidence: high — Test: test_retry_bounded
+5. [blocking] Each attempt is logged distinctly in `history.jsonl` with `attempt` index visible in `extra`, distinct `run_id` (`-retryN` suffix yielding distinct `branch` via `build_branch_name` injectivity and distinct report path), and `last_terminal_run` returns the final attempt's record for `schedule.decide` — confidence: high — Test: test_retry_history_distinct
+6. [non-blocking] Validation rejects unknown `retry_on` strings (ConfigError naming `retry_on` and the value), `retry_attempts` out of bounds / non-int / bool, and `retry_attempts > 0` with empty/null `retry_on`; empty list for `retry_on` is valid; `retry_on` non-empty with `retry_attempts == 0` warns (exit 0) and `retry_attempts > 0` on `workspace: root` warns — confidence: medium — Test: test_retry_validation
 
 ## Review
 
 - blocking: criteria 1–5 (opt-in, default-no-retry, eligibility gating, boundedness, distinct history).
 - non-blocking: criterion 6 (validation matrix / warnings).
 - confidence: high for blocking (directly tied to issue 008's three acceptance bullets + transient reasons already classified in `runner.py`/`tick.py`); medium for the validation edge matrix.
+- v2 reviewer verdict: spec is acceptance-ready — approach is bounded, opt-in, gated on closed reason set, and default-zero; risks are triaged with mitigations; each criterion is independently testable via the named test. Remaining medium-confidence risk is `retry_on` closed-set drift (mitigated by validation error that surfaces allowed values) and the `workspace: root` warning being soft.
 
+## Changelog v1→v2
 
+- Retained v1 problem/approach/files-touched; no change to scoped file list or out-of-scope declaration (gated/pipeline paths remain untouched).
+- Refined Acceptance criteria 1: added explicit "per-job-only, not inheritable via `defaults.yaml`" and "`retry_attempts > 0` without non-empty `retry_on` is rejected" to make the schema test falsifiable; kept test name `test_retry_config_requires_explicit_eligible_reasons`.
+- Refined criterion 2: specified "exactly once / exactly one terminal record" to prevent off-by-one ambiguous assertions; kept test name `test_default_no_retry_unchanged`.
+- Refined criterion 3: added `outcome.state == "failed"` guard, explicit exclusion of `done`/`interrupted_unknown`, enumerated unlisted reasons, and noted `fallback_model` orthogonality (does not consume `retry_attempts`) to close reviewer gap on double-retry; kept test name `test_retry_only_on_eligible_reason`.
+- Refined criterion 4: added "synchronously within the same tick (lock held, not deferred)" and "no further attempt after bound" to codify the tick-lock/idempotency invariant from Approach §2; kept test name `test_retry_bounded`.
+- Refined criterion 5: expanded to require `attempt` index in `extra`, distinct `run_id` with `-retryN` suffix, branch injectivity via `build_branch_name`, distinct report path, and `last_terminal_run` final-record semantics; kept test name `test_retry_history_distinct`.
+- Refined criterion 6: enumerated all rejected shapes (unknown string with `retry_on` in message, non-int/bool/out-of-bounds), declared empty list valid, and listed both warning cases (`retry_on` without `retry_attempts`, `workspace: root` with retries); kept test name `test_retry_validation`.
+- Added explicit `[blocking]`/`[non-blocking]` and `confidence:` labels to every criterion (already on risks) to satisfy v2 tiering gate.
+- Added this Changelog v1→v2 section and expanded Review with v2 verdict; no new blocking criteria introduced, so stage-3 test surface is unchanged (6 tests).
