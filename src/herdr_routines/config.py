@@ -82,6 +82,27 @@ VALID_NOTIFY_POLICIES = frozenset({"always", "terminal", "on-finding", "on-failu
 # (the old `checks is not None` discriminator); kind is the exhaustive SSOT.
 VALID_JOB_KINDS = frozenset({"routine", "gated", "pipeline"})
 
+# Closed set of known terminal RunOutcome.reason values eligible for retry.
+# Derived from runner.py + tick.py failure sites. Unknown strings in retry_on
+# raise ConfigError to catch typos and drift as new reasons are added.
+VALID_RETRY_REASONS = frozenset(
+    {
+        "agent_start_failed",
+        "agent_not_interactive",
+        "pane_creation_failed",
+        "clone_failed",
+        "repo_sync_failed",
+        "agent_prompt_failed",
+        "tmp_full",
+        "report_dir_creation_failed",
+        "blocked",
+        "no_report",
+        "quota_exhausted",
+        "unsettled_status_unknown",
+        "interrupted_unknown",
+    }
+)
+
 # A pipeline job's fixed catch_up_minutes. NOT 0: `schedule.decide()`'s grace window is a
 # strict `late <= grace`, and tick only samples every 5 minutes and evaluates jobs
 # sequentially under one lock — a job listed after a slow gated job (e.g. babysit-prs
@@ -135,6 +156,8 @@ _JOB_ALLOWED_KEYS = (
             "prompt_file",
             "deadline_ms",
             "tmp_hygiene",
+            "retry_attempts",
+            "retry_on",
         }
     )
 )
@@ -167,6 +190,8 @@ _JOB_DEFAULTS = {
     "prompt_file": None,
     "deadline_ms": None,
     "tmp_hygiene": None,
+    "retry_attempts": 0,
+    "retry_on": None,
 }
 
 
@@ -248,6 +273,12 @@ class Job:
     deadline_ms: int | None = None
     # Optional /tmp hygiene config (issue 027). None = use global defaults.
     tmp_hygiene: TmphgieneConfig | None = None
+    # Per-job retry for transient failures (issue 008): total extra attempts after
+    # the first failure. 0 = no retries (default). NOT inheritable via defaults.yaml.
+    retry_attempts: int = 0
+    # Whitelist of RunOutcome.reason values eligible for retry. None = no eligible
+    # reasons (so retry_attempts is inert). NOT inheritable via defaults.yaml.
+    retry_on: tuple[str, ...] | None = None
 
     @property
     def agent_name(self) -> str:
@@ -845,6 +876,57 @@ def _build_job(
             enabled=th_enabled, max_age_s=th_max_age_s, tmp_dir=th_tmp_dir
         )
 
+    # -- retry_attempts / retry_on (issue 008) ----------------------------------
+    #
+    # Per-job only — NOT inheritable via defaults.yaml (same precedent as kind/checks
+    # in issue 049). retry_attempts is bounded 0..3 to prevent tick-hogging.
+
+    retry_attempts = merged["retry_attempts"]
+    if not isinstance(retry_attempts, int) or isinstance(retry_attempts, bool):
+        raise ConfigError(f"{label}: 'retry_attempts' must be an integer")
+    if retry_attempts < 0 or retry_attempts > 3:
+        raise ConfigError(
+            f"{label}: 'retry_attempts' must be between 0 and 3 (inclusive)"
+        )
+
+    retry_on_raw = merged.get("retry_on")
+    retry_on: tuple[str, ...] | None = None
+    if retry_on_raw is not None:
+        if not isinstance(retry_on_raw, list):
+            raise ConfigError(f"{label}: 'retry_on' must be null or a list of strings")
+        for ri, reason in enumerate(retry_on_raw):
+            if not isinstance(reason, str) or not reason:
+                raise ConfigError(
+                    f"{label}: 'retry_on[{ri}]' must be a non-empty string"
+                )
+            if reason not in VALID_RETRY_REASONS:
+                raise ConfigError(
+                    f"{label}: 'retry_on' contains unknown reason {reason!r} — "
+                    f"valid reasons: {sorted(VALID_RETRY_REASONS)}"
+                )
+        retry_on = tuple(retry_on_raw) if retry_on_raw else None
+
+    # retry_attempts > 0 with empty/null retry_on is a hard error
+    if retry_attempts > 0 and not retry_on:
+        raise ConfigError(
+            f"{label}: 'retry_attempts' requires non-empty 'retry_on' — "
+            "declare which reasons are retry-eligible"
+        )
+    # retry_on non-empty with retry_attempts == 0 is allowed but inert
+    if retry_on and retry_attempts == 0:
+        warnings.warn(
+            f"{label}: 'retry_on' is set but 'retry_attempts' is 0 — "
+            "retry_on is inert (no retries will occur)",
+            stacklevel=2,
+        )
+    # workspace: root with retries is a soft warning
+    if retry_attempts > 0 and workspace == "root":
+        warnings.warn(
+            f"{label}: 'retry_attempts' > 0 on workspace: root — "
+            "retries are only safe for idempotent jobs",
+            stacklevel=2,
+        )
+
     return Job(
         name=name,
         enabled=enabled,
@@ -872,4 +954,6 @@ def _build_job(
         prompt_file=prompt_file,
         deadline_ms=deadline_ms,
         tmp_hygiene=tmp_hygiene,
+        retry_attempts=retry_attempts,
+        retry_on=retry_on,
     )
