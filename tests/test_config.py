@@ -1245,3 +1245,187 @@ def test_pipeline_deploy_example_loads_cleanly(tmp_path: Path) -> None:
     assert job is not None
     assert job.kind == "pipeline"
     assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
+
+
+# -- retry_attempts / retry_on (issue 008) -------------------------------------------
+
+
+def test_retry_config_requires_explicit_eligible_reasons(tmp_config_path: Path) -> None:
+    """Acceptance criterion 1: retry_attempts > 0 without non-empty retry_on is rejected.
+    retry_on must contain known RunOutcome.reason strings; unlisted reasons are rejected."""
+    # retry_attempts > 0 with no retry_on → ConfigError
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 1
+"""
+    with pytest.raises(
+        ConfigError, match="retry_attempts.*requires non-empty 'retry_on'"
+    ):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts > 0 with retry_on: [] → ConfigError (empty list = null)
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 2
+    retry_on: []
+"""
+    with pytest.raises(
+        ConfigError, match="retry_attempts.*requires non-empty 'retry_on'"
+    ):
+        load_config(write(tmp_config_path, text))
+
+    # retry_on with unknown reason string → ConfigError
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 1
+    retry_on:
+      - agent_start_failed
+      - totally_bogus_reason
+"""
+    with pytest.raises(ConfigError, match="unknown reason.*totally_bogus_reason"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts > 0 with valid retry_on → succeeds
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 1
+    retry_on:
+      - agent_start_failed
+      - agent_not_interactive
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.retry_attempts == 1
+    assert job.retry_on == ("agent_start_failed", "agent_not_interactive")
+
+
+def test_retry_validation(tmp_config_path: Path) -> None:
+    """Acceptance criterion 6: validation rejects retry_attempts out of bounds / non-int /
+    bool, empty/null retry_on is valid, retry_on non-empty with retry_attempts == 0 warns,
+    and retry_attempts > 0 on workspace: root warns."""
+    # retry_attempts negative
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: -1
+"""
+    with pytest.raises(ConfigError, match="retry_attempts.*must be between 0 and 3"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts > 3
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 4
+"""
+    with pytest.raises(ConfigError, match="retry_attempts.*must be between 0 and 3"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts is a bool
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: true
+"""
+    with pytest.raises(ConfigError, match="retry_attempts.*must be an integer"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts is a string
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: "one"
+"""
+    with pytest.raises(ConfigError, match="retry_attempts.*must be an integer"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_on with empty list is valid (but inert)
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_on: []
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.retry_on is None  # empty list collapses to None
+
+    # retry_on non-empty with retry_attempts == 0 → warns (not error)
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 0
+    retry_on:
+      - agent_start_failed
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.retry_attempts == 0
+    assert job.retry_on == ("agent_start_failed",)
+
+    # retry_attempts > 0 on workspace: root → warns (not error)
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    workspace: root
+    retry_attempts: 1
+    retry_on:
+      - agent_start_failed
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.retry_attempts == 1
+
+    # retry_attempts and retry_on are NOT inheritable via defaults.yaml
+    text = """
+version: 1
+defaults:
+  retry_attempts: 1
+  retry_on: ["agent_start_failed"]
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+"""
+    with pytest.raises(ConfigError, match="unknown key.*retry_attempts"):
+        load_config(write(tmp_config_path, text))

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -1247,6 +1248,16 @@ def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
     return extra
 
 
+def _retry_eligible(outcome: RunOutcome, job: Job) -> bool:
+    """Check if this outcome is eligible for a retry attempt per the job's retry config."""
+    return (
+        outcome.state == "failed"
+        and outcome.reason is not None
+        and job.retry_on is not None
+        and outcome.reason in job.retry_on
+    )
+
+
 def _process_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
@@ -1370,14 +1381,61 @@ def _process_job(
 
     outcome = execute_run(job, client, run_id=run_id)
     used_fallback = False
+    attempt = 0  # 0 = first try
 
-    if (
-        outcome.state == "failed"
-        and outcome.reason == "quota_exhausted"
-        and job.fallback_model
-        and job.fallback_model != job.model
-    ):
-        used_fallback = True
+    # Per-job retry loop (issue 008): bounded synchronous retries within the same
+    # tick, gated on retry_on whitelist. The fallback_model quota retry runs inside
+    # each attempt so retried attempts also get the fallback treatment.
+    base_run_id = run_id
+    while True:
+        # Fallback_model quota retry (issue 008): runs inside each attempt so a
+        # retried attempt that hits quota_exhausted also gets the fallback.
+        if (
+            outcome.state == "failed"
+            and outcome.reason == "quota_exhausted"
+            and job.fallback_model
+            and job.fallback_model != job.model
+        ):
+            used_fallback = True
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state=outcome.state,
+                    run_id=run_id,
+                    extra=_outcome_extra(outcome),
+                ),
+            )
+            log.info(
+                "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
+                job.name,
+                job.fallback_model,
+            )
+            fallback_run_id = make_run_id(f"{job.name}-fallback", now)
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="running",
+                    run_id=fallback_run_id,
+                    extra={"reason": "fallback_retry", "primary_run_id": run_id},
+                ),
+            )
+            run_id = fallback_run_id
+            outcome = execute_run(
+                replace(job, model=job.fallback_model), client, run_id=run_id
+            )
+
+        # Check if this outcome is eligible for a retry attempt
+        if not _retry_eligible(outcome, job) or attempt >= job.retry_attempts:
+            break
+
+        # Log the failed attempt as a distinct history record with attempt metadata
+        extra = _outcome_extra(outcome)
+        extra["attempt"] = attempt
+        extra["retry_eligible_reason"] = outcome.reason
         append(
             history_path,
             HistoryRecord(
@@ -1385,34 +1443,46 @@ def _process_job(
                 job=job.name,
                 state=outcome.state,
                 run_id=run_id,
-                extra=_outcome_extra(outcome),
+                extra=extra,
             ),
         )
+        attempt += 1
+        run_id = f"{base_run_id}-retry{attempt}"
         log.info(
-            "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
+            "%s: retry attempt %d/%d after %s",
             job.name,
-            job.fallback_model,
+            attempt,
+            job.retry_attempts,
+            outcome.reason,
         )
-        # `now` (wall-clock) rather than `result.occurrence` for the fallback's own run_id
-        # (both are fine now that `build_branch_name` is injective in run_id — see its
-        # docstring — but keeping `now` preserves the original PR #65 intent of the fallback
-        # attempt recording when it actually ran, not the primary's scheduled occurrence).
-        fallback_run_id = make_run_id(f"{job.name}-fallback", now)
+        # Brief backoff (reuses PROMPT_RETRY_DELAYS_S shape: 5s, 15s, ...)
+        backoff = (5.0, 15.0)[min(attempt - 1, 1)]
+        time.sleep(backoff)
+        # Append a running record for the retry attempt
         append(
             history_path,
             HistoryRecord(
                 ts=now,
                 job=job.name,
                 state="running",
-                run_id=fallback_run_id,
-                extra={"reason": "fallback_retry", "primary_run_id": run_id},
+                run_id=run_id,
+                extra={
+                    "attempt": attempt,
+                    "max_retries": job.retry_attempts,
+                    "retried_from_run_id": base_run_id
+                    if attempt == 1
+                    else f"{base_run_id}-retry{attempt - 1}",
+                },
             ),
         )
-        run_id = fallback_run_id
-        outcome = execute_run(
-            replace(job, model=job.fallback_model), client, run_id=run_id
-        )
+        outcome = execute_run(job, client, run_id=run_id)
 
+    # Terminal record for final outcome (last retry or first attempt if no retries)
+    final_extra = _outcome_extra(outcome)
+    final_extra["attempt"] = attempt
+    final_extra["max_retries"] = job.retry_attempts
+    if attempt > 0:
+        final_extra["final_attempt"] = True
     append(
         history_path,
         HistoryRecord(
@@ -1420,7 +1490,7 @@ def _process_job(
             job=job.name,
             state=outcome.state,
             run_id=run_id,
-            extra=_outcome_extra(outcome),
+            extra=final_extra,
         ),
     )
 

@@ -1,7 +1,7 @@
 ---
 id: "008"
 title: "Retries on failure"
-status: open
+status: done
 priority: low
 area: cli
 ---
