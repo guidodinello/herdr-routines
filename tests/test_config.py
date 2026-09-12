@@ -1429,3 +1429,24 @@ jobs:
 """
     with pytest.raises(ConfigError, match="unknown key.*retry_attempts"):
         load_config(write(tmp_config_path, text))
+
+
+# ---------------------------------------------------------------------------
+# Issue 007: Approval path for blocked runs
+# ---------------------------------------------------------------------------
+
+
+def test_no_auto_approve_mode_rejects_permission_keys(tmp_config_path: Path) -> None:
+    """AC 7: config.py rejects unknown keys permission_mode, allow_dangerous,
+    skip_permissions (via unknown key ConfigError)."""
+    for bad_key in ("permission_mode", "allow_dangerous", "skip_permissions"):
+        text = f"""
+version: 1
+jobs:
+  - name: nightly-audit
+    cron: "0 3 * * *"
+    repo: /home/guido/projects/fitted
+    {bad_key}: auto
+"""
+        with pytest.raises(ConfigError, match="unknown key"):
+            load_config(write(tmp_config_path, text))
