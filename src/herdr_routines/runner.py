@@ -790,13 +790,14 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             reaped_stale_agent=reaped_stale_agent,
         )
 
-    # Best-effort diagnostic tail — never allowed to fail the run (docs/plan-v1.md §6 layer 2).
-    try:
-        tail = client.agent_read(job.agent_name, lines=200)
-        if tail:
-            (report_path.parent / f"{run_id}.tail.txt").write_text(tail)
-    except OSError:
-        pass
+    # Best-effort diagnostic tail — bounded visible screen (200 lines) persisted before
+    # pane close on every settled path, success included (issue 011). Uses visible source
+    # (not recent-unwrapped) for consistency with every failure path; after settle the
+    # agent is idle/done so visible is always accepted, but recent-unwrapped is still
+    # unreliable for alternate-screen TUI agents (docs/plan-v1.md §93).
+    _capture_visible_tail(
+        client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+    )
 
     report_written = report_path.exists()
     report_bytes = report_path.stat().st_size if report_written else 0

@@ -893,12 +893,9 @@ def _process_base_target(
         )
         return f"{job.name}: failed (agent_prompt_failed)", True
 
-    try:
-        tail = client.agent_read(agent_name, lines=200)
-        if tail:
-            (report_path.parent / f"{run_id}.tail.txt").write_text(tail)
-    except OSError:
-        pass
+    _capture_visible_tail(
+        client, agent_name, reports_dir=report_path.parent, run_id=run_id
+    )
 
     report_written = report_path.exists()
     _report_bytes = report_path.stat().st_size if report_written else 0
@@ -1197,12 +1194,9 @@ def _dispatch_fix_worker(
         }
 
     # Capture tail and close pane
-    try:
-        tail = client.agent_read(agent_name, lines=200)
-        if tail:
-            (report_path.parent / f"{pr_run_id}.tail.txt").write_text(tail)
-    except OSError:
-        pass
+    _capture_visible_tail(
+        client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id
+    )
 
     report_written = report_path.exists()
     report_bytes = report_path.stat().st_size if report_written else 0
