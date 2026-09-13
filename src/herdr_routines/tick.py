@@ -900,6 +900,12 @@ def _process_base_target(
     report_written = report_path.exists()
     _report_bytes = report_path.stat().st_size if report_written else 0
 
+    session_id: str | None = None
+    try:
+        session_id = client.agent_session_id(agent_name)
+    except Exception as e:  # noqa: BLE001 — session id is best-effort reporting data
+        log.debug("could not read session id for %s: %s", agent_name, e)
+
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
     _cleanup_worktree(job.repo, fix_wt_path)
 
@@ -925,6 +931,7 @@ def _process_base_target(
                 "report_path": str(report_path) if report_written else None,
                 "report_written": report_written,
                 "final_agent_status": settled_status,
+                "session_id": session_id,
             },
         ),
     )

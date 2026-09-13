@@ -790,15 +790,6 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             reaped_stale_agent=reaped_stale_agent,
         )
 
-    # Best-effort diagnostic tail — bounded visible screen (200 lines) persisted before
-    # pane close on every settled path, success included (issue 011). Uses visible source
-    # (not recent-unwrapped) for consistency with every failure path; after settle the
-    # agent is idle/done so visible is always accepted, but recent-unwrapped is still
-    # unreliable for alternate-screen TUI agents (docs/plan-v1.md §93).
-    _capture_visible_tail(
-        client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
-    )
-
     report_written = report_path.exists()
     report_bytes = report_path.stat().st_size if report_written else 0
 
@@ -818,10 +809,8 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
     if settled_status == "blocked":
         # Leave the pane open (no _close_run_pane/_capture_session_id) so a human can
         # resume and see what it's stuck on — but still capture a diagnostic tail, since
-        # the pane may not survive until then (manual close, host reboot). The best-effort
-        # block above uses plain agent_read, which is rejected while unsettled/blocked; use
-        # _capture_visible_tail's agent_read_visible instead, same as every other failure
-        # path (issue 033).
+        # the pane may not survive until then (manual close, host reboot). Uses
+        # agent_read_visible (visible source) which succeeds while unsettled/blocked.
         tail = _capture_visible_tail(
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
@@ -839,7 +828,8 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         # "working" here means agent_prompt_wait's --wait settled on something that isn't a
         # completion signal — treat as interrupted/unclear rather than success, and close our
         # pane: herdr still classifies the agent as live, so leaving it behind wedges the job
-        # exactly like the prompt-failed path (docs/failure-reaping.md §3.1).
+        # exactly like the prompt-failed path (docs/failure-reaping.md §3.1). Capture a
+        # diagnostic tail via visible source before close (issue 033).
         _capture_visible_tail(
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
@@ -874,6 +864,12 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         # The nudge can itself take real wall-clock time (up to NUDGE_TIMEOUT_MS); reflect it
         # in the recorded duration rather than the pre-nudge snapshot taken above.
         common["duration_seconds"] = (datetime.now(UTC) - started_at).total_seconds()
+
+    # Bounded visible-tail capture (issue 011): placed after the nudge so the tail
+    # reflects the nudge's final screen if the nudge ran, matching spec v2 L33.
+    _capture_visible_tail(
+        client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+    )
 
     # Pane-lifecycle v2: close our own pane now instead of leaving it for the next run's
     # stale-pane reap (root-mode jobs share the ambient workspace and are never auto-closed,

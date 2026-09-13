@@ -354,17 +354,17 @@ def test_execute_run_nudge_success_ends_done_and_records_nudged(
     assert outcome.report_written is True
     assert outcome.report_bytes > 0
     assert outcome.nudged is True
-    # Pins the nudge strictly before the pane close (worktree mode): the second
-    # agent_prompt_wait call must land between the diagnostic tail read and pane_close, or the
-    # still-open agent would no longer be reachable.
+    # Pins the nudge strictly before the visible-tail capture, which is itself before
+    # pane_close (issue 011 spec v2 L33: nudge stays before capture so the tail
+    # reflects the nudge's final screen).
     assert client.calls == [
         "settled_agent_pane",
         "worktree_create",
         "agent_start",
         "agent_interactive_ready",
         "agent_prompt_wait",
-        "agent_read_visible",
         "agent_prompt_wait",
+        "agent_read_visible",
         "agent_session_id",
         "pane_close",
     ]

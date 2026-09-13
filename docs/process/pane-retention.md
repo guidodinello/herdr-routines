@@ -31,6 +31,10 @@ a lingering pane.
 **Pipeline workers**: same policy — per-stage close on gate-pass
 (`design.md` G-16), orchestrator close at end, mirroring routine jobs.
 Pipeline tails are written to `reports/pipeline-{run_id}.tail.txt`.
+Exception: the pipeline orchestrator (`pipeline-launch.sh`) only captures
+visible tail on non-idle/done settle (failure/blocked/unknown); on
+idle/done success the orchestrator pane is closed with no tail — the
+orchestrator writes its own `$PIPELINE_REPORT` as the primary artifact.
 
 ## Artifact retention
 
