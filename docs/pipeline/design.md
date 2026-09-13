@@ -197,7 +197,8 @@ fresh worktree does not show another worktree's untracked files.
   commits, (2) close worker tabs/panes (per-stage as gates pass, plus final sweep for any still-open), (3) leave shared worktree+branch for
   manual GC per `roadmap:77-79`. Leaked live `pl-*` agents were the central
   incident of reaping §1. Future `herdr-routines gc` must exclude `auto/pipeline-*`
-  (G-14).
+  (G-14). Retention policy for panes, sessions, and artifacts: see
+  `docs/process/pane-retention.md` (issue 011).
 
 ## Worker spawning (what must be ported, not rediscovered)
 
