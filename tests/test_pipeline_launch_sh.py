@@ -174,3 +174,23 @@ def test_launcher_closes_pane_after_capture(tmp_path: Path) -> None:
     assert read_calls, "expected a visible-tail capture call"
     assert close_calls, "expected the cleanup trap to close the pane"
     assert max(read_calls) < min(close_calls)
+
+
+def test_pipeline_launcher_captures_visible_tail_on_failure(tmp_path: Path) -> None:
+    """AC 7: Pipeline launcher captures visible --lines 200 to sibling
+    ${RUN_ID}.tail.txt before pane close on non-idle/done settle."""
+    tail_text = "orchestrator stuck on quota modal"
+    report_path, call_log = _run_launcher(
+        tmp_path, settle_status="unknown", tail_text=tail_text
+    )
+
+    run_id = report_path.stem.removeprefix("pipeline-")
+    tail_file = report_path.parent / f"{run_id}.tail.txt"
+    assert tail_file.exists()
+    assert tail_text in tail_file.read_text()
+
+    # Verify visible source and 200-line bound in the call log.
+    lines = call_log.read_text().splitlines()
+    read_calls = [l for l in lines if l.startswith("agent read")]
+    assert any("--source visible" in l for l in read_calls)
+    assert any("--lines 200" in l for l in read_calls)
