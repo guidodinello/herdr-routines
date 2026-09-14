@@ -55,12 +55,14 @@ VALID_AGENT_KINDS = frozenset(
 )
 
 # Native model-selection flag per agent kind, passed as a native arg after `--`. Confirmed
-# empirically against herdr 0.8.2 (see docs/plan-v1.md): only these two kinds have a pinned-down
+# empirically against herdr 0.8.2 (see docs/plan-v1.md): only these kinds have a pinned-down
 # flag — a job's 'model' is rejected for any other agent_kind rather than guessing. Also consumed
 # by herdr.py's `build_agent_start_args`, which is where the flag is actually applied.
+# codex 0.52.0 --help: --model <model> (confirmed 2026-09-14)
 AGENT_MODEL_FLAGS: dict[str, str] = {
     "claude": "--model",
     "opencode": "-m",
+    "codex": "--model",
 }
 
 VALID_WORKSPACE_MODES = frozenset({"worktree", "root"})
