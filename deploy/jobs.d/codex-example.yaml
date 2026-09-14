@@ -1,0 +1,15 @@
+# Example: codex agent with model selection (issue 018).
+# codex --model <model> is the native flag (confirmed against codex 0.52.0 --help).
+
+enabled: true
+cron: "0 4 * * *"
+repo: /home/guido/projects/herdr-routines
+workspace: worktree
+base: main
+agent_kind: codex
+model: o3
+prompt: |
+  Run the test suite and report results to $ROUTINE_REPORT as Markdown.
+timeout_ms: 1800000
+start_timeout_ms: 120000
+on_missed: log
