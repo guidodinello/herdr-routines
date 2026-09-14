@@ -1,7 +1,7 @@
 # Example: codex agent with model selection (issue 018).
 # codex --model <model> is the native flag (confirmed against codex 0.52.0 --help).
 
-enabled: true
+enabled: false
 cron: "0 4 * * *"
 repo: /home/guido/projects/herdr-routines
 workspace: worktree

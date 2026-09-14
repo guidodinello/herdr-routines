@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -1501,7 +1502,11 @@ def test_plan_docs_list_model_flags_for_new_kind() -> None:
 
     plan = Path(__file__).resolve().parent.parent / "docs" / "plan-v1.md"
     plan_text = plan.read_text()
-    assert "codex" in plan_text
+    # Verify codex's flag is enumerated in the AGENT_MODEL_FLAGS comment block,
+    # not just that the substring "codex" appears somewhere in the file.
+    assert re.search(r"--model` for\s+`codex`", plan_text), (
+        "plan-v1.md model-flags comment must list --model as codex's flag"
+    )
 
     deploy_dir = Path(__file__).resolve().parent.parent / "deploy" / "jobs.d"
     found = False
