@@ -704,3 +704,28 @@ def test_cmd_run_pipeline_never_calls_execute_run(
 
     assert cli.main(["run", "nightly-pipeline"]) == 0
     assert len(launched) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue 018: Model selection per job beyond claude/opencode
+# ---------------------------------------------------------------------------
+
+
+def test_validate_rejects_model_for_unsupported_kind_as_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """validate reports model for unsupported kind as blocking error: (exit 1), not warning:."""
+    jobs_dir = tmp_path / "jobs.d"
+    jobs_dir.mkdir()
+    (jobs_dir / "a.yaml").write_text(
+        "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\nagent_kind: gemini\nmodel: gemini-2.0\n"
+    )
+    args = _validate_args(jobs_dir, tmp_path)
+    assert _cmd_validate(args) == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert "warning:" not in captured.err or captured.err.index("error:") < (
+        captured.err.index("warning:")
+        if "warning:" in captured.err
+        else len(captured.err)
+    )

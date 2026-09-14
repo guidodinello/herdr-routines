@@ -1,7 +1,7 @@
 ---
 id: "018"
 title: "Model selection per job beyond claude/opencode"
-status: open
+status: done
 priority: low
 area: config
 ---

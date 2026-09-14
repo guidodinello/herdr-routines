@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -280,7 +281,7 @@ def test_empty_jobs_list_is_valid(tmp_config_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "agent_kind,model",
-    [("claude", "opus"), ("opencode", "opencode/big-pickle")],
+    [("claude", "opus"), ("opencode", "opencode/big-pickle"), ("codex", "o3")],
 )
 def test_model_is_accepted_for_supported_agent_kinds(
     tmp_config_path: Path, agent_kind: str, model: str
@@ -307,11 +308,48 @@ jobs:
   - name: a
     cron: "0 3 * * *"
     repo: /repo/a
-    agent_kind: codex
+    agent_kind: gemini
     model: some-model
 """
     with pytest.raises(ConfigError, match="model"):
         load_config(write(tmp_config_path, text))
+
+
+def test_model_accepted_for_codex_kind(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: codex
+    model: o3
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.model == "o3"
+
+
+def test_model_rejected_for_unsupported_kind_mentions_supported_list(
+    tmp_config_path: Path,
+) -> None:
+    from herdr_routines.config import AGENT_MODEL_FLAGS
+
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: gemini
+    model: some-model
+"""
+    with pytest.raises(ConfigError, match="supported") as exc_info:
+        load_config(write(tmp_config_path, text))
+    msg = str(exc_info.value)
+    for kind in sorted(AGENT_MODEL_FLAGS):
+        assert kind in msg
 
 
 def test_non_string_model_raises(tmp_config_path: Path) -> None:
@@ -356,14 +394,14 @@ def test_defaults_fallback_model_is_inert_for_unsupported_agent_kind(
 ) -> None:
     """Regression (PR #65 review): fallback_model in defaults.yaml is deliberately shared
     across every job (unlike model). A job whose own agent_kind doesn't support model
-    selection at all (e.g. codex) must still load — the inherited default is simply inert
+    selection at all (e.g. gemini) must still load — the inherited default is simply inert
     for it, not a config error. Only an *explicit* per-job fallback_model for an unsupported
     agent_kind stays an error (see test_fallback_model_raises_for_unsupported_agent_kind)."""
     jobs_dir = _make_jobs_d(
         tmp_path,
         {
             "defaults.yaml": "fallback_model: openrouter/free\n",
-            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\nagent_kind: codex\n",
+            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\nagent_kind: gemini\n",
         },
     )
     cfg = load_config(jobs_dir)
@@ -381,7 +419,7 @@ jobs:
   - name: a
     cron: "0 3 * * *"
     repo: /repo/a
-    agent_kind: codex
+    agent_kind: gemini
     fallback_model: some-model
 """
     with pytest.raises(ConfigError, match="fallback_model"):
@@ -1450,3 +1488,33 @@ jobs:
 """
         with pytest.raises(ConfigError, match="unknown key"):
             load_config(write(tmp_config_path, text))
+
+
+# ---------------------------------------------------------------------------
+# Issue 018: Model selection per job beyond claude/opencode
+# ---------------------------------------------------------------------------
+
+
+def test_plan_docs_list_model_flags_for_new_kind() -> None:
+    """docs/plan-v1.md enumerates codex alongside claude/opencode in the model-flags
+    comment, and deploy/jobs.d/ contains an example job using the new kind with model."""
+    from pathlib import Path
+
+    plan = Path(__file__).resolve().parent.parent / "docs" / "plan-v1.md"
+    plan_text = plan.read_text()
+    # Verify codex's flag is enumerated in the AGENT_MODEL_FLAGS comment block,
+    # not just that the substring "codex" appears somewhere in the file.
+    assert re.search(r"--model` for\s+`codex`", plan_text), (
+        "plan-v1.md model-flags comment must list --model as codex's flag"
+    )
+
+    deploy_dir = Path(__file__).resolve().parent.parent / "deploy" / "jobs.d"
+    found = False
+    for yml in deploy_dir.glob("*.yaml"):
+        content = yml.read_text()
+        if "agent_kind: codex" in content and "model:" in content:
+            found = True
+            break
+    assert found, (
+        "deploy/jobs.d/ must contain an example job with agent_kind: codex and model:"
+    )

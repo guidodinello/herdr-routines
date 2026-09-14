@@ -235,8 +235,9 @@ Notes on the schema:
   message since they fail earlier as `agent_prompt_failed` rather than `no_report` — and
   checks the systemd unit's `TimeoutStartSec` covers the worst-case tick duration.
 - `model` is passed as a native arg after `--`, using the flag pinned down per `agent_kind` in
-  `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `-m` for `opencode`. Config load
-  rejects a non-null `model` for any other `agent_kind` rather than guessing its flag.
+  `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `-m` for `opencode`, `--model` for
+  `codex` (see `codex --help`). Config load rejects a non-null `model` for any other
+  `agent_kind` rather than guessing its flag.
 
 ---
 
