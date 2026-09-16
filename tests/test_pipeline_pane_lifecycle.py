@@ -83,3 +83,45 @@ def test_proposal_doc_marked_implemented() -> None:
     assert "auto/pipeline-20260825T021919Z" in text
     # Should still reference the evidence but not be marked as proposal
     assert "PR" in text
+
+
+# ---------------------------------------------------------------------------
+# Issue 011: pane/session retention — retention policy documented
+# ---------------------------------------------------------------------------
+
+RETENTION_DOC = REPO_ROOT / "docs" / "process" / "pane-retention.md"
+
+
+def test_retention_policy_documented() -> None:
+    """AC 8: Retention policy is documented in docs/process/pane-retention.md
+    (and referenced from docs/pipeline/design.md) stating: panes close immediately
+    after capture (exceptions: blocked stays open, root never closes), artifacts
+    retained 14 days, pruning explicit/opt-in only, session_id retained indefinitely."""
+    assert RETENTION_DOC.exists(), "docs/process/pane-retention.md must exist"
+    text = _read(RETENTION_DOC)
+
+    # Pane cleanup policy
+    assert "immediately after tail capture" in text.lower()
+    assert "blocked" in text
+    assert "stays open" in text.lower()
+    assert "root" in text
+    assert "never closes" in text.lower()
+
+    # Artifact retention window
+    assert "14 days" in text
+
+    # Pruning is explicit, not automatic
+    assert "opt-in" in text.lower() or "explicit" in text.lower()
+
+    # Session id retained indefinitely
+    assert "session_id" in text
+    assert "indefinite" in text.lower()
+
+    # Ordering invariant documented
+    assert "capture" in text.lower()
+    assert "session_id" in text
+    assert "pane_close" in text or "pane close" in text.lower()
+
+    # Reference from design.md
+    design_text = _read(DESIGN)
+    assert "pane-retention.md" in design_text

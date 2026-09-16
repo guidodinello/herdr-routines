@@ -887,6 +887,9 @@ class FakePrDispatchClient:
     def agent_read(self, target, *, lines=200):
         return ""
 
+    def agent_read_visible(self, target, *, lines=200):
+        return ""
+
     def pane_close(self, pane_id):
         pass
 
@@ -2304,3 +2307,95 @@ def test_blocked_does_not_renotify_on_next_tick(
     assert same_run_count == 1, (
         f"run_id {first_run_id!r} was notified {same_run_count} times (expected exactly 1)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue 011: pane/session retention — pipeline workers capture tail before close
+# ---------------------------------------------------------------------------
+
+
+class TailTrackingFixClient:
+    """Records whether agent_read_visible was called before pane_close in
+    _dispatch_fix_worker, and writes visible screen content to the tail file."""
+
+    def __init__(self, *, visible_screen: str = "") -> None:
+        self.visible_screen = visible_screen
+        self.calls: list[str] = []
+        self.closed_panes: list[str] = []
+        self.read_visible_before_close: bool | None = None
+
+    def tab_create(self, *, cwd, label=None):
+        self.calls.append("tab_create")
+        return "w1:p1"
+
+    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+        self.calls.append("agent_start")
+
+    def agent_interactive_ready(self, target):
+        return True
+
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        self.calls.append("agent_prompt_wait_with_watchdog")
+        return "idle"
+
+    def agent_read(self, target, *, lines=200):
+        self.calls.append("agent_read")
+        return ""
+
+    def agent_read_visible(self, target, *, lines=200):
+        self.calls.append("agent_read_visible")
+        return self.visible_screen
+
+    def pane_close(self, pane_id):
+        self.calls.append("pane_close")
+        self.closed_panes.append(pane_id)
+        self.read_visible_before_close = "agent_read_visible" in self.calls
+
+    def agent_session_id(self, target):
+        self.calls.append("agent_session_id")
+        return "ses_pipeline123"
+
+    def agent_statuses(self) -> dict[str, str]:
+        return {}
+
+
+def test_pipeline_workers_capture_tail_before_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 6: Pipeline gated/base workers mirror the same capture-before-close with
+    agent_read_visible --lines 200 and single tail file."""
+    from herdr_routines.auto_fix import PRInfo
+    from herdr_routines.tick import _dispatch_fix_worker
+
+    branch = "auto/pipeline-20260913T050000Z"
+    repo = _init_repo_with_branch(tmp_path, branch=branch)
+
+    job = make_fix_worker_job(tmp_path, repo=repo)
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+
+    client = TailTrackingFixClient(visible_screen="pipeline worker tail output")
+    pr = PRInfo(
+        number=99, head_ref=branch, author="bot", url="https://example.invalid/99"
+    )
+
+    outcome = _dispatch_fix_worker(
+        job=job,
+        pr=pr,
+        reason="failing_checks",
+        run_id="auto-fix-prs-20260913T050000Z",
+        attempt=0,
+        owner="acme",
+        repo="widgets",
+        client=client,  # type: ignore[arg-type]
+        failing_checks="",
+        thread_bodies="",
+    )
+
+    assert outcome["state"] == "done"
+    assert client.read_visible_before_close is True
+    # Visible source used, not recent-unwrapped.
+    assert "agent_read_visible" in client.calls
+    assert "agent_read" not in client.calls
+    assert "pane_close" in client.calls

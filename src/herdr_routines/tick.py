@@ -893,15 +893,18 @@ def _process_base_target(
         )
         return f"{job.name}: failed (agent_prompt_failed)", True
 
-    try:
-        tail = client.agent_read(agent_name, lines=200)
-        if tail:
-            (report_path.parent / f"{run_id}.tail.txt").write_text(tail)
-    except OSError:
-        pass
+    _capture_visible_tail(
+        client, agent_name, reports_dir=report_path.parent, run_id=run_id
+    )
 
     report_written = report_path.exists()
     _report_bytes = report_path.stat().st_size if report_written else 0
+
+    session_id: str | None = None
+    try:
+        session_id = client.agent_session_id(agent_name)
+    except Exception as e:  # noqa: BLE001 — session id is best-effort reporting data
+        log.debug("could not read session id for %s: %s", agent_name, e)
 
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
     _cleanup_worktree(job.repo, fix_wt_path)
@@ -928,6 +931,7 @@ def _process_base_target(
                 "report_path": str(report_path) if report_written else None,
                 "report_written": report_written,
                 "final_agent_status": settled_status,
+                "session_id": session_id,
             },
         ),
     )
@@ -1197,12 +1201,9 @@ def _dispatch_fix_worker(
         }
 
     # Capture tail and close pane
-    try:
-        tail = client.agent_read(agent_name, lines=200)
-        if tail:
-            (report_path.parent / f"{pr_run_id}.tail.txt").write_text(tail)
-    except OSError:
-        pass
+    _capture_visible_tail(
+        client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id
+    )
 
     report_written = report_path.exists()
     report_bytes = report_path.stat().st_size if report_written else 0

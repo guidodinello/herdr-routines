@@ -1,7 +1,7 @@
 ---
 id: "011"
 title: "Pane/session retention policy"
-status: open
+status: done
 priority: low
 area: pipeline
 ---
