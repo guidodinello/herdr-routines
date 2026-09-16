@@ -106,13 +106,26 @@ def test_agent_start_passes_opencode_model_via_native_flag() -> None:
     assert argv[-3:] == ["--", "-m", "opencode/big-pickle"]
 
 
+def test_build_agent_start_args_codex_includes_model_flag() -> None:
+    from herdr_routines.herdr import build_agent_start_args
+
+    args = build_agent_start_args(
+        name="rt-a",
+        kind="codex",
+        pane_id="w1:p1",
+        start_timeout_ms=120_000,
+        model="o3",
+    )
+    assert args[-3:] == ["--", "--model", "o3"]
+
+
 def test_agent_start_rejects_model_for_unsupported_kind() -> None:
     runner = FakeRunner([])
     client = HerdrClient(runner=runner)
-    with pytest.raises(ValueError, match="codex"):
+    with pytest.raises(ValueError, match="gemini"):
         client.agent_start(
             name="rt-a",
-            kind="codex",
+            kind="gemini",
             pane_id="w1:p1",
             start_timeout_ms=120_000,
             model="something",
