@@ -1628,6 +1628,8 @@ def _classify_pipeline_outcome(report_text: str) -> tuple[str, str | None]:
     if status.startswith("failed"):
         if "watchdog" in status:
             return "failed", "watchdog_killed"
+        if "quota_exhausted" in status:
+            return "failed", "quota_exhausted"
         return "failed", "orchestrator_failed"
     return "interrupted_unknown", "outcome_marker_unrecognized"
 
@@ -1702,6 +1704,11 @@ def _build_pipeline_launch_argv(
     ]
     if job.model:
         argv += ["--model", job.model]
+    # Same default the routine-job watchdog uses (tick.py's other call site, runner.py's
+    # DEFAULT_FAILURE_MARKERS) — the launcher polls the orchestrator's visible screen for
+    # this so a quota-exhaustion wedge fails fast instead of burning the full deadline.
+    for marker in job.failure_markers or ("Free usage exceeded",):
+        argv += ["--failure-marker", marker]
     return argv
 
 
@@ -1763,6 +1770,39 @@ def _process_pipeline_job(
                 if _notify_gate(job, "success"):
                     _notify(client, f"herdr-routines: {job.name} done", sound="done")
                 return f"{job.name}: done", False
+
+            # Retry once with fallback_model, same bound as the routine-job path
+            # (tick._process_job): a run that is itself already a fallback attempt
+            # (extra.reason == "fallback_retry") never chains a second one, so two
+            # exhausted providers in one night still terminates rather than looping.
+            already_fallback = (open_run.extra or {}).get("reason") == "fallback_retry"
+            if (
+                reason == "quota_exhausted"
+                and job.fallback_model
+                and job.fallback_model != job.model
+                and not already_fallback
+            ):
+                log.info(
+                    "%s: orchestrator quota_exhausted, retrying once with "
+                    "fallback_model=%r",
+                    job.name,
+                    job.fallback_model,
+                )
+                fallback_run_id = make_run_id(job.name, now)
+                fallback_bare_run_id = _bare_pipeline_run_id(job.name, fallback_run_id)
+                return _launch_pipeline_run(
+                    replace(job, model=job.fallback_model),
+                    history_path,
+                    client=client,
+                    now=now,
+                    run_id=fallback_run_id,
+                    bare_run_id=fallback_bare_run_id,
+                    running_extra={
+                        "reason": "fallback_retry",
+                        "primary_run_id": open_run.run_id,
+                    },
+                )
+
             if _notify_gate(job, "failure"):
                 _notify(
                     client,
@@ -1884,6 +1924,35 @@ def _process_pipeline_job(
     assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
     bare_run_id = _bare_pipeline_run_id(job.name, run_id)
+    return _launch_pipeline_run(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        run_id=run_id,
+        bare_run_id=bare_run_id,
+        running_extra={
+            "scheduled_for": result.occurrence.isoformat(),
+            "late_seconds": result.late_seconds,
+        },
+    )
+
+
+def _launch_pipeline_run(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    run_id: str,
+    bare_run_id: str,
+    running_extra: dict[str, Any],
+) -> tuple[str, bool]:
+    """Sync the repo, launch the detached orchestrator unit, and record the outcome.
+    Shared by the scheduled Decision.RUN dispatch and the same-tick quota_exhausted
+    fallback_model retry (`_process_pipeline_job`) — the two differ only in which run_id
+    they launch under and what goes in the `running` record's `extra` (scheduled_for/
+    late_seconds for the former, reason=fallback_retry/primary_run_id for the latter)."""
     report_path = pipeline_report_path(bare_run_id)
     unit_name = f"herdr-pipeline-{bare_run_id}"
 
@@ -1948,8 +2017,7 @@ def _process_pipeline_job(
             state="running",
             run_id=run_id,
             extra={
-                "scheduled_for": result.occurrence.isoformat(),
-                "late_seconds": result.late_seconds,
+                **running_extra,
                 "pipeline_run_id": bare_run_id,
                 "report": str(report_path),
                 "unit": unit_name,

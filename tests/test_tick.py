@@ -1599,6 +1599,176 @@ def test_pipeline_partial_deadline_report_is_tolerated_but_failed(
     assert outcome.any_job_failed is True
 
 
+def test_pipeline_quota_exhausted_report_is_classified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pipeline-launch.sh's quota-exhaustion stub (`## Outcome: failed
+    (quota_exhausted)`) must reconcile to reason=quota_exhausted, not the generic
+    orchestrator_failed catch-all — that reason is what gates the fallback_model retry
+    below."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("## Outcome: failed (quota_exhausted)\n")
+
+    t2 = t1 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: failed (quota_exhausted)",)
+    assert outcome.any_job_failed is True
+
+
+def test_pipeline_retries_once_with_fallback_model_after_quota_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `fallback_model`-configured pipeline job gets one same-tick relaunch, under a
+    fresh run_id, when the primary orchestrator's report classifies as quota_exhausted —
+    mirrors the routine-job path (tick._process_job) instead of waiting for the next
+    scheduled cron occurrence."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path, fallback_model="fallback-model")
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+
+    launches: list[list[str]] = []
+
+    def fake_launch(argv, *, timeout_s=30.0):
+        launches.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    primary = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = primary.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("## Outcome: failed (quota_exhausted)\n")
+
+    t2 = t1 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries[0].startswith("nightly-pipeline: dispatched")
+    assert outcome.any_job_failed is False
+
+    assert len(launches) == 2  # primary (previous tick) + fallback (this tick)
+    fallback_argv = launches[-1]
+    assert "fallback-model" in fallback_argv
+
+    records = read_job(history_path, job.name)
+    running_records = [r for r in records if r.state == "running"]
+    assert len(running_records) == 2
+    fallback_run = running_records[-1]
+    assert fallback_run.run_id != primary.run_id
+    assert fallback_run.extra is not None
+    assert fallback_run.extra["reason"] == "fallback_retry"
+    assert fallback_run.extra["primary_run_id"] == primary.run_id
+    # A distinct bare run_id => a distinct report path, no collision with the primary's.
+    assert fallback_run.extra["pipeline_run_id"] != bare_run_id
+
+
+def test_pipeline_fallback_retry_does_not_chain_a_second_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback attempt itself hitting quota_exhausted must terminate, not launch a
+    third run — bounded to exactly one retry so two exhausted providers in one night
+    can't loop."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path, fallback_model="fallback-model")
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    launches: list[list[str]] = []
+
+    def fake_launch(argv, *, timeout_s=30.0):
+        launches.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    primary = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    primary_bare = primary.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    reports_dir = tmp_path / "state" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / f"pipeline-{primary_bare}.md").write_text(
+        "## Outcome: failed (quota_exhausted)\n"
+    )
+
+    t2 = t1 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    fallback_run = [
+        r for r in read_job(history_path, job.name) if r.state == "running"
+    ][-1]
+    fallback_bare = fallback_run.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    (reports_dir / f"pipeline-{fallback_bare}.md").write_text(
+        "## Outcome: failed (quota_exhausted)\n"
+    )
+
+    t3 = t2 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t3)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: failed (quota_exhausted)",)
+    assert outcome.any_job_failed is True
+    assert len(launches) == 2  # no third launch
+
+
+def test_pipeline_no_fallback_retry_when_fallback_model_not_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a configured fallback_model, quota_exhausted is terminal — same
+    no-change-in-behavior guarantee the routine-job path gives."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path, fallback_model=None)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    launches: list[list[str]] = []
+
+    def fake_launch(argv, *, timeout_s=30.0):
+        launches.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("## Outcome: failed (quota_exhausted)\n")
+
+    t2 = t1 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: failed (quota_exhausted)",)
+    assert len(launches) == 1  # only the primary — no fallback attempted
+
+
 def _dispatch_pipeline_and_get_run_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Any, Any, Any, str, Path]:
