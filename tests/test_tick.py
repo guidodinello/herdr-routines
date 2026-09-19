@@ -887,6 +887,9 @@ class FakePrDispatchClient:
     def agent_read(self, target, *, lines=200):
         return ""
 
+    def agent_read_visible(self, target, *, lines=200):
+        return ""
+
     def pane_close(self, pane_id):
         pass
 
@@ -2174,3 +2177,393 @@ def test_tick_reconciles_launcher_failure_stub(
     records = read_job(history_path, job.name)
     assert [r.state for r in records[-1:]] == ["failed"]
     assert client.notifications  # a failure must notify
+
+
+# ---------------------------------------------------------------------------
+# Per-job retry (issue 008)
+# ---------------------------------------------------------------------------
+
+
+class FailOnceThenSucceedClient(FakeClient):
+    """Fails with the given fail_at on the first call, then succeeds on subsequent
+    attempts. Used to test the retry loop: execute_run is called multiple times
+    within the same tick, so the client's call counter tracks which attempt we're on."""
+
+    def __init__(self, *, fail_at: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._call_counts: dict[str, int] = {}
+        self._fail_at = fail_at
+
+    def _maybe_raise(self, call: str) -> None:
+        self._call_counts[call] = self._call_counts.get(call, 0) + 1
+        if call == self._fail_at and self._call_counts[call] == 1:
+            raise HerdrCliError(f"{call} boom", exit_code=1)
+
+
+class FailNTimesThenSucceedClient(FakeClient):
+    """Fails with the given fail_at for the first N calls, then succeeds."""
+
+    def __init__(self, *, fail_at: str, fail_count: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._call_counts: dict[str, int] = {}
+        self._fail_at = fail_at
+        self._fail_count = fail_count
+
+    def _maybe_raise(self, call: str) -> None:
+        self._call_counts[call] = self._call_counts.get(call, 0) + 1
+        if call == self._fail_at and self._call_counts[call] <= self._fail_count:
+            raise HerdrCliError(f"{call} boom", exit_code=1)
+
+
+def test_default_no_retry_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 2: a job with no retry_* keys that fails invokes
+    execute_run exactly once and appends exactly one terminal history record."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(fail_at="agent_start")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]  # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: failed (agent_start_failed)",)
+    records = read_job(history_path, job.name)
+    terminal = [r for r in records if r.state in ("done", "failed")]
+    assert len(terminal) == 1
+    assert terminal[0].state == "failed"
+    assert terminal[0].extra is not None
+    assert terminal[0].extra.get("attempt") == 0
+    assert terminal[0].extra.get("max_retries") == 0
+
+
+def test_retry_only_on_eligible_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 3: retry fires only when outcome.state == 'failed' and
+    outcome.reason in retry_on and attempt < retry_attempts. Unlisted reasons never
+    retry even with retry_attempts > 0. done/interrupted_unknown never retry."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    # retry_on only allows agent_start_failed, not agent_prompt_failed
+    job = make_job(
+        tmp_path,
+        retry_attempts=2,
+        retry_on=("agent_start_failed",),
+    )
+    config = RoutinesConfig(jobs=(job,))
+    # Fail with agent_prompt_failed (not in retry_on) → no retry despite retry_attempts=2
+    client = FakeClient(fail_at="agent_prompt_wait")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]  # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: failed (agent_prompt_failed)",)
+    records = read_job(history_path, job.name)
+    terminal = [r for r in records if r.state in ("done", "failed")]
+    # Only 1 terminal record: the initial failure, no retry
+    assert len(terminal) == 1
+    assert terminal[0].extra is not None
+    assert terminal[0].extra["attempt"] == 0
+
+
+def test_retry_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Acceptance criterion 4: at most retry_attempts extra attempts are made
+    synchronously, then the final failure is recorded and no further attempt occurs."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr("herdr_routines.tick.time.sleep", lambda s: None)
+    history_path = tmp_path / "state" / "history.jsonl"
+    # retry_attempts=2 means 2 extra attempts after the first failure = 3 total
+    job = make_job(
+        tmp_path,
+        retry_attempts=2,
+        retry_on=("agent_start_failed",),
+    )
+    config = RoutinesConfig(jobs=(job,))
+    # Fail agent_start every time → exhaust retries
+    client = FailNTimesThenSucceedClient(
+        fail_at="agent_start", fail_count=10, settle_status="idle"
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]  # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: failed (agent_start_failed)",)
+    records = read_job(history_path, job.name)
+    # 1 running + 1 failed (attempt 0) + 2 retries (running+failed each) + 1 final failed
+    # = running(0) + failed(0) + running(1) + failed(1) + running(2) + failed(2)
+    terminal = [r for r in records if r.state == "failed"]
+    running = [r for r in records if r.state == "running"]
+    assert len(terminal) == 3  # attempt 0, 1, 2 all failed
+    assert len(running) == 3  # initial + retry1 + retry2
+    # Final terminal record shows attempt 2 and final_attempt=True
+    last_terminal = terminal[-1]
+    assert last_terminal.extra is not None
+    assert last_terminal.extra["attempt"] == 2
+    assert last_terminal.extra["final_attempt"] is True
+
+
+def test_retry_history_distinct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion 5: each attempt is logged distinctly with attempt index,
+    distinct run_id (-retryN suffix), and last_terminal_run returns the final attempt."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr("herdr_routines.tick.time.sleep", lambda s: None)
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(
+        tmp_path,
+        retry_attempts=1,
+        retry_on=("agent_start_failed",),
+    )
+    config = RoutinesConfig(jobs=(job,))
+    # Fail once, then succeed on retry
+    client = FailOnceThenSucceedClient(fail_at="agent_start", settle_status="idle")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]  # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    records = read_job(history_path, job.name)
+    run_records = [r for r in records if r.run_id is not None]
+
+    # running(0) + failed(0) + running(retry1) + done(retry1)
+    assert [r.state for r in run_records] == ["running", "failed", "running", "done"]
+    running0, failed0, running1, done1 = run_records
+
+    # Distinct run_ids: attempt 0 keeps original, attempt 1 gets -retry1 suffix
+    assert running0.run_id is not None
+    assert failed0.run_id == running0.run_id
+    assert running1.run_id == f"{running0.run_id}-retry1"
+    assert done1.run_id == running1.run_id
+
+    # Attempt metadata visible in extra
+    assert failed0.extra is not None
+    assert failed0.extra["attempt"] == 0
+    assert failed0.extra["retry_eligible_reason"] == "agent_start_failed"
+    assert done1.extra is not None
+    assert done1.extra["attempt"] == 1
+    assert done1.extra["final_attempt"] is True
+
+    # last_terminal_run returns the final attempt's record (the done)
+    from herdr_routines.history import last_terminal_run
+
+    last = last_terminal_run(history_path, job.name)
+    assert last is not None
+    assert last.state == "done"
+    assert last.run_id == running1.run_id
+
+
+# ---------------------------------------------------------------------------
+# Issue 007: Approval path for blocked runs
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_emits_single_actionable_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 1: A blocked settle emits exactly one actionable notification whose body
+    identifies the job, run_id, pane_id and agent, and includes a permission prompt
+    excerpt (truncated, best-effort) plus an approval hint; title is
+    ``herdr-routines: <job> blocked`` and sound is ``request``."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(settle_status="blocked")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.any_job_failed is True
+    assert len(client.notifications) == 1
+    title, body, sound = client.notifications[0]
+    assert title == "herdr-routines: a blocked"
+    assert sound == "request"
+    assert body is not None
+    assert "job=a" in body
+    assert "run=" in body
+    assert "pane=" in body
+    assert "agent=" in body
+    assert "Reply to this message to approve" in body
+
+
+def test_blocked_notification_gated_as_failure_across_all_policies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 2: The blocked notification is gated as ``failure`` so it fires under every
+    ``notify_policy`` (always, terminal, on-finding, on-failure) and is never suppressed."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    for policy in ("always", "terminal", "on-finding", "on-failure"):
+        history_path = tmp_path / "state" / f"history-{policy}.jsonl"
+        job = make_job(tmp_path, notify_policy=policy)
+        config = RoutinesConfig(jobs=(job,))
+        client = FakeClient(settle_status="blocked")
+
+        t0 = datetime.now(UTC).replace(microsecond=0)
+        run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+        t1 = t0 + timedelta(minutes=1)
+        run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+        assert len(client.notifications) >= 1, (
+            f"blocked must notify under notify_policy={policy}"
+        )
+        last_title = client.notifications[-1][0]
+        assert last_title == "herdr-routines: a blocked", (
+            f"wrong title under notify_policy={policy}"
+        )
+        client.notifications.clear()
+
+
+def test_blocked_does_not_renotify_on_next_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 3: A blocked run_id is notified exactly once — a subsequent tick does not
+    re-notify for the same terminal failed/blocked record (last_terminal_run advances
+    past it)."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeClient(settle_status="blocked")
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type] # blocked
+
+    blocked_notifications = [
+        n for n in client.notifications if n[0] == "herdr-routines: a blocked"
+    ]
+    assert len(blocked_notifications) == 1
+    first_body = blocked_notifications[0][1]
+    assert first_body is not None
+
+    # Extract the run_id from the notification body to verify exact-once.
+    first_run_id = next(
+        line.split("=", 1)[1]
+        for line in first_body.splitlines()
+        if line.startswith("run=")
+    )
+
+    # A subsequent tick may start a *new* run (new cron occurrence) that also gets
+    # blocked — that's a fresh notification for a different run_id. The spec contract
+    # is that the *same* run_id is never re-notified.
+    t2 = t1 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+
+    all_blocked_bodies = [
+        n[1] for n in client.notifications if n[0] == "herdr-routines: a blocked"
+    ]
+    same_run_count = sum(
+        1
+        for body in all_blocked_bodies
+        if body is not None and f"run={first_run_id}" in body
+    )
+    assert same_run_count == 1, (
+        f"run_id {first_run_id!r} was notified {same_run_count} times (expected exactly 1)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue 011: pane/session retention — pipeline workers capture tail before close
+# ---------------------------------------------------------------------------
+
+
+class TailTrackingFixClient:
+    """Records whether agent_read_visible was called before pane_close in
+    _dispatch_fix_worker, and writes visible screen content to the tail file."""
+
+    def __init__(self, *, visible_screen: str = "") -> None:
+        self.visible_screen = visible_screen
+        self.calls: list[str] = []
+        self.closed_panes: list[str] = []
+        self.read_visible_before_close: bool | None = None
+
+    def tab_create(self, *, cwd, label=None):
+        self.calls.append("tab_create")
+        return "w1:p1"
+
+    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+        self.calls.append("agent_start")
+
+    def agent_interactive_ready(self, target):
+        return True
+
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        self.calls.append("agent_prompt_wait_with_watchdog")
+        return "idle"
+
+    def agent_read(self, target, *, lines=200):
+        self.calls.append("agent_read")
+        return ""
+
+    def agent_read_visible(self, target, *, lines=200):
+        self.calls.append("agent_read_visible")
+        return self.visible_screen
+
+    def pane_close(self, pane_id):
+        self.calls.append("pane_close")
+        self.closed_panes.append(pane_id)
+        self.read_visible_before_close = "agent_read_visible" in self.calls
+
+    def agent_session_id(self, target):
+        self.calls.append("agent_session_id")
+        return "ses_pipeline123"
+
+    def agent_statuses(self) -> dict[str, str]:
+        return {}
+
+
+def test_pipeline_workers_capture_tail_before_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC 6: Pipeline gated/base workers mirror the same capture-before-close with
+    agent_read_visible --lines 200 and single tail file."""
+    from herdr_routines.auto_fix import PRInfo
+    from herdr_routines.tick import _dispatch_fix_worker
+
+    branch = "auto/pipeline-20260913T050000Z"
+    repo = _init_repo_with_branch(tmp_path, branch=branch)
+
+    job = make_fix_worker_job(tmp_path, repo=repo)
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+
+    client = TailTrackingFixClient(visible_screen="pipeline worker tail output")
+    pr = PRInfo(
+        number=99, head_ref=branch, author="bot", url="https://example.invalid/99"
+    )
+
+    outcome = _dispatch_fix_worker(
+        job=job,
+        pr=pr,
+        reason="failing_checks",
+        run_id="auto-fix-prs-20260913T050000Z",
+        attempt=0,
+        owner="acme",
+        repo="widgets",
+        client=client,  # type: ignore[arg-type]
+        failing_checks="",
+        thread_bodies="",
+    )
+
+    assert outcome["state"] == "done"
+    assert client.read_visible_before_close is True
+    # Visible source used, not recent-unwrapped.
+    assert "agent_read_visible" in client.calls
+    assert "agent_read" not in client.calls
+    assert "pane_close" in client.calls

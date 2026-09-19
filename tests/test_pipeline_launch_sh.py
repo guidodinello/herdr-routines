@@ -288,3 +288,23 @@ def test_launcher_custom_failure_marker_replaces_default(tmp_path: Path) -> None
     report_text = report_path.read_text()
     assert "## Outcome: failed" in report_text
     assert "quota_exhausted" not in report_text
+
+
+def test_pipeline_launcher_captures_visible_tail_on_failure(tmp_path: Path) -> None:
+    """AC 7: Pipeline launcher captures visible --lines 200 to sibling
+    ${RUN_ID}.tail.txt before pane close on non-idle/done settle."""
+    tail_text = "orchestrator stuck on quota modal"
+    report_path, call_log = _run_launcher(
+        tmp_path, settle_status="unknown", tail_text=tail_text
+    )
+
+    run_id = report_path.stem.removeprefix("pipeline-")
+    tail_file = report_path.parent / f"{run_id}.tail.txt"
+    assert tail_file.exists()
+    assert tail_text in tail_file.read_text()
+
+    # Verify visible source and 200-line bound in the call log.
+    lines = call_log.read_text().splitlines()
+    read_calls = [l for l in lines if l.startswith("agent read")]
+    assert any("--source visible" in l for l in read_calls)
+    assert any("--lines 200" in l for l in read_calls)

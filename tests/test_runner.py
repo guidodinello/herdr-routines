@@ -277,7 +277,7 @@ def test_execute_run_success_writes_report(
         "agent_start",
         "agent_interactive_ready",
         "agent_prompt_wait",
-        "agent_read",
+        "agent_read_visible",
         "agent_session_id",
         "pane_close",
     ]
@@ -354,17 +354,17 @@ def test_execute_run_nudge_success_ends_done_and_records_nudged(
     assert outcome.report_written is True
     assert outcome.report_bytes > 0
     assert outcome.nudged is True
-    # Pins the nudge strictly before the pane close (worktree mode): the second
-    # agent_prompt_wait call must land between the diagnostic tail read and pane_close, or the
-    # still-open agent would no longer be reachable.
+    # Pins the nudge strictly before the visible-tail capture, which is itself before
+    # pane_close (issue 011 spec v2 L33: nudge stays before capture so the tail
+    # reflects the nudge's final screen).
     assert client.calls == [
         "settled_agent_pane",
         "worktree_create",
         "agent_start",
         "agent_interactive_ready",
         "agent_prompt_wait",
-        "agent_read",
         "agent_prompt_wait",
+        "agent_read_visible",
         "agent_session_id",
         "pane_close",
     ]
@@ -1089,7 +1089,6 @@ def test_unknown_status_keeps_pane_alive(tmp_path: Path) -> None:
     outcome = execute_run(job, client, run_id="a-unknown")  # type: ignore[arg-type]
     assert outcome.state == "interrupted_unknown"
     assert "pane_close" not in client.calls
-    assert "agent_read_visible" not in client.calls
 
 
 def test_defensive_unsettled_status_reaps_pane(tmp_path: Path) -> None:
@@ -1412,3 +1411,171 @@ def test_execute_run_keeps_underlying_reason_when_disk_not_full(
     outcome = execute_run(job, client, run_id="a-run-038c")  # type: ignore[arg-type]
     assert outcome.state == "failed"
     assert outcome.reason == "agent_not_interactive"
+
+
+# ---------------------------------------------------------------------------
+# Issue 007: Approval path for blocked runs
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_leaves_pane_open_and_writes_tail(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """AC 4: A blocked settle leaves the pane open (no pane_close) and writes the
+    visible tail to reports/<run_id>.tail.txt via agent_read_visible, preserving the
+    steer target for phone approval."""
+    job = make_job(tmp_path)
+    run_id = "a-blocked-pane"
+    client = ScriptedClient(
+        agent_status="blocked", visible_screen="Do you want to allow? [y/n]"
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "blocked"
+    assert outcome.pane_id == "w1:p1"
+    assert "pane_close" not in client.calls
+    assert "agent_read_visible" in client.calls
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.exists()
+    assert tail_path.read_text() == "Do you want to allow? [y/n]"
+
+
+def test_blocked_prompt_excerpt_is_truncated_and_best_effort() -> None:
+    """AC 5: Prompt excerpt extraction is truncated (<=300 chars), agent-agnostic,
+    and never fails the run — an empty or unparseable tail still produces a valid
+    excerpt."""
+    from herdr_routines.runner import extract_prompt_excerpt
+
+    # Empty tail
+    assert extract_prompt_excerpt("") == ""
+
+    # Keyword match — permission prompt
+    tail = "some noise\nDo you want to approve? [y/n]\nmore noise"
+    excerpt = extract_prompt_excerpt(tail)
+    assert "approve" in excerpt.lower()
+    assert excerpt == "Do you want to approve? [y/n]"
+
+    # Oversized line gets truncated to 300 chars
+    long_line = "approve " * 50  # 400 chars
+    excerpt = extract_prompt_excerpt(long_line)
+    assert len(excerpt) <= 300
+    assert excerpt.endswith("...")
+
+    # No keyword: returns last non-empty line
+    tail = "no keywords here\nlast line"
+    assert extract_prompt_excerpt(tail) == "last line"
+
+    # Pure whitespace — no keyword match, no non-empty line
+    assert extract_prompt_excerpt("   \n  \n  ") == ""
+
+
+# ---------------------------------------------------------------------------
+# Issue 011: pane/session retention — success-path visible tail capture
+# ---------------------------------------------------------------------------
+
+
+def test_success_captures_bounded_visible_tail_before_close(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """AC 1: Routine success (idle with non-empty report) persists a bounded visible tail
+    to reports/{run_id}.tail.txt before pane close."""
+    job = make_job(tmp_path)
+    run_id = "a-success-tail"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(
+        agent_status="idle",
+        write_report_at=report_path,
+        visible_screen="last screenful of agent output\nline 2\nline 3",
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.exists()
+    assert "last screenful" in tail_path.read_text()
+    # Pane close must come after the tail is on disk.
+    assert client.calls.index("agent_read_visible") < client.calls.index("pane_close")
+
+
+def test_success_tail_uses_visible_source_and_single_write(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """AC 2: Success tail is a single write via agent_read_visible --lines 200 (visible
+    source, 200-line bound); no leftover recent-unwrapped write and no dual-write."""
+    job = make_job(tmp_path)
+    run_id = "a-visibility"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(
+        agent_status="idle",
+        write_report_at=report_path,
+        visible_screen="visible output only",
+    )
+    execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    # agent_read_visible must have been called (visible source), agent_read must not.
+    assert "agent_read_visible" in client.calls
+    assert "agent_read" not in client.calls
+    # Exactly one tail file produced.
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.exists()
+    assert tail_path.read_text() == "visible output only"
+
+
+def test_capture_before_session_id_before_close_invariant(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """AC 3: Ordering invariant on success: agent_read_visible (tail) → agent_session_id →
+    pane_close; pane is never closed before tail is on disk."""
+    job = make_job(tmp_path)
+    run_id = "a-order"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(
+        agent_status="idle",
+        write_report_at=report_path,
+        visible_screen="diagnostic tail",
+    )
+    execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    idx_tail = client.calls.index("agent_read_visible")
+    idx_sid = client.calls.index("agent_session_id")
+    idx_close = client.calls.index("pane_close")
+    assert idx_tail < idx_sid < idx_close
+
+
+def test_blocked_captures_tail_but_leaves_pane_open(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """AC 4: blocked settle captures visible tail via agent_read_visible but skips
+    pane_close and session_id (pane stays open for human)."""
+    job = make_job(tmp_path)
+    run_id = "a-blocked-retention"
+    client = ScriptedClient(
+        agent_status="blocked",
+        visible_screen="waiting on approval [y/n]",
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "blocked"
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.exists()
+    assert "waiting on approval" in tail_path.read_text()
+    assert "pane_close" not in client.calls
+    assert "agent_session_id" not in client.calls
+
+
+def test_root_mode_never_closes_pane(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """AC 5: root workspace jobs never call pane_close and never capture session_id
+    on success; tail capture remains best-effort."""
+    job = make_job(tmp_path, workspace="root")
+    run_id = "a-root-retention"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    client = ScriptedClient(
+        agent_status="idle",
+        write_report_at=report_path,
+        visible_screen="root tail",
+    )
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert "pane_close" not in client.calls
+    assert "agent_session_id" not in client.calls
+    # Tail capture is best-effort — it still fires in root mode.
+    assert "agent_read_visible" in client.calls

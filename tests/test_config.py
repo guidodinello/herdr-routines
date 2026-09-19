@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -280,7 +281,7 @@ def test_empty_jobs_list_is_valid(tmp_config_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "agent_kind,model",
-    [("claude", "opus"), ("opencode", "opencode/big-pickle")],
+    [("claude", "opus"), ("opencode", "opencode/big-pickle"), ("codex", "o3")],
 )
 def test_model_is_accepted_for_supported_agent_kinds(
     tmp_config_path: Path, agent_kind: str, model: str
@@ -307,11 +308,48 @@ jobs:
   - name: a
     cron: "0 3 * * *"
     repo: /repo/a
-    agent_kind: codex
+    agent_kind: gemini
     model: some-model
 """
     with pytest.raises(ConfigError, match="model"):
         load_config(write(tmp_config_path, text))
+
+
+def test_model_accepted_for_codex_kind(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: codex
+    model: o3
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.model == "o3"
+
+
+def test_model_rejected_for_unsupported_kind_mentions_supported_list(
+    tmp_config_path: Path,
+) -> None:
+    from herdr_routines.config import AGENT_MODEL_FLAGS
+
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: gemini
+    model: some-model
+"""
+    with pytest.raises(ConfigError, match="supported") as exc_info:
+        load_config(write(tmp_config_path, text))
+    msg = str(exc_info.value)
+    for kind in sorted(AGENT_MODEL_FLAGS):
+        assert kind in msg
 
 
 def test_non_string_model_raises(tmp_config_path: Path) -> None:
@@ -356,14 +394,14 @@ def test_defaults_fallback_model_is_inert_for_unsupported_agent_kind(
 ) -> None:
     """Regression (PR #65 review): fallback_model in defaults.yaml is deliberately shared
     across every job (unlike model). A job whose own agent_kind doesn't support model
-    selection at all (e.g. codex) must still load — the inherited default is simply inert
+    selection at all (e.g. gemini) must still load — the inherited default is simply inert
     for it, not a config error. Only an *explicit* per-job fallback_model for an unsupported
     agent_kind stays an error (see test_fallback_model_raises_for_unsupported_agent_kind)."""
     jobs_dir = _make_jobs_d(
         tmp_path,
         {
             "defaults.yaml": "fallback_model: openrouter/free\n",
-            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\nagent_kind: codex\n",
+            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\nagent_kind: gemini\n",
         },
     )
     cfg = load_config(jobs_dir)
@@ -381,7 +419,7 @@ jobs:
   - name: a
     cron: "0 3 * * *"
     repo: /repo/a
-    agent_kind: codex
+    agent_kind: gemini
     fallback_model: some-model
 """
     with pytest.raises(ConfigError, match="fallback_model"):
@@ -1245,3 +1283,238 @@ def test_pipeline_deploy_example_loads_cleanly(tmp_path: Path) -> None:
     assert job is not None
     assert job.kind == "pipeline"
     assert job.catch_up_minutes == PIPELINE_CATCH_UP_MINUTES
+
+
+# -- retry_attempts / retry_on (issue 008) -------------------------------------------
+
+
+def test_retry_config_requires_explicit_eligible_reasons(tmp_config_path: Path) -> None:
+    """Acceptance criterion 1: retry_attempts > 0 without non-empty retry_on is rejected.
+    retry_on must contain known RunOutcome.reason strings; unlisted reasons are rejected."""
+    # retry_attempts > 0 with no retry_on → ConfigError
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 1
+"""
+    with pytest.raises(
+        ConfigError, match="retry_attempts.*requires non-empty 'retry_on'"
+    ):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts > 0 with retry_on: [] → ConfigError (empty list = null)
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 2
+    retry_on: []
+"""
+    with pytest.raises(
+        ConfigError, match="retry_attempts.*requires non-empty 'retry_on'"
+    ):
+        load_config(write(tmp_config_path, text))
+
+    # retry_on with unknown reason string → ConfigError
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 1
+    retry_on:
+      - agent_start_failed
+      - totally_bogus_reason
+"""
+    with pytest.raises(ConfigError, match="unknown reason.*totally_bogus_reason"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts > 0 with valid retry_on → succeeds
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 1
+    retry_on:
+      - agent_start_failed
+      - agent_not_interactive
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.retry_attempts == 1
+    assert job.retry_on == ("agent_start_failed", "agent_not_interactive")
+
+
+def test_retry_validation(tmp_config_path: Path) -> None:
+    """Acceptance criterion 6: validation rejects retry_attempts out of bounds / non-int /
+    bool, empty/null retry_on is valid, retry_on non-empty with retry_attempts == 0 warns,
+    and retry_attempts > 0 on workspace: root warns."""
+    # retry_attempts negative
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: -1
+"""
+    with pytest.raises(ConfigError, match="retry_attempts.*must be between 0 and 3"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts > 3
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 4
+"""
+    with pytest.raises(ConfigError, match="retry_attempts.*must be between 0 and 3"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts is a bool
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: true
+"""
+    with pytest.raises(ConfigError, match="retry_attempts.*must be an integer"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_attempts is a string
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: "one"
+"""
+    with pytest.raises(ConfigError, match="retry_attempts.*must be an integer"):
+        load_config(write(tmp_config_path, text))
+
+    # retry_on with empty list is valid (but inert)
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_on: []
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.retry_on is None  # empty list collapses to None
+
+    # retry_on non-empty with retry_attempts == 0 → warns (not error)
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    retry_attempts: 0
+    retry_on:
+      - agent_start_failed
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.retry_attempts == 0
+    assert job.retry_on == ("agent_start_failed",)
+
+    # retry_attempts > 0 on workspace: root → warns (not error)
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    workspace: root
+    retry_attempts: 1
+    retry_on:
+      - agent_start_failed
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.retry_attempts == 1
+
+    # retry_attempts and retry_on are NOT inheritable via defaults.yaml
+    text = """
+version: 1
+defaults:
+  retry_attempts: 1
+  retry_on: ["agent_start_failed"]
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+"""
+    with pytest.raises(ConfigError, match="unknown key.*retry_attempts"):
+        load_config(write(tmp_config_path, text))
+
+
+# ---------------------------------------------------------------------------
+# Issue 007: Approval path for blocked runs
+# ---------------------------------------------------------------------------
+
+
+def test_no_auto_approve_mode_rejects_permission_keys(tmp_config_path: Path) -> None:
+    """AC 7: config.py rejects unknown keys permission_mode, allow_dangerous,
+    skip_permissions (via unknown key ConfigError)."""
+    for bad_key in ("permission_mode", "allow_dangerous", "skip_permissions"):
+        text = f"""
+version: 1
+jobs:
+  - name: nightly-audit
+    cron: "0 3 * * *"
+    repo: /home/guido/projects/fitted
+    {bad_key}: auto
+"""
+        with pytest.raises(ConfigError, match="unknown key"):
+            load_config(write(tmp_config_path, text))
+
+
+# ---------------------------------------------------------------------------
+# Issue 018: Model selection per job beyond claude/opencode
+# ---------------------------------------------------------------------------
+
+
+def test_plan_docs_list_model_flags_for_new_kind() -> None:
+    """docs/plan-v1.md enumerates codex alongside claude/opencode in the model-flags
+    comment, and deploy/jobs.d/ contains an example job using the new kind with model."""
+    from pathlib import Path
+
+    plan = Path(__file__).resolve().parent.parent / "docs" / "plan-v1.md"
+    plan_text = plan.read_text()
+    # Verify codex's flag is enumerated in the AGENT_MODEL_FLAGS comment block,
+    # not just that the substring "codex" appears somewhere in the file.
+    assert re.search(r"--model` for\s+`codex`", plan_text), (
+        "plan-v1.md model-flags comment must list --model as codex's flag"
+    )
+
+    deploy_dir = Path(__file__).resolve().parent.parent / "deploy" / "jobs.d"
+    found = False
+    for yml in deploy_dir.glob("*.yaml"):
+        content = yml.read_text()
+        if "agent_kind: codex" in content and "model:" in content:
+            found = True
+            break
+    assert found, (
+        "deploy/jobs.d/ must contain an example job with agent_kind: codex and model:"
+    )
