@@ -1746,10 +1746,12 @@ def test_pipeline_no_fallback_retry_when_fallback_model_not_set(
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
     launches: list[list[str]] = []
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline",
-        lambda argv, **kw: (launches.append(argv), (0, "", ""))[1],
-    )
+
+    def fake_launch(argv, *, timeout_s=30.0):
+        launches.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
