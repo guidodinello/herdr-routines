@@ -233,6 +233,45 @@ Deliberately deferred (YAGNI, issue 022's log): an ordered multi-entry failover 
 per-fallback `agent_kind` override. Revisit if quota exhaustion recurs on the fallback
 provider too.
 
+## 10. Phase 4 (shipped 2026-09-19 — same wedge, on `kind: pipeline`'s orchestrator)
+
+Real incident: `feature-pipeline`'s 2026-09-19T050000Z run wedged the same way §1 describes,
+but on the orchestrator itself. `pipeline-launch.sh` had no watchdog — it did one blocking
+`herdr agent prompt --wait --timeout <deadline_ms>` (7h) — so the quota dialog burned the
+entire deadline before `settle_status` was even checked, at which point it was always
+`working`, never `blocked`/`idle`/`done`. §8's Python-side `agent_prompt_wait_with_watchdog`
+doesn't apply here: the launcher is a detached bash script under `systemd-run --user`, not
+`runner.execute_run`.
+
+Ported the same two pieces to the bash launcher, ~30s poll cadence
+(`PIPELINE_LAUNCH_POLL_INTERVAL_S`, mirrors `WATCHDOG_POLL_INTERVAL_S`) and env-overridable
+for tests:
+
+- **Fast-fail watchdog (§8's shape, shell version):** `herdr agent prompt --wait` now runs
+  backgrounded; a loop races a `sleep "$POLL_INTERVAL_S"` against it via `wait -n` (reaping
+  whichever finishes first — a naive `kill -0`-then-`sleep` loop leaves the prompt job a
+  zombie forever visible to `kill -0`, spinning indefinitely) and polls `herdr agent read
+  --source visible` for `--failure-marker` text (same `job.failure_markers` config,
+  `tick._build_pipeline_launch_argv` passes it through; defaults to `("Free usage
+  exceeded",)`). Same two-consecutive-poll stability gate as §8. On a confirmed match: the
+  wait job is killed, and the stub report's `## Outcome:` line reads `failed
+  (quota_exhausted)` instead of the generic `failed` — pointing tick at the actual reason
+  instead of the `orchestrator_failed` catch-all.
+- **fallback_model retry (§9's shape, pipeline version):** `tick._process_pipeline_job`
+  recognizes `quota_exhausted` in a reconciled report's Outcome line and, when
+  `job.fallback_model` is set and the failing run wasn't itself already a fallback attempt
+  (`extra.reason == "fallback_retry"`), relaunches immediately in the same tick via the new
+  `_launch_pipeline_run` helper (factored out of the scheduled Decision.RUN dispatch, now
+  shared by both call sites) under a fresh `make_run_id(job.name, now)` — a distinct bare
+  timestamp, not `f"{job.name}-fallback-..."`: the pipeline's bare run_id also names the
+  worker agents (`pl-<N>-<bare_run_id>`, capped at 32 chars) and the worktree/`state.json`
+  path, so it must stay a plain timestamp rather than growing a suffix. Bounded to one retry
+  the same way as §9, via the `fallback_retry` marker instead of a run_id substring.
+
+`feature-pipeline`'s live `fallback_model` already comes from the shared `defaults.yaml`
+entry §9 added (`openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`) — no config change was
+needed to enable this, only the tick/launcher plumbing above.
+
 ## Appendix: 2026-08-23 incident timeline
 
 - 05:30:14 fitted-implementer starts; prompt attempt 2/3 at 05:30:28 (early EmptyResponse

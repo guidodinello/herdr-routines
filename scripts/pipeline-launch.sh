@@ -19,7 +19,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-name NAME
                            [--agent-kind KIND] [--model MODEL] [--prompt-file PATH]
-                           [--wait-timeout-ms MS]
+                           [--wait-timeout-ms MS] [--failure-marker TEXT]...
 
   --run-id           bare UTC timestamp, e.g. 20260905T020000Z (fits the pl-<N>-<run_id>
                       worker agent-name cap once "pl-N-" is prepended)
@@ -37,6 +37,11 @@ Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-n
                       (default: docs/pipeline/orchestrator-prompt.md)
   --wait-timeout-ms  --wait timeout passed to `herdr agent prompt` (default: 25200000,
                       i.e. 7h — must match the job's deadline_ms)
+  --failure-marker   text to watch for on the orchestrator's visible screen while
+                      waiting (repeatable; default: "Free usage exceeded" — same as
+                      runner.py's DEFAULT_FAILURE_MARKERS). Two consecutive sightings of
+                      the same marker end the run early with an outcome of "failed
+                      (quota_exhausted)" instead of waiting out the full deadline.
 EOF
   exit 64
 }
@@ -49,6 +54,7 @@ RUN_ID=""
 REPO_PARENT=""
 REPORT=""
 AGENT_NAME=""
+FAILURE_MARKERS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -60,10 +66,20 @@ while [ $# -gt 0 ]; do
     --model) MODEL="$2"; shift 2 ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --wait-timeout-ms) WAIT_TIMEOUT_MS="$2"; shift 2 ;;
+    --failure-marker) FAILURE_MARKERS+=("$2"); shift 2 ;;
     -h|--help) usage ;;
     *) echo "pipeline-launch.sh: unknown argument: $1" >&2; usage ;;
   esac
 done
+
+if [ ${#FAILURE_MARKERS[@]} -eq 0 ]; then
+  FAILURE_MARKERS=("Free usage exceeded")
+fi
+
+# How often the wait-loop below polls the visible screen for a failure marker while the
+# orchestrator prompt is outstanding. Mirrors runner.py's WATCHDOG_POLL_INTERVAL_S (30s);
+# overridable so tests don't have to sleep for real.
+POLL_INTERVAL_S="${PIPELINE_LAUNCH_POLL_INTERVAL_S:-30}"
 
 for required in RUN_ID REPO_PARENT REPORT AGENT_NAME; do
   if [ -z "${!required}" ]; then
@@ -118,8 +134,60 @@ PROMPT_FILE_TMP="/tmp/full_prompt_${RUN_ID}.md"
 # --wait blocks until the orchestrator agent settles; the `cleanup` trap above closes
 # $WS_PANE on every exit path from here, normal or killed, instead of only a fall-through
 # (the 2026-08-24 leak this pattern fixes — see docs/pipeline/pane-lifecycle-v2-proposal.md).
-herdr agent prompt "$AGENT_NAME" "$(cat "$PROMPT_FILE_TMP")" --wait --timeout "$WAIT_TIMEOUT_MS"
-PROMPT_STATUS=$?
+#
+# Run it in the background and poll the visible screen concurrently for a quota-exhaustion
+# wedge (runner.py's _prompt_with_watchdog pattern, ported here): a provider's free-tier
+# limit dialog (e.g. "Free usage exceeded ... retrying in 11h 59m") never changes the
+# agent's herdr-visible state away from "working", so a plain blocking `--wait` would sit
+# for the entire multi-hour deadline before noticing. Two consecutive sightings of the SAME
+# marker (a stability gate against a transient screen tear) end the wait early.
+herdr agent prompt "$AGENT_NAME" "$(cat "$PROMPT_FILE_TMP")" --wait --timeout "$WAIT_TIMEOUT_MS" &
+WAIT_PID=$!
+
+QUOTA_MARKER=""
+PREV_HIT=""
+while kill -0 "$WAIT_PID" 2>/dev/null; do
+  # Race a fresh sleep against the still-running prompt job and reap whichever finishes
+  # first with `wait -n` — a plain `kill -0`-then-`sleep` loop leaves the prompt job a
+  # zombie once it exits (still visible to `kill -0` until something `wait`s it), which
+  # would spin this loop forever re-sleeping on a job that already finished.
+  sleep "$POLL_INTERVAL_S" &
+  SLEEP_PID=$!
+  wait -n 2>/dev/null || true
+  if ! kill -0 "$WAIT_PID" 2>/dev/null; then
+    # The prompt job finished (and was just reaped by wait -n above); drop the leftover
+    # sleep rather than let it become the next iteration's zombie.
+    kill "$SLEEP_PID" 2>/dev/null || true
+    wait "$SLEEP_PID" 2>/dev/null || true
+    break
+  fi
+  # Still running past a full poll interval — the sleep is what finished. Poll the screen.
+  SCREEN=$(herdr agent read "$AGENT_NAME" --source visible --lines 200 2>/dev/null)
+  HIT=""
+  for marker in "${FAILURE_MARKERS[@]}"; do
+    if [ -n "$marker" ] && printf '%s' "$SCREEN" | grep -qF "$marker"; then
+      HIT="$marker"
+      break
+    fi
+  done
+  if [ -n "$HIT" ] && [ "$HIT" = "$PREV_HIT" ]; then
+    QUOTA_MARKER="$HIT"
+    break
+  fi
+  PREV_HIT="$HIT"
+done
+
+if [ -n "$QUOTA_MARKER" ]; then
+  kill "$WAIT_PID" 2>/dev/null || true
+  wait "$WAIT_PID" 2>/dev/null || true
+  PROMPT_STATUS=124
+  echo "=== quota-exhaustion marker '$QUOTA_MARKER' confirmed on two consecutive" \
+    "${POLL_INTERVAL_S}s polls; ending run_id=$RUN_ID early instead of waiting out the" \
+    "full deadline ==="
+else
+  wait "$WAIT_PID"
+  PROMPT_STATUS=$?
+fi
 echo "=== prompted (wait exited status=$PROMPT_STATUS), run_id=$RUN_ID ws=$WS_PANE report=$REPORT ==="
 
 # `--wait` exits 0 for a `blocked` settle exactly as it does for `idle`/`done` (issue 037) —
@@ -130,9 +198,9 @@ echo "=== prompted (wait exited status=$PROMPT_STATUS), run_id=$RUN_ID ws=$WS_PA
 SETTLE_JSON=$(herdr agent get "$AGENT_NAME" 2>&1)
 SETTLE_STATUS=$(printf '%s' "$SETTLE_JSON" | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
 [ -z "$SETTLE_STATUS" ] && SETTLE_STATUS="unknown"
-echo "=== settle status: $SETTLE_STATUS ==="
+echo "=== settle status: $SETTLE_STATUS (quota_marker='$QUOTA_MARKER') ==="
 
-if [ "$SETTLE_STATUS" != "idle" ] && [ "$SETTLE_STATUS" != "done" ]; then
+if [ -n "$QUOTA_MARKER" ] || { [ "$SETTLE_STATUS" != "idle" ] && [ "$SETTLE_STATUS" != "done" ]; }; then
   # --source visible, not the default read: the plain read is rejected while unsettled
   # (agent_not_idle), which is precisely the blocked/unknown case here — same reasoning as
   # runner._capture_visible_tail (issue 033).
@@ -147,20 +215,37 @@ if [ "$SETTLE_STATUS" != "idle" ] && [ "$SETTLE_STATUS" != "done" ]; then
   # Only stub the report if the orchestrator hasn't already written one itself — a report
   # with real content always wins over this best-effort marker.
   if [ ! -s "$REPORT" ]; then
-    {
-      echo "# Pipeline run $RUN_ID — launcher stub report"
-      echo
-      echo "## Outcome: failed"
-      echo
-      echo "settle_status: $SETTLE_STATUS"
-      echo "tail: $TAIL_FILE"
-      echo
-      echo "pipeline-launch.sh wrote this stub: the orchestrator settled '$SETTLE_STATUS'" \
-        "instead of idle/done, so \`herdr agent prompt --wait\` returned without a real" \
-        "report. Written before the pane was closed so tick reconciles on the next tick" \
-        "instead of waiting out the full deadline (issue 037). See the tail file above" \
-        "for what the orchestrator was stuck on."
-    } > "$REPORT"
+    if [ -n "$QUOTA_MARKER" ]; then
+      {
+        echo "# Pipeline run $RUN_ID — launcher stub report"
+        echo
+        echo "## Outcome: failed (quota_exhausted)"
+        echo
+        echo "settle_status: $SETTLE_STATUS"
+        echo "tail: $TAIL_FILE"
+        echo
+        echo "pipeline-launch.sh wrote this stub: the orchestrator's visible screen showed" \
+          "the failure marker '$QUOTA_MARKER' on two consecutive ${POLL_INTERVAL_S}s polls," \
+          "so the run was ended early instead of waiting out the full deadline. Configure" \
+          "this job's \`fallback_model\` (config.py) to have tick retry automatically with" \
+          "a different model. See the tail file above for the exact screen content."
+      } > "$REPORT"
+    else
+      {
+        echo "# Pipeline run $RUN_ID — launcher stub report"
+        echo
+        echo "## Outcome: failed"
+        echo
+        echo "settle_status: $SETTLE_STATUS"
+        echo "tail: $TAIL_FILE"
+        echo
+        echo "pipeline-launch.sh wrote this stub: the orchestrator settled '$SETTLE_STATUS'" \
+          "instead of idle/done, so \`herdr agent prompt --wait\` returned without a real" \
+          "report. Written before the pane was closed so tick reconciles on the next tick" \
+          "instead of waiting out the full deadline (issue 037). See the tail file above" \
+          "for what the orchestrator was stuck on."
+      } > "$REPORT"
+    fi
     echo "=== wrote failed-outcome stub report to $REPORT ==="
   fi
 
