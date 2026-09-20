@@ -41,7 +41,13 @@ permissions:
 jobs:
   lint-python:
     name: Lint Python
-    runs-on: ubuntu-latest
+    # Runner pool is switchable per repo without editing this file: set the
+    # CI_RUNNERS repo variable to a JSON array of runner labels — e.g.
+    # ["self-hosted","linux","x64"] — to route CI off GitHub-hosted runners
+    # when their minutes are unavailable (on a private repo, exhausting the
+    # free tier makes every job refuse to start). Unset means ubuntu-latest.
+    # See dev-standards' README § CI runners for the commands.
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -61,7 +67,7 @@ jobs:
 
   typecheck-python:
     name: Typecheck Python
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -80,7 +86,7 @@ jobs:
 
   test-python:
     name: Tests (Python)
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v7
 
