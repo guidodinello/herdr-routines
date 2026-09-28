@@ -18,9 +18,11 @@ from pathlib import Path
 from logger import get_logger, init_logging
 
 import herdr_routines
-from herdr_routines import gc
+from herdr_routines import gc, reports_prune
 from herdr_routines.auto_fix import RealGhClient
 from herdr_routines.config import (
+    DEFAULT_REPORTS_MAX_AGE_DAYS,
+    TINY_HISTORY_MAX_BYTES,
     ConfigError,
     RoutinesConfig,
     default_config_path,
@@ -48,6 +50,11 @@ from herdr_routines.pipeline_watchdog import (
     run_watchdog,
 )
 from herdr_routines.ps import collect_ps_rows, render_ps
+from herdr_routines.reports_prune import (
+    PruneResult,
+    prune_reports,
+    prune_rolled_history,
+)
 from herdr_routines.repos import _fetch_and_fast_forward
 from herdr_routines.runner import (
     build_dry_run_argv,
@@ -57,6 +64,7 @@ from herdr_routines.runner import (
 )
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
+from herdr_routines.table import render_table
 from herdr_routines.tick import (
     _build_pipeline_launch_argv,
     default_lock_path,
@@ -237,6 +245,49 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_gc.set_defaults(handler=_cmd_gc)
+
+    p_prune = sub.add_parser(
+        "prune",
+        help=(
+            "delete old state-dir artifacts (issue 021): reports by default, or rolled "
+            "history files. Nothing is ever deleted without --yes"
+        ),
+    )
+    p_prune.add_argument(
+        "target",
+        choices=["reports", "history"],
+        help="'reports' prunes the reports dir; 'history' prunes rolled history-*.jsonl",
+    )
+    prune_mode = p_prune.add_mutually_exclusive_group()
+    prune_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list only; deletes nothing (the default, so the flag is for explicitness)",
+    )
+    prune_mode.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="required to delete; without it the listing prints and nothing is removed",
+    )
+    p_prune.add_argument(
+        "--older-than",
+        type=int,
+        default=None,
+        dest="older_than_days",
+        help=(
+            "age in days before an entry is collectable (mtime-based); reports default to "
+            f"retention.reports_max_age_days (fallback {DEFAULT_REPORTS_MAX_AGE_DAYS}), "
+            f"history to {reports_prune.DEFAULT_HISTORY_MAX_AGE_DAYS}"
+        ),
+    )
+    p_prune.add_argument(
+        "--reports-dir",
+        type=Path,
+        default=None,
+        help="reports directory to prune (default: $HERDR_PLUGIN_STATE_DIR/reports)",
+    )
+    p_prune.set_defaults(handler=_cmd_prune)
 
     p_gate = sub.add_parser(
         "gate",
@@ -647,6 +698,19 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                     f"fail with no_report; tell the agent to write its summary there"
                 )
 
+    # Soft, exit-code-unchanged, same posture as the $ROUTINE_REPORT checks above: a
+    # threshold this small is almost certainly a typo or a test, but rotation is
+    # non-destructive (it renames, never deletes) so a bad value costs file churn, not data.
+    if (
+        config.retention.history_max_bytes is not None
+        and config.retention.history_max_bytes < TINY_HISTORY_MAX_BYTES
+    ):
+        warnings.append(
+            f"retention.history_max_bytes is {config.retention.history_max_bytes} bytes, "
+            f"below 1 MiB — history.jsonl will roll on essentially every tick; "
+            f"expect a new history-<timestamp>.jsonl per tick"
+        )
+
     problems += _check_systemd_timeout(config, args.systemd_unit)
 
     for w in warnings:
@@ -848,6 +912,114 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         older_than_days=args.older_than_days,
         worktrees_root=args.worktrees_root,
     )
+
+
+def _cmd_prune(args: argparse.Namespace) -> int:
+    """`prune reports` / `prune history` — the only deletion path in the state dir, and only
+    ever reached from here. Mirrors `gc --delete`'s shape exactly: `--yes` (not a required
+    argument) is what turns a listing into a deletion, and the refusal without it is the same
+    message and the same rc 2, so there is no second "delete" vocabulary in this CLI to learn
+    or audit.
+
+    The mode group is deliberately *not* required, for the same reason `gc`'s is not: making
+    argparse reject a missing flag would exit 2 with a usage error instead of the gc-style
+    refusal, and it would skip the listing an operator needs in order to decide. Without
+    `--yes` the sweep still runs, in dry-run mode, purely to print that listing — which is what
+    makes "deletes nothing without --yes" a property of the code path rather than of the
+    argument check.
+    """
+    if args.target == "reports":
+        reports_dir = args.reports_dir or default_reports_dir()
+        older_than = args.older_than_days
+        if older_than is None:
+            older_than = _configured_reports_window(args)
+        if older_than < 0:
+            print(
+                f"error: --older-than must be a non-negative number of days: {older_than}",
+                file=sys.stderr,
+            )
+            return 1
+        result = prune_reports(
+            reports_dir,
+            older_than_days=older_than,
+            dry_run=args.dry_run or not args.yes,
+        )
+        what = f"reports in {reports_dir}"
+    else:
+        history_path = default_history_path()
+        older_than = (
+            args.older_than_days
+            if args.older_than_days is not None
+            else reports_prune.DEFAULT_HISTORY_MAX_AGE_DAYS
+        )
+        if older_than < 0:
+            print(
+                f"error: --older-than must be a non-negative number of days: {older_than}",
+                file=sys.stderr,
+            )
+            return 1
+        result = prune_rolled_history(
+            history_path,
+            older_than_days=older_than,
+            dry_run=args.dry_run or not args.yes,
+        )
+        what = f"rolled history beside {history_path}"
+
+    _render_prune_result(result, would_be=not args.yes, what=what)
+    for err in result.errors:
+        print(f"warning: prune: {err}", file=sys.stderr)
+    if result.error_count:
+        return 1
+    if not args.dry_run and not args.yes:
+        print(
+            "error: refusing to delete without --yes; --yes is required for prune",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
+def _render_prune_result(result: PruneResult, *, would_be: bool, what: str) -> None:
+    """One listing, three verdicts: collectable, too fresh, protected. `gc` prints a table
+    for the same reason — an operator about to delete has to be able to see exactly what
+    they are about to lose, and which runs were exempted and why."""
+    remove_label = "would remove" if would_be else "removed"
+    rows = [[remove_label, str(p)] for p in result.removed]
+    rows += [["keep (fresh)", str(p)] for p in result.kept_fresh]
+    rows += [["protected (in-flight pipeline run)", str(p)] for p in result.protected]
+    if rows:
+        print(render_table(["ACTION", "PATH"], rows))
+    else:
+        print("nothing to prune")
+    print(
+        f"{what}: {remove_label} {result.removed_count}, "
+        f"kept {result.kept_fresh_count} fresh, "
+        f"protected {result.protected_count}, errors {result.error_count}"
+    )
+
+
+def _configured_reports_window(args: argparse.Namespace) -> int:
+    """`--older-than` unset: take retention.reports_max_age_days from config, falling back to
+    the built-in 90 days when there is no config to read. The fallback is what keeps `prune`
+    usable on a host whose config is broken or absent — a destructive command should not
+    refuse to run because an unrelated file failed to parse, and 90 days is the documented
+    generous default anyway."""
+    try:
+        config = load_config(args.config or default_config_path())
+    except (ConfigError, OSError) as e:
+        log.warning(
+            "prune: could not read retention.reports_max_age_days (%s); using the %d-day "
+            "default",
+            e,
+            DEFAULT_REPORTS_MAX_AGE_DAYS,
+        )
+        return DEFAULT_REPORTS_MAX_AGE_DAYS
+    if config.errors:
+        log.warning(
+            "prune: ignoring config errors while reading retention.reports_max_age_days: %s",
+            "; ".join(config.errors),
+        )
+    return config.retention.reports_max_age_days
 
 
 def _cmd_pick_feature(args: argparse.Namespace) -> int:
