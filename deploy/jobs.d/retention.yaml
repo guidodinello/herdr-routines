@@ -1,0 +1,18 @@
+# State-dir retention (issue 021) — history rotation + the prune window.
+#
+# In a jobs.d/ layout this file is read for its `retention:` keys only; it is never
+# treated as a job file (same rule as defaults.yaml), so it can exist alongside the
+# job files with no name to keep unique.
+#
+# Every key below is commented out, which is the default everywhere: history rotation is
+# off until you turn it on. Uncomment what you want — in a single-file jobs.yaml the same
+# keys go under a top-level `retention:` block (see deploy/jobs.example.yaml).
+#
+# Rotation is a rename, never a delete, and runs at the end of every tick. Deleting is
+# always explicit: `herdr-routines prune reports --dry-run` lists what would go, `--yes`
+# does it. Reports of an in-flight pipeline run are protected regardless of age.
+
+# retention:
+#   history_max_bytes: 10485760   # roll history.jsonl aside past 10 MiB (null = never)
+#   history_max_age_days: 30      # ...or once its oldest record is 30 days old (null = never)
+#   reports_max_age_days: 90      # window for `prune reports` (null = 90)
