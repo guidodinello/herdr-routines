@@ -326,3 +326,31 @@ def test_prune_rolled_history_leaves_the_live_file(tmp_path: Path) -> None:
     assert history_path not in zero.removed
     assert fresh_roll in zero.removed
     assert history_path.exists()
+
+
+# -- docs ---------------------------------------------------------------------
+
+
+def test_plan_no_longer_defers_log_rotation() -> None:
+    """Acceptance 17: the plan's two "log rotation is out of scope" claims are corrected in
+    place rather than left to contradict a shipped feature (this repo's own convention, see
+    plan-v1.md §7's build-order record), and the issue file is closed with a log entry."""
+    plan = (REPO_ROOT / "docs" / "plan-v1.md").read_text()
+    assert "No log rotation in v1" not in plan
+    out_of_scope = plan.split("## Out of scope for v1", 1)[1]
+    # The list entry, not every mention of rotation: §5 now describes the shipped policy.
+    assert "log rotation" not in out_of_scope.split("##", 1)[0]
+    assert "prune reports" in plan
+    assert "retention:" in plan
+
+    issue = (
+        REPO_ROOT / "docs" / "process" / "issues" / "021-log-rotation.md"
+    ).read_text()
+    assert "status: done" in issue
+    assert "status: open" not in issue
+    # A Log entry dated today, and the two design decisions worth writing down rather than
+    # leaving to be rediscovered: why the rolls are timestamped, and why `prune history` is
+    # not on a timer.
+    assert issue.count("- **2026-09-28**") >= 1
+    assert "history-YYYYMM" in issue, "the month-bucket naming trap is recorded"
+    assert "first_seen_at" in issue, "the prune-history caveat is recorded"
