@@ -14,9 +14,20 @@ from typing import Any
 import pytest
 
 from herdr_routines.auto_fix import attempt_count_for_pr
-from herdr_routines.config import PIPELINE_CATCH_UP_MINUTES, Job, RoutinesConfig
+from herdr_routines.config import (
+    PIPELINE_CATCH_UP_MINUTES,
+    Job,
+    Retention,
+    RoutinesConfig,
+)
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
-from herdr_routines.history import HistoryRecord, append, read_job
+from herdr_routines.history import (
+    HistoryRecord,
+    append,
+    read_job,
+    rolled_history_paths,
+    rolled_path,
+)
 from herdr_routines.tick import _live_agent_exists, run_tick
 
 
@@ -2569,3 +2580,68 @@ def test_pipeline_workers_capture_tail_before_close(
     assert "agent_read_visible" in client.calls
     assert "agent_read" not in client.calls
     assert "pane_close" in client.calls
+
+
+# ---------------------------------------------------------------------------
+# Issue 021: history rotation in the tick preamble
+# ---------------------------------------------------------------------------
+
+
+def test_run_tick_rotates_and_survives_rotation_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Acceptance 7: the tick rotates, and rotation is as best-effort as the `/tmp` reap above
+    it — an exception is logged and the jobs still run, because a state-dir housekeeping
+    failure must not be the reason systemd marks the unit failed and an operator's job never
+    dispatched.
+
+    Rotation is invisible to readers: the records move to a roll, and `read_job` still sees
+    them in order, so a rotation cannot make a job look unregistered.
+    """
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_job(tmp_path, cron="0 3 * * *")
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+    # 1 byte of headroom, so the first tick's `registered` record trips it.
+    config = RoutinesConfig(jobs=(job,), retention=Retention(history_max_bytes=1))
+    with caplog.at_level("INFO"):
+        outcome = run_tick(config, history_path, client=FakeClient(), now=t0)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: registered",), "rotation must not change dispatch"
+    rolls = rolled_history_paths(history_path)
+    assert len(rolls) == 1
+    assert rolls[0] == rolled_path(history_path, t0)
+    assert (
+        HistoryRecord(ts=t0, job="a", state="registered")
+        == read_job(history_path, "a")[0]
+    )
+    assert history_path.read_text() == "", "the live log starts empty and appendable"
+
+    # The next tick's own record trips the threshold again, and the reader is unaffected:
+    # both rolls are read in order, the job is still the one registered on day one (not a
+    # fresh arrival, which is what a lost or reset log would look like), and nothing is
+    # duplicated.
+    t1 = t0 + timedelta(days=1)
+    outcome = run_tick(config, history_path, client=FakeClient(), now=t1)  # type: ignore[arg-type]
+    assert outcome.summaries == ("a: missed",)
+    assert [r.state for r in read_job(history_path, "a")] == ["registered", "missed"]
+    assert len(rolled_history_paths(history_path)) == 2
+    assert history_path.read_text() == "", "each tick rolls what it just wrote"
+
+    # 2: a rotation that raises is logged, and the tick carries on.
+    def exploding_rotate(*args: Any, **kwargs: Any) -> None:
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr("herdr_routines.tick.maybe_rotate", exploding_rotate)
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        later = t1 + timedelta(days=1)
+        outcome = run_tick(config, history_path, client=FakeClient(), now=later)  # type: ignore[arg-type]
+
+    assert "history rotation failed (continuing)" in caplog.text
+    assert outcome.summaries == ("a: missed",), "dispatch is unaffected by the rotation"
+    assert outcome.any_job_failed is False
+    # And the record the failed rotation was supposed to sweep is still there — a rotation
+    # error loses nothing.
+    assert [r.state for r in read_job(history_path, "a")][-1] == "missed"
