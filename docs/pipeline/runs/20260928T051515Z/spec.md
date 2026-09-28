@@ -1,4 +1,4 @@
-# Spec — Log rotation: `history.jsonl` + reports retention (021) — 20260928T051515Z — v1
+# Spec — Log rotation: `history.jsonl` + reports retention (021) — 20260928T051515Z — v2
 
 Implements `docs/process/issues/021-log-rotation.md`. Per-run spec at `docs/pipeline/runs/20260928T051515Z/spec.md` (per-run path avoids the PR #28/#29 shared-path conflict — G-15).
 
@@ -282,8 +282,8 @@ decision). — confidence: high
     path outside `prune` unlinks a report or a roll — [blocking] confidence: high — Test: `test_no_automatic_deletion_outside_prune`
 15. A per-entry `OSError` during the sweep is counted and does not abort the remaining entries —
     [non-blocking] confidence: high — Test: `test_prune_reports_survives_per_entry_error`
-16. `validate` warns (exit 0) when `history_max_bytes` is below 1 MiB — [non-blocking] confidence:
-    medium — Test: `test_validate_warns_on_tiny_history_max_bytes`
+16. `validate` warns (exit 0) when `history_max_bytes` is below 1 MiB — [non-blocking]
+    confidence: medium — Test: `test_validate_warns_on_tiny_history_max_bytes`
 17. `docs/plan-v1.md:415` and `:650` no longer claim log rotation is out of scope, and
     `docs/process/issues/021-log-rotation.md` is `status: done` with a Log entry — [non-blocking]
     confidence: medium — Test: `test_plan_no_longer_defers_log_rotation`
@@ -295,3 +295,34 @@ end-to-end: set `history_max_bytes` to something tiny in a scratch config, run o
 confirm a `history-<ts>.jsonl` roll appears, the live file is non-empty afterwards, and
 `herdr-routines history <job>` still lists the run — i.e. transparency verified against a real
 rotation, not only a fixture one.
+
+## Changelog v1→v2
+
+Editorial pass. No design change, no new requirement, no renamed or removed test, and no
+change to any `blocking`/`non-blocking` call or confidence tier.
+
+- **The `## Acceptance criteria` section was audited, not added.** v2 was requested to *add*
+  it, but v1 already shipped one (commit `7b49d09`, 17 numbered items). It was checked against
+  the required shape instead of being duplicated or rewritten — a second section would have left
+  two competing acceptance lists for the implementer to reconcile. Post-audit state: 17 items
+  numbered 1–17 with no gaps, all 17 terminating in `Test: <exact test name>`, 14 `[blocking]`
+  and 3 `[non-blocking]`, and 15 `confidence: high` / 2 `confidence: medium`. — confidence: high
+- **Item 16's confidence tier no longer wraps.** v1 broke the line between `confidence:` and
+  `medium`, so the tier was present for a human but invisible to anything matching
+  `confidence: <tier>` — the same 16-of-17 count this pass is built to prevent. The value is now
+  inline with the key, as in every other item. — confidence: high
+- **Item 10's continuation line re-indented** from 5 spaces to 4, so it aligns with the wrapped
+  list body rather than hanging one space inside it. Cosmetic only. — confidence: high
+- **Coverage of the issue's named acceptance surfaces re-checked and left unchanged.** Issue 021
+  names `history` / `ps` / `scheduled`; the Problem table adds `digest`, `auto_fix`,
+  `pick_feature` and `pipeline_watchdog` as unlisted readers. All are already reached — the
+  three history readers by items 1–4 via the `read_all` transparency argument in §2,
+  `ps`/`pick_feature`/`pipeline_watchdog` by item 13's protected set. No item was added,
+  because the existing items cover the surfaces; the mapping is recorded here so the next
+  reviewer does not re-derive it. — confidence: high
+- **Not yet verified, and deliberately so:** no test in §Files touched exists on disk
+  (`tests/test_reports_prune.py` is new, and no `retention`/`maybe_rotate` symbol exists under
+  `src/`). Every test name above is a specification to be written by the implementation, not a
+  reference to a passing test. Tiering in this spec is a judgement about what must block the
+  PR, not an observation of current behaviour. — confidence: high
+
