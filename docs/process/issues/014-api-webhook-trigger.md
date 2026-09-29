@@ -1,10 +1,9 @@
 ---
 id: "014"
 title: "API / webhook trigger"
-status: blocked
+status: open
 priority: low
 area: infra
-gate: issue 015 (auto-fix PRs) shipping first — it establishes the gh-api-polling pattern this would generalize; revisit after it lands
 ---
 
 ## Description
@@ -39,3 +38,6 @@ To be written once issue 015 has shipped and its polling pattern is known.
   issue 015" — 015 establishes the gh-api-polling pattern this generalizes,
   so building both independently is wasteful. Trigger unchanged: a recurring
   need to start runs from outside the cron model.
+- **2026-09-29**: unblocked. The gate, issue 015 shipping first, is met: `babysit-prs`
+  (015) is merged and runs on the Pi, so the gh-api-polling pattern this
+  generalizes exists.

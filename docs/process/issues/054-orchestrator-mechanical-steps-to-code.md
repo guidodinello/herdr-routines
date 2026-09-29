@@ -56,7 +56,8 @@ A `herdr-routines pipeline-prepare --run-id … --repo-parent …` subcommand, c
 1. `sync-repo` (`_fetch_and_fast_forward`, `repos.py:93`).
 2. `pick-feature --mark-in-progress`. On "no open issues", write the terminal report
    `## Outcome: skipped (no_feature)` and exit without starting any agent. **This
-   subsumes issue 052.**
+   subsumes issue 052**: the phase A PR also flips 052 (`blocked` pending this) to
+   `status: done`.
 3. Create the shared worktree and branch, and the shared workspace.
 4. Write `state.json` atomically, with `deadline_epoch` (from `--deadline-epoch`),
    `feature_source`, `shared_worktree`, `branch`, `shared_workspace`,

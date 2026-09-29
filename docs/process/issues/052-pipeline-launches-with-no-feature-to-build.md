@@ -1,9 +1,10 @@
 ---
 id: "052"
 title: "tick launches the pipeline orchestrator even when pick-feature has nothing to build"
-status: open
+status: blocked
 priority: low
 area: pipeline
+gate: superseded by issue 054 phase A (pre-flight in code, which skips a run with no feature before any agent starts); 054's phase A PR flips this to done
 ---
 
 ## Description
@@ -153,3 +154,8 @@ Each ends `Test: <name>`.
   a full orchestrator spin-up before the run bails. Scoped narrowly per the
   human: a read-only tick-side precheck, not moving the claim out of stage 0,
   and explicitly not the declarative-pipeline-gates Roadmap item.
+- **2026-09-29**: blocked as superseded by issue 054. Its phase A moves
+  `pick-feature` out of the orchestrator into a `pipeline-prepare` step that runs
+  before any agent starts, so an empty backlog costs nothing, which is this issue's
+  goal. Kept out of `pick-feature`'s queue so the pipeline doesn't build a separate
+  tick-side precheck that phase A would replace.
