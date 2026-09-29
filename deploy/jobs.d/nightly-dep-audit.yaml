@@ -12,10 +12,11 @@
 
 enabled: true
 cron: "0 3 * * *"
-repo: /home/guido/projects/fitted # a normal clone is fine; `herdr worktree create` makes a
-                                   # new linked worktree elsewhere from it each run
+repo: /home/guido/.local/state/herdr-routines/repos/fitted # a normal clone is fine;
+    # `herdr worktree create` makes a new linked worktree elsewhere from it each run.
+    # Same per-host clone dir the other examples use, so `validate` passes on the Pi.
 workspace: worktree
-base: main
+base: development # fitted's default branch
 agent_kind: opencode
 model: null # native model flag, e.g. "opencode/big-pickle"; null = agent default.
             # Only supported for agent_kind claude/opencode (see docs/plan-v1.md §2).
