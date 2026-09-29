@@ -1518,3 +1518,122 @@ def test_plan_docs_list_model_flags_for_new_kind() -> None:
     assert found, (
         "deploy/jobs.d/ must contain an example job with agent_kind: codex and model:"
     )
+
+
+# -- retention policy (issue 021) ------------------------------------------------
+
+
+def test_retention_parses_in_both_layouts(tmp_path: Path) -> None:
+    """Acceptance 9: the same three keys parse from the top-level `retention:` block of a
+    legacy jobs.yaml and from a jobs.d/retention.yaml sibling, an unknown key under
+    `retention` is a ConfigError in both, and a config that says nothing about retention
+    gets the documented defaults (rotation off, a generous 90-day prune window)."""
+    body = """
+version: 1
+retention:
+  history_max_bytes: 10485760
+  history_max_age_days: 30
+  reports_max_age_days: 7
+jobs:
+  - name: nightly-audit
+    cron: "0 3 * * *"
+    repo: /home/guido/projects/fitted
+"""
+    from_file = load_config(write(tmp_path / "jobs.yaml", body))
+    assert from_file.retention.history_max_bytes == 10_485_760
+    assert from_file.retention.history_max_age_days == 30
+    assert from_file.retention.reports_max_age_days == 7
+
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "retention.yaml": (
+                "history_max_bytes: 10485760\n"
+                "history_max_age_days: 30\n"
+                "reports_max_age_days: 7\n"
+            ),
+            "nightly-audit.yaml": (
+                "name: nightly-audit\ncron: '0 3 * * *'\nrepo: /repo/nightly-audit\n"
+            ),
+        },
+    )
+    from_dir = load_config(jobs_dir)
+    assert from_dir.errors == ()
+    assert from_dir.retention == from_file.retention
+    assert len(from_dir.jobs) == 1  # retention.yaml is not a job
+
+    # Explicit nulls are the documented "off" spelling, not a type error.
+    off = _make_jobs_d(
+        tmp_path / "off",
+        {
+            "retention.yaml": "history_max_bytes: null\nhistory_max_age_days: null\n",
+            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n",
+        },
+    )
+    assert load_config(off).retention.history_max_bytes is None
+    assert load_config(off).retention.history_max_age_days is None
+
+    # Absent config: rotation off, reports window 90.
+    absent_file = load_config(write(tmp_path / "plain.yaml", VALID_MINIMAL))
+    assert absent_file.retention.history_max_bytes is None
+    assert absent_file.retention.history_max_age_days is None
+    assert absent_file.retention.reports_max_age_days == 90
+    absent_dir = load_config(
+        _make_jobs_d(
+            tmp_path / "bare", {"a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n"}
+        )
+    )
+    assert absent_dir.retention == absent_file.retention
+
+    # Unknown keys under retention are rejected, not ignored.
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(
+            write(
+                tmp_path / "typo.yaml",
+                VALID_MINIMAL + "\nretention:\n  history_max_byte: 1\n",
+            )
+        )
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(
+            _make_jobs_d(
+                tmp_path / "typo",
+                {
+                    "retention.yaml": "history_max_byte: 1\n",
+                    "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n",
+                },
+            )
+        )
+    # ... and so are nonsensical values, which would otherwise silently disable a
+    # threshold the operator believes they set.
+    with pytest.raises(ConfigError, match="positive integer"):
+        load_config(
+            write(
+                tmp_path / "bad.yaml",
+                VALID_MINIMAL + "\nretention:\n  history_max_bytes: 0\n",
+            )
+        )
+
+
+def test_retention_yaml_is_not_a_job_file(tmp_path: Path) -> None:
+    """Acceptance 10: `retention.yaml` in a jobs.d/ directory is excluded from job
+    discovery, exactly like the existing `defaults.yaml` special case. Without the
+    exclusion it would load as a job named "retention" and fail for a missing
+    `cron:` — one spurious config error per host, on a file that is not a job at all."""
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "retention.yaml": "history_max_bytes: 10485760\n",
+            "a.yaml": "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n",
+        },
+    )
+    cfg = load_config_dir(jobs_dir)
+    assert [j.name for j in cfg.jobs] == ["a"]
+    assert cfg.errors == ()
+    assert cfg.retention.history_max_bytes == 10_485_760
+
+    # The committed example layout ships a commented retention.yaml; it must load clean
+    # and still not register a "retention" job.
+    deploy_dir = Path(__file__).resolve().parent.parent / "deploy" / "jobs.d"
+    if (deploy_dir / "retention.yaml").exists():
+        deploy_cfg = load_config_dir(deploy_dir)
+        assert deploy_cfg.job("retention") is None

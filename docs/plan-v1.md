@@ -411,8 +411,60 @@ CLI:
   `--dry-run` prints the exact `herdr` argv it would execute and exits. This is the debugging
   tool that makes §7 tier-3 verification tractable.
 - `herdr-routines tick` — what systemd calls.
+- `herdr-routines prune {reports,history} [--dry-run|--yes] [--older-than N]` — see
+  "Retention" below. Deletion only, so it is the one retention path that demands `--yes`.
 
-No log rotation in v1; a handful of jobs writing a few lines a day will not matter for years.
+### Retention
+
+Both the history file and the reports dir are append-only in normal operation, so they only
+ever grow. Two mechanisms, deliberately asymmetric, because the risk of each is different:
+
+**Rotation is automatic and non-destructive.** At the top of every tick, `history.maybe_rotate`
+renames the live log aside when it crosses a threshold, and starts a fresh empty
+`history.jsonl`:
+
+```sh
+mv ~/.local/state/herdr-routines/history.jsonl \
+   ~/.local/state/herdr-routines/history-20260928T051515Z.jsonl
+```
+
+A rename cannot lose data, so this is safe to run unattended inside the tick (it runs under the
+same best-effort contract as the `/tmp` reap: a failure logs a warning and the jobs still run).
+The timestamped name is a *roll*, not a month bucket, so several rolls from the same month sort
+chronologically; `read_job`/`status`/`history` read live-plus-rolls in that order, so rotation is
+invisible to every reader. Off by default — set either threshold in the `retention:` block. The
+age threshold measures the *oldest record* in the file, not the mtime, so a long-idle job still
+rolls even if the file was last touched just now.
+
+**Deletion is explicit and opt-in.** Rotation bounds nothing on its own, because the rolls
+accumulate, so `prune` sweeps them:
+
+- `prune reports` collects top-level entries in the reports dir older than
+  `retention.reports_max_age_days` (default 90) — reports, failure tails, and finished runs'
+  `state.json` alike. Selection is mtime-based and top-level only, like the `/tmp` reap; a stray
+  subdirectory is left for a human. An **in-flight pipeline run is protected regardless of
+  age** — the same `ps` predicate, "its final report has not been written yet" — because
+  deleting its `state.json` makes `ps` drop the row and `pick_feature` re-pick the same issue.
+  A finished run's report is collectable; that is the point.
+- `prune history` collects rolls older than 365 days. The live `history.jsonl` is never a
+  candidate. Deliberately conservative: deleting the *earliest* roll can make `first_seen_at`
+  return `None` for a long-lived job, which re-registers it and shifts the `job_registered_at`
+  fed into `schedule.decide`. If this is ever wired to a timer, always exclude the most recent
+  roll first.
+
+Both print the same summary line (`would remove N, kept N fresh, protected N, errors N`) and exit
+non-zero if any entry errored, so a locked file cannot masquerade as a clean run. `--dry-run` is
+the default posture and `--yes` is required to delete anything, exactly like `gc --delete`.
+Per-entry `OSError` is counted and the sweep continues.
+
+Configured in one place, either inline in `jobs.yaml` or as `retention.yaml` in `jobs.d/`:
+
+```yaml
+retention:
+  history_max_bytes: 10485760    # 10 MiB; null (default) = never roll on size
+  history_max_age_days: 30       # roll once the oldest record is this old; null = never
+  reports_max_age_days: 90       # window for `prune reports`; null = fall back to 90
+```
 
 ---
 
@@ -648,7 +700,7 @@ the tool is host-agnostic and step 9 already proved the loop works against a rea
 
 Skip-permissions / unattended auto-approve; automatic worktree GC; off-box notifications
 (Telegram); a daily digest; a web or TUI dashboard; global concurrency caps beyond the single
-tick lock; retries on failure; log rotation; the `herdr-plugin.toml` manifest (§8.4 — v1.5); Pi
+tick lock; retries on failure; the `herdr-plugin.toml` manifest (§8.4 — v1.5); Pi
 deployment (a separate step, above).
 
 ## Verification

@@ -2,6 +2,11 @@
 
 The file is a log of state transitions, not a mutable record set — see docs/plan-v1.md §5.
 States actually written: registered, running, done, failed, skipped, missed, interrupted_unknown.
+
+Rotation (issue 021) is non-destructive: `maybe_rotate` renames the live file to a
+timestamped sibling (`history-<YYYYMMDDTHHMMSSZ>.jsonl`) and leaves a fresh empty live
+file behind, so nothing is ever lost by rotating. Every read goes through `read_all`,
+which spans the rolls, so no caller has to know they exist.
 """
 
 from __future__ import annotations
@@ -79,23 +84,131 @@ def append(path: Path, record: HistoryRecord) -> None:
 
 
 def read_all(path: Path) -> list[HistoryRecord]:
-    """Read every record in file order (oldest first). Empty list if the file doesn't exist.
+    """Every record in file order (oldest first), spanning rolled files. Empty list when
+    neither the live file nor any roll exists.
+
+    Rolls are the `history-<timestamp>.jsonl` siblings left behind by `maybe_rotate`. The
+    read order is `sorted(rolls) + [live]` — explicit, rather than leaning on the fact that
+    `history-*.jsonl` happens to sort before `history.jsonl`. That coincidence is an ASCII
+    artifact of `-` (0x2D) vs `.` (0x2E) and would silently reverse the order of two
+    differently-named file families; the roll timestamp suffix itself is what makes
+    `sorted()` chronological (issue 021).
 
     A line that fails to parse (e.g. truncated by a power cut or SIGKILL mid-append, since
     `append` is not atomic) is skipped rather than raised — one bad line must not take down
-    every future tick."""
+    every future tick. A file that can't be read at all (unreadable permissions, or a roll
+    pruned by a concurrent `prune history`) degrades to a warning for the same reason."""
+    records: list[HistoryRecord] = []
+    for source in (*rolled_history_paths(path), path):
+        records.extend(_read_file(source))
+    return records
+
+
+def rolled_history_paths(path: Path) -> list[Path]:
+    """The rolled history siblings of *path*, oldest first, by name. Empty when nothing
+    has been rolled yet. The suffix shape is derived from the live file's own name, so a
+    non-default live path (`custom.jsonl` -> `custom-*.jsonl`) rolls consistently too."""
+    return sorted(path.parent.glob(f"{path.stem}-*{path.suffix}"))
+
+
+def rolled_path(path: Path, now: datetime) -> Path:
+    """Where the roll for *path* taken at *now* goes. The same `<YYYYMMDDTHHMMSSZ>` suffix
+    `runner.make_run_id` uses, so roll names sort strictly chronologically and match repo
+    convention. Deliberately NOT `<YYYYMM>`: two size-triggered rolls in one month would
+    need a disambiguator, and the obvious one breaks lexicographic ordering (`-` < `.`),
+    which would feed a wrong `first_seen_at` — and therefore a wrong `job_registered_at` —
+    into `schedule.decide` (issue 021)."""
+    stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return path.parent / f"{path.stem}-{stamp}{path.suffix}"
+
+
+def maybe_rotate(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    max_age_days: int | None = None,
+    now: datetime,
+) -> Path | None:
+    """Roll *path* aside if it is over either threshold; returns the roll's path, or None if
+    it did not rotate. No-op (returning None) when both thresholds are unset, which is the
+    default: the mechanism exists, but nothing rolls until an operator asks for it.
+
+    The trigger is size OR age, either one sufficing:
+      - size: the live file's `st_size` exceeds *max_bytes*.
+      - age:  the live file's oldest record is older than *max_age_days*. The record's own
+        `ts` is preferred over mtime — a file restored from backup or copied in carries a
+        misleading mtime, and the records' timestamps are what the age policy is about.
+        mtime is the fallback for a live file with no parseable records.
+
+    Rotation is `os.replace` (atomic rename, so a concurrent reader sees either the whole
+    old file or the whole new one, never a truncated one) followed by re-creating an empty
+    live file. The window where the live file doesn't exist self-heals on the next `append`,
+    which creates parents and opens in "a" mode.
+
+    A same-second collision (two rotations in the same second) skips the rotation and warns
+    rather than inventing a suffix, which would reintroduce the ordering bug `rolled_path`'s
+    docstring rules out. Callers hold the exclusive `tick.lock` (see tick.run_tick), which
+    makes this unreachable in practice; the guard is there so the failure mode is a
+    warning, not corrupted history. `Retention`-independent on purpose — the thresholds are
+    passed in, so this module stays free of any config import.
+    """
+    if max_bytes is None and max_age_days is None:
+        return None
+    if not path.exists():
+        return None
+    if not _over_rotation_threshold(
+        path, max_bytes=max_bytes, max_age_days=max_age_days, now=now
+    ):
+        return None
+
+    target = rolled_path(path, now)
+    if target.exists():
+        log.warning(
+            "history rotation skipped: %s already exists (leaving %s in place)",
+            target,
+            path,
+        )
+        return None
+
+    os.replace(path, target)
+    path.touch()
+    log.info("history rotated: %s -> %s", path, target)
+    return target
+
+
+def _over_rotation_threshold(
+    path: Path, *, max_bytes: int | None, max_age_days: int | None, now: datetime
+) -> bool:
+    if max_bytes is not None and path.stat().st_size > max_bytes:
+        return True
+    if max_age_days is None:
+        return False
+    records = _read_file(path)
+    baseline = (
+        records[0].ts if records else datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    )
+    return now - baseline > timedelta(days=max_age_days)
+
+
+def _read_file(path: Path) -> list[HistoryRecord]:
+    """Records from one history file, in file order. Missing file -> empty list; an
+    unreadable file -> a warning and an empty list (fail open, as with a bad line)."""
     if not path.exists():
         return []
     records = []
-    with path.open() as f:
-        for lineno, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(HistoryRecord.from_dict(json.loads(line)))
-            except (json.JSONDecodeError, KeyError, ValueError):
-                log.warning("skipping unparseable history line %s:%d", path, lineno)
+    try:
+        with path.open() as f:
+            for lineno, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(HistoryRecord.from_dict(json.loads(line)))
+                except (json.JSONDecodeError, KeyError, ValueError):
+                    log.warning("skipping unparseable history line %s:%d", path, lineno)
+    except OSError as e:
+        log.warning("skipping unreadable history file %s: %s", path, e)
+        return []
     return records
 
 

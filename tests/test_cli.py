@@ -8,7 +8,10 @@ unit "failed" rather than always reporting success).
 from __future__ import annotations
 
 import argparse
+import os
+import time
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,6 +19,7 @@ import pytest
 from herdr_routines import cli
 from herdr_routines.cli import _check_systemd_timeout, _cmd_validate, default_log_path
 from herdr_routines.config import GateCheck, Job, RoutinesConfig
+from herdr_routines.history import rolled_path
 from herdr_routines.tick import TickOutcome
 
 
@@ -729,3 +733,196 @@ def test_validate_rejects_model_for_unsupported_kind_as_error(
         if "warning:" in captured.err
         else len(captured.err)
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue 021: retention — `prune` and the tiny-history-threshold warning
+# ---------------------------------------------------------------------------
+
+
+def _plant_report(reports: Path, name: str, *, age_days: float) -> Path:
+    """A report file backdated by *age_days* — `prune` selects on mtime, so tests set it
+    rather than sleeping."""
+    path = reports / name
+    path.write_text("report\n")
+    stamp = time.time() - age_days * 86_400
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_prune_reports_requires_yes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance 11: `prune reports --dry-run` lists candidates and deletes nothing, and
+    `prune reports` with no mode at all exits non-zero with gc's refusal — *and* still prints
+    the listing, because an operator cannot decide without seeing what they would lose. Same
+    rc 2 and message shape as `gc --delete` without `--yes` (`gc.run_gc_delete`), so there is
+    one refusal to learn and one message to grep for.
+
+    Driven through `cli.main`, not the handler, so the argparse wiring is covered too: a
+    `required=True` mode group here would exit 2 with a *usage* error instead, and the
+    criterion is specifically the gc-style refusal. Hence the mutually-exclusive group is
+    optional and the handler owns the refusal.
+    """
+    # Inside tmp_path, so the rendered table shows whole paths — it truncates cells at 48
+    # characters, which pytest's long tmp dirs would otherwise eat.
+    monkeypatch.chdir(tmp_path)
+    reports = Path("reports")
+    reports.mkdir()
+    old = _plant_report(reports, "a-20260101T000000Z.md", age_days=200)
+    fresh = _plant_report(reports, "a-20260927T000000Z.md", age_days=1)
+    base = [
+        "--config",
+        "jobs.yaml",
+        "prune",
+        "reports",
+        "--reports-dir",
+        "reports",
+        "--older-than",
+        "90",
+    ]
+
+    assert cli.main([*base, "--dry-run"]) == 0
+    out = capsys.readouterr()
+    assert "reports/a-20260101T000000Z.md" in out.out
+    assert "reports/a-20260927T000000Z.md" in out.out
+    assert "keep (fresh)" in out.out
+    assert old.exists() and fresh.exists(), "--dry-run must not delete"
+
+    assert cli.main(base) == 2
+    out = capsys.readouterr()
+    assert "refusing to delete without --yes" in out.err
+    assert "a-20260101T000000Z.md" in out.out, (
+        "the listing still prints, to decide with"
+    )
+    assert old.exists() and fresh.exists(), "no --yes means no deletion"
+
+    # --yes is what deletes, and only the collectable entry.
+    assert cli.main([*base, "--yes"]) == 0
+    assert "removed 1" in capsys.readouterr().out
+    assert not old.exists() and fresh.exists()
+
+    # Both modes at once is a usage error, not a silent preference for one of them.
+    with pytest.raises(SystemExit):
+        cli.main([*base, "--dry-run", "--yes"])
+
+    # A negative window is rejected rather than silently collecting everything.
+    assert cli.main([*base, "--older-than", "-1", "--dry-run"]) == 1
+    assert "non-negative" in capsys.readouterr().err
+    assert fresh.exists()
+
+
+def test_prune_reports_takes_its_window_from_config(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no `--older-than`, the window comes from `retention.reports_max_age_days` — so one
+    setting governs both `prune reports` and the fallback, instead of a second flag that can
+    disagree with it. A config that cannot be parsed falls back to the documented 90 days
+    rather than refusing to run: a destructive command should not be unusable because an
+    unrelated file is broken."""
+    monkeypatch.chdir(tmp_path)
+    reports = Path("reports")
+    reports.mkdir()
+    # 40 days old: past the configured 30-day window, inside the 90-day fallback. One file
+    # distinguishes the two.
+    forty_days = _plant_report(reports, "a-20260819T000000Z.md", age_days=40)
+    config_path = Path("jobs.yaml")
+    config_path.write_text(
+        "version: 1\nretention:\n  reports_max_age_days: 30\njobs: []\n"
+    )
+    base = [
+        "--config",
+        "jobs.yaml",
+        "prune",
+        "reports",
+        "--reports-dir",
+        "reports",
+        "--dry-run",
+    ]
+
+    assert cli.main(base) == 0
+    assert "would remove 1" in capsys.readouterr().out
+    assert forty_days.exists()
+
+    # A broken config still prunes, on the built-in window — 40 days is inside 90.
+    config_path.write_text("version: 1\njobs: [\n")
+    assert cli.main(base) == 0
+    assert "would remove 0" in capsys.readouterr().out
+
+    # An explicit --older-than overrides both.
+    assert cli.main([*base, "--older-than", "5"]) == 0
+    assert "would remove 1" in capsys.readouterr().out
+
+
+def test_prune_history_uses_its_own_window_and_spares_the_live_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`prune history` collects old *rolls* and never the live file, at any window. The
+    built-in 365-day window is deliberately generous — this is a by-name command, and the
+    earliest roll is what `first_seen_at` still needs for a long-lived job (see
+    `reports_prune.prune_rolled_history`)."""
+    monkeypatch.chdir(tmp_path)
+    history_path = Path("history.jsonl")
+    history_path.write_text("")
+    old_roll = rolled_path(history_path, datetime(2024, 1, 1, tzinfo=UTC))
+    old_roll.write_text('{"ts": "2024-01-01T00:00:00Z", "job": "a", "state": "done"}\n')
+    recent_roll = rolled_path(history_path, datetime(2026, 9, 27, tzinfo=UTC))
+    recent_roll.write_text(
+        '{"ts": "2026-09-27T00:00:00Z", "job": "a", "state": "done"}\n'
+    )
+    for path, age_days in ((old_roll, 400), (recent_roll, 1)):
+        stamp = time.time() - age_days * 86_400
+        os.utime(path, (stamp, stamp))
+    os.utime(history_path, (0, 0))  # ancient, and still not a candidate
+    monkeypatch.setattr(cli, "default_history_path", lambda: history_path)
+
+    assert cli.main(["prune", "history", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "would remove 1" in out, "400 days is past the 365-day built-in window"
+    assert "history-2024" in out
+    assert old_roll.exists() and recent_roll.exists() and history_path.exists()
+
+    # --older-than 0 collects the recent roll too; the live file is still not a candidate,
+    # which the count (2 of the 2 rolls) is the assertion for.
+    assert cli.main(["prune", "history", "--dry-run", "--older-than", "0"]) == 0
+    assert "would remove 2" in capsys.readouterr().out
+    assert history_path.exists()
+
+    # And with --yes, only the rolls go.
+    assert cli.main(["prune", "history", "--yes", "--older-than", "0"]) == 0
+    assert "removed 2" in capsys.readouterr().out
+    assert not old_roll.exists() and not recent_roll.exists()
+    assert history_path.exists() and history_path.read_text() == ""
+
+
+def test_validate_warns_on_tiny_history_max_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Acceptance 16: `history_max_bytes` below 1 MiB is a warning, not an error. It is legal
+    — it just rolls the log on essentially every tick, and `validate` is the only place anyone
+    would notice before wondering why the state dir is full of rolls. Same posture as the
+    `$ROUTINE_REPORT` warnings: stderr, exit code unchanged.
+
+    A value at or above 1 MiB must stay silent, or the warning is noise on every run — and
+    so must an unset threshold, which means no rotation at all.
+    """
+    config_path = tmp_path / "jobs.yaml"
+    args = _validate_args(config_path, tmp_path)
+
+    config_path.write_text(
+        "version: 1\nretention:\n  history_max_bytes: 4096\njobs: []\n"
+    )
+    assert _cmd_validate(args) == 0
+    err = capsys.readouterr().err
+    assert "warning:" in err
+    assert "history_max_bytes" in err
+
+    config_path.write_text(
+        "version: 1\nretention:\n  history_max_bytes: 1048576\njobs: []\n"
+    )
+    assert _cmd_validate(args) == 0
+    assert "history_max_bytes" not in capsys.readouterr().err
+
+    config_path.write_text("version: 1\nretention: {}\njobs: []\n")
+    assert _cmd_validate(args) == 0
+    assert "history_max_bytes" not in capsys.readouterr().err

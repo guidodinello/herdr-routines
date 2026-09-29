@@ -63,6 +63,7 @@ Then:
 uv sync
 uv run herdr-routines validate
 uv run herdr-routines tmp-hygiene --dry-run  # optional: preview /tmp cleanup
+uv run herdr-routines prune reports --dry-run  # optional: preview state-dir cleanup (issue 021)
 systemctl --user enable --now herdr-server.service
 systemctl --user enable --now herdr-routines.timer
 systemctl --user enable --now herdr-routines-watchdog.timer
@@ -74,6 +75,15 @@ before every job dispatch (under the tick lock). On agent start failure, `df -h 
 is logged to the report tail and the `RunOutcome.diagnosis` field distinguishes
 `tmp_full` from quota `blocked`. Configure via `tmp_hygiene:` under `defaults:` or
 per-job in `jobs.yaml`/`jobs.d/` — see `jobs.example.yaml`.
+
+**Note on state-dir retention (issue 021):** nothing is collected unless you ask.
+`history.jsonl` rotation is opt-in via the `retention:` block (a rename at the end of
+every tick — it can never lose a record); reports and rolled history are only deleted by
+`herdr-routines prune`, which requires `--yes` and spares anything belonging to an
+in-flight pipeline run. Copy [`jobs.d/retention.yaml`](jobs.d/retention.yaml) or the
+commented block in [`jobs.example.yaml`](jobs.example.yaml) to set thresholds, and put
+`prune` on a timer only once you have read its `--dry-run` output — see
+[`../docs/plan-v1.md`](../docs/plan-v1.md#retention).
 
 ## Manual smoke checklist
 
