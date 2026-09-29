@@ -2,10 +2,13 @@
 Description=Fast-forward the herdr-routines runner checkout once a night
 
 [Timer]
-# 21:30 UTC, after the 21:00 tick and before the night's feature pipeline takes the
-# checkout's working tree for its own run: the job's fast-forward (ensure_repo) and
-# this one then agree, and a deferred update costs nothing but a night.
-OnCalendar=*-*-* 21:30:00
+# 21:30 UTC, pinned explicitly: an OnCalendar with no timezone suffix is read in the
+# *system* zone, which is America/Montevideo on the Pi, so an unsuffixed value would
+# fire at 00:30 UTC. After the day's tick work and well before the night's feature
+# pipeline (02:00 local) takes the checkout's working tree for its own run: the job's
+# fast-forward (ensure_repo) and this one then agree, and a deferred update costs
+# nothing but a night.
+OnCalendar=*-*-* 21:30:00 UTC
 # A host that was asleep at 21:30 runs it on wake instead of skipping the night.
 Persistent=true
 AccuracySec=5min

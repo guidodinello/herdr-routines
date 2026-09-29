@@ -25,13 +25,16 @@ merge.
 
 **Normally you don't run this by hand at all** (issue 053):
 `herdr-routines-update.timer` fires `herdr-routines self-update` every night at
-21:30 UTC, which does steps 0-4 below automatically — CI check, fast-forward, validate,
-`git reset --keep` rollback on failure — and defers silently when the tick lock is held,
-a `kind: pipeline` run is in flight, CI is not green, or the commit has already been
-rolled back once. The steps below are still the procedure for the two cases it cannot
-cover: a **config schema migration** (below), and a host it has *refused* (dirty tree,
-not on `main`, detached HEAD, or an unpushed hand-hotfix) — both of which notify and
-explain themselves. Check what it did with:
+21:30 UTC (the unit's `OnCalendar` pins `UTC`, so this is 18:30 on the Pi's
+`America/Montevideo`), which does steps 0-4 below automatically — CI check,
+fast-forward onto the gated commit, validate, `git reset --keep` rollback on
+failure — and defers silently when the tick lock is held, a `kind: pipeline` run is
+in flight, CI is not green, or the commit has already been rolled back once. The
+steps below are still the procedure for the two cases it cannot cover: a **config
+schema migration** (below), and a host it has *refused* (dirty tree, not on
+`main`, detached HEAD, an unpushed hand-hotfix, or a checkout still sitting on a
+commit that failed its own validation) — both of which notify and explain
+themselves. Check what it did with:
 
 ```sh
 ssh $HOST "systemctl --user status herdr-routines-update.service"
@@ -109,6 +112,13 @@ this, `validate` / `tick` raise a ConfigError containing `kind: gated` and
   `done`, so the flip lands on `main` atomically at merge. After pulling a merged
   PR, **do not** hand-flip any issue status — it's already in main via the PR, and
   you shouldn't leave the issue `open`/`in-progress` expecting a manual close.
-- The manual step is the deliberate design: the release/update strategy on
-  `ROADMAP.md` Parking lot carves out the runner fast-forward as a human/`update`
-  action, keeping self-update off the always-on Pi.
+- The runner fast-forward is automated, with the manual steps above as its
+  fallback: `herdr-routines-update.timer` (issue 053) does the green-CI gate, the
+  fast-forward and the out-of-process validate on its own, and rolls back with
+  `git reset --keep` if the new code will not load the host's config. This is the
+  one carve-out in the `ROADMAP.md` Parking-lot release/update strategy — herdr-
+  routines' own changes already flow through PR + green CI, so the Pi may
+  fast-forward *itself*. Plugins, the herdr CLI and `jobs.yaml` stay explicit and
+  are never auto-mutated, and `deploy/` changes are reported by the notification
+  rather than applied. Run the manual steps when the timer refuses the host (it
+  says why) or when a merge needs a config migration before it can validate.

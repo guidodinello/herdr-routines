@@ -18,12 +18,18 @@ decision in here, and all three come from that incident:
   whenever HEAD already contains `origin/<base>` — *including* when HEAD is strictly
   ahead of it, which is the state a hand-hotfixed host is left in. So the post-ff
   HEAD re-read is authoritative and is the only thing that decides "updated" vs
-  "up to date" (spec finding F3).
+  "up to date" (spec finding F3). The merge itself targets the *gated* SHA
+  (`git merge --ff-only <new>`), never a re-resolved `origin/<base>`: the CI gate is
+  on one commit, so the commit that moves HEAD has to be that one.
 - **Never re-attempt a commit already rejected.** A bad commit would otherwise be
   re-fetched, re-validated, re-rolled-back and re-notified every night forever, so
   the operator cannot tell a broken timer from a broken commit — and mutes it. The
   rejected SHA is persisted to `$HERDR_PLUGIN_STATE_DIR/self-update.json` and
-  deferred on, which clears itself for free when main moves (spec finding F2).
+  deferred on, which clears itself for free when main moves (spec finding F2). A
+  host whose HEAD *is* the rejected commit — `reset --keep` refused, the operator
+  then discarded their edit without moving HEAD — is a refusal, not an
+  "up to date": it is running code that failed its own validation, and saying
+  nothing there is how this command's reason for existing is defeated.
 - **Fail closed, exit 0.** Anything unverifiable — a tick lock held, an open
   pipeline run, a red or pending or unqueryable CI state, a missing `uv` — defers
   quietly and leaves the host exactly as it was.
@@ -38,15 +44,22 @@ Sequence (spec 20260929T050000Z, `### Sequence`):
 
     1. tick_lock                       not acquired -> deferred,  rc 0
     2. pipeline_run_open               open run     -> deferred,  rc 0
-    3. repo_state                      dirty / not <base> / detached -> refused, rc 1
+    3. repo_state       unreadable HEAD / dirty / not <base> / detached
+                                                        -> refused,  rc 1
     4. resolve_uv                      missing      -> refused,  rc 1   (before any git op)
-    5. fetch + CI gate on the new SHA  not green    -> deferred,  rc 0
+    5. one fetch, resolve `new`, CI gate on that exact `new`
+                                         not green    -> deferred,  rc 0
                                          already rejected -> deferred, rc 0
     6. baseline validate (best effort) failure -> no baseline, count check skipped
-    7. _fetch_and_fast_forward         diverged     -> refused,  rc 1
-    8. re-read HEAD                    unchanged    -> up_to_date (+ warn if unpushed)
+    7. merge --ff-only <gated new>      failed       -> refused,  rc 1
+    8. re-read HEAD                    unchanged    -> up_to_date (+ warn if unpushed),
+                                                      refused if HEAD is a rejected SHA
     9. post validate                   failed / fewer jobs -> reset --keep, rc 1
    10. deploy changes are reported, never applied
+
+Nothing on this path raises: every git call is bounded and a `TimeoutExpired` comes
+back as a non-zero git (see `_git`), so a degraded link is a `SelfUpdateResult` and
+a notification rather than a traceback out of `_cmd_self_update`.
 """
 
 from __future__ import annotations
@@ -71,14 +84,15 @@ from herdr_routines.gates import (
     evaluate_commit_checks,
     remote_owner_and_repo,
 )
-from herdr_routines.repos import _fetch_and_fast_forward
 from herdr_routines.tick import _open_pipeline_run, tick_lock
 
 log = get_logger(__name__)
 
 # Every git call in this module is bounded the same way repos._fetch_and_fast_forward
 # bounds its own; a degraded network link is exactly the 2026-09-27 incident's
-# "5 GHz link degraded", and an unbounded git is how a host wedges overnight.
+# "5 GHz link degraded", and an unbounded git is how a host wedges overnight. A
+# bound is only useful if hitting it is a *result*, though, so `_git` reports the
+# timeout as a failing git rather than raising it.
 GIT_TIMEOUT_S = 120
 # The unit's TimeoutStartSec is sized so systemd cannot land a SIGTERM inside the
 # git merge window: two `uv run` invocations at up to VALIDATE_TIMEOUT_S each, plus
@@ -163,23 +177,51 @@ def default_state_path() -> Path:
 def _git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """One bounded `git -C <checkout> ...`. Every git call in this module goes
     through here so the flow is auditable in one place (and so a test can record
-    the argv without mocking git's behaviour)."""
-    return subprocess.run(
-        ["git", "-C", str(checkout), *args],
-        capture_output=True,
-        text=True,
-        timeout=GIT_TIMEOUT_S,
-        check=False,
-    )
+    the argv without mocking git's behaviour).
+
+    A timeout is *returned* as an ordinary failing git — rc 124, the `timeout(1)`
+    convention — instead of raised. `subprocess.TimeoutExpired` is not a
+    `RuntimeError`, so letting it out of here would sail past the flow's error
+    handling and escape `run_self_update` entirely: no `SelfUpdateResult`, no
+    notification, no rollback, just a traceback out of `_cmd_self_update`. That is
+    the one night this command most needs to work — a degraded link is what the
+    2026-09-27 incident ran into — and every caller already branches on
+    `returncode`, so a timeout lands in the same refuse path as any other git
+    failure. `validate_subprocess` catches its own for the same reason.
+    """
+    argv = ["git", "-C", str(checkout), *args]
+    try:
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "self-update: git %s timed out after %ss", " ".join(args), GIT_TIMEOUT_S
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            124,
+            "",
+            f"git {' '.join(args)} timed out after {GIT_TIMEOUT_S}s",
+        )
 
 
 def repo_state(checkout: Path) -> RepoState:
     """(old_sha, branch, dirty) for the checkout. A detached HEAD is reported by
     `rev-parse --abbrev-ref` as the literal string `HEAD`, which is why the
     detached case is a comparison against the branch name rather than a special
-    check with a nicer name — `_fetch_and_fast_forward` short-circuits on detached
-    HEAD and returns having merged nothing, so without a refusal this command would
-    report a successful "update" of a checkout it never moved."""
+    check with a nicer name: nothing would be tracking which commit the runner is
+    on, so every branch-relative answer this command gives (the unpushed-commit
+    warning, "already up to date") would be meaningless, and a detached HEAD that
+    happens to contain `origin/<base>` is indistinguishable from a stale one.
+
+    An empty `old` or `branch` means the read failed or timed out (see `_git`);
+    the caller refuses on it rather than reading that as "clean, on `main`".
+    """
     head = _git(checkout, "rev-parse", "HEAD")
     branch = _git(checkout, "rev-parse", "--abbrev-ref", "HEAD")
     porcelain = _git(checkout, "status", "--porcelain")
@@ -188,6 +230,24 @@ def repo_state(checkout: Path) -> RepoState:
         branch=branch.stdout.strip(),
         dirty=bool(porcelain.stdout.strip()),
     )
+
+
+def fast_forward_to(checkout: Path, sha: str) -> tuple[int, str, str]:
+    """`git merge --ff-only <sha>` — the CI-gated SHA *itself*.
+
+    Issue 053 allows either `repos._fetch_and_fast_forward` or "an ff-only merge of
+    exactly `new`", and only the second is safe here: `_fetch_and_fast_forward`
+    runs a *second* fetch and merges whatever `origin/<base>` happens to be at that
+    moment, so a commit landing on main during the baseline validate (a full
+    `uv run`, up to `VALIDATE_TIMEOUT_S`) would be deployed and reported as
+    `updated` without a single `gh` call about it. The gate is on `sha`, so the
+    move has to be onto `sha`.
+
+    A non-zero rc is the diverged case, or a worktree that moved under us; the
+    caller refuses rather than forces.
+    """
+    proc = _git(checkout, "merge", "--ff-only", sha)
+    return proc.returncode, proc.stdout, proc.stderr
 
 
 def reset_keep(checkout: Path, sha: str) -> tuple[int, str, str]:
@@ -487,6 +547,12 @@ def run_self_update(
             return _deferred(f"pipeline run open for {open_job}", checkout)
 
         state = repo_state(checkout)
+        if not state.old or not state.branch:
+            return _refused(
+                f"cannot read HEAD of {checkout} (git failed or timed out)",
+                checkout,
+                notify=notify,
+            )
         if state.dirty:
             return _refused(
                 "working tree is dirty", checkout, notify=notify, old=state.old
@@ -525,13 +591,29 @@ def run_self_update(
                 f"cannot resolve origin/{base}", checkout, notify=notify, old=old
             )
 
+        # Read the rejected-SHA state *before* the no-op short-circuit below: a host
+        # whose HEAD is itself the rejected commit (the rollback could not be
+        # applied, and the operator then discarded their edit without moving HEAD)
+        # must not be told it is up to date — it is running code that failed its own
+        # validation, silently, every night.
+        rejected_sha, rejected_reason = read_rejected(state_path)
+
         # Cheap short-circuit only: `merge --ff-only` is also a no-op when HEAD is
         # strictly ahead of origin/<base>, and step 8 is what actually decides.
         if new == old:
+            if new == rejected_sha:
+                return _refused(
+                    f"HEAD is on {old}, the commit that was rolled back "
+                    f"({rejected_reason or 'unknown reason'}) — the checkout is "
+                    "running code that failed its own validation; fix it by hand, "
+                    f"or let origin/{base} move on and this clears itself",
+                    checkout,
+                    notify=notify,
+                    old=old,
+                )
             log.info("self-update: %s already at %s on %s", checkout, old, base)
             return SelfUpdateResult(status="up_to_date", old=old, new=old)
 
-        rejected_sha, rejected_reason = read_rejected(state_path)
         if new == rejected_sha:
             return _deferred(
                 f"already rolled back: {new} — {rejected_reason or 'unknown reason'}",
@@ -576,16 +658,33 @@ def run_self_update(
                 checkout,
             )
 
-        try:
-            _fetch_and_fast_forward(checkout, base=base)
-        except RuntimeError as e:
+        # The merge targets the gated SHA, never a re-resolved origin/<base>: a
+        # commit landing on main during the baseline validate above has not been
+        # through the CI gate, so it must not be deployed by this run.
+        rc, _out, stderr = fast_forward_to(checkout, new)
+        if rc != 0:
             return _refused(
-                f"fast-forward failed: {e}", checkout, notify=notify, old=old
+                f"fast-forward to {new} failed: {stderr.strip() or 'unknown error'}",
+                checkout,
+                notify=notify,
+                old=old,
             )
 
         # Authoritative: what is on disk after the fast-forward is what happened,
         # not what origin/<base> said before it (spec finding F3).
         head_after = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+        if head_after not in (old, new):
+            # Unreachable while the merge targets `new` — a guard, not a path. Kept
+            # because "report an update that did not happen" is the failure this
+            # command exists to prevent, and this is the only place a third SHA
+            # could enter.
+            return _refused(
+                f"HEAD is on {head_after or '(unknown)'}, which is neither the old "
+                f"{old} nor the CI-gated {new} — refusing to report an update for it",
+                checkout,
+                notify=notify,
+                old=old,
+            )
         if head_after == old:
             unpushed = _unpushed_count(checkout, base)
             if unpushed:

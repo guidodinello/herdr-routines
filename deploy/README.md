@@ -1,6 +1,6 @@
 # Deploying herdr-routines
 
-Three systemd **user** unit pairs drive this tool — no daemon of our own, no root required. See
+Four systemd **user** unit pairs drive this tool — no daemon of our own, no root required. See
 [`../docs/plan-v1.md`](../docs/plan-v1.md) §3 for the full rationale.
 
 ## Install
@@ -19,29 +19,33 @@ cp systemd/herdr-server.service systemd/herdr-routines.timer systemd/herdr-routi
 systemctl --user daemon-reload
 ```
 
-`herdr-routines-watchdog.{timer,service}` is a third, independent unit pair (own
+`herdr-routines-watchdog.{timer,service}` is a second, independent unit pair (own
 `ExecStart=... herdr-routines pipeline-watchdog`, own 15-min `OnCalendar`) — **not** a
 `jobs.d/` entry. `tick`'s job model (`herdr-routines.timer` above) only ever dispatches an
 agent prompt per job; the pipeline stall watchdog (issue 031) spawns no agent and issues no
 prompt, so it gets its own timer the same way `tick` itself does, rather than being forced
 into a job shape it doesn't fit.
 
-`herdr-routines-digest.{timer,service}` is a fourth, independent unit pair for the same
+`herdr-routines-digest.{timer,service}` is a third, independent unit pair for the same
 reason (issue 010): the daily digest reads existing `history.jsonl` + the reports dir and
 posts one summary notification — it spawns no agent, dispatches no job, and needs no new
 per-job config field, so it gets its own once-a-morning timer rather than a `jobs.d/` entry.
 Edit `--timezone` in the unit's `ExecStart` (default in the example is
 `America/Montevideo`) to your own; drop `--notify` to only print to the service log.
 
-`herdr-routines-update.{timer,service}` is a fifth unit pair, and the one that keeps this
-checkout current (issue 053). It runs once a night at 21:30 UTC:
-`ExecStart` is `uv run herdr-routines self-update`, which fast-forwards **this** checkout
-to `origin/main` — but only once the new commit's CI is green and only after the new
-code has validated this host's live config *out of process*; if that validate fails the
-checkout goes back to where it was with `git reset --keep` and a notification. It
-reports (and applies) nothing under `deploy/` — unit changes are reported in the
-notification and installed by hand, per this file. Deferrals (tick lock held, a pipeline
-run in flight, a red or pending CI, a commit already rolled back) are silent and exit 0.
+`herdr-routines-update.{timer,service}` is a fourth unit pair, and the one that keeps this
+checkout current (issue 053). It runs once a night at 21:30 UTC — the unit's
+`OnCalendar` pins `UTC` explicitly, so it does not follow the host's
+`America/Montevideo`, where that hour is 18:30. `ExecStart` is
+`uv run herdr-routines self-update`, which fast-forwards **this** checkout to
+`origin/main` — but only onto the exact commit the CI gate was asked about, and only
+after the new code has validated this host's live config *out of process*; if that
+validate fails the checkout goes back to where it was with `git reset --keep` and a
+notification. It reports (and applies) nothing under `deploy/` — unit changes are
+reported in the notification and installed by hand, per this file. Deferrals (tick
+lock held, a pipeline run in flight, a red or pending CI, a commit already rolled
+back) are silent and exit 0; refusals (dirty tree, not on `main`, detached HEAD, a
+checkout still sitting on a commit that failed validation) notify and exit 1.
 Preview it any time without touching the checkout:
 
 ```sh

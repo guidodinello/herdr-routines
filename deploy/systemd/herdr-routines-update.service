@@ -18,8 +18,14 @@ Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=%h/.local/bin/uv run herdr-routines self-update
 
 # Finite, and sized so systemd cannot land a SIGTERM inside the window where the
-# checkout is at the new commit but the new code has not been proven: two bounded
-# validate children at up to 300s each, up to five bounded git calls at 120s, one gh
-# query, plus slack. A run that overruns is killed by systemd rather than wedging the
-# host, and the next night's run re-reads HEAD and tries again.
+# checkout is at the new commit but the new code has not been proven. Budget as the
+# code actually issues calls: two bounded `uv run` children at up to 300s each, plus
+# up to nine bounded git calls at 120s (rev-parse HEAD, rev-parse --abbrev-ref HEAD,
+# status --porcelain, fetch, rev-parse origin/main, merge --ff-only, rev-parse HEAD,
+# diff --name-only, rev-list --count), plus one gh query — about 1700s, inside the
+# 1800s below. A rollback adds `reset --keep` and two more reads, whose theoretical
+# worst case is over the line; being SIGTERMed there is the fail-closed outcome this
+# bound exists for, and the next night's run re-reads HEAD rather than assuming the
+# update landed. A run that overruns is killed by systemd rather than wedging the
+# host.
 TimeoutStartSec=1800

@@ -417,10 +417,11 @@ def test_self_update_defers_while_pipeline_run_open(sandbox: Sandbox) -> None:
 
 def test_self_update_refuses_dirty_or_diverged(tmp_path: Path) -> None:
     """Criterion 4. Four distinct refuse paths, each leaving the checkout exactly as
-    it was and notifying. The detached case matters on its own: `repos.
-    _fetch_and_fast_forward` short-circuits on a detached HEAD and returns having
-    merged nothing, so without an explicit refusal this command would report a
-    successful "update" of a checkout it never moved."""
+    it was and notifying. The detached case matters on its own: nothing would be
+    tracking which commit the runner checkout is on, so a detached HEAD that happens
+    to contain `origin/<base>` is indistinguishable from a stale one — and the
+    branch-relative answers this command gives (the unpushed-commit warning, "already
+    up to date") would be meaningless on it."""
     cases: list[tuple[str, Callable[[Sandbox], object]]] = [
         ("dirty", lambda sb: (sb.checkout / "README.md").write_text("hand-edited\n")),
         ("non-main branch", lambda sb: _git(sb.checkout, "checkout", "-b", "side")),
@@ -609,7 +610,10 @@ def test_self_update_units_and_docs_are_shipped() -> None:
     assert "[Install]" not in service_text
     assert "[Install]" not in digest_text
 
-    assert "OnCalendar=*-*-* 21:30:00" in timer_text
+    # `UTC` is pinned explicitly: an OnCalendar with no suffix is read in the
+    # *system* zone, which is America/Montevideo on the Pi, so the docs' "21:30 UTC"
+    # would otherwise be 21:30 local.
+    assert "OnCalendar=*-*-* 21:30:00 UTC" in timer_text
     assert "Persistent=true" in timer_text
     assert "AccuracySec=5min" in timer_text
     assert "WantedBy=timers.target" in timer_text
@@ -992,20 +996,159 @@ def test_self_update_git_operations_are_real_not_mocked(
     assert sandbox.head() == new
     assert sandbox.porcelain() == ""
     assert ["git", "-C", checkout, "fetch", "--prune", "origin"] in recorded
-    assert [
-        "git",
-        "-C",
-        checkout,
-        "merge",
-        "--ff-only",
-        f"origin/{sandbox.base}",
-    ] in recorded
+    # The merge targets the CI-gated SHA, not a re-resolved origin/<base>: the gate
+    # is on one commit, so that is the only commit this run may deploy.
+    assert ["git", "-C", checkout, "merge", "--ff-only", new] in recorded
+    assert not any(
+        argv[-2:] == ["--ff-only", f"origin/{sandbox.base}"] for argv in recorded
+    )
     assert not any("--hard" in argv for argv in recorded)
     # The three fakes, and only those: no `uv` process was ever spawned.
     assert len(validate.calls) == 2
     assert gh.calls == [new]
     assert len(notify.calls) == 1
     assert not any(argv and argv[0] == "/usr/bin/uv" for argv in recorded)
+
+
+# ---------------------------------------------------------------------------
+# 22. the PR #130 review fixes: the gate, the timeout, and the rejected HEAD
+# ---------------------------------------------------------------------------
+
+
+def test_self_update_deploys_only_the_ci_gated_sha(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review fix 1 — the gate must cover the commit that actually moves HEAD. The
+    fast-forward used to be `repos._fetch_and_fast_forward`, which runs a *second*
+    fetch and merges whatever `origin/<base>` is at that moment, so a commit landing
+    on main during the baseline validate (a full `uv run`, up to
+    `VALIDATE_TIMEOUT_S`) was deployed and reported as `updated` with no `gh` call
+    about it. Here main moves mid-run: the gated SHA is deployed, and the newcomer
+    waits for its own night's gate."""
+    gated = sandbox.push("ONE.md", "one\n", "add ONE.md")
+
+    def land_a_commit_mid_validate(index: int) -> None:
+        if index == 0:
+            sandbox.push("TWO.md", "two\n", "a commit that lands after the gate")
+
+    git_calls = _record_git_calls(monkeypatch)
+    gh = FakeGh()
+    notify = Recorder()
+    result = sandbox.run(
+        notify=notify,
+        runner=FakeValidate(before_return=land_a_commit_mid_validate),
+        gh=gh,
+    )
+
+    assert result.status == "updated"
+    assert result.new == gated
+    assert sandbox.head() == gated
+    assert sandbox.porcelain() == ""
+    assert gh.calls == [gated]
+    assert ("merge", "--ff-only", gated) in git_calls.calls
+    # One fetch, not two: the newcomer is not even in this checkout's object store.
+    assert [c for c in git_calls.calls if c and c[0] == "fetch"] == [
+        ("fetch", "--prune", "origin")
+    ]
+
+
+def test_a_git_timeout_is_a_result_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review fix 2 — a bounded git call that hits its bound is a *result*. Every git
+    call here is bounded by `GIT_TIMEOUT_S` precisely because a degraded link is what
+    the 2026-09-27 incident ran into, but `subprocess.TimeoutExpired` is not a
+    `RuntimeError`, so it used to raise straight out of `run_self_update`: no
+    `SelfUpdateResult`, no notification, no rollback, and `_cmd_self_update` has no
+    catch-all to turn it into one. `_git` reports the bound as a failing git instead,
+    so both the fetch and the merge land in the refuse path with HEAD untouched."""
+    real_run = subprocess.run
+
+    for label, slow_arg in (("fetch", "fetch"), ("merge", "merge")):
+        sb = _sandbox(tmp_path, label)
+        old = sb.head()
+        sb.push("NEW.md", "new\n", "new commit")
+
+        def flaky_run(argv: Any, arg: str = slow_arg, **kwargs: Any) -> Any:
+            if isinstance(argv, list) and arg in argv:
+                raise subprocess.TimeoutExpired(
+                    cmd=argv, timeout=self_update.GIT_TIMEOUT_S
+                )
+            return real_run(argv, **kwargs)
+
+        monkeypatch.setattr(self_update.subprocess, "run", flaky_run)
+
+        notify = Recorder()
+        validate = FakeValidate()
+        result = sb.run(notify=notify, runner=validate)
+
+        assert result.status == "refused", label
+        assert result.exit_code == 1, label
+        assert "timed out" in (result.reason or ""), label
+        assert sb.head() == old, label
+        assert sb.porcelain() == "", label
+        assert len(notify.calls) == 1, label
+        assert "timed out" in notify.body, label
+        # The baseline validate runs before the merge and not at all before the fetch.
+        assert len(validate.calls) == (0 if slow_arg == "fetch" else 1), label
+
+
+def test_a_host_left_on_a_rejected_sha_is_refused_not_up_to_date(
+    sandbox: Sandbox,
+) -> None:
+    """Review fix 3 — a rollback that could not be applied (`reset --keep` refused
+    because of a local edit) leaves HEAD on the commit that failed validation. Once
+    the operator discards that edit without moving HEAD, the `new == old`
+    short-circuit used to answer `up_to_date` *before* it ever read the
+    rejected-SHA file: the host ran unvalidated code and said nothing, every night,
+    which is exactly what the state file exists to prevent. It refuses instead —
+    loudly — and clears itself when main moves."""
+    sandbox.push("changed.txt", "one\n", "add changed.txt")
+    _git(sandbox.checkout, "fetch", "origin")
+    _git(sandbox.checkout, "merge", "--ff-only", f"origin/{sandbox.base}")
+    rejected = sandbox.push("changed.txt", "two\n", "rewrite changed.txt")
+
+    def edit_after_ff(index: int) -> None:
+        """The post-update validate child leaves a local edit to a file the fast
+        forward changed — precisely what makes `reset --keep` refuse."""
+        if index == 1:
+            (sandbox.checkout / "changed.txt").write_text("hand edit\n")
+
+    first_notify = Recorder()
+    first = sandbox.run(
+        notify=first_notify,
+        runner=FakeValidate(
+            results=[(0, PASSING_VALIDATE), (1, "error: broken new code")],
+            before_return=edit_after_ff,
+        ),
+    )
+    assert first.status == "rolled_back"
+    assert sandbox.head() == rejected
+    assert json.loads(sandbox.state_path.read_text())["last_rejected_sha"] == rejected
+
+    # The operator throws their edit away, and HEAD stays where it is.
+    _git(sandbox.checkout, "checkout", "--", "changed.txt")
+
+    second_notify = Recorder()
+    second_validate = FakeValidate()
+    second_gh = FakeGh()
+    second = sandbox.run(notify=second_notify, runner=second_validate, gh=second_gh)
+
+    assert second.status == "refused"
+    assert second.exit_code == 1
+    assert rejected in (second.reason or "")
+    assert sandbox.head() == rejected
+    assert len(second_notify.calls) == 1
+    assert rejected in second_notify.body
+    assert second_validate.calls == []
+    assert second_gh.calls == []
+
+    # And it clears itself for free once main moves, like every other rejection.
+    moved = sandbox.push("THREE.md", "three\n", "a later commit")
+    third = sandbox.run(notify=Recorder(), runner=FakeValidate(), gh=FakeGh())
+
+    assert third.status == "updated"
+    assert sandbox.head() == moved
 
 
 # ---------------------------------------------------------------------------
