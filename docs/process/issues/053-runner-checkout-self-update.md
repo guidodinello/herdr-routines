@@ -1,7 +1,7 @@
 ---
 id: "053"
 title: "runner checkout is never updated — merged fixes silently don't reach the host"
-status: open
+status: done
 priority: high
 area: deploy
 ---

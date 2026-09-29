@@ -46,6 +46,14 @@ CI_POLL_INTERVAL_S = 15.0
 FAILING_CI_CONCLUSIONS = frozenset({"FAILURE"})
 TOLERATED_CI_CONCLUSIONS = frozenset({"SKIPPED", "NEUTRAL"})
 
+# The complement for a *commit* self-update is about to deploy (spec
+# 20260929T050000Z). `evaluate_ci_checks` above tolerates everything that is not
+# FAILURE, which is right for a PR whose gate is about authoring a fix; it is wrong
+# here, because a CANCELLED / TIMED_OUT / ACTION_REQUIRED / STALE runner is not
+# green, and an unrecognised conclusion string is not evidence of anything. So this
+# set is an allowlist, not a denylist.
+ACCEPTED_COMMIT_CONCLUSIONS = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
+
 # Anchored to the literal bracketed form so "[non-blocking]" — which contains the
 # substring "blocking" but not "[blocking]" — can never satisfy this by substring
 # (issue 035's secondary finding: jq's `test("blocking")` matched both).
@@ -124,6 +132,81 @@ def evaluate_ci_checks(checks: Sequence[dict[str, object]]) -> GateVerdict:
         str(c.get("name") or c.get("context") or "unknown") for c in failing
     )
     return GateVerdict(passed=False, reason=f"CI check(s) failed: {names}")
+
+
+# ---------------------------------------------------------------------------
+# Commit gate — the stricter sibling evaluate_ci_checks defers on
+# ---------------------------------------------------------------------------
+
+
+def _normalise_token(value: object) -> str | None:
+    """Uppercase, whitespace-trimmed copy of one API token, or None if absent.
+
+    The REST check-runs API speaks lowercase (`"completed"`, `"success"`) and the
+    GraphQL rollup speaks uppercase (`"COMPLETED"`, `"SUCCESS"`). Comparing a raw
+    value against the uppercase constants above therefore classifies *every* real
+    REST check as pending.
+    """
+    if value is None:
+        return None
+    return str(value).strip().upper()
+
+
+def _is_pending_check_normalised(check: dict[str, object]) -> bool:
+    status = _normalise_token(check.get("status"))
+    if status is not None:
+        return status != "COMPLETED"
+    return _normalise_token(check.get("state")) == "PENDING"
+
+
+def _conclusion_of_normalised(check: dict[str, object]) -> str | None:
+    return _normalise_token(check.get("conclusion") or check.get("state"))
+
+
+def _check_name(check: dict[str, object]) -> str:
+    return str(check.get("name") or check.get("context") or "unknown")
+
+
+def evaluate_commit_checks(checks: Sequence[dict[str, object]]) -> GateVerdict:
+    """Is this *commit* green enough to install? Case-normalised; safe for both the
+    REST check-runs shape and the GraphQL rollup shape.
+
+    Deliberately stricter than `evaluate_ci_checks`, which fails only on `FAILURE`
+    and is right for a PR the orchestrator is about to fix up. A commit is
+    different: the host is about to *deploy* it, so
+
+    - an empty list defers — an unverifiable commit is not a green one. Note REST
+      check-runs omit legacy commit statuses, so a statuses-only repo lands here,
+      which is the correct fail-closed answer;
+    - any still-pending check defers;
+    - any conclusion outside {SUCCESS, SKIPPED, NEUTRAL} defers, so a CANCELLED /
+      TIMED_OUT / ACTION_REQUIRED / STALE runner (or an unrecognised string from a
+      runner we don't know) is not mistaken for green.
+
+    Every failure is a *defer* (exit 0, nothing changed), never an error: the
+    human merge to main is the real gate, and this only keeps the host off
+    something red (spec 20260929T050000Z finding F5).
+    """
+    if not checks:
+        return GateVerdict(passed=False, reason="no check runs reported for the commit")
+
+    pending = [c for c in checks if _is_pending_check_normalised(c)]
+    if pending:
+        names = ", ".join(_check_name(c) for c in pending)
+        return GateVerdict(passed=False, reason=f"check(s) still pending: {names}")
+
+    unaccepted = [
+        c
+        for c in checks
+        if _conclusion_of_normalised(c) not in ACCEPTED_COMMIT_CONCLUSIONS
+    ]
+    if unaccepted:
+        names = ", ".join(
+            f"{_check_name(c)} ({_conclusion_of_normalised(c)})" for c in unaccepted
+        )
+        return GateVerdict(passed=False, reason=f"check(s) not green: {names}")
+
+    return GateVerdict(passed=True)
 
 
 def run_ci_gate(

@@ -50,6 +50,14 @@ class GhClient(Protocol):
         """Execute a GraphQL query via gh api graphql."""
         ...
 
+    def commit_check_runs(
+        self, *, owner: str, repo: str, sha: str
+    ) -> list[dict[str, object]]:
+        """Return the check runs reported for one commit (REST shape: lowercase
+        ``status``/``conclusion``). Raises ``RuntimeError`` when the query fails —
+        callers must treat that as "unverifiable", not as "green"."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class PRInfo:
@@ -154,6 +162,31 @@ class RealGhClient:
             return json.loads(stdout)
         except json.JSONDecodeError:
             return {}
+
+    def commit_check_runs(
+        self, *, owner: str, repo: str, sha: str
+    ) -> list[dict[str, object]]:
+        """The REST check-runs endpoint, whose response is
+        ``{"total_count": N, "check_runs": [...]}`` — a dict, not a list, so the
+        ``check_runs`` key has to be unwrapped. The entries use the *lowercase* REST
+        vocabulary (``status: "completed"``, ``conclusion: "success"``), which is
+        why ``gates.evaluate_commit_checks`` normalises case rather than reusing
+        ``_is_pending_check`` (spec 20260929T050000Z finding F5)."""
+        exit_code, stdout, stderr = self._run(
+            ["gh", "api", f"repos/{owner}/{repo}/commits/{sha}/check-runs"]
+        )
+        if exit_code != 0:
+            raise RuntimeError(f"gh api check-runs failed: {stderr.strip()}")
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, dict):
+            return []
+        raw = payload.get("check_runs", [])
+        if not isinstance(raw, list):
+            return []
+        return [c for c in raw if isinstance(c, dict)]
 
 
 def repo_owner_and_name(remote_url: str) -> tuple[str, str]:
