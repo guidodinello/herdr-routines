@@ -27,28 +27,33 @@ an *unmade design decision*, not on elapsed time (each says so in its file).
 
 In progress or ready to build; no real-run evidence required.
 
-- **Overnight feature-pipeline orchestrator (POC)** — `in-progress`, 4 real
+- **Overnight feature-pipeline orchestrator (POC)** — `done`, 4 real
   dogfood runs so far. → [`004-overnight-feature-pipeline-poc.md`](docs/process/issues/004-overnight-feature-pipeline-poc.md)
-- **Pipeline never gates on CI: a red PR passes every stage** — `open`,
+- **Pipeline never gates on CI: a red PR passes every stage** — `done`,
   `high`. Gate 3 only runs `pytest`; nothing calls `gh pr checks` or reads
   `statusCheckRollup`, so a PR with failing `ruff format --check`/`ruff
   check` still gets `## Outcome: ok` (hit on PR #81). →
   [`034`](docs/process/issues/034-gate-ci-checks.md)
 - **Gate 6 measures blocking-count, not reply coverage — unanswered threads
-  pass** — `open`, `high`. Stage 6's contract is fix-and-reply-to-every-
+  pass** — `done`, `high`. Stage 6's contract is fix-and-reply-to-every-
   thread; the gate only checks for a `[blocking]`-tagged thread, so an
   unfixed, unanswered non-blocking thread still passes (PR #81). →
   [`035`](docs/process/issues/035-gate6-reply-coverage.md)
 - **`babysit-prs` can never fix a pipeline PR: worktree collision on the
-  retained branch** — `open`, `high`. Its per-PR worktree checkout collides
+  retained branch** — `done`, `high`. Its per-PR worktree checkout collides
   with the orchestrator's deliberately-retained `auto/pipeline-*` worktree,
   so it can't touch the 20+ PRs it exists to catch. →
   [`036`](docs/process/issues/036-babysit-worktree-collision.md)
 - **`pipeline-launch.sh` never inspects settle status: a blocked
-  orchestrator looks like success for 8h** — `open`, `high`. `--wait` exits 0
+  orchestrator looks like success for 8h** — `done`, `high`. `--wait` exits 0
   for `blocked` same as `idle`/`done`, and the pane-close cleanup trap
   destroys the diagnostic screen before anything captures it. →
   [`037`](docs/process/issues/037-launcher-blocked-settle.md)
+- **Move the orchestrator's mechanical steps into code** — `open`, `high`.
+  Pre-flight, the stage loop and stage 4 (push + PR) run in code; agents keep
+  only the judgment stages. Supersedes issue 052 and the "Code-level pipeline
+  gates" Parking Lot item. →
+  [`054`](docs/process/issues/054-orchestrator-mechanical-steps-to-code.md)
 
 Done (kept as `status: done` issue files for history): plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
@@ -148,14 +153,14 @@ Curated into issue files 2026-08-27. Time-gated items were promoted to
   `tick` instead of its own detached `systemd-run` launcher; stages stay
   prompt-hardcoded for now. →
   [`026`](docs/process/issues/026-pipeline-as-routine.md)
-- **Model selection per job beyond claude/opencode** — `open`, `low`. Extend
+- **Model selection per job beyond claude/opencode** — `done`, `low`. Extend
   `model` to another `agent_kind` + a validate-time existence check. →
   [`018`](docs/process/issues/018-model-selection-per-job.md)
-- **Log rotation** — `open`, `low`. Size/age rotation of `history.jsonl` +
+- **Log rotation** — `done`, `low`. Size/age rotation of `history.jsonl` +
   opt-in reports prune. → [`021`](docs/process/issues/021-log-rotation.md)
-- **API / webhook trigger** — `blocked` on issue 015 shipping first (it
-  builds the gh-api-polling pattern this would generalize); transport is
-  otherwise settled as poll-based. →
+- **API / webhook trigger** — `open`, `low`. Unblocked 2026-09-29: its gate,
+  issue 015 (babysit-prs, the gh-api-polling pattern this generalizes), has
+  shipped; transport is settled as poll-based. →
   [`014`](docs/process/issues/014-api-webhook-trigger.md)
 - **Docker image for trivial multi-host setup** — `blocked`: PTY-in-container
   worry resolved; now gated on a secret-injection + image-architecture
@@ -195,60 +200,29 @@ files 2026-08-27.
 - **Review `@me` PRs across repos** — idea, not designed. Scan open PRs authored
   by me (or `--review-requested`) across all my repos and code-review each one.
   Distinct from `babysit-prs` (issue 015), which only watches PRs a routine
-  itself opened (`auto/*`). Gate: the jobs refactor (issue 006 / 025 design)
-  — a poll-to-dispatch job shape. 2026-08-30 brainstorm.
+  itself opened (`auto/*`). Its prerequisite, the jobs refactor (issue 006 /
+  025 design, then 049's `kind: gated`), has shipped, so this is ready to
+  refine. 2026-08-30 brainstorm.
 - **Audit skills as report→diff gate jobs** — idea, not designed. Turn fitted's
   audit skills (`type-health`, `ui-ux-review`, `accessibility-review`,
   `fix-ignores`, `discover-conventions`, `improve-codebase-architecture`,
   `api-gap-audit`) into scheduled jobs: run cheap check/report → next cycle
   diffs against last report → spawn a fix worker only for new/regressed
-  findings. Maps onto issue 025's gate model ("all checks pass → free"). Gate:
-  025 design merged. 2026-08-30 brainstorm.
-- **Release/update strategy for herdr-routines + plugins** — idea, not designed.
-  Industry standard is explicit `update` commands, not auto-updates; but the
-  one safe carve-out: herdr-routines' own changes already flow through PR+CI
-  gate, so the Pi can fast-forward its checkout to released/CI-green commits
-  (folds into issue 016's `repository:` clone+fast-forward). The manual
-  fast-forward is runnable today — see
-  [`docs/process/pi-update-runbook.md`](docs/process/pi-update-runbook.md).
-  Plugins + herdr
-  CLI + `jobs.yaml` stay explicit; never auto-mutate. Needs refinement. Gate:
-   issue 016. 2026-08-30 brainstorm.
-- **Unify routines + pipeline as one "gated workflow" engine** — idea, not designed.
-  Investigation (2026-08-30) found the pipeline is *not* a distinct engine: it's a
-  single `herdr` agent whose `orchestrator-prompt.md` tells it to spawn `pl-1..pl-6`
-  workers via its own `herdr` tool calls — there is **no Python stage/spawn loop**
-  in `src/herdr_routines/` (only `pick-feature` stage-0 selector + `ps` stage-*display*
-  read `pl-<N>-<run_id>` names; `tick.py` runs exactly one agent per job). So a
-  routine ("1-step pipeline": one agent, one worktree, one report) and the pipeline
-  ("N-step": one agent whose prompt spawns sub-agents + gates) are the **same engine
-  at two scales**, differing only in the *prompt*, not the harness. Both already
-  schedule on **systemd user timers** (`herdr-routines.timer`→`.service`→`tick` for
-  routines vs. transient `systemd-run --on-calendar` for the pipeline) — the only
-  real scheduler difference is a persistent cron-evaluating tick loop vs. a one-shot
-  unit, so the pipeline could trivially become a `jobs.yaml` entry with a `cron:`
-  (long `timeout_ms`) and ride the existing recurring tick. This is design.md's
-  deferred "`herdr-routines run orchestrator` job wrapper" (not v1) + "Option C: tick
-  owns the pipeline as a scheduled job." Toward a shared abstraction: both = a
-  **gated workflow** (routine = single-agent gated [has `checks`]; pipeline =
-  multi-agent gated [has `stages`, each with a gate]). → folds into the
-  "Code-level pipeline gates" item below. 2026-08-30 investigation.
-  → [`049`](docs/process/issues/049-unify-routines-pipeline-as-one-gated-workflow-engine.md)
-- **Code-level pipeline gates (prompt → enforcement)** — idea, not designed.
-  Today pipeline stage gates live only in the orchestrator prompt (stages are
-  hardcoded there; there's no `workflows/pipeline.yaml` parser yet), so they're
-  prompt-compliance, not enforced. Promote gates into the job definition as
-  declarative `checks:`, exactly the shape the unified gate model (issue 025 /
-  PR 56) just added to `jobs.yaml` + `tick.py`: e.g. a gate "issue file is
-  `status: done` on the PR branch" would be a real pre/post check the runner
-  enforces, not a prompt instruction. Gate: works when the pipeline (or its
-  stages) move out of prompt-hardcoded form — either issue 013's
-  `workflows/pipeline.yaml`, or per-stage gate fields. 2026-08-30 brainstorm.
-  First slice landed 2026-09-07 (PR #109): `tick` reconcile now enforces the
-  G-17 stage-independence gate in code — a run reporting `ok` with fabricated /
-  reused / missing `stage_sessions` is overridden to `failed`
-  (`validate_stage_sessions`). The rest (declarative per-stage `checks:`) is
-  still open.
+  findings. Maps onto issue 025's gate model ("all checks pass → free"). Its
+  prerequisite, the 025 design, merged in PR #56, so this is ready to refine.
+  2026-08-30 brainstorm.
+- **Release/update strategy for herdr-routines + plugins** — `done` for the
+  runner: it fast-forwards itself to CI-green `main` nightly (self-update
+  timer, [`053`](docs/process/issues/053-runner-checkout-self-update.md)),
+  with [`docs/process/pi-update-runbook.md`](docs/process/pi-update-runbook.md)
+  as the manual fallback. Plugins, the herdr CLI and `jobs.yaml` stay
+  explicit, never auto-mutated. 2026-08-30 brainstorm.
+- **Code-level pipeline gates (prompt → enforcement)** — folded into
+  [`054`](docs/process/issues/054-orchestrator-mechanical-steps-to-code.md),
+  whose phase B runs each stage's gate in code instead of trusting the
+  orchestrator prompt. First slice landed 2026-09-07 (PR #109): `tick`
+  reconcile enforces the G-17 stage-independence gate
+  (`validate_stage_sessions`). 2026-08-30 brainstorm.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives
