@@ -57,6 +57,7 @@ from herdr_routines.runner import (
 )
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
+from herdr_routines.self_update import default_state_path, run_self_update
 from herdr_routines.tick import (
     _build_pipeline_launch_argv,
     default_lock_path,
@@ -391,6 +392,36 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_watchdog.set_defaults(handler=_cmd_pipeline_watchdog)
+
+    p_self_update = sub.add_parser(
+        "self-update",
+        help=(
+            "fast-forward the runner checkout to origin/<base> once the new commit is "
+            "green and validates this host's config, and roll back if it does not "
+            "(issue 053)"
+        ),
+    )
+    p_self_update.add_argument(
+        "--path",
+        type=Path,
+        default=Path.home() / "projects" / "herdr-routines",
+        help="the runner checkout to update (default: ~/projects/herdr-routines)",
+    )
+    p_self_update.add_argument(
+        "--base",
+        default="main",
+        help="branch to track (default: main)",
+    )
+    p_self_update.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "fetch, check CI and print the old..new range and deploy diff, then stop "
+            "before the fast-forward; reports 'deferred' (exit 0), including when the "
+            "tick lock is held"
+        ),
+    )
+    p_self_update.set_defaults(handler=_cmd_self_update)
 
     return parser
 
@@ -978,6 +1009,67 @@ def _cmd_digest(args: argparse.Namespace) -> int:
         except HerdrCliError as e:
             log.warning("digest: notification failed: %s", e)
     return 0
+
+
+def _self_update_notify(title: str, body: str | None = None) -> None:
+    """The notification seam for self-update. `HerdrCliError` (no server, no
+    workspace, `herdr` binary gone) is logged and swallowed: a failed *notification*
+    must not turn a successful update into a failed command — the outcome is already
+    in the log line the handler prints and in the state file, which is what the next
+    run reads. Same posture as `_cmd_digest`."""
+    try:
+        HerdrClient().notification_show(title, body=body)
+    except HerdrCliError as e:
+        log.warning("self-update: notification failed: %s", e)
+
+
+def _cmd_self_update(args: argparse.Namespace) -> int:
+    """`herdr-routines self-update` (issue 053).
+
+    Deliberately not `_load_config_or_exit`: that turns a ConfigError into a bare
+    SystemExit(1) with no notification and no mention of the path, and "this host's
+    config no longer loads" is precisely the thing this command must say out loud —
+    it is the first thing a human needs to know when the runner stops updating. Same
+    for `config.errors`, the per-file soft errors from jobs.d/: running happily on a
+    half-broken config is what the runbook's "Config migrations" section warns about.
+
+    A refusal returns 1; a deferral returns 0, because "the tick lock was held" is a
+    correct outcome and a non-zero exit would make the timer's failure visible.
+    """
+    path = args.config or default_config_path()
+    try:
+        config = load_config(path)
+    except ConfigError as e:
+        log.error("self-update: config %s failed to load: %s", path, e)
+        _self_update_notify(
+            f"herdr-routines: self-update refused ({args.path})",
+            body=f"config failed to load: {path}\n{e}",
+        )
+        return 1
+    if config.errors:
+        for err in config.errors:
+            log.error("self-update: config: %s", err)
+        _self_update_notify(
+            f"herdr-routines: self-update refused ({args.path})",
+            body="config has errors:\n" + "\n".join(config.errors),
+        )
+        return 1
+
+    result = run_self_update(
+        checkout=args.path,
+        base=args.base,
+        dry_run=args.dry_run,
+        config=config,
+        gh=RealGhClient(),
+        notify=_self_update_notify,
+        lock_path=default_lock_path(),
+        history_path=default_history_path(),
+        state_path=default_state_path(),
+    )
+    # up_to_date and deferred are quiet by design (the handler logs them at info /
+    # warning inside the module); nothing here adds a second notification.
+    log.info("self-update: %s (%s)", result.status, result.reason or "no reason")
+    return result.exit_code
 
 
 if __name__ == "__main__":
