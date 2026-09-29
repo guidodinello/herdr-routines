@@ -1417,6 +1417,39 @@ def test_tick_dispatches_pipeline_launch_before_record(
     assert running[0].extra["unit"].startswith("herdr-pipeline-")
 
 
+def test_pipeline_deadline_is_computed_by_tick_and_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run's deadline is launch time + deadline_ms, computed by tick, passed to the
+    launcher and recorded in the `running` record (which the watchdog reads), rather than
+    left to the orchestrator model (a fallback model wrote one a year off, 2026-09-28)."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    calls: list[list[str]] = []
+
+    def fake_launch(argv, *, timeout_s=30.0):
+        calls.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=FakePipelineClient(), now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=FakePipelineClient(), now=t1)  # type: ignore[arg-type]
+
+    expected = int(t1.timestamp()) + 25_200
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[argv.index("--deadline-epoch") + 1] == str(expected)
+    running = [r for r in read_job(history_path, job.name) if r.state == "running"]
+    assert running[0].extra is not None
+    assert running[0].extra["deadline_epoch"] == expected
+
+
 def test_pipeline_dispatches_despite_realistic_tick_delay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

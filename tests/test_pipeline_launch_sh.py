@@ -12,8 +12,10 @@ script hardcodes its own PATH rather than trusting the caller's.
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -79,6 +81,7 @@ def _run_launcher(
     failure_markers: tuple[str, ...] = (),
     tail_sequence: list[str] | None = None,
     wait_timeout_ms: str = "1000",
+    deadline_epoch: str | None = None,
 ) -> tuple[Path, Path]:
     """Runs the real launcher script against the fake herdr CLI above. Returns
     (report_path, call_log_path)."""
@@ -136,6 +139,8 @@ def _run_launcher(
     ]
     for marker in failure_markers:
         argv += ["--failure-marker", marker]
+    if deadline_epoch is not None:
+        argv += ["--deadline-epoch", deadline_epoch]
     subprocess.run(argv, env=env, timeout=60, check=False)
     return report_path, call_log
 
@@ -308,3 +313,27 @@ def test_pipeline_launcher_captures_visible_tail_on_failure(tmp_path: Path) -> N
     read_calls = [l for l in lines if l.startswith("agent read")]
     assert any("--source visible" in l for l in read_calls)
     assert any("--lines 200" in l for l in read_calls)
+
+
+def test_launcher_hands_orchestrator_tick_computed_deadline(tmp_path: Path) -> None:
+    """The deadline reaches the orchestrator as a value to copy, not a sum to compute:
+    a fallback model once computed it a year in the past (2026-09-28)."""
+    _, call_log = _run_launcher(
+        tmp_path, settle_status="idle", deadline_epoch="1790597715"
+    )
+
+    assert "DEADLINE_EPOCH: 1790597715" in call_log.read_text()
+
+
+def test_launcher_computes_deadline_when_tick_passes_none(tmp_path: Path) -> None:
+    """The launcher (auto-synced job repo) can be newer than tick (runner checkout), so
+    it still hands over a code-computed deadline when no --deadline-epoch arrives."""
+    before = int(time.time())
+    _, call_log = _run_launcher(
+        tmp_path, settle_status="idle", wait_timeout_ms="3600000"
+    )
+    after = int(time.time())
+
+    match = re.search(r"DEADLINE_EPOCH: (\d+)", call_log.read_text())
+    assert match is not None
+    assert before + 3600 <= int(match.group(1)) <= after + 3600

@@ -19,7 +19,8 @@ usage() {
   cat >&2 <<'EOF'
 Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-name NAME
                            [--agent-kind KIND] [--model MODEL] [--prompt-file PATH]
-                           [--wait-timeout-ms MS] [--failure-marker TEXT]...
+                           [--wait-timeout-ms MS] [--deadline-epoch EPOCH]
+                           [--failure-marker TEXT]...
 
   --run-id           bare UTC timestamp, e.g. 20260905T020000Z (fits the pl-<N>-<run_id>
                       worker agent-name cap once "pl-N-" is prepended)
@@ -37,6 +38,10 @@ Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-n
                       (default: docs/pipeline/orchestrator-prompt.md)
   --wait-timeout-ms  --wait timeout passed to `herdr agent prompt` (default: 25200000,
                       i.e. 7h — must match the job's deadline_ms)
+  --deadline-epoch   the run's wall-clock deadline (unix seconds), computed by tick
+                      from the launch time + deadline_ms and handed to the
+                      orchestrator verbatim as DEADLINE_EPOCH (default: now +
+                      --wait-timeout-ms, for a tick that predates this flag)
   --failure-marker   text to watch for on the orchestrator's visible screen while
                       waiting (repeatable; default: "Free usage exceeded" — same as
                       runner.py's DEFAULT_FAILURE_MARKERS). Two consecutive sightings of
@@ -50,6 +55,7 @@ AGENT_KIND="opencode"
 MODEL="opencode/big-pickle"  # orchestrator model; tick passes job.model via --model
 PROMPT_FILE="docs/pipeline/orchestrator-prompt.md"
 WAIT_TIMEOUT_MS="25200000"
+DEADLINE_EPOCH=""
 RUN_ID=""
 REPO_PARENT=""
 REPORT=""
@@ -66,11 +72,19 @@ while [ $# -gt 0 ]; do
     --model) MODEL="$2"; shift 2 ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --wait-timeout-ms) WAIT_TIMEOUT_MS="$2"; shift 2 ;;
+    --deadline-epoch) DEADLINE_EPOCH="$2"; shift 2 ;;
     --failure-marker) FAILURE_MARKERS+=("$2"); shift 2 ;;
     -h|--help) usage ;;
     *) echo "pipeline-launch.sh: unknown argument: $1" >&2; usage ;;
   esac
 done
+
+# The launcher comes from the auto-synced job repo while tick runs from the runner
+# checkout, so the two can briefly be on different versions: compute the deadline here
+# too rather than leaving it to the orchestrator model.
+if [ -z "$DEADLINE_EPOCH" ]; then
+  DEADLINE_EPOCH=$(( $(date +%s) + WAIT_TIMEOUT_MS / 1000 ))
+fi
 
 if [ ${#FAILURE_MARKERS[@]} -eq 0 ]; then
   FAILURE_MARKERS=("Free usage exceeded")
@@ -128,7 +142,8 @@ sleep 5
 PROMPT_FILE_TMP="/tmp/full_prompt_${RUN_ID}.md"
 {
   cat "$PROMPT_FILE"
-  printf '\nRUN_ID: %s\nREPO_PARENT: %s\nPIPELINE_REPORT: %s\n' "$RUN_ID" "$REPO_PARENT" "$REPORT"
+  printf '\nRUN_ID: %s\nREPO_PARENT: %s\nPIPELINE_REPORT: %s\nDEADLINE_EPOCH: %s\n' \
+    "$RUN_ID" "$REPO_PARENT" "$REPORT" "$DEADLINE_EPOCH"
 } > "$PROMPT_FILE_TMP"
 
 # --wait blocks until the orchestrator agent settles; the `cleanup` trap above closes
