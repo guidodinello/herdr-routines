@@ -1151,6 +1151,52 @@ def test_a_host_left_on_a_rejected_sha_is_refused_not_up_to_date(
     assert sandbox.head() == moved
 
 
+def test_the_module_docstring_lists_self_update() -> None:
+    """Review fix 4 (unanchored) — `cli.py`'s module docstring carries a partial
+    subcommand list, and this PR added a subcommand to the CLI without adding it
+    there. Spec finding F14 is explicit that only `self-update` is in scope: the other
+    seven missing subparsers are unrelated churn, so the fix is one word and a note
+    that the list is partial on purpose — otherwise the next reader "completes" it."""
+    docstring = (REPO_ROOT / "src" / "herdr_routines" / "cli.py").read_text()
+    summary = docstring.split('"""', 2)[1]
+
+    assert "self-update" in summary
+    # Not swept: the seven subparsers F14 left out stay out.
+    assert "pick-feature" not in summary
+    assert "pipeline-watchdog" not in summary
+    assert "deliberately partial" in summary
+
+
+def test_path_default_is_the_runner_not_the_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review fix 5 (unanchored) — the spec's `--path` default was `Path.cwd()`; the
+    shipped default is `~/projects/herdr-routines`. The deviation is the right call (a
+    cwd default would update whatever directory the timer happened to start in,
+    including the `repos/` clone, which is a separate lifecycle), but it was
+    undocumented, which made `deploy/README.md`'s "the unit only ever updates the
+    checkout it runs *in* (`WorkingDirectory`)" false as a general statement: the unit
+    passes no `--path`, so the flag's default is what decides, and it merely *happens*
+    to equal the unit's `WorkingDirectory`.
+
+    This pins the behaviour, and that it survives a different cwd — which is the whole
+    reason the default is not `Path.cwd()`."""
+    default = Path.home() / "projects" / "herdr-routines"
+    assert default != Path.cwd()
+    parser = cli._build_parser()  # type: ignore[attr-defined]
+    resolved = parser.parse_args(["self-update"])
+    assert resolved.handler is cli._cmd_self_update  # type: ignore[attr-defined]
+    assert resolved.path == default
+
+    # And the deploy README says so, rather than crediting `WorkingDirectory`.
+    readme = (REPO_ROOT / "deploy" / "README.md").read_text()
+    assert "WorkingDirectory" in readme  # still mentioned...
+    assert (
+        "only ever updates the checkout it runs *in*" not in readme
+    )  # ...but not as the reason
+    assert "--path" in readme
+
+
 # ---------------------------------------------------------------------------
 # the module-level seams the tests above pin
 # ---------------------------------------------------------------------------

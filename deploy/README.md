@@ -52,8 +52,13 @@ Preview it any time without touching the checkout:
 uv run herdr-routines self-update --dry-run
 ```
 
-Note the unit only ever updates the checkout it runs *in* (`WorkingDirectory`): the
-`~/.local/state/herdr-routines/repos/` clone is a separate lifecycle (issue 016).
+Note the unit updates a hardcoded path, not its own `WorkingDirectory`: `ExecStart`
+passes no `--path`, so the checkout acted on is the flag's default,
+`~/projects/herdr-routines`. That happens to equal the unit's `WorkingDirectory`, but
+by convention rather than by derivation — if you move one, pass `--path` explicitly in
+the other. The point of the fixed default is that it does *not* follow the cwd, so a
+hand-run `self-update` from the `~/.local/state/herdr-routines/repos/` clone updates the
+runner and not that one (issue 016).
 
 **On a fresh Pi (not needed on this laptop — `Linger` is already `yes` here):**
 

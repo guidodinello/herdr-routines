@@ -1,4 +1,8 @@
-"""herdr-routines CLI: tick | status | ps | scheduled | history | validate | run | gc.
+"""herdr-routines CLI: tick | status | ps | scheduled | history | validate | run | gc |
+self-update.
+
+The list is deliberately partial — `self-update` was added here for issue 053, not as a
+sweep over the other subparsers.
 
 See docs/plan-v1.md §5 and docs/pipeline/runs/20260825T070012Z/spec.md for the two
 read-only visibility commands."""
@@ -405,7 +409,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--path",
         type=Path,
         default=Path.home() / "projects" / "herdr-routines",
-        help="the runner checkout to update (default: ~/projects/herdr-routines)",
+        help=(
+            "the runner checkout to update (default: ~/projects/herdr-routines, NOT "
+            "the cwd — a deliberate deviation from the spec, which said Path.cwd(): a "
+            "cwd default would make this update whatever directory the timer happened "
+            "to start in, including the ~/.local/state/herdr-routines/repos/ clone, "
+            "which is a separate lifecycle)"
+        ),
     )
     p_self_update.add_argument(
         "--base",
