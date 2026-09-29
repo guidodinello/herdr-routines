@@ -43,6 +43,26 @@ uv run herdr-routines run <job> --dry-run   # eyeball the herdr argv before trus
 uv run herdr-routines status
 ```
 
+## Retention
+
+`history.jsonl` and `reports/` only grow, so the state dir needs a policy. Two halves, and
+the split is the safety argument:
+
+- **Rotation** (opt-in via `retention:`) is a rename at the end of every tick — never a delete —
+  so it is safe to run unattended. `history.jsonl` becomes `history-<UTC ts>.jsonl` and every
+  reader keeps working across rolls.
+- **Deletion** is explicit only: `prune` refuses without `--yes`, exactly like `gc --delete`.
+  Reports belonging to an in-flight pipeline run are protected regardless of age.
+
+```sh
+uv run herdr-routines prune reports --dry-run   # list what is collectable, delete nothing
+uv run herdr-routines prune reports --yes       # collect it
+uv run herdr-routines prune history --dry-run   # rolled history files older than a year
+```
+
+See [`docs/plan-v1.md`](docs/plan-v1.md#retention) for the policy, the thresholds, and the
+`first_seen_at` caveat on pruning history.
+
 See [`deploy/README.md`](deploy/README.md) for the systemd units and deployment smoke checklist.
 
 ## Development

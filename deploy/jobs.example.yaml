@@ -23,6 +23,16 @@ defaults:
     max_age_s: 3600 # reap files older than 1h (default)
     tmp_dir: /tmp
 
+# retention: # optional (issue 021): state-dir history rotation + prune window. Uncomment to
+#   # enable; the default is rotation off, so a copy of this file changes nothing until you do.
+#   history_max_bytes: 10485760   # roll history.jsonl aside past 10 MiB (null = never)
+#   history_max_age_days: 30      # ...or once its oldest record is 30 days old (null = never)
+#   reports_max_age_days: 90      # window for `herdr-routines prune reports` (null = 90)
+#
+# Rotation is a rename, never a delete, and happens at the end of every tick. Deleting is
+# always explicit: `herdr-routines prune reports --dry-run` to see, `--yes` to do it. In a
+# jobs.d/ layout this lives in its own retention.yaml instead (never treated as a job).
+
 jobs:
   - name: nightly-dep-audit
     enabled: true

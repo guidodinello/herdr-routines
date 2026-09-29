@@ -5,9 +5,10 @@ Pure: no filesystem access beyond reading YAML files, no subprocess, no clock re
 
 Supports two config layouts:
 - Legacy single file: ``jobs.yaml`` (deprecated, emits a warning when used).
-- Directory layout: ``jobs.d/`` with one ``<name>.yaml`` per job and an optional
-  ``defaults.yaml`` for shared fields.  The loader picks directory over file when
-  both exist.
+- Directory layout: ``jobs.d/`` with one ``<name>.yaml`` per job, an optional
+  ``defaults.yaml`` for shared fields, and an optional ``retention.yaml`` for the
+  state-dir retention policy (issue 021).  The loader picks directory over file
+  when both exist.
 """
 
 from __future__ import annotations
@@ -140,6 +141,14 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
 )
 
 _JOB_REQUIRED_KEYS = frozenset({"name", "cron"})
+_RETENTION_ALLOWED_KEYS = frozenset(
+    {"history_max_bytes", "history_max_age_days", "reports_max_age_days"}
+)
+# Recognized non-job files in a jobs.d/ directory. `defaults.yaml` was already special-cased
+# in load_config_dir; `retention.yaml` is its issue-021 twin (the directory-layout spelling
+# of the top-level `retention:` block).
+_RETENTION_FILENAME = "retention.yaml"
+_NON_JOB_FILENAMES = frozenset({"defaults.yaml", _RETENTION_FILENAME})
 _JOB_ALLOWED_KEYS = (
     _JOB_REQUIRED_KEYS
     | _DEFAULTS_ALLOWED_KEYS
@@ -205,6 +214,16 @@ class ConfigError(ValueError):
 DEFAULT_TMP_DIR = "/tmp"
 DEFAULT_MAX_AGE_S = 3600
 
+# Retention defaults (issue 021). Rotation is OFF by default: the mechanism ships so an
+# operator can turn it on when the day comes, not so it runs on day one. The prune window
+# is generous on purpose — it only ever applies to an explicit `prune reports --yes`.
+DEFAULT_REPORTS_MAX_AGE_DAYS = 90
+
+# `history_max_bytes` under this would rotate on essentially every tick (a 5-minute tick
+# appending a handful of lines per run crosses 1 MiB in well under a day). A soft
+# `validate` warning, not a load error — same posture as the $ROUTINE_REPORT checks.
+TINY_HISTORY_MAX_BYTES = 1_048_576  # 1 MiB
+
 
 @dataclass(frozen=True, slots=True)
 class TmphgieneConfig:
@@ -213,6 +232,23 @@ class TmphgieneConfig:
     enabled: bool = True
     max_age_s: int = DEFAULT_MAX_AGE_S
     tmp_dir: str = DEFAULT_TMP_DIR
+
+
+@dataclass(frozen=True, slots=True)
+class Retention:
+    """State-dir retention policy (issue 021).
+
+    A top-level block, deliberately NOT a per-job key and NOT a `defaults:` entry: rotation
+    is a property of *one* file, so merging it under every job would be semantically wrong.
+
+      history_max_bytes:    roll history.jsonl past this size. None = off.
+      history_max_age_days: roll it once its oldest record is this old. None = off.
+      reports_max_age_days: default window for `prune reports`.
+    """
+
+    history_max_bytes: int | None = None
+    history_max_age_days: int | None = None
+    reports_max_age_days: int = DEFAULT_REPORTS_MAX_AGE_DAYS
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +329,10 @@ class RoutinesConfig:
     jobs: tuple[Job, ...] = field(default_factory=tuple)
     # Per-file errors from directory loader (empty for single-file or clean directory load).
     errors: tuple[str, ...] = field(default_factory=tuple)
+    # Rotation / prune policy (issue 021). Defaults mean "rotate nothing, prune at 90 days
+    # if explicitly asked" — a config that never mentions `retention:` behaves exactly as
+    # it did before this block existed.
+    retention: Retention = field(default_factory=Retention)
 
     def job(self, name: str) -> Job | None:
         for j in self.jobs:
@@ -375,9 +415,14 @@ def _load_config_file(path: Path) -> RoutinesConfig:
             f"unsupported config version: {version!r} (only 1 is supported)"
         )
 
-    unknown_top = set(raw) - {"version", "defaults", "jobs"}
+    unknown_top = set(raw) - {"version", "defaults", "jobs", "retention"}
     if unknown_top:
         raise ConfigError(f"unknown top-level key(s): {sorted(unknown_top)}")
+
+    raw_retention = raw.get("retention") or {}
+    if not isinstance(raw_retention, dict):
+        raise ConfigError("'retention' must be a mapping")
+    retention = _build_retention(raw_retention, "retention")
 
     raw_defaults = raw.get("defaults") or {}
     if not isinstance(raw_defaults, dict):
@@ -403,7 +448,7 @@ def _load_config_file(path: Path) -> RoutinesConfig:
         seen_names.add(job.name)
         jobs.append(job)
 
-    return RoutinesConfig(jobs=tuple(jobs))
+    return RoutinesConfig(jobs=tuple(jobs), retention=retention)
 
 
 def load_config_dir(path: Path) -> RoutinesConfig:
@@ -412,11 +457,12 @@ def load_config_dir(path: Path) -> RoutinesConfig:
     Directory contract::
 
         <path>/
-            defaults.yaml   # optional; shared fields merged under each job
-            <name>.yaml     # one per job; filename stem is the canonical name
+            defaults.yaml    # optional; shared fields merged under each job
+            retention.yaml   # optional; rotation / prune policy (issue 021)
+            <name>.yaml      # one per job; filename stem is the canonical name
 
-    Discovery is deterministic (``sorted()`` glob).  ``defaults.yaml`` is excluded
-    from the job file list.
+    Discovery is deterministic (``sorted()`` glob).  ``defaults.yaml`` and
+    ``retention.yaml`` are excluded from the job file list.
 
     Per-file YAML syntax errors surface the file name and do **not** prevent other
     jobs from loading (for diagnostics).  Unknown keys or bad values in one file also
@@ -431,11 +477,20 @@ def load_config_dir(path: Path) -> RoutinesConfig:
     defaults_path = path / "defaults.yaml"
     raw_defaults: dict = {}
     if defaults_path.exists():
-        raw_defaults = _load_yaml_or_error(defaults_path, is_defaults=True)
+        raw_defaults = _load_yaml_or_error(defaults_path, kind="defaults")
         _validate_defaults_keys(raw_defaults, defaults_path)
 
-    # --- discover job files (sorted, exclude defaults.yaml) ----------------------
-    job_files = sorted(p for p in path.glob("*.yaml") if p.name != "defaults.yaml")
+    # --- load retention.yaml (optional, issue 021) -------------------------------
+    retention_path = path / _RETENTION_FILENAME
+    retention = Retention()
+    if retention_path.exists():
+        raw_retention = _load_yaml_or_error(retention_path, kind="retention")
+        retention = _build_retention(raw_retention, str(retention_path))
+
+    # --- discover job files (sorted, exclude the two non-job files) ---------------
+    job_files = sorted(
+        p for p in path.glob("*.yaml") if p.name not in _NON_JOB_FILENAMES
+    )
 
     jobs: list[Job] = []
     seen_names: set[str] = set()
@@ -443,7 +498,7 @@ def load_config_dir(path: Path) -> RoutinesConfig:
 
     for job_file in job_files:
         try:
-            raw_job = _load_yaml_or_error(job_file, is_defaults=False)
+            raw_job = _load_yaml_or_error(job_file, kind="job")
         except ConfigError as e:
             errors.append(str(e))
             continue
@@ -496,12 +551,13 @@ def load_config_dir(path: Path) -> RoutinesConfig:
         for err in errors:
             log.warning("config: %s", err)
 
-    return RoutinesConfig(jobs=tuple(jobs), errors=tuple(errors))
+    return RoutinesConfig(jobs=tuple(jobs), errors=tuple(errors), retention=retention)
 
 
-def _load_yaml_or_error(path: Path, *, is_defaults: bool) -> dict:
+def _load_yaml_or_error(path: Path, *, kind: str) -> dict:
     """Read and parse a single YAML file.  Raises :class:`ConfigError` with the file
-    name embedded for clear diagnostics."""
+    name embedded for clear diagnostics.  *kind* ("defaults" | "retention" | "job") only
+    shapes the error message."""
     try:
         text = path.read_text()
     except OSError as e:
@@ -513,7 +569,6 @@ def _load_yaml_or_error(path: Path, *, is_defaults: bool) -> dict:
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        kind = "defaults" if is_defaults else "job"
         raise ConfigError(
             f"{path}: {kind} file must be a mapping, got {type(raw).__name__}"
         )
@@ -526,6 +581,41 @@ def _validate_defaults_keys(raw: dict, path: Path) -> None:
     unknown = set(raw) - _DEFAULTS_ALLOWED_KEYS
     if unknown:
         raise ConfigError(f"{path}: unknown key(s): {sorted(unknown)}")
+
+
+def _validate_retention_keys(raw: dict, label: str) -> None:
+    """Reject unknown keys under `retention` (same contract for the top-level block and for
+    ``retention.yaml``). *label* is the file path, or "retention" for the inline block."""
+    unknown = set(raw) - _RETENTION_ALLOWED_KEYS
+    if unknown:
+        raise ConfigError(f"{label}: unknown key(s): {sorted(unknown)}")
+
+
+def _build_retention(raw: dict, label: str) -> Retention:
+    """Build a :class:`Retention` from a parsed retention mapping. Validates the unknown key
+    set first, so a typo is reported as a typo rather than as a type error on `None`."""
+    _validate_retention_keys(raw, label)
+
+    def _optional_positive_int(key: str) -> int | None:
+        value = raw.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ConfigError(f"{label}: '{key}' must be a positive integer or null")
+        return value
+
+    reports_max_age_days = raw.get("reports_max_age_days", DEFAULT_REPORTS_MAX_AGE_DAYS)
+    if (
+        not isinstance(reports_max_age_days, int)
+        or isinstance(reports_max_age_days, bool)
+        or reports_max_age_days <= 0
+    ):
+        raise ConfigError(f"{label}: 'reports_max_age_days' must be a positive integer")
+    return Retention(
+        history_max_bytes=_optional_positive_int("history_max_bytes"),
+        history_max_age_days=_optional_positive_int("history_max_age_days"),
+        reports_max_age_days=reports_max_age_days,
+    )
 
 
 _REPO_URL_PREFIXES = ("https://", "ssh://", "git@", "git://")

@@ -1182,6 +1182,9 @@ def test_path_default_is_the_runner_not_the_cwd(
     This pins the behaviour, and that it survives a different cwd — which is the whole
     reason the default is not `Path.cwd()`."""
     default = Path.home() / "projects" / "herdr-routines"
+    # Run from somewhere else: on the runner host (and a dev checkout at the same path)
+    # the real cwd *is* the default, which would make the check below vacuous-or-false.
+    monkeypatch.chdir(tmp_path)
     assert default != Path.cwd()
     parser = cli._build_parser()  # type: ignore[attr-defined]
     resolved = parser.parse_args(["self-update"])

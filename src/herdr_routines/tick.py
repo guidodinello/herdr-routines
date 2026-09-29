@@ -48,6 +48,7 @@ from herdr_routines.history import (
     has_ever_been_seen,
     is_currently_running,
     last_terminal_run,
+    maybe_rotate,
     read_job,
 )
 from herdr_routines.pipeline_watchdog import (
@@ -144,6 +145,23 @@ def run_tick(
         summary, failed = _process_job(job, history_path, client=client, now=now)
         summaries.append(summary)
         any_job_failed = any_job_failed or failed
+
+    # History rotation (issue 021), after dispatch rather than before it: the records that
+    # pushed the file past the threshold are the ones this tick just wrote, and rotating
+    # first would always be a tick behind. `maybe_rotate` is a rename and never a delete, so
+    # it is safe to run unattended here; it carries the same best-effort contract as the reap
+    # above, because a state-dir housekeeping failure must not be the reason systemd marks
+    # the unit failed and a job never dispatches. Deleting anything is `prune`'s job.
+    try:
+        maybe_rotate(
+            history_path,
+            max_bytes=config.retention.history_max_bytes,
+            max_age_days=config.retention.history_max_age_days,
+            now=now,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("history rotation failed (continuing): %s", e)
+
     return TickOutcome(summaries=tuple(summaries), any_job_failed=any_job_failed)
 
 
