@@ -51,12 +51,14 @@ class FakeGhClient:
         pr_views: dict[int, dict[str, object]] | None = None,
         review_threads: dict[int, dict[str, object]] | None = None,
         raise_on: str | None = None,
+        check_runs: dict[str, list[dict[str, object]]] | None = None,
     ) -> None:
         self.user = user
         self.prs = prs or []
         self.pr_views = pr_views or {}
         self.review_threads = review_threads or {}
         self.raise_on = raise_on
+        self.check_runs = check_runs or {}
         self.calls: list[str] = []
 
     def api_user(self) -> str:
@@ -85,6 +87,18 @@ class FakeGhClient:
             raise RuntimeError("gh api graphql failed")
         num = int(variables.get("number", "0"))
         return self.review_threads.get(num, {"data": {}})
+
+    # `commit_check_runs` rides the `GhClient` protocol for `self-update`'s green-CI
+    # gate; this fake is passed to `GhClient`-annotated parameters, and
+    # `uv run mypy` (a required CI job) checks protocol conformance statically.
+    # Omitting it here is 15 mypy errors in this file alone (spec finding F1).
+    def commit_check_runs(
+        self, *, owner: str, repo: str, sha: str
+    ) -> list[dict[str, object]]:
+        self.calls.append(f"commit_check_runs:{sha}")
+        if self.raise_on == "commit_check_runs":
+            raise RuntimeError("gh api check-runs failed")
+        return self.check_runs.get(sha, [])
 
 
 class FakeFullClient:
