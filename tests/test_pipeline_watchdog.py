@@ -13,11 +13,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from herdr_routines.herdr import HerdrCliError
+from herdr_routines.history import HistoryRecord, append
 from herdr_routines.pipeline_watchdog import (
     DEADLINE_GRACE_SECONDS,
     HEARTBEAT_STALE_SECONDS,
     find_inflight_runs,
     is_stalled,
+    recorded_pipeline_deadlines,
     run_watchdog,
     system_boot_epoch,
     validate_stage_sessions,
@@ -489,3 +491,95 @@ def test_run_watchdog_fails_fast_on_host_reboot(tmp_path: Path) -> None:
     assert "host_rebooted_mid_run: true" in report
     title, _body, _sound = client.notifications[0]
     assert "host rebooted mid-run" in title
+
+
+# -- tick's recorded deadline wins over state.json ------------------------------------------
+
+
+def _record_launch(history_path: Path, *, deadline_epoch: int) -> None:
+    append(
+        history_path,
+        HistoryRecord(
+            ts=NOW,
+            job="feature-pipeline",
+            state="running",
+            run_id=f"feature-pipeline-{RUN_ID}",
+            extra={"pipeline_run_id": RUN_ID, "deadline_epoch": deadline_epoch},
+        ),
+    )
+
+
+def test_recorded_deadline_overrides_a_bogus_state_json_deadline(
+    tmp_path: Path,
+) -> None:
+    """Replays 2026-09-28: the fallback model wrote a state.json deadline a year in the
+    past and no heartbeat. With tick's recorded deadline still hours away, the live run
+    must be left alone."""
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "hb"
+    heartbeat_dir.mkdir()
+    history_path = tmp_path / "history.jsonl"
+    a_year_ago = int(NOW.timestamp()) - 365 * 24 * 3600
+    write_state_json(worktrees_root, deadline_epoch=a_year_ago, current_stage=1)
+    _record_launch(history_path, deadline_epoch=int(NOW.timestamp()) + 6 * 3600)
+    client = FakeWatchdogClient(panes_by_run={RUN_ID: {f"pl-1-{RUN_ID}": "w1:p1"}})
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        history_path=history_path,
+        now=NOW,
+        boot_epoch=0,
+    )
+
+    assert actions == []
+    assert client.closed_panes == []
+
+
+def test_recorded_deadline_still_reaps_a_genuinely_stalled_run(tmp_path: Path) -> None:
+    """The recorded deadline is used in both directions: past it (plus grace) with a
+    stale heartbeat, the run is reaped even though state.json claims more time."""
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "hb"
+    heartbeat_dir.mkdir()
+    history_path = tmp_path / "history.jsonl"
+    write_state_json(worktrees_root, deadline_epoch=int(NOW.timestamp()) + 3600)
+    _record_launch(
+        history_path,
+        deadline_epoch=int(NOW.timestamp()) - DEADLINE_GRACE_SECONDS - 60,
+    )
+    client = FakeWatchdogClient()
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        history_path=history_path,
+        now=NOW,
+        boot_epoch=0,
+    )
+
+    assert [a.run_id for a in actions] == [RUN_ID]
+
+
+def test_recorded_deadline_covers_a_state_json_without_one(tmp_path: Path) -> None:
+    """A state.json missing deadline_epoch used to make the run invisible to the
+    watchdog forever; tick's recorded deadline now covers it."""
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    run_dir = worktrees_root / f"auto-pipeline-{RUN_ID}"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text(json.dumps({"run_id": RUN_ID}))
+    history_path = tmp_path / "history.jsonl"
+    _record_launch(history_path, deadline_epoch=1234)
+
+    runs = find_inflight_runs(
+        worktrees_root, reports_dir, recorded_pipeline_deadlines(history_path)
+    )
+
+    assert [(r.run_id, r.deadline_epoch) for r in runs] == [(RUN_ID, 1234)]

@@ -1689,8 +1689,17 @@ def launch_pipeline(
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def pipeline_deadline_epoch(job: Job, now: datetime) -> int:
+    """The run's wall-clock deadline: launch time + `deadline_ms`. Computed in code and
+    handed to the orchestrator verbatim (`DEADLINE_EPOCH`). It used to be computed by the
+    orchestrator model itself, and a fallback model once wrote a timestamp a year in the
+    past, so the watchdog reaped a live run 15 min in (2026-09-28)."""
+    assert job.deadline_ms is not None  # config.py requires this for kind: pipeline
+    return int(now.timestamp()) + job.deadline_ms // 1000
+
+
 def _build_pipeline_launch_argv(
-    job: Job, *, run_id: str, report_path: Path, unit_name: str
+    job: Job, *, run_id: str, report_path: Path, unit_name: str, deadline_epoch: int
 ) -> list[str]:
     assert job.deadline_ms is not None  # config.py requires this for kind: pipeline
     assert job.prompt_file is not None
@@ -1719,6 +1728,8 @@ def _build_pipeline_launch_argv(
         str(job.repo / job.prompt_file),
         "--wait-timeout-ms",
         str(job.deadline_ms),
+        "--deadline-epoch",
+        str(deadline_epoch),
     ]
     if job.model:
         argv += ["--model", job.model]
@@ -1973,6 +1984,8 @@ def _launch_pipeline_run(
     late_seconds for the former, reason=fallback_retry/primary_run_id for the latter)."""
     report_path = pipeline_report_path(bare_run_id)
     unit_name = f"herdr-pipeline-{bare_run_id}"
+    # Recorded in the `running` record below: the watchdog reads it from history.
+    deadline_epoch = pipeline_deadline_epoch(job, now)
 
     try:
         ensure_repo(job)
@@ -1997,7 +2010,11 @@ def _launch_pipeline_run(
         return f"{job.name}: failed (repo_sync_failed)", True
 
     argv = _build_pipeline_launch_argv(
-        job, run_id=bare_run_id, report_path=report_path, unit_name=unit_name
+        job,
+        run_id=bare_run_id,
+        report_path=report_path,
+        unit_name=unit_name,
+        deadline_epoch=deadline_epoch,
     )
     # Launch first, record second: writing the `running` record before confirming the
     # launch succeeded would wedge this job for the full deadline if `systemd-run` failed
@@ -2039,6 +2056,7 @@ def _launch_pipeline_run(
                 "pipeline_run_id": bare_run_id,
                 "report": str(report_path),
                 "unit": unit_name,
+                "deadline_epoch": deadline_epoch,
             },
         ),
     )

@@ -57,6 +57,7 @@ from pathlib import Path
 from logger import get_logger
 
 from herdr_routines.herdr import HerdrClient, HerdrCliError
+from herdr_routines.history import read_all
 
 log = get_logger(__name__)
 
@@ -224,7 +225,30 @@ def _has_terminal_report(reports_dir: Path, run_id: str, raw_state: dict) -> boo
     )
 
 
-def _parse_state_json(state_path: Path, reports_dir: Path) -> InflightRun | None:
+def recorded_pipeline_deadlines(history_path: Path) -> dict[str, int]:
+    """Bare pipeline run_id -> the `deadline_epoch` tick recorded in the run's `running`
+    history record at launch (`tick.pipeline_deadline_epoch`). This is the authoritative
+    deadline: `state.json`'s copy is written by the orchestrator model, and a fallback
+    model once wrote one a year in the past, which got a live run reaped 15 min in
+    (2026-09-28)."""
+    deadlines: dict[str, int] = {}
+    for record in read_all(history_path):
+        extra = record.extra or {}
+        run_id = extra.get("pipeline_run_id")
+        deadline = extra.get("deadline_epoch")
+        if (
+            record.state == "running"
+            and isinstance(run_id, str)
+            and isinstance(deadline, int)
+            and not isinstance(deadline, bool)
+        ):
+            deadlines[run_id] = deadline
+    return deadlines
+
+
+def _parse_state_json(
+    state_path: Path, reports_dir: Path, recorded_deadlines: Mapping[str, int]
+) -> InflightRun | None:
     try:
         raw = json.loads(state_path.read_text())
     except (OSError, json.JSONDecodeError) as e:
@@ -238,7 +262,19 @@ def _parse_state_json(state_path: Path, reports_dir: Path) -> InflightRun | None
         log.warning("skipping %s: missing run_id", state_path)
         return None
     deadline_epoch = raw.get("deadline_epoch")
-    if not isinstance(deadline_epoch, int) or isinstance(deadline_epoch, bool):
+    recorded = recorded_deadlines.get(run_id)
+    if recorded is not None:
+        if deadline_epoch != recorded:
+            log.warning(
+                "%s: ignoring state.json deadline_epoch %r, using tick's recorded %d",
+                run_id,
+                deadline_epoch,
+                recorded,
+            )
+        deadline_epoch = recorded
+    elif not isinstance(deadline_epoch, int) or isinstance(deadline_epoch, bool):
+        # No recorded deadline (a manual `herdr-routines run`, or a run launched before
+        # tick recorded one): state.json is all there is.
         log.warning("skipping %s: missing/invalid deadline_epoch", state_path)
         return None
     if _has_terminal_report(reports_dir, run_id, raw):
@@ -258,15 +294,20 @@ def _parse_state_json(state_path: Path, reports_dir: Path) -> InflightRun | None
     )
 
 
-def find_inflight_runs(worktrees_root: Path, reports_dir: Path) -> list[InflightRun]:
+def find_inflight_runs(
+    worktrees_root: Path,
+    reports_dir: Path,
+    recorded_deadlines: Mapping[str, int] | None = None,
+) -> list[InflightRun]:
     """Every parseable `state.json` under `worktrees_root/auto-pipeline-*/` that has no
     terminal report yet. Unreadable/malformed files are skipped with a warning
-    (fail-open, matching `ps.py`'s `scan_pipeline_runs`)."""
+    (fail-open, matching `ps.py`'s `scan_pipeline_runs`). A run's deadline comes from
+    `recorded_deadlines` (tick's history) when present, else from its `state.json`."""
     if not worktrees_root.exists():
         return []
     runs = []
     for state_path in sorted(worktrees_root.glob(f"{WORKTREE_GLOB}/{STATE_JSON_NAME}")):
-        run = _parse_state_json(state_path, reports_dir)
+        run = _parse_state_json(state_path, reports_dir, recorded_deadlines or {})
         if run is not None:
             runs.append(run)
     return runs
@@ -444,6 +485,7 @@ def run_watchdog(
     worktrees_root: Path,
     reports_dir: Path,
     heartbeat_dir: Path,
+    history_path: Path | None = None,
     now: datetime | None = None,
     boot_epoch: float | None = None,
 ) -> list[WatchdogAction]:
@@ -455,7 +497,10 @@ def run_watchdog(
     if boot_epoch is None:
         boot_epoch = system_boot_epoch()
     actions: list[WatchdogAction] = []
-    for run in find_inflight_runs(worktrees_root, reports_dir):
+    recorded_deadlines = (
+        recorded_pipeline_deadlines(history_path) if history_path is not None else {}
+    )
+    for run in find_inflight_runs(worktrees_root, reports_dir, recorded_deadlines):
         if not is_stalled(
             run, now=now, heartbeat_dir=heartbeat_dir, boot_epoch=boot_epoch
         ):

@@ -74,6 +74,7 @@ from herdr_routines.tick import (
     _build_pipeline_launch_argv,
     default_lock_path,
     launch_pipeline,
+    pipeline_deadline_epoch,
     pipeline_report_path,
     run_tick,
     tick_lock,
@@ -893,7 +894,11 @@ def _cmd_run_pipeline(job, args: argparse.Namespace, *, now: datetime) -> int:
         else f"herdr-pipeline-{bare_run_id}-r{now:%H%M%S}"
     )
     argv = _build_pipeline_launch_argv(
-        job, run_id=bare_run_id, report_path=report_path, unit_name=unit_name
+        job,
+        run_id=bare_run_id,
+        report_path=report_path,
+        unit_name=unit_name,
+        deadline_epoch=pipeline_deadline_epoch(job, now),
     )
 
     if args.dry_run:
@@ -1154,6 +1159,7 @@ def _cmd_pipeline_watchdog(args: argparse.Namespace) -> int:
         worktrees_root=default_worktrees_root(),
         reports_dir=default_reports_dir(),
         heartbeat_dir=default_heartbeat_dir(),
+        history_path=default_history_path(),
     )
     for action in actions:
         if action.killed_agents:
