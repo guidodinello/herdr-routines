@@ -1,0 +1,14 @@
+[Unit]
+Description=Fast-forward the herdr-routines runner checkout once a night
+
+[Timer]
+# 21:30 UTC, after the 21:00 tick and before the night's feature pipeline takes the
+# checkout's working tree for its own run: the job's fast-forward (ensure_repo) and
+# this one then agree, and a deferred update costs nothing but a night.
+OnCalendar=*-*-* 21:30:00
+# A host that was asleep at 21:30 runs it on wake instead of skipping the night.
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

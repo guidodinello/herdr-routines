@@ -23,6 +23,26 @@ merge.
   `main` with **green CI**.
 - Docs-only PRs don't need the runner updated (but are harmless to pull).
 
+**Normally you don't run this by hand at all** (issue 053):
+`herdr-routines-update.timer` fires `herdr-routines self-update` every night at
+21:30 UTC, which does steps 0-4 below automatically — CI check, fast-forward, validate,
+`git reset --keep` rollback on failure — and defers silently when the tick lock is held,
+a `kind: pipeline` run is in flight, CI is not green, or the commit has already been
+rolled back once. The steps below are still the procedure for the two cases it cannot
+cover: a **config schema migration** (below), and a host it has *refused* (dirty tree,
+not on `main`, detached HEAD, or an unpushed hand-hotfix) — both of which notify and
+explain themselves. Check what it did with:
+
+```sh
+ssh $HOST "systemctl --user status herdr-routines-update.service"
+ssh $HOST "journalctl --user -u herdr-routines-update.service -n 50 --no-pager"
+ssh $HOST "cd ~/projects/herdr-routines && uv run herdr-routines self-update --dry-run"
+```
+
+`--dry-run` fetches, checks CI and prints the `old..new` range and deploy diff, then
+stops before the fast-forward. It reports `deferred` (exit 0) — including under a held
+tick lock, which is correct and not a failure.
+
 ## Steps
 
 ```sh

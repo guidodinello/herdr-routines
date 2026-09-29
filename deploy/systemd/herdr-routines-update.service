@@ -1,0 +1,25 @@
+[Unit]
+Description=herdr-routines runner self-update (issue 053)
+After=herdr-server.service
+Wants=herdr-server.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/herdr-routines
+# Same PATH note as herdr-routines.service: a systemd --user unit does not inherit your
+# login shell's PATH. uv is addressed by its full path below, so this is belt and
+# braces — but a PATH without ~/.local/bin is also how a future unit would lose
+# `herdr`, and herdr.py invokes the bare command name.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Runs the OLD code, fast-forwards the checkout, then exercises the NEW code out of
+# process (`uv run --frozen herdr-routines validate` in the checkout) and rolls back
+# with `git reset --keep` if it does not. Deferrals are silent and exit 0; a refusal
+# or a rollback exits 1 and notifies.
+ExecStart=%h/.local/bin/uv run herdr-routines self-update
+
+# Finite, and sized so systemd cannot land a SIGTERM inside the window where the
+# checkout is at the new commit but the new code has not been proven: two bounded
+# validate children at up to 300s each, up to five bounded git calls at 120s, one gh
+# query, plus slack. A run that overruns is killed by systemd rather than wedging the
+# host, and the next night's run re-reads HEAD and tries again.
+TimeoutStartSec=1800
