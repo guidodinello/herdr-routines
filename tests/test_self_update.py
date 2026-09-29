@@ -112,6 +112,9 @@ class Sandbox:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        # Several tests want more than one independent sandbox, so the caller passes
+        # a not-yet-existing subdirectory of tmp_path.
+        root.mkdir(parents=True, exist_ok=True)
         self.bare = root / "bare.git"
         _init_bare_git_repo(self.bare)
         self.base = _default_branch(self.bare)
@@ -341,14 +344,21 @@ def test_self_update_rolls_back_on_validate_failure(
     old = sandbox.head()
     sandbox.push("NEW.md", "new\n", "add NEW.md")
 
+    # Recorded from the argv the implementation actually builds (its own `_git`
+    # calls), not from an argv the test writes itself — a test that builds the
+    # expected argv and compares it to itself pins nothing.
     rollback_argv: list[list[str]] = []
-    real_reset_keep = self_update.reset_keep
+    all_argv: list[list[str]] = []
+    real_git = self_update._git
 
-    def recording_reset_keep(checkout: Path, sha: str) -> tuple[int, str, str]:
-        rollback_argv.append(["git", "-C", str(checkout), "reset", "--keep", sha])
-        return real_reset_keep(checkout, sha)
+    def recording_git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        argv = ["git", "-C", str(checkout), *args]
+        all_argv.append(argv)
+        if args and args[0] == "reset":
+            rollback_argv.append(argv)
+        return real_git(checkout, *args)
 
-    monkeypatch.setattr(self_update, "reset_keep", recording_reset_keep)
+    monkeypatch.setattr(self_update, "_git", recording_git)
 
     notify = Recorder()
     result = sandbox.run(
@@ -365,9 +375,10 @@ def test_self_update_rolls_back_on_validate_failure(
     assert "cannot import name 'boom'" in notify.body
     assert rollback_argv, "expected a rollback attempt"
     for argv in rollback_argv:
+        assert argv[-2:] == ["--keep", old]
+    for argv in all_argv:
         assert "--hard" not in argv
         assert "--force" not in argv
-        assert argv[-2:] == ["--keep", old]
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +421,7 @@ def test_self_update_refuses_dirty_or_diverged(tmp_path: Path) -> None:
     _fetch_and_fast_forward` short-circuits on a detached HEAD and returns having
     merged nothing, so without an explicit refusal this command would report a
     successful "update" of a checkout it never moved."""
-    cases: list[tuple[str, Callable[[Sandbox], None]]] = [
+    cases: list[tuple[str, Callable[[Sandbox], object]]] = [
         ("dirty", lambda sb: (sb.checkout / "README.md").write_text("hand-edited\n")),
         ("non-main branch", lambda sb: _git(sb.checkout, "checkout", "-b", "side")),
         ("detached HEAD", lambda sb: _git(sb.checkout, "checkout", "--detach")),
@@ -744,7 +755,10 @@ def test_self_update_refuses_when_uv_is_missing(
     assert result.status == "refused"
     assert "uv" in (result.reason or "")
     assert sandbox.head() == old
-    assert notify.calls == []
+    # A refusal is loud (R3), unlike a deferral: a host missing `uv` is a host that
+    # silently stops updating, which is the failure this command exists to prevent.
+    assert len(notify.calls) == 1
+    assert "uv" in notify.body
     mutating = [
         args for args in git_calls.calls if args and args[0] in {"fetch", "merge"}
     ]
@@ -801,7 +815,11 @@ def test_self_update_reports_head_sha_when_rollback_fails(sandbox: Sandbox) -> N
 
     notify = Recorder()
     result = sandbox.run(
-        notify=notify, runner=FakeValidate(before_return=edit_after_ff)
+        notify=notify,
+        runner=FakeValidate(
+            results=[(0, PASSING_VALIDATE), (1, "error: broken new code")],
+            before_return=edit_after_ff,
+        ),
     )
 
     assert result.status == "rolled_back"
