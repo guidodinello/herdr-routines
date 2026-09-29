@@ -25,7 +25,10 @@ workspace: worktree
 base: main
 agent_kind: opencode
 model: opencode/big-pickle # the author. The reviewer runs as a separate
-    # `opencode run -m opencode/muse-spark-1.2-contributor-free` (see prompt).
+    # `opencode run -m nvidia/moonshotai/kimi-k3` (see prompt) — a different
+    # provider AND model family, so the review is independent of the author.
+fallback_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free" # quota_exhausted on Zen → retry on
+    # OpenRouter; deliberately not the reviewer's model, so a fallback run stays independent.
 timeout_ms: 3600000 # 1h — a 3-pass author→reviewer loop plus PR creation.
 start_timeout_ms: 120000
 on_missed: log
@@ -54,7 +57,7 @@ prompt: |
   3. REVIEW LOOP — at most 3 passes. Independence is the point: each pass runs a
      FRESH reviewer in its own session and a different model — never re-read your
      own draft as the review.
-       opencode run --dir . -m opencode/muse-spark-1.2-contributor-free \
+       opencode run --dir . -m nvidia/moonshotai/kimi-k3 \
          "You are reviewing a draft issue file for herdr-routines. Read
           docs/process/issues/NNN-<slug>.md and compare it to the other files in
           docs/process/issues/. Judge whether it is buildable by a single worker
