@@ -234,8 +234,19 @@ def test_prune_reports_survives_per_entry_error(
 # clone, tmp_hygiene reaps /tmp leaks from the tick — all pre-existing. reports_prune.py is
 # the new one. Anything else that shows up here is a new delete path that has not been
 # reviewed against the "only `prune` deletes" rule.
+#
+# pipeline_prepare.py (issue 054 phase A) is reviewed and allowed: its only unlink is the
+# `tempfile.mkstemp` scratch file it created itself in `_write_state_json`, removed only on
+# the failure path so a partial write never becomes `state.json`. It cannot name a report
+# or a history roll, and it deletes nothing on the success path.
 _DELETE_CALL_RE = re.compile(r"\.(?:unlink|rmdir)\(|\bos\.remove\(|\bshutil\.rmtree\(")
-_EXPECTED_DELETERS = {"gc.py", "reports_prune.py", "repos.py", "tmp_hygiene.py"}
+_EXPECTED_DELETERS = {
+    "gc.py",
+    "pipeline_prepare.py",
+    "reports_prune.py",
+    "repos.py",
+    "tmp_hygiene.py",
+}
 
 
 def test_no_automatic_deletion_outside_prune(tmp_path: Path) -> None:

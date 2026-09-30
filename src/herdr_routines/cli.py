@@ -48,6 +48,14 @@ from herdr_routines.history import (
 )
 from herdr_routines.issue_refinement import run_refine_issue
 from herdr_routines.pick_feature import ReclaimedPick, run_pick_feature
+from herdr_routines.pipeline_prepare import (
+    DEFAULT_ISSUES_DIR,
+    EXIT_FAILURE,
+    EXIT_NO_FEATURE,
+    EXIT_PREPARED,
+    prepare_run,
+    render_prepared_values,
+)
 from herdr_routines.pipeline_watchdog import (
     default_heartbeat_dir,
     default_worktrees_root,
@@ -379,6 +387,47 @@ def _build_parser() -> argparse.ArgumentParser:
         "--base", default="main", help="branch to fast-forward to (default: main)"
     )
     p_sync_repo.set_defaults(handler=_cmd_sync_repo)
+
+    p_prepare = sub.add_parser(
+        "pipeline-prepare",
+        help="pre-flight for the overnight pipeline: sync the parent clone, pick and "
+        "claim the feature, create the shared worktree/workspace and write state.json "
+        "— all before any agent starts (issue 054 phase A)",
+    )
+    p_prepare.add_argument(
+        "--run-id", required=True, help="bare UTC timestamp, e.g. 20260930T050000Z"
+    )
+    p_prepare.add_argument(
+        "--repo-parent",
+        type=Path,
+        required=True,
+        help="parent clone to sync and branch the run's worktree from",
+    )
+    p_prepare.add_argument(
+        "--report",
+        type=Path,
+        required=True,
+        help="terminal-report path to write on a skip/failure (tick reconciles from it)",
+    )
+    p_prepare.add_argument(
+        "--deadline-epoch",
+        type=int,
+        required=True,
+        help="the run's wall-clock deadline (unix seconds), forwarded from tick by the "
+        "launcher verbatim — never computed here, so no caller can invent one",
+    )
+    p_prepare.add_argument(
+        "--base",
+        default="main",
+        help="branch to sync and branch the worktree from (default: main)",
+    )
+    p_prepare.add_argument(
+        "--issues-dir",
+        default=DEFAULT_ISSUES_DIR,
+        help=f"issue files to pick from, relative to --repo-parent "
+        f"(default: {DEFAULT_ISSUES_DIR})",
+    )
+    p_prepare.set_defaults(handler=_cmd_pipeline_prepare)
 
     p_refine = sub.add_parser(
         "refine-issue",
@@ -1137,6 +1186,40 @@ def _cmd_sync_repo(args: argparse.Namespace) -> int:
         return 1
     log.info("sync-repo: %s up to date with origin/%s", args.path, args.base)
     return 0
+
+
+def _cmd_pipeline_prepare(args: argparse.Namespace) -> int:
+    # The launcher branches on these exit codes and nothing else: 0 prepared, 3 no
+    # feature (a healthy night with an empty backlog — distinct from 1 on purpose, so
+    # the launcher can skip the agent quietly instead of reporting a break).
+    result = prepare_run(
+        run_id=args.run_id,
+        repo_parent=args.repo_parent,
+        report=args.report,
+        deadline_epoch=args.deadline_epoch,
+        base=args.base,
+        issues_dir=args.issues_dir,
+    )
+    if result.outcome == "ok":
+        # stdout is the machine-parsed KEY=VALUE stream; logs went to stderr, which the
+        # launcher has already redirected into the run log.
+        print(render_prepared_values(result))
+        return EXIT_PREPARED
+    if result.outcome == "no_feature":
+        log.info(
+            "pipeline-prepare: no feature to build for run %s; wrote %s — no agent, no "
+            "worktree, no workspace, no state.json",
+            args.run_id,
+            args.report,
+        )
+        return EXIT_NO_FEATURE
+    log.error(
+        "pipeline-prepare: run %s did not prepare (%s); wrote %s — no agent started",
+        args.run_id,
+        result.outcome,
+        args.report,
+    )
+    return EXIT_FAILURE
 
 
 def _cmd_refine_issue(args: argparse.Namespace) -> int:
