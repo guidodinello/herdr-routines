@@ -197,12 +197,15 @@ files 2026-08-27.
   `/run <job>` mapping to `workspace create` + `agent start`; transport is
   settled by [`023`]. →
   [`024`](docs/process/issues/024-spawn-session-from-telegram.md)
-- **Review `@me` PRs across repos** — idea, not designed. Scan open PRs authored
-  by me (or `--review-requested`) across all my repos and code-review each one.
-  Distinct from `babysit-prs` (issue 015), which only watches PRs a routine
-  itself opened (`auto/*`). Its prerequisite, the jobs refactor (issue 006 /
-  025 design, then 049's `kind: gated`), has shipped, so this is ready to
-  refine. 2026-08-30 brainstorm.
+- **Review `@me` PRs across repos** — `open`, `medium`. A cross-repo
+  `kind: review` job: one batched `gh` search for open PRs authored by me
+  (or `review-requested`) across all repos, one worktree per dispatched PR, one
+  posted review each. Distinct from `babysit-prs` (issue 015), which only watches
+  PRs a routine itself opened (`auto/*`); that `auto/` slice is excluded here too,
+  so pipeline PRs aren't reviewed twice. The design's hard part is that a review
+  has no self-clearing gate: a content marker plus a per-`owner/repo#N` attempt
+  budget is what makes it a finite loop. 2026-08-30 brainstorm. →
+  [`055`](docs/process/issues/055-review-me-prs-across-repos.md)
 - **Audit skills as report→diff gate jobs** — idea, not designed. Turn fitted's
   audit skills (`type-health`, `ui-ux-review`, `accessibility-review`,
   `fix-ignores`, `discover-conventions`, `improve-codebase-architecture`,
