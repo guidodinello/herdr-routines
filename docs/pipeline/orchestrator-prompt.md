@@ -8,24 +8,18 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
 
 ## Inputs you will receive
 
-- `FEATURE_IDEA`: one paragraph from the human (the feature to build). **If not provided**, pick
-  one yourself from the curated backlog instead of asking and waiting (2026-08-25, see
-  `ROADMAP.md` § "Autonomous task selection for the pipeline" for why this is scoped narrowly):
-  run `uv run herdr-routines pick-feature --issues-dir docs/process/issues --mark-in-progress`
-  in `$REPO_PARENT` and use its stdout verbatim as `FEATURE_IDEA`. `--mark-in-progress` records the
-  claim out-of-tree (issue 041: it used to write `status: in-progress` into the issue file as an
-  uncommitted edit, which collided with the implementing PR's own edit to the same line and
-  wedged `sync-repo`/`ensure_repo` for every job on that repo path once the PR merged) — so
-  `$REPO_PARENT` stays a clean mirror of `origin/main` after the pick, exactly what `sync-repo`
-  and `ensure_repo` assume. Record which issue you picked in `state.json`
-  (`"feature_source": "docs/process/issues/<file>"`) so the report and a human reviewing in the
-  morning can trace the run back to its issue. If the command exits 1 (`no open issues`), **stop
-  and write a report saying so** — do not fabricate a feature idea. `--mark-in-progress` also
-  reclaims any stale claim past its lease (issue 040: a prior run that died before opening a PR
-  must not orphan the issue it picked forever) — carry any `reclaimed stale claim: ...` line it
-  writes to stderr into `$PIPELINE_REPORT` verbatim, so a human reviewing in the morning sees that
-  an issue went back in the pool. This only covers picking
-  *which* Now-horizon item to build; it does not make the pipeline self-scheduling — a human (or
+- `FEATURE_IDEA`: the feature to build, already picked and claimed for you. It is one
+  `KEY=VALUE` line in the values block at the end of this prompt; a literal `\n` in it
+  is an escaped newline, so read it as a single line and unescape it. Do not re-pick it
+  and do not substitute your own idea.
+- `FEATURE_SOURCE`: `docs/process/issues/<file>` — the issue this run picked, the same
+  path recorded as `state.json`'s `feature_source`. The pick's claim is out-of-tree
+  (issue 041 — `$REPO_PARENT` stays a clean mirror of `origin/main`), and `--mark-in-progress`
+  reclaims any stale claim past its lease (issue 040: a prior run that died before opening
+  a PR must not orphan the issue it picked forever). Any `reclaimed stale claim: ...`
+  line the pre-flight wrote into `$PIPELINE_REPORT` says an issue went back in the pool —
+  carry it into your own report if you rewrite it. This only covers picking *which*
+  Now-horizon item to build; it does not make the pipeline self-scheduling — a human (or
   `systemd-run --on-calendar`, launcher-side) still decides *when* a run happens. **The
   implementing PR carries the issue's `status: done` flip** (stage 3 commits `status: open` →
   `done` on the issue file — the issue file itself was never touched by the pick, so this is the
@@ -35,9 +29,36 @@ Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6
 - `RUN_ID`: e.g. `20260824T020000Z` (UTC). If not provided, derive `date -u +%Y%m%dT%H%M%SZ`.
 - `REPO_PARENT`: parent clone path, e.g. `~/.local/state/herdr-routines/repos/herdr-routines`
 - `$PIPELINE_REPORT`: path for your final report, e.g. `~/.local/state/herdr-routines/reports/<run_id>.md`
-- `$WT` and `$SHARED_WS` after you create them (below)
+- `WT`, `BRANCH`, `SHARED_WS`, `STATE_JSON`: the shared worktree, its branch, the shared
+  workspace and the state file — all already created (below)
 
-## Prerequisite (do once, before stage 1)
+## Prerequisite (already done for you — do not redo it)
+
+**The pre-flight ran before you were started.** `scripts/pipeline-launch.sh` called
+`uv run herdr-routines pipeline-prepare` first, which synced `$REPO_PARENT` to
+`origin/main`, picked and claimed the feature, created the shared worktree/branch and
+the shared workspace (with `--env HERDR_ENV=1`), wrote `$WT/state.json`, and printed the
+resolved values into the `KEY=VALUE` block at the end of this prompt:
+
+| Key | What it is |
+|---|---|
+| `FEATURE_IDEA` / `FEATURE_SOURCE` / `ISSUE_ID` | the picked feature and its issue file |
+| `WT` | the shared worktree — your cwd and every worker's |
+| `BRANCH` | `auto/pipeline-$RUN_ID`, the run's one branch |
+| `SHARED_WS` | the shared workspace (already forked with `HERDR_ENV=1`, so your `herdr` calls do not settle `blocked` — design:98) |
+| `STATE_JSON` | `$WT/state.json`, already written: `current_stage: 0`, `stage_sessions: {}`, `feature_source`, `deadline_epoch` |
+
+`deadline_epoch` in `state.json` is the `DEADLINE_EPOCH` value given at the end of this
+prompt: **copy that integer exactly — do not compute, round or re-derive it** (tick
+computes it from the real launch time + the job's `deadline_ms`, and the watchdog reads
+tick's value, not yours). You own `state.json` from here: update `current_stage` and
+`stage_sessions` as the run progresses, writing via `tmpfile && mv` (atomic rename — G-9).
+Never re-run the pre-flight, never re-create the worktree or the workspace, never
+re-sync the parent clone, and never re-pick a different feature.
+
+`stage_sessions` (G-17): record `agent_session.value` for **every** stage's worker as it spawns — `"1": "<session_id>"`, `"2": "<session_id>"`, etc. — not just the reused `pl-3` worker (G-16 already does that one). This is what Gate 2i (and any future stage-independence gate) compares against to confirm a stage actually ran in its own session rather than reusing a prior stage's.
+
+**This is now enforced in code, not just a gate you self-check.** `tick`'s reconcile (`herdr_routines.pipeline_watchdog.validate_stage_sessions`) reads this map when your run reports `## Outcome: ok` and **overrides the run to `failed` (`stage_independence_unverified`)** if it finds a placeholder id (anything containing `fake`/`stub`/`todo`/…), an id that isn't a real `ses_…` value, the same session reused across two stages, or fewer entries than the stage you reached. Real distinct `agent_session.value` per stage, or the run does not count — do not write `ses_..._fake1` / `ses_placeholder` / a copied id to move on.
 
 **Invoke `herdr-routines` as `uv run herdr-routines` everywhere below.** It is not
 installed as a standalone binary on the pipeline hosts (no `uv tool install`, not on
@@ -46,48 +67,7 @@ units do (`deploy/systemd/*.service`: `uv run herdr-routines …`). A bare `herd
 call fails with command-not-found, and the orchestrator then wanders off probing
 `~/.local/bin` for a launcher and wedges on a permission prompt (issue 050).
 
-1. Sync `$REPO_PARENT` to `origin/main` before branching off it (issue 030: a stale local
-   checkout here previously produced a run that branched days behind `origin/main` and
-   duplicated already-merged work). Use the same fetch+fast-forward primitive
-   `tick.py`/`runner.py` already run before every routine job — one source of truth, not a
-   bespoke `git fetch` here:
-
-```sh
-uv run herdr-routines sync-repo --path "$REPO_PARENT" --base main
-# non-zero exit ⇒ stop and write a report saying so; never branch off a stale/diverged
-# $REPO_PARENT (mirrors ensure_repo's fail-loud behavior in repos.py)
-```
-
-2. Create the **single shared worktree+branch** (design:68, spec:72):
-
-```sh
-herdr worktree create --cwd "$REPO_PARENT" --base main --branch "auto/pipeline-$RUN_ID"
-# parse output: jq -r '.result.worktree.path' → $WT, '.result.branch' → $BRANCH
-# also record: herdr workspace list | jq → find workspace with label or cwd == $WT → $SHARED_WS
-# if $SHARED_WS not found, herdr workspace create --cwd "$WT" --label "pipeline-$RUN_ID" --env HERDR_ENV=1 | jq -r '.result.workspace.workspace_id'
-```
-
-3. Write `state.json` atomically to `$WT/state.json` (design:131):
-
-```json
-{
-  "run_id": "<RUN_ID>",
-  "current_stage": 0,
-  "pr_number": null,
-  "shared_worktree": "<WT>",
-  "branch": "auto/pipeline-<RUN_ID>",
-  "shared_workspace": "<SHARED_WS>",
-  "deadline_epoch": <DEADLINE_EPOCH>,
-  "artifact_paths": {"spec": "$WT/docs/pipeline/runs/$RUN_ID/spec.md", "report": "$PIPELINE_REPORT"},
-  "stage_sessions": {}
-}
-```
-
-`stage_sessions` (G-17): record `agent_session.value` for **every** stage's worker as it spawns — `"1": "<session_id>"`, `"2": "<session_id>"`, etc. — not just the reused `pl-3` worker (G-16 already does that one). This is what Gate 2i (and any future stage-independence gate) compares against to confirm a stage actually ran in its own session rather than reusing a prior stage's.
-
-**This is now enforced in code, not just a gate you self-check.** `tick`'s reconcile (`herdr_routines.pipeline_watchdog.validate_stage_sessions`) reads this map when your run reports `## Outcome: ok` and **overrides the run to `failed` (`stage_independence_unverified`)** if it finds a placeholder id (anything containing `fake`/`stub`/`todo`/…), an id that isn't a real `ses_…` value, the same session reused across two stages, or fewer entries than the stage you reached. Real distinct `agent_session.value` per stage, or the run does not count — do not write `ses_..._fake1` / `ses_placeholder` / a copied id to move on.
-
-Write via `tmpfile && mv` (atomic rename — G-9). `deadline_epoch` is the `DEADLINE_EPOCH` value given at the end of this prompt: **copy that integer exactly — do not compute, round or re-derive it** (tick computes it from the real launch time + the job's `deadline_ms`, and the watchdog reads tick's value, not yours). Fork a `herdr workspace` with `--env HERDR_ENV=1` already — this is required or every `herdr` call wedges as `blocked` (design:98). Host prerequisites (signing key, allowlist, tools like `rg`) are configured **outside this prompt** per [`setup.md`](setup.md) — do not attempt to install tools or change git/gh config mid-run; if a gate fails on a missing tool, abort with report noting the gap. Write a heartbeat line (`echo "stage N poll $(date -u +%H:%M:%SZ)" >> /tmp/pipeline_resume_$RUN_ID.log`) each poll cycle so a silent orchestrator death is diagnosable (first run: wS:p1 killed between stages 4→5, no error, only `herdr-server.log agent → None`).
+Host prerequisites (signing key, allowlist, tools like `rg`) are configured **outside this prompt** per [`setup.md`](setup.md) — do not attempt to install tools or change git/gh config mid-run; if a gate fails on a missing tool, abort with report noting the gap. Write a heartbeat line (`echo "stage N poll $(date -u +%H:%M:%SZ)" >> /tmp/pipeline_resume_$RUN_ID.log`) each poll cycle so a silent orchestrator death is diagnosable (first run: wS:p1 killed between stages 4→5, no error, only `herdr-server.log agent → None`).
 
 ## Worker spawn template (use for every stage — no exceptions, G-17)
 

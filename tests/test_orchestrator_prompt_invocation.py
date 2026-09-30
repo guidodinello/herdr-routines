@@ -17,8 +17,12 @@ SETUP = REPO_ROOT / "docs" / "pipeline" / "setup.md"
 PERMISSION_FILE = REPO_ROOT / "deploy" / "opencode.pipeline.json"
 ISSUE_REFINEMENT_JOB = REPO_ROOT / "deploy" / "jobs.d" / "issue-refinement.yaml"
 
-# Subcommands the prompt tells the orchestrator to run.
-HERDR_ROUTINES_SUBCOMMANDS = ("sync-repo", "pick-feature", "gate")
+# Subcommands the prompt tells the orchestrator to run. `sync-repo` and `pick-feature`
+# used to be here; issue 054 phase A moved both into the launcher's `pipeline-prepare`
+# call, so the orchestrator no longer runs them. `pipeline-prepare` is deliberately
+# absent too — the *launcher* runs it, not the model, which is the whole point of the
+# phase (test_prompt_no_longer_asks_the_orchestrator_to_do_setup).
+HERDR_ROUTINES_SUBCOMMANDS = ("gate",)
 
 
 def _read(p: Path) -> str:
@@ -88,3 +92,44 @@ def test_setup_references_tracked_opencode_file() -> None:
     assert "not** add" in text and "`~/.local/bin/**`" in text
     # The stale-launcher cleanup step is documented.
     assert "pipeline-launch-nightly.sh" in text
+
+
+# -- issue 054 phase A: the orchestrator no longer does the mechanical setup -------------
+
+
+def test_prompt_no_longer_asks_the_orchestrator_to_do_setup() -> None:
+    """Phase A moved sync, pick, worktree, workspace and `state.json` into
+    `herdr-routines pipeline-prepare`, which the launcher runs before the agent exists.
+    A prompt that still asks a model to do them is not just redundant: it is the
+    fabrication risk issue 054 exists to remove — the 2026-09-28 fallback model wrote a
+    deadline a year in the past and the watchdog believed it.
+
+    So the prompt must not *instruct* any of those steps. Asserting on the commands and
+    on the prose, not just the absence of a heading, so a reworded checklist still fails.
+    """
+    text = _read(PROMPT)
+    flat = " ".join(text.split())
+
+    # The commands themselves are gone from the prompt: the launcher runs them.
+    for gone in (
+        "herdr-routines sync-repo",
+        "herdr-routines pick-feature",
+        "herdr worktree create",
+    ):
+        assert gone not in text, f"prompt still asks the orchestrator to run `{gone}`"
+
+    # Nor the checklist prose that told it to go do them.
+    for gone in (
+        "Before you start, confirm",
+        "Pick the feature",
+        "Create the shared worktree",
+    ):
+        assert gone not in flat, f"prompt still has the phase-A setup checklist: {gone}"
+
+    # ...and it says so, so the orchestrator knows the values are already resolved
+    # rather than silently missing its old instructions.
+    assert "pipeline-prepare" in flat
+    assert "pre-flight" in flat.lower()
+    # The header values the launcher appends are named, so the model knows to copy them.
+    for key in ("FEATURE_IDEA", "FEATURE_SOURCE", "ISSUE_ID", "STATE_JSON"):
+        assert key in text, f"prompt no longer mentions the {key} it is handed"

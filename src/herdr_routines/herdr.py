@@ -66,6 +66,19 @@ SETTLED_AGENT_STATUSES = frozenset({AGENT_STATUS_IDLE, AGENT_STATUS_DONE})
 STICKY_AGENT_STATUSES = frozenset({AGENT_STATUS_BLOCKED, AGENT_STATUS_UNKNOWN})
 
 
+@dataclass(frozen=True, slots=True)
+class WorktreeInfo:
+    """What `herdr worktree create` reports back: where the new worktree landed, which
+    branch it was branched onto, and the root pane herdr opened for it. `path` and
+    `branch` are what the pipeline launcher used to scrape out of the CLI's stdout with
+    `jq` (orchestrator-prompt.md's Prerequisite 2) — they are unreachable through
+    `worktree_create`, which reads only the pane id."""
+
+    path: str
+    branch: str
+    root_pane_id: str
+
+
 class HerdrCliError(Exception):
     """A `herdr` invocation exited non-zero. Carries the parsed JSON error body when there was
     one (exit 1, server error) vs. plain stderr text (exit 2, syntax error)."""
@@ -261,22 +274,76 @@ class HerdrClient:
     def worktree_create(
         self, *, cwd: str, branch: str, base: str, label: str | None = None
     ) -> str:
-        """Returns the new workspace's root pane id."""
-        args = [
-            "worktree",
-            "create",
-            "--cwd",
-            cwd,
-            "--branch",
-            branch,
-            "--base",
-            base,
-            "--no-focus",
-        ]
+        """Returns the new workspace's root pane id. Unchanged contract: only the pane
+        id is read, so a response carrying no `result.worktree.path` still works — use
+        `worktree_create_full` when the path/branch are needed too (issue 054 phase A)."""
+        body = self._call(
+            _worktree_create_argv(cwd=cwd, branch=branch, base=base, label=label)
+        )
+        return _extract_pane_id(body, path=("result", "root_pane", "pane_id"))
+
+    def worktree_create_full(
+        self, *, cwd: str, branch: str, base: str, label: str | None = None
+    ) -> WorktreeInfo:
+        """Same argv as `worktree_create`, but the full result: the worktree's absolute
+        `path`, the `branch` it was created on, and the root pane id. `pipeline_prepare`
+        needs all three (the path is the worker's cwd, the branch is the run's only
+        branch, the pane hosts the per-stage agents).
+
+        `path` and `branch` both live *under* `result.worktree` — the
+        `worktree_created` variant of herdr's `ResponseResult` requires `worktree` and
+        has no top-level `branch` at all (tests/fixtures/api-schema.json; live `herdr
+        0.8.2` confirms), so reading a sibling `result.branch` raises on every call."""
+        body = self._call(
+            _worktree_create_argv(cwd=cwd, branch=branch, base=base, label=label)
+        )
+        return WorktreeInfo(
+            path=_extract_str(body, path=("result", "worktree", "path")),
+            branch=_extract_str(body, path=("result", "worktree", "branch")),
+            root_pane_id=_extract_pane_id(
+                body, path=("result", "root_pane", "pane_id")
+            ),
+        )
+
+    def workspace_create(
+        self, *, cwd: str, label: str | None = None, env: dict[str, str] | None = None
+    ) -> str:
+        """Creates a workspace and returns its id. `env` is the `--env KEY=VALUE` pair
+        the pipeline's shared workspace requires (`HERDR_ENV=1`, without which every
+        `herdr` call from inside the workspace's agent settles `blocked` — see
+        docs/pipeline/design.md)."""
+        args = ["workspace", "create", "--cwd", cwd]
         if label:
             args += ["--label", label]
+        for key, value in (env or {}).items():
+            args += ["--env", f"{key}={value}"]
         body = self._call(args)
-        return _extract_pane_id(body, path=("result", "root_pane", "pane_id"))
+        return _extract_str(body, path=("result", "workspace", "workspace_id"))
+
+    def workspace_list(self) -> list[dict[str, Any]]:
+        """Every known workspace as herdr reports it, for locate-or-create lookups.
+        Returns the raw entries so a caller is not boxed into this module's idea of the
+        shape; an empty list when the server reports none.
+
+        There is **no `cwd` key** — live `herdr 0.8.2` `workspace list` entries are
+        `workspace_id, label, number, focused, pane_count, tab_count, active_tab_id,
+        agent_status` plus, for a workspace rooted in a checkout, a `worktree` object
+        carrying `checkout_path`/`repo_root`/`is_linked_worktree`. `worktree` is absent
+        entirely (not null) for a workspace whose cwd is not a checkout. `checkout_path`
+        is therefore the only way to tell two same-labelled workspaces apart, and
+        `_ensure_shared_workspace` (pipeline_prepare) relies on it."""
+        body = self._call(["workspace", "list"], timeout_s=10)
+        result = body.get("result")
+        if not isinstance(result, dict):
+            raise HerdrCliError(
+                f"unexpected herdr workspace response shape: {body!r}", exit_code=0
+            )
+        workspaces = result.get("workspaces")
+        if not isinstance(workspaces, list):
+            raise HerdrCliError(
+                f"unexpected herdr workspace response shape: {body!r}", exit_code=0
+            )
+        return [w for w in workspaces if isinstance(w, dict)]
 
     def tab_create(self, *, cwd: str, label: str | None = None) -> str:
         """Returns the new tab's root pane id. Used for `workspace: root` jobs."""
@@ -649,6 +716,28 @@ def build_agent_start_args(
     return args
 
 
+def _worktree_create_argv(
+    *, cwd: str, branch: str, base: str, label: str | None
+) -> list[str]:
+    """The `worktree create` argv, shared by `worktree_create` and
+    `worktree_create_full` so the two can't drift (the same reason
+    `build_agent_start_args` exists for `agent start`)."""
+    args = [
+        "worktree",
+        "create",
+        "--cwd",
+        cwd,
+        "--branch",
+        branch,
+        "--base",
+        base,
+        "--no-focus",
+    ]
+    if label:
+        args += ["--label", label]
+    return args
+
+
 def _try_parse_json(text: str) -> dict[str, Any] | None:
     text = text.strip()
     if not text:
@@ -661,6 +750,22 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 
 
 def _extract_pane_id(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
+    node: Any = body
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            raise HerdrCliError(
+                f"unexpected herdr response shape, missing {path}: {body!r}",
+                exit_code=0,
+            )
+        node = node[key]
+    if not isinstance(node, str):
+        raise HerdrCliError(
+            f"unexpected herdr response shape at {path}: {body!r}", exit_code=0
+        )
+    return node
+
+
+def _extract_str(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
     node: Any = body
     for key in path:
         if not isinstance(node, dict) or key not in node:
