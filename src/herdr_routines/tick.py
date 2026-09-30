@@ -1634,13 +1634,21 @@ def _classify_pipeline_outcome(report_text: str) -> tuple[str, str | None]:
 
     `partial (deadline exceeded)` is tolerated content-wise (the orchestrator is
     documented to wait out an in-flight stage before writing it, design.md G-7) but is
-    still reported `failed` here — a run that didn't finish is not silently green."""
+    still reported `failed` here — a run that didn't finish is not silently green.
+
+    `skipped (…)` is its own terminal state, not a flavour of failure: `pipeline-prepare`
+    writes `## Outcome: skipped (no_feature)` when the backlog is empty and the launcher
+    starts no agent at all (issue 054 phase A, which closes issue 052). A healthy night
+    with nothing to build must not read as a red history line — and the reconcile path
+    below returns before the failure notification for it."""
     match = _OUTCOME_RE.search(report_text)
     if match is None:
         return "interrupted_unknown", "outcome_marker_missing"
     status = match.group("status").strip().lower()
     if status.startswith("ok"):
         return "done", None
+    if status.startswith("skipped"):
+        return "skipped", None
     if status.startswith("partial"):
         return "failed", "partial_deadline"
     if status.startswith("failed"):
@@ -1785,6 +1793,10 @@ def _process_pipeline_job(
             }
             if reason is not None:
                 extra["reason"] = reason
+            elif state == "skipped":
+                # The marker text itself is the reason ("skipped (no_feature)"), but the
+                # classifier returns None so a skip can never be retried as a failure.
+                extra["reason"] = "no_feature"
             append(
                 history_path,
                 HistoryRecord(
@@ -1799,6 +1811,14 @@ def _process_pipeline_job(
                 if _notify_gate(job, "success"):
                     _notify(client, f"herdr-routines: {job.name} done", sound="done")
                 return f"{job.name}: done", False
+
+            # `skipped` is terminal and quiet: prepare already wrote the report and no
+            # agent ever ran, so there is nothing to retry and nothing to page anyone
+            # about (issue 052/054 phase A). Without this early return it would fall
+            # through to the failure notify below — a Telegram request at 05:00 for a
+            # night where the backlog was simply empty.
+            if state == "skipped":
+                return f"{job.name}: skipped", False
 
             # Retry once with fallback_model, same bound as the routine-job path
             # (tick._process_job): a run that is itself already a fallback attempt

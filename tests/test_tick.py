@@ -2678,3 +2678,87 @@ def test_run_tick_rotates_and_survives_rotation_error(
     # And the record the failed rotation was supposed to sweep is still there — a rotation
     # error loses nothing.
     assert [r.state for r in read_job(history_path, "a")][-1] == "missed"
+
+
+# -- issue 054 phase A: an empty backlog is a quiet skip, not a failure ------------------
+
+
+def test_pipeline_skipped_report_classifies_as_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 052 via phase A: `pipeline-prepare` writes
+    `## Outcome: skipped (no_feature)` and no agent ever starts, so the run that tick
+    reconciles is a *skip*. It gets its own terminal history state — not `failed`
+    (nothing broke) and not `done` (nothing was built), which matters because `done`
+    feeds the success notification and the pipeline's green/red history."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    # Exactly what pipeline_prepare._write_terminal_report emits.
+    report_path.write_text(
+        f"# pipeline run {running.run_id}\n\n"
+        "## Outcome: skipped (no_feature)\n"
+        "reason: no open unclaimed issue in docs/process/issues\n"
+    )
+
+    t2 = t0 + timedelta(minutes=2)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("nightly-pipeline: skipped",)
+    # A skip is not a break, so tick's failure signal stays clear.
+    assert outcome.any_job_failed is False
+    record = read_job(history_path, job.name)[-1]
+    assert record.state == "skipped"
+    # The reason is recorded, so `tick` history answers "why was nothing built?".
+    assert (record.extra or {}).get("reason") == "no_feature"
+    # And the run is closed, not left in flight for the next tick to re-reconcile.
+    assert record.run_id == running.run_id
+
+
+def test_pipeline_skipped_report_sends_no_failure_notification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user-visible half of the skip. `_classify_pipeline_outcome` returns
+    `(skipped, None)` and the reconcile path returns before the failure notify, so an
+    empty backlog at 05:00 does not page anyone. Compare the `failed` case in the same
+    shape: it does notify, which is what makes this assertion mean something."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = running.run_id.removeprefix(f"{job.name}-")  # type: ignore[union-attr]
+    report_path = tmp_path / "state" / "reports" / f"pipeline-{bare_run_id}.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("## Outcome: skipped (no_feature)\nreason: none\n")
+
+    run_tick(config, history_path, client=client, now=t0 + timedelta(minutes=2))  # type: ignore[arg-type]
+
+    assert client.notifications == [], (
+        f"a no-feature skip must not notify: {client.notifications}"
+    )
