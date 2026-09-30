@@ -102,6 +102,7 @@ def prepare_run(
     )
     branch = f"auto/pipeline-{run_id}"
     reclaim_lines: list[str] = []
+    claimed_issue_id: str | None = None
 
     def _reclaim_line(reclaimed: ReclaimedPick) -> None:
         reclaim_lines.append(
@@ -115,12 +116,35 @@ def prepare_run(
         outcome_marker: str,
         reason: str,
     ) -> PrepareResult:
-        _write_terminal_report(
-            report,
-            run_id=run_id,
-            outcome=outcome_marker,
-            lines=[f"reason: {reason}", *reclaim_lines],
-        )
+        # "Never raises" is the contract `_cmd_pipeline_prepare`'s exit-code table is
+        # built on, so an unwritable report path must not escape as NotADirectoryError
+        # and leave the launcher with a non-{0,3,1,2} exit and no report to reconcile.
+        # Degrade to log-only: the run is lost either way, but the failure is still loud.
+        try:
+            _write_terminal_report(
+                report,
+                run_id=run_id,
+                outcome=outcome_marker,
+                lines=[
+                    f"reason: {reason}",
+                    # Once step 2 has claimed, the morning report has to say *which*
+                    # issue went into the claimed set — the claim self-heals via
+                    # `reclaim_stale_claims`, but a silent claim is exactly what issue
+                    # 040 forbids. Absent before the pick, so the two are never confused.
+                    *(
+                        [f"claimed issue: {claimed_issue_id}"]
+                        if claimed_issue_id is not None
+                        else []
+                    ),
+                    *reclaim_lines,
+                ],
+            )
+        except OSError as e:
+            log.error(
+                "pipeline-prepare: could not write the terminal report at %s: %s",
+                report,
+                e,
+            )
         return PrepareResult(
             outcome=outcome,
             feature_idea=None,
@@ -164,6 +188,8 @@ def prepare_run(
             "skipped (no_feature)",
             f"no open unclaimed issue in {Path(issues_dir).as_posix()}",
         )
+    # The claim is on disk from here on, so every later `_failed` records it.
+    claimed_issue_id = picked.issue.id
 
     # 3. shared worktree + branch, then the shared workspace (first step needing Herdr).
     try:
@@ -270,13 +296,32 @@ def _feature_source(issue_path: Path, repo_parent: Path) -> str:
 
 
 def _ensure_shared_workspace(client: HerdrClient, *, cwd: str, label: str) -> str:
-    """Locate-or-create the run's shared workspace. A workspace already carrying this
-    run's label is reused (a relaunch after a crash must not pile up workspaces)."""
+    """Locate-or-create the run's shared workspace: the one carrying this run's label
+    *and* rooted at this run's worktree.
+
+    Both conditions, never the label alone. `scripts/pipeline-launch.sh` creates a
+    second workspace with the identical `pipeline-{run_id}` label for the orchestrator,
+    rooted at `$REPO_PARENT`, so a label-only match can hand back that one — and every
+    stage worker spawned into it would operate on the parent clone instead of the run's
+    branch. Equally, `worktree create` already opens a workspace *on the worktree* and
+    reports it as `worktree.open_workspace_id`, so a path-only match can hand back that
+    one instead — a workspace not forked with `HERDR_ENV=1`, in which every `herdr` call
+    from inside an agent settles `blocked` (docs/pipeline/design.md).
+
+    `herdr workspace list` carries no `cwd` key (live `herdr 0.8.2`); `worktree.
+    checkout_path` is the nearest real one, and it is absent entirely for a workspace
+    whose cwd is not a checkout."""
     for entry in client.workspace_list():
-        if entry.get("label") == label:
-            workspace_id = entry.get("workspace_id")
-            if isinstance(workspace_id, str) and workspace_id:
-                return workspace_id
+        if entry.get("label") != label:
+            continue
+        entry_worktree = entry.get("worktree")
+        if not isinstance(entry_worktree, dict):
+            continue
+        if entry_worktree.get("checkout_path") != cwd:
+            continue
+        workspace_id = entry.get("workspace_id")
+        if isinstance(workspace_id, str) and workspace_id:
+            return workspace_id
     return client.workspace_create(cwd=cwd, label=label, env=SHARED_WORKSPACE_ENV)
 
 

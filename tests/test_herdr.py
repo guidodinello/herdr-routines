@@ -54,6 +54,38 @@ def test_worktree_create_builds_expected_argv_and_parses_pane_id() -> None:
     assert "--no-focus" in argv
 
 
+def worktree_created_body(*, path: str, branch: str, pane_id: str) -> dict:
+    """A `worktree create` success body built from the real shape, not a plausible one.
+
+    herdr's `worktree_created` variant of `ResponseResult` requires
+    `[type, workspace, tab, root_pane, worktree]`, `worktree` is a `WorktreeInfo` whose
+    `branch` lives *under* it, and none of the 58 `ResponseResult` variants declares a
+    top-level `branch` (tests/fixtures/api-schema.json; live `herdr 0.8.2` agrees). An
+    earlier draft of this file hand-authored `{"result": {"worktree": {...}, "branch":
+    ...}}`, which cannot occur — and it shipped a client that read `result.branch`, so
+    `pipeline_prepare` raised on every run. Building the fixture here keeps the two
+    facts in one place: the shape is real, and the client reads it.
+    """
+    return {
+        "result": {
+            "type": "worktree_created",
+            "worktree": {
+                "path": path,
+                "branch": branch,
+                "label": branch,
+                "is_bare": False,
+                "is_detached": False,
+                "is_prunable": False,
+                "is_linked_worktree": True,
+                "open_workspace_id": "w65",
+            },
+            "workspace": {"workspace_id": "w65", "label": branch},
+            "tab": {"tab_id": "w65:t1", "label": branch},
+            "root_pane": {"pane_id": pane_id},
+        }
+    }
+
+
 def test_worktree_create_full_returns_path_and_branch() -> None:
     """`worktree_create` returns only the pane id, but the pipeline's pre-flight needs the
     worktree's path and branch too (issue 054 phase A) — they used to be scraped out of
@@ -61,13 +93,11 @@ def test_worktree_create_full_returns_path_and_branch() -> None:
     runner = FakeRunner(
         [
             ok(
-                {
-                    "result": {
-                        "worktree": {"path": "/wt/auto-pipeline-20260930T050000Z"},
-                        "branch": "auto/pipeline-20260930T050000Z",
-                        "root_pane": {"pane_id": "w9:p1"},
-                    }
-                }
+                worktree_created_body(
+                    path="/wt/auto-pipeline-20260930T050000Z",
+                    branch="auto/pipeline-20260930T050000Z",
+                    pane_id="w9:p1",
+                )
             )
         ]
     )
@@ -87,6 +117,41 @@ def test_worktree_create_full_returns_path_and_branch() -> None:
     assert argv[argv.index("--branch") + 1] == "auto/pipeline-20260930T050000Z"
     assert argv[argv.index("--base") + 1] == "main"
     assert argv[argv.index("--label") + 1] == "pipeline-20260930T050000Z"
+
+
+def test_worktree_create_full_branch_is_not_read_from_result_root() -> None:
+    """The regression pin for the defect this PR was reviewed on: the branch is
+    `result.worktree.branch`, so a real `worktree_created` body — which has no
+    top-level `result.branch` — must parse, and a body carrying *only* a top-level
+    `branch` (the impossible shape the old fixture invented) must raise rather than
+    silently read a key herdr never sends."""
+    runner = FakeRunner(
+        [ok(worktree_created_body(path="/wt/x", branch="auto/x", pane_id="w1:p1"))]
+    )
+    assert (
+        HerdrClient(runner=runner)
+        .worktree_create_full(cwd="/repo", branch="auto/x", base="main")
+        .branch
+        == "auto/x"
+    )
+
+    impossible = FakeRunner(
+        [
+            ok(
+                {
+                    "result": {
+                        "worktree": {"path": "/wt/x"},
+                        "branch": "auto/x",
+                        "root_pane": {"pane_id": "w1:p1"},
+                    }
+                }
+            )
+        ]
+    )
+    with pytest.raises(HerdrCliError):
+        HerdrClient(runner=impossible).worktree_create_full(
+            cwd="/repo", branch="auto/x", base="main"
+        )
 
 
 def test_worktree_create_full_rejects_response_without_worktree_path() -> None:

@@ -14,13 +14,13 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Any, TypedDict, cast
 
 import pytest
 
 from herdr_routines import cli
 from herdr_routines.claims import load_claims
-from herdr_routines.herdr import HerdrClient, WorktreeInfo
+from herdr_routines.herdr import HerdrClient, HerdrCliError, WorktreeInfo
 from herdr_routines.pipeline_prepare import (
     EXIT_FAILURE,
     EXIT_NO_FEATURE,
@@ -94,20 +94,27 @@ def _detect_bare_default_branch(bare_path: Path) -> str:
 class FakeHerdr:
     """A HerdrClient-shaped fake for prepare-level tests: it creates a real directory to
     stand in for the worktree (so `state.json` lands where a real run's would) and records
-    every call, so a test can assert which steps ran at all."""
+    every call, so a test can assert which steps ran at all.
+
+    `raise_on` raises `HerdrCliError`, not a bare `RuntimeError`, because that is what a
+    real down server raises and what `prepare_run`'s `except (HerdrCliError, OSError)`
+    is there to catch — a `RuntimeError` would sail past the handler and the test would
+    be asserting the wrong thing entirely."""
 
     def __init__(self, worktrees_root: Path) -> None:
         self.worktrees_root = worktrees_root
         self.calls: list[str] = []
         self.created_worktrees: list[Path] = []
         self.created_workspaces: list[tuple[str, str, dict[str, str]]] = []
-        self.existing_workspaces: list[dict[str, str]] = []
+        self.existing_workspaces: list[dict[str, Any]] = []
         self.raise_on: str | None = None
 
     def worktree_create_full(self, *, cwd, branch, base, label=None):
         self.calls.append("worktree_create_full")
         if self.raise_on == "worktree_create_full":
-            raise RuntimeError("boom")
+            raise HerdrCliError(
+                "herdr server error running worktree create", exit_code=1
+            )
         assert cwd and branch and base
         # herdr names the dir after the branch with the slash flattened, e.g.
         # auto-pipeline-<run_id> (pick_feature.PIPELINE_WORKTREE_GLOB relies on that).
@@ -118,12 +125,18 @@ class FakeHerdr:
 
     def workspace_list(self):
         self.calls.append("workspace_list")
+        if self.raise_on == "workspace_list":
+            raise HerdrCliError(
+                "herdr server error running workspace list", exit_code=1
+            )
         return list(self.existing_workspaces)
 
     def workspace_create(self, *, cwd, label=None, env=None):
         self.calls.append("workspace_create")
         if self.raise_on == "workspace_create":
-            raise RuntimeError("boom")
+            raise HerdrCliError(
+                "herdr server error running workspace create", exit_code=1
+            )
         assert cwd
         self.created_workspaces.append((cwd, label or "", dict(env or {})))
         return "ws1"
@@ -365,30 +378,30 @@ def test_pipeline_prepare_prints_resolved_values(
     assert values["BRANCH"] == f"auto/pipeline-{RUN_ID}"
     assert values["STATE_JSON"] == str(result.state_path)
     # Multi-line values survive as one escaped line, so a multi-paragraph feature idea
-    # can't break the line format the launcher appends to the prompt header.
+    # can't break the line format the launcher appends to the prompt header. The two
+    # real guarantees are the line count and the round trip; anything more here
+    # (`"\n" not in values[...].splitlines()`, `count("\\n") >= 0`) is a tautology that
+    # reads like a check but cannot fail.
     rendered = render_prepared_values(result)
     assert len(rendered.splitlines()) == 7
-    assert all("\\n" in line or "\n" not in line for line in rendered.splitlines())
-    assert "\n" not in values["FEATURE_IDEA"]
-    assert values["FEATURE_IDEA"].count("\\n") >= 0
     assert "Do the thing for issue 001." in values["FEATURE_IDEA"].replace("\\n", "\n")
 
-    # And the CLI itself put exactly that KEY=VALUE stream on stdout.
-    cli_lines = [line for line in captured.out.splitlines() if "=" in line]
-    assert cli_lines, f"expected KEY=VALUE stdout, got: {captured.out!r}"
-    assert all(
-        line.split("=", 1)[0]
-        in {
-            "FEATURE_IDEA",
-            "FEATURE_SOURCE",
-            "ISSUE_ID",
-            "WT",
-            "BRANCH",
-            "SHARED_WS",
-            "STATE_JSON",
-        }
-        for line in cli_lines
-    )
+    # And the CLI itself put exactly that KEY=VALUE stream on stdout. The *exact* set,
+    # not just "every key it emitted is allowed": the launcher parses this stream, so a
+    # key silently dropped from the CLI path (SHARED_WS=, WT=) would otherwise leave the
+    # orchestrator with an empty variable and no test failing.
+    cli_keys = [
+        line.split("=", 1)[0] for line in captured.out.splitlines() if "=" in line
+    ]
+    assert cli_keys == [
+        "FEATURE_IDEA",
+        "FEATURE_SOURCE",
+        "ISSUE_ID",
+        "WT",
+        "BRANCH",
+        "SHARED_WS",
+        "STATE_JSON",
+    ], f"expected all seven KEY=VALUE lines on stdout, got: {captured.out!r}"
     assert "INFO" not in captured.out and "pipeline-prepare:" not in captured.out
 
 
@@ -674,6 +687,177 @@ def test_pipeline_prepare_needs_no_herdr_server(
     )
     assert skipped.outcome == "no_feature"
     assert client2.calls == []
+
+
+# --- the shared-workspace lookup: the launcher's label collision (review blocking #2) -----
+
+
+def test_ensure_shared_workspace_reuses_only_the_workspace_on_the_run_worktree(
+    tmp_path: Path, no_open_prs: None
+) -> None:
+    """`scripts/pipeline-launch.sh` creates a *second* workspace with the identical
+    `pipeline-{run_id}` label for the orchestrator, rooted at `$REPO_PARENT`. A
+    label-only match returns whichever `workspace list` happens to order first, and
+    every stage worker spawned into that one operates on the parent clone instead of the
+    run's branch. So the lookup requires the label *and* `worktree.checkout_path` to
+    match the run's worktree — the closest real key to a `cwd` (live `herdr workspace
+    list` entries carry no `cwd`). This is the reuse branch, which until now no test
+    exercised at all."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+    worktrees_root = tmp_path / "worktrees"
+    client = FakeHerdr(worktrees_root)
+    label = f"pipeline-{RUN_ID}"
+    # The orchestrator's workspace first in the list — exactly the ordering that made the
+    # old label-only lookup return the wrong one. It is rooted at $REPO_PARENT, which is
+    # itself a checkout, so herdr reports a `worktree.checkout_path` for it too: the
+    # label alone genuinely cannot tell these two apart.
+    client.existing_workspaces = [
+        {
+            "workspace_id": "ws-orchestrator",
+            "label": label,
+            "worktree": {"checkout_path": str(parent), "is_linked_worktree": False},
+        },
+        {
+            "workspace_id": "ws-shared",
+            "label": label,
+            "worktree": {
+                "checkout_path": str(worktrees_root / f"auto-pipeline-{RUN_ID}")
+            },
+        },
+    ]
+
+    result = prepare_run(
+        **_prepare_kwargs(tmp_path, parent=parent, base=base, client=client)
+    )
+
+    assert result.outcome == "ok"
+    assert result.workspace_id == "ws-shared"
+    # Reused, not re-created — a relaunch after a crash must not pile up workspaces.
+    assert "workspace_create" not in client.calls
+    assert client.created_workspaces == []
+
+
+def test_ensure_shared_workspace_ignores_worktree_workspace_opened_by_herdr(
+    tmp_path: Path, no_open_prs: None
+) -> None:
+    """The mirror trap, and the reason the match needs *both* conditions rather than
+    just `checkout_path`: `worktree create` already opens a workspace on the new
+    worktree and reports it as `worktree.open_workspace_id`, and that workspace carries
+    herdr's default label, not ours — and not `HERDR_ENV=1`, in which every `herdr` call
+    from inside an agent settles `blocked`. Matching on the path alone would hand it
+    back."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+    worktrees_root = tmp_path / "worktrees"
+    client = FakeHerdr(worktrees_root)
+    worktree_path = worktrees_root / f"auto-pipeline-{RUN_ID}"
+    client.existing_workspaces = [
+        {
+            "workspace_id": "w65",
+            "label": "auto-pipeline",
+            "worktree": {"checkout_path": str(worktree_path)},
+        }
+    ]
+
+    result = prepare_run(
+        **_prepare_kwargs(tmp_path, parent=parent, base=base, client=client)
+    )
+
+    assert result.outcome == "ok"
+    # Created, and forked with HERDR_ENV=1 — never the unenv'd workspace herdr opened.
+    assert result.workspace_id == "ws1"
+    assert client.created_workspaces == [
+        (str(worktree_path), f"pipeline-{RUN_ID}", {"HERDR_ENV": "1"})
+    ]
+
+
+def test_ensure_shared_workspace_creates_when_entry_has_no_worktree_key(
+    tmp_path: Path, no_open_prs: None
+) -> None:
+    """Live `herdr workspace list` omits `worktree` entirely (not null) for a workspace
+    whose cwd is not a checkout. A chained `.get()` on the missing key must not raise —
+    it must fall through to create, which is the same answer a genuinely new run gets."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+    client = FakeHerdr(tmp_path / "worktrees")
+    client.existing_workspaces = [
+        {"workspace_id": "ws-plain", "label": f"pipeline-{RUN_ID}"}
+    ]
+
+    result = prepare_run(
+        **_prepare_kwargs(tmp_path, parent=parent, base=base, client=client)
+    )
+
+    assert result.outcome == "ok"
+    assert result.workspace_id == "ws1"
+    assert "workspace_create" in client.calls
+
+
+# --- herdr down: the most likely real prepare failure, finally covered (review NB #7) -----
+
+
+@pytest.mark.parametrize(
+    ("raise_on", "expected_marker"),
+    [
+        ("worktree_create_full", "## Outcome: failed (worktree_setup_failed)"),
+        ("workspace_list", "## Outcome: failed (worktree_setup_failed)"),
+        ("workspace_create", "## Outcome: failed (worktree_setup_failed)"),
+    ],
+)
+def test_pipeline_prepare_reports_herdr_failure_instead_of_raising(
+    tmp_path: Path, no_open_prs: None, raise_on: str, expected_marker: str
+) -> None:
+    """AC 3's sibling: when the herdr server is down, every step of the pre-flight's
+    Herdr half raises `HerdrCliError`, and `prepare_run` must turn that into a terminal
+    report plus a `prepare_failed` result — never an exception out of the function whose
+    "Never raises" contract the launcher's {0, 3, 1, 2} exit-code table is built on.
+
+    This is the coverage that was missing while the client read `result.branch`: the
+    fake's `raise_on` was wired to a bare `RuntimeError`, which `except (HerdrCliError,
+    OSError)` would not even have caught, so no test could have reached this handler."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+    report = tmp_path / "reports" / f"pipeline-{RUN_ID}.md"
+    client = FakeHerdr(tmp_path / "worktrees")
+    client.raise_on = raise_on
+
+    result = prepare_run(
+        **_prepare_kwargs(tmp_path, parent=parent, base=base, client=client)
+    )
+
+    assert result.outcome == "prepare_failed"
+    assert result.state_path is None and result.workspace_id is None
+    assert expected_marker in report.read_text()
+    # The claim already on disk is named, so the morning report can say which issue went
+    # into the claimed set instead of the claim silently self-healing later.
+    assert "claimed issue: 001" in report.read_text()
+    assert "001" in load_claims(tmp_path / "claims.json")
+
+
+def test_pipeline_prepare_never_raises_on_an_unwritable_report_path(
+    tmp_path: Path, no_open_prs: None
+) -> None:
+    """The docstring promises a `PrepareResult` plus a report; under a report path whose
+    parent is a regular file, `path.parent.mkdir(…)` raises `NotADirectoryError`, which
+    escaped the function entirely. The launcher then printed "report already at $REPORT"
+    for a report that did not exist and the run sat `running` until its deadline. The
+    run is unrecoverable either way, so the contract is kept and the write degrades to
+    log-only — the exit code is still 1, which is what the launcher branches on."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-done.md", "done"))
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory\n")
+    client = FakeHerdr(tmp_path / "worktrees")
+
+    result = prepare_run(
+        **_prepare_kwargs(tmp_path, parent=parent, base=base, client=client)
+        | {"report": blocker / "reports" / f"pipeline-{RUN_ID}.md"}
+    )
+
+    assert result.outcome == "no_feature"
+    assert not (blocker / "reports").exists()
+    assert client.calls == []
 
 
 # --- AC 14: the follow-on issue exists before 054 is closed ------------------------------

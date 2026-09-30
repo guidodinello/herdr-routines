@@ -288,13 +288,18 @@ class HerdrClient:
         """Same argv as `worktree_create`, but the full result: the worktree's absolute
         `path`, the `branch` it was created on, and the root pane id. `pipeline_prepare`
         needs all three (the path is the worker's cwd, the branch is the run's only
-        branch, the pane hosts the per-stage agents)."""
+        branch, the pane hosts the per-stage agents).
+
+        `path` and `branch` both live *under* `result.worktree` — the
+        `worktree_created` variant of herdr's `ResponseResult` requires `worktree` and
+        has no top-level `branch` at all (tests/fixtures/api-schema.json; live `herdr
+        0.8.2` confirms), so reading a sibling `result.branch` raises on every call."""
         body = self._call(
             _worktree_create_argv(cwd=cwd, branch=branch, base=base, label=label)
         )
         return WorktreeInfo(
             path=_extract_str(body, path=("result", "worktree", "path")),
-            branch=_extract_str(body, path=("result", "branch")),
+            branch=_extract_str(body, path=("result", "worktree", "branch")),
             root_pane_id=_extract_pane_id(
                 body, path=("result", "root_pane", "pane_id")
             ),
@@ -317,9 +322,16 @@ class HerdrClient:
 
     def workspace_list(self) -> list[dict[str, Any]]:
         """Every known workspace as herdr reports it, for locate-or-create lookups.
-        Returns the raw entries (id/label/cwd live under whatever keys herdr uses) so a
-        caller matching by label or cwd is not boxed into this module's idea of the
-        shape; an empty list when the server reports none."""
+        Returns the raw entries so a caller is not boxed into this module's idea of the
+        shape; an empty list when the server reports none.
+
+        There is **no `cwd` key** — live `herdr 0.8.2` `workspace list` entries are
+        `workspace_id, label, number, focused, pane_count, tab_count, active_tab_id,
+        agent_status` plus, for a workspace rooted in a checkout, a `worktree` object
+        carrying `checkout_path`/`repo_root`/`is_linked_worktree`. `worktree` is absent
+        entirely (not null) for a workspace whose cwd is not a checkout. `checkout_path`
+        is therefore the only way to tell two same-labelled workspaces apart, and
+        `_ensure_shared_workspace` (pipeline_prepare) relies on it."""
         body = self._call(["workspace", "list"], timeout_s=10)
         result = body.get("result")
         if not isinstance(result, dict):
