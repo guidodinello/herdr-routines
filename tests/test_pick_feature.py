@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import subprocess
@@ -20,6 +21,7 @@ from herdr_routines.pick_feature import (
     parse_issue,
     render_feature_idea,
     run_pick_feature,
+    select_and_claim_feature,
     select_next,
 )
 
@@ -327,13 +329,22 @@ def test_pick_feature_skips_in_progress_inflight_run(
 ) -> None:
     """Acceptance criterion 3: a claim past its lease is NOT released while its issue
     belongs to an in-flight pipeline run (a `state.json` with no terminal report)."""
-    _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
+    # 001 is stale-claimed and low priority: its claim is released and it loses the
+    # pick, so the returned Issue and the released claim are provably different objects.
+    _write_issue(
+        issues_dir, "001-foo.md", id="001", title="Foo", status="open", priority="low"
+    )
     _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
     claims_path = tmp_path / "claims.json"
     claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
     claim_issue(claims_path, "001", now=claimed_at)
     monkeypatch.setattr(
         pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
+    )
+    monkeypatch.setattr(
+        pick_feature_module,
+        "pipeline_open_pr_issue_ids",
+        lambda repo, worktrees_root=None: frozenset(),
     )
 
     worktrees_root = tmp_path / "worktrees"
@@ -601,3 +612,140 @@ def test_pipeline_structural_derivation(
     assert code == 0
     assert "Bar" in out.getvalue()
     assert "Foo" not in out.getvalue()
+
+
+# --- Issue 054 phase A: the structured core `run_pick_feature` prints over -----------
+
+
+def test_select_and_claim_feature_returns_issue_and_reclaims(
+    issues_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The picked `Issue` itself — not a path scraped back out of the rendered
+    `feature_idea` — plus the reclaims the pick performed. `pipeline_prepare` writes
+    `state.json`'s `feature_source` from exactly this return value."""
+    # 001 is stale-claimed and low priority: its claim is released and it loses the
+    # pick, so the returned Issue and the released claim are provably different objects.
+    _write_issue(
+        issues_dir, "001-foo.md", id="001", title="Foo", status="open", priority="low"
+    )
+    _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
+    claims_path = tmp_path / "claims.json"
+    claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
+    claim_issue(claims_path, "001", now=claimed_at)
+    monkeypatch.setattr(
+        pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
+    )
+    monkeypatch.setattr(
+        pick_feature_module,
+        "pipeline_open_pr_issue_ids",
+        lambda repo, worktrees_root=None: frozenset(),
+    )
+
+    surfaced: list[ReclaimedPick] = []
+    result = select_and_claim_feature(
+        issues_dir,
+        mark=True,
+        claims_path=claims_path,
+        repo=tmp_path,
+        worktrees_root=tmp_path / "worktrees",
+        reports_dir=tmp_path / "reports",
+        now=_stale_now(claimed_at),
+        on_reclaim=surfaced.append,
+    )
+
+    assert result is not None
+    assert result.issue.id == "002"
+    assert result.issue.path == issues_dir / "002-bar.md"
+    assert result.issue.path.name in result.feature_idea
+    assert result.feature_idea == render_feature_idea(result.issue)
+    # The stale claim was released and reported, not silently dropped.
+    assert [r.issue_id for r in result.reclaimed] == ["001"]
+    assert [r.issue_id for r in surfaced] == ["001"]
+    # ...and the pick itself claimed the new issue, out of tree.
+    assert set(load_claims(claims_path)) == {"002"}
+
+
+def test_select_and_claim_feature_returns_none_when_nothing_open(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_issue(issues_dir, "001-foo.md", id="001", status="done")
+    monkeypatch.setattr(
+        pick_feature_module,
+        "pipeline_open_pr_issue_ids",
+        lambda repo, worktrees_root=None: frozenset(),
+    )
+    assert (
+        select_and_claim_feature(
+            issues_dir, mark=True, claims_path=tmp_path / "claims.json", repo=tmp_path
+        )
+        is None
+    )
+
+
+def test_select_and_claim_feature_raises_on_unreadable_issues_dir(
+    tmp_path: Path,
+) -> None:
+    """The core raises; `run_pick_feature` is what turns that into `error: …` + exit 1."""
+    with pytest.raises(IssueParseError):
+        select_and_claim_feature(tmp_path / "nope", claims_path=tmp_path / "c.json")
+
+
+def test_run_pick_feature_contract_unchanged(
+    issues_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`run_pick_feature` is now a thin printer over `select_and_claim_feature`, so its
+    public surface must be byte-for-byte what every existing caller (and the
+    orchestrator prompt) already depends on: same signature, same stdout rendering, same
+    stderr lines, same exit codes."""
+    assert list(inspect.signature(run_pick_feature).parameters) == [
+        "issues_dir",
+        "mark",
+        "out",
+        "claims_path",
+        "repo",
+        "worktrees_root",
+        "reports_dir",
+        "now",
+        "notify",
+    ]
+
+    monkeypatch.setattr(
+        pick_feature_module,
+        "pipeline_open_pr_issue_ids",
+        lambda repo, worktrees_root=None: frozenset(),
+    )
+
+    # Happy path: the rendered feature idea on stdout, nothing on stderr, exit 0.
+    issue = _write_issue(issues_dir, "001-foo.md", id="001", title="Foo")
+    claims_path = tmp_path / "claims.json"
+    code = run_pick_feature(
+        issues_dir, mark=True, claims_path=claims_path, repo=tmp_path
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == render_feature_idea(parse_issue(issue)) + "\n"
+    assert captured.err == ""
+
+    # Empty backlog: nothing on stdout, `no open issues` on stderr, exit 1. Same
+    # claims store, so 001 is now claimed and only the done 002 is left.
+    done = _write_issue(issues_dir, "002-done.md", id="002", status="done")
+    code = run_pick_feature(
+        issues_dir, mark=True, claims_path=claims_path, repo=tmp_path
+    )
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err == "no open issues\n"
+
+    # Unreadable issues dir: `error: …` on stderr, exit 1.
+    code = run_pick_feature(tmp_path / "missing", claims_path=claims_path)
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert done.exists()

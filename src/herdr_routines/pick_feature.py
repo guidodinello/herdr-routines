@@ -427,58 +427,56 @@ def reclaim_stale_claims(
     return reclaimed
 
 
-def run_pick_feature(
+@dataclass(frozen=True, slots=True)
+class PickResult:
+    """A successful pick, as data. `issue` is what lets a caller that needs
+    `feature_source` read the issue's own path instead of scraping it back out of the
+    rendered `feature_idea` (issue 054 phase A: the pipeline launcher needs both)."""
+
+    issue: Issue
+    feature_idea: str
+    reclaimed: tuple[ReclaimedPick, ...]
+
+
+def select_and_claim_feature(
     issues_dir: Path,
     mark: bool = False,
-    out: TextIO | None = None,
     claims_path: Path | None = None,
     repo: Path | None = None,
     worktrees_root: Path | None = None,
     reports_dir: Path | None = None,
     now: datetime | None = None,
-    notify: Callable[[ReclaimedPick], None] | None = None,
-) -> int:
-    """Entry point behind `herdr-routines pick-feature`.
+    on_reclaim: Callable[[ReclaimedPick], None] | None = None,
+) -> PickResult | None:
+    """The structured core behind `pick-feature`: returns the picked `Issue` (already
+    claimed when `mark`) plus the reclaims it performed, or `None` when there is nothing
+    to pick. Raises `IssueParseError` when `issues_dir` itself is unusable.
 
-    A pick is recorded as a claim in `claims_path` (default
-    `claims.default_claims_path()`), never as an edit to the issue file in
-    `$REPO_PARENT` (issue 041: that edit collided with the implementing PR's own
-    edit to the same line once merged). `$REPO_PARENT` stays a clean mirror of
-    `origin/main`, and a claimed issue is skipped by future picks until it either
-    lands as `status: done` on `main` or its claim is released (issue 040).
+    `run_pick_feature` is a thin printer over this (signature, stdout, stderr and exit
+    codes unchanged); `pipeline_prepare` is the other caller, and it needs the `Issue`
+    itself so `state.json`'s `feature_source` is a return value rather than text
+    recovered from a human-readable rendering.
 
-    With `mark=True`, stale claims are reclaimed first (see `reclaim_stale_claims`) so
-    a run that died before opening a PR does not orphan its issue forever — gated on
-    `mark` so a read-only pick (no `--mark-in-progress`) never mutates someone else's
-    claim. Each reclaim is printed to stderr and, if `notify` is given, passed to it
-    (issue 040 acceptance criterion 4: a reclaim must be visible, never silent).
+    `on_reclaim` is called for every released stale claim as it happens — including on a
+    run that ends up picking nothing, where there is no `PickResult` to carry them — so
+    issue 040's "a reclaim must be visible, never silent" holds for both callers.
     """
-    # Resolved lazily so callers that swap sys.stdout (pytest capsys) are honored.
-    stream: TextIO = out if out is not None else sys.stdout
     resolved_claims_path = (
         claims_path if claims_path is not None else default_claims_path()
     )
-    try:
-        issues = load_issues(issues_dir)
-    except IssueParseError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
+    issues = load_issues(issues_dir)
+    reclaimed: list[ReclaimedPick] = []
     if mark:
-        for reclaimed in reclaim_stale_claims(
+        reclaimed = reclaim_stale_claims(
             resolved_claims_path,
             repo=repo if repo is not None else Path.cwd(),
             worktrees_root=worktrees_root,
             reports_dir=reports_dir,
             now=now,
-        ):
-            print(
-                f"reclaimed stale claim: issue {reclaimed.issue_id} "
-                f"(claimed {reclaimed.claimed_at.isoformat()}, "
-                "no open PR, no in-flight run)",
-                file=sys.stderr,
-            )
-            if notify is not None:
-                notify(reclaimed)
+        )
+        for reclaim in reclaimed:
+            if on_reclaim is not None:
+                on_reclaim(reclaim)
     claimed_ids = frozenset(load_claims(resolved_claims_path))
     # Issue 028 re-scoped: an issue with an open auto/pipeline-* PR is treated as
     # claimed even when claims.py holds no claim for it. Unconditional, batched,
@@ -508,9 +506,75 @@ def run_pick_feature(
         pipeline_pr_ids = frozenset()
     picked = select_next(issues, claimed_ids, pipeline_pr_ids)
     if picked is None:
-        print("no open issues", file=sys.stderr)
-        return 1
+        return None
     if mark:
         claim_issue(resolved_claims_path, picked.id)
-    stream.write(render_feature_idea(picked) + "\n")
+    return PickResult(
+        issue=picked,
+        feature_idea=render_feature_idea(picked),
+        reclaimed=tuple(reclaimed),
+    )
+
+
+def run_pick_feature(
+    issues_dir: Path,
+    mark: bool = False,
+    out: TextIO | None = None,
+    claims_path: Path | None = None,
+    repo: Path | None = None,
+    worktrees_root: Path | None = None,
+    reports_dir: Path | None = None,
+    now: datetime | None = None,
+    notify: Callable[[ReclaimedPick], None] | None = None,
+) -> int:
+    """Entry point behind `herdr-routines pick-feature`.
+
+    A printer over `select_and_claim_feature`, and the reason that function exists
+    structured: the picked `Issue` — and therefore `state.json`'s `feature_source` — is
+    not recoverable from this command's `int` return (issue 054 phase A).
+
+    A pick is recorded as a claim in `claims_path` (default
+    `claims.default_claims_path()`), never as an edit to the issue file in
+    `$REPO_PARENT` (issue 041: that edit collided with the implementing PR's own
+    edit to the same line once merged). `$REPO_PARENT` stays a clean mirror of
+    `origin/main`, and a claimed issue is skipped by future picks until it either
+    lands as `status: done` on `main` or its claim is released (issue 040).
+
+    With `mark=True`, stale claims are reclaimed first (see `reclaim_stale_claims`) so
+    a run that died before opening a PR does not orphan its issue forever — gated on
+    `mark` so a read-only pick (no `--mark-in-progress`) never mutates someone else's
+    claim. Each reclaim is printed to stderr and, if `notify` is given, passed to it
+    (issue 040 acceptance criterion 4: a reclaim must be visible, never silent).
+    """
+    # Resolved lazily so callers that swap sys.stdout (pytest capsys) are honored.
+    stream: TextIO = out if out is not None else sys.stdout
+
+    def _surface_reclaim(reclaimed: ReclaimedPick) -> None:
+        print(
+            f"reclaimed stale claim: issue {reclaimed.issue_id} "
+            f"(claimed {reclaimed.claimed_at.isoformat()}, "
+            "no open PR, no in-flight run)",
+            file=sys.stderr,
+        )
+        if notify is not None:
+            notify(reclaimed)
+
+    try:
+        picked = select_and_claim_feature(
+            issues_dir,
+            mark=mark,
+            claims_path=claims_path,
+            repo=repo,
+            worktrees_root=worktrees_root,
+            reports_dir=reports_dir,
+            now=now,
+            on_reclaim=_surface_reclaim,
+        )
+    except IssueParseError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if picked is None:
+        print("no open issues", file=sys.stderr)
+        return 1
+    stream.write(picked.feature_idea + "\n")
     return 0
