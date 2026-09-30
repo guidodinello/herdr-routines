@@ -49,11 +49,15 @@ In progress or ready to build; no real-run evidence required.
   for `blocked` same as `idle`/`done`, and the pane-close cleanup trap
   destroys the diagnostic screen before anything captures it. →
   [`037`](docs/process/issues/037-launcher-blocked-settle.md)
-- **Move the orchestrator's mechanical steps into code** — `open`, `high`.
-  Pre-flight, the stage loop and stage 4 (push + PR) run in code; agents keep
-  only the judgment stages. Supersedes issue 052 and the "Code-level pipeline
-  gates" Parking Lot item. →
+- **Move the orchestrator's mechanical steps into code** — `done` (phase A,
+  PR #137), `high`. Pre-flight now runs in code (`pipeline-prepare`); agents
+  keep only the judgment stages. Supersedes issue 052 and the "Code-level
+  pipeline gates" Parking Lot item. →
   [`054`](docs/process/issues/054-orchestrator-mechanical-steps-to-code.md)
+- **Orchestrator stage loop and stage 4 in code** — `open`, `high`. Phases B
+  and C of 054: the stage loop and stage 4 (push + PR) move out of the
+  orchestrator session. →
+  [`056`](docs/process/issues/056-orchestrator-stage-loop-in-code.md)
 
 Done (kept as `status: done` issue files for history): plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
