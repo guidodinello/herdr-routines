@@ -1,7 +1,7 @@
 ---
 id: "052"
 title: "tick launches the pipeline orchestrator even when pick-feature has nothing to build"
-status: blocked
+status: done
 priority: low
 area: pipeline
 gate: superseded by issue 054 phase A (pre-flight in code, which skips a run with no feature before any agent starts); 054's phase A PR flips this to done
