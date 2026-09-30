@@ -9,10 +9,11 @@
 # flagged) — every value that script hardcoded is now a flag, so the script is generic
 # across jobs/hosts and lives under version control.
 #
-# Does NOT sync the repo itself — that is `docs/pipeline/orchestrator-prompt.md`
-# Prerequisite 1's job (`herdr-routines sync-repo`, issue 030's shipped primitive),
-# which runs once inside the orchestrator's own session so there is exactly one owner
-# of "is $REPO_PARENT up to date with origin/<base>".
+# Runs the pre-flight in code (`herdr-routines pipeline-prepare`, issue 054 phase A)
+# and then, only if there is something to build, starts the orchestrator agent. The
+# prompt no longer performs setup: sync, pick/claim, worktree+workspace and state.json
+# are all done before any agent exists, so a night with an empty backlog costs a report
+# and nothing else (issue 052).
 set -u
 
 usage() {
@@ -123,6 +124,32 @@ trap cleanup EXIT INT TERM
 
 cd "$REPO_PARENT" || exit 1
 
+# Pre-flight in code (issue 054 phase A), BEFORE any agent exists: sync the parent clone,
+# pick+claim the feature, create the shared worktree+workspace and write state.json. On
+# success it prints the resolved values as KEY=VALUE on stdout, which go into the
+# orchestrator's prompt header below instead of being computed by a model. `uv run` is
+# required — herdr-routines is not a standalone binary on the pipeline hosts (issue 050).
+#
+# Exit codes: 0 prepared, 3 nothing to build (a healthy night with an empty backlog),
+# 1 sync/setup failure, 2 usage. 3 is distinct from 1 on purpose so this branch can skip
+# the agent quietly instead of reporting a break. Both non-zero paths already have their
+# terminal report written at $REPORT (tick reconciles from there), so add nothing here.
+#
+# stdout only: stderr is already redirected into $LOG above, and merging it in would
+# splice log text into a KEY=VALUE stream about to be appended to the prompt.
+PREPARE_OUT=$(uv run herdr-routines pipeline-prepare \
+  --run-id "$RUN_ID" --repo-parent "$REPO_PARENT" --report "$REPORT" \
+  --deadline-epoch "$DEADLINE_EPOCH") ; PREPARE_RC=$?
+if [ "$PREPARE_RC" -ne 0 ]; then
+  echo "=== pipeline-prepare exited $PREPARE_RC; report already at $REPORT, no agent started ==="
+  if [ "$PREPARE_RC" -eq 3 ]; then
+    exit 0   # a skip is a successful skip
+  fi
+  exit "$PREPARE_RC"
+fi
+echo "=== prepared values for run_id=$RUN_ID ==="
+echo "$PREPARE_OUT"
+
 WS_JSON=$(herdr workspace create --cwd "$REPO_PARENT" \
   --label "pipeline-$RUN_ID" --env HERDR_ENV=1 2>&1)
 WS_PANE=$(printf '%s' "$WS_JSON" | jq -r '.result.root_pane.pane_id')
@@ -144,6 +171,9 @@ PROMPT_FILE_TMP="/tmp/full_prompt_${RUN_ID}.md"
   cat "$PROMPT_FILE"
   printf '\nRUN_ID: %s\nREPO_PARENT: %s\nPIPELINE_REPORT: %s\nDEADLINE_EPOCH: %s\n' \
     "$RUN_ID" "$REPO_PARENT" "$REPORT" "$DEADLINE_EPOCH"
+  # The values pipeline-prepare resolved, appended rather than substituted into the
+  # prompt file so --prompt-file keeps working for a custom prompt.
+  printf '%s\n' "$PREPARE_OUT"
 } > "$PROMPT_FILE_TMP"
 
 # --wait blocks until the orchestrator agent settles; the `cleanup` trap above closes
