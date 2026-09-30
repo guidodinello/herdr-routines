@@ -54,6 +54,91 @@ def test_worktree_create_builds_expected_argv_and_parses_pane_id() -> None:
     assert "--no-focus" in argv
 
 
+def test_worktree_create_full_returns_path_and_branch() -> None:
+    """`worktree_create` returns only the pane id, but the pipeline's pre-flight needs the
+    worktree's path and branch too (issue 054 phase A) — they used to be scraped out of
+    the CLI's stdout with `jq` by the orchestrator prompt."""
+    runner = FakeRunner(
+        [
+            ok(
+                {
+                    "result": {
+                        "worktree": {"path": "/wt/auto-pipeline-20260930T050000Z"},
+                        "branch": "auto/pipeline-20260930T050000Z",
+                        "root_pane": {"pane_id": "w9:p1"},
+                    }
+                }
+            )
+        ]
+    )
+    client = HerdrClient(runner=runner)
+    info = client.worktree_create_full(
+        cwd="/repo",
+        branch="auto/pipeline-20260930T050000Z",
+        base="main",
+        label="pipeline-20260930T050000Z",
+    )
+    assert info.path == "/wt/auto-pipeline-20260930T050000Z"
+    assert info.branch == "auto/pipeline-20260930T050000Z"
+    assert info.root_pane_id == "w9:p1"
+    argv = runner.calls[0]
+    assert argv[0] == "herdr"
+    assert argv[1:4] == ["worktree", "create", "--cwd"]
+    assert argv[argv.index("--branch") + 1] == "auto/pipeline-20260930T050000Z"
+    assert argv[argv.index("--base") + 1] == "main"
+    assert argv[argv.index("--label") + 1] == "pipeline-20260930T050000Z"
+
+
+def test_worktree_create_full_rejects_response_without_worktree_path() -> None:
+    """The path is really read out of the response, not defaulted: a shape herdr didn't
+    return must raise rather than hand the caller an empty cwd."""
+    runner = FakeRunner([ok({"result": {"root_pane": {"pane_id": "w9:p1"}}})])
+    client = HerdrClient(runner=runner)
+    with pytest.raises(HerdrCliError):
+        client.worktree_create_full(cwd="/repo", branch="auto/x", base="main")
+
+
+def test_workspace_create_passes_env_argv() -> None:
+    """The shared pipeline workspace must be forked with `--env HERDR_ENV=1`; without it
+    every `herdr` call made from inside the workspace's agent settles `blocked`."""
+    runner = FakeRunner([ok({"result": {"workspace": {"workspace_id": "w3G"}}})])
+    client = HerdrClient(runner=runner)
+    workspace_id = client.workspace_create(
+        cwd="/wt/auto-pipeline-20260930T050000Z",
+        label="pipeline-20260930T050000Z",
+        env={"HERDR_ENV": "1"},
+    )
+    assert workspace_id == "w3G"
+    argv = runner.calls[0]
+    assert argv[0] == "herdr"
+    assert argv[1:3] == ["workspace", "create"]
+    assert argv[argv.index("--cwd") + 1] == "/wt/auto-pipeline-20260930T050000Z"
+    assert argv[argv.index("--label") + 1] == "pipeline-20260930T050000Z"
+    assert argv[argv.index("--env") + 1] == "HERDR_ENV=1"
+
+
+def test_workspace_list_returns_entries() -> None:
+    """The locate-or-create lookup needs the workspace list; a malformed shape raises
+    like every other response parser rather than reading as "no workspaces"."""
+    runner = FakeRunner(
+        [
+            ok(
+                {
+                    "result": {
+                        "workspaces": [
+                            {"workspace_id": "w3G", "label": "pipeline-1"},
+                            "not-a-dict",
+                        ]
+                    }
+                }
+            )
+        ]
+    )
+    client = HerdrClient(runner=runner)
+    assert client.workspace_list() == [{"workspace_id": "w3G", "label": "pipeline-1"}]
+    assert runner.calls[0][1:] == ["workspace", "list"]
+
+
 def test_tab_create_builds_root_mode_argv() -> None:
     runner = FakeRunner([ok({"result": {"root_pane": {"pane_id": "w2:p3"}}})])
     client = HerdrClient(runner=runner)
