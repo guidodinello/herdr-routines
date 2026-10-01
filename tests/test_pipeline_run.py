@@ -31,11 +31,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from herdr_routines.pipeline_run import RunOutcome, run_pipeline
 
 from herdr_routines import tick
 from herdr_routines.auto_fix import GhClient
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
+from herdr_routines.pipeline_run import RunOutcome, run_pipeline
 from herdr_routines.pipeline_stages import STAGES
 from herdr_routines.pipeline_watchdog import (
     heartbeat_log_path,
@@ -78,6 +78,10 @@ Build it in `pipeline_run.py`.
 ## risks
 
 1. None.
+
+## Changelog v1→v2
+
+v1 had no acceptance criteria; v2 adds two, each ending `Test: <name>`.
 """
 
 # The gate-3 mechanical check only asks "does this test name exist under tests/".
@@ -159,6 +163,7 @@ class FakeHerdr:
         self.notifications: list[str] = []
         self.polls = 0
         self._next_pane = 0
+        self._resumed: dict[str, str] = {}
 
     # -- panes -----------------------------------------------------------------
 
@@ -187,8 +192,17 @@ class FakeHerdr:
                 "session_id": session_id,
             }
         )
+        if session_id is not None:
+            # A resumed agent reports the session it resumed: verified against live herdr
+            # 2026-08-25, `-s <session_id>` resumes rather than forks and
+            # `agent_session.value` on the new agent matches the original. Modelling that
+            # here is what makes stage 6's recorded id stage 3's id, which is the whole
+            # point of G-16's close-then-resume.
+            self._resumed[name] = session_id
 
     def agent_session_id(self, target: str) -> str | None:
+        if target in self._resumed:
+            return self._resumed[target]
         for stage, session_id in self.session_ids.items():
             if target.lower() == f"pl-{stage}-{RUN_ID}".lower():
                 return session_id
@@ -237,7 +251,19 @@ class FakeGh:
         self.head_ref = head_ref
         self.created: list[dict[str, Any]] = []
         self.viewed: list[int] = []
-        self.reviews: list[dict[str, Any]] = []
+        # Stage 5's model is what posts the review; the fake cannot run a model, so it
+        # starts from the review a tier-structured run leaves behind. Gate 5 then checks
+        # that structure rather than its absence.
+        self.reviews: list[dict[str, Any]] = [
+            {
+                "body": (
+                    "### blocking\n\n"
+                    "[blocking] `pipeline_run` never re-reads state.json between stages\n\n"
+                    "### non-blocking\n\n"
+                    "[non-blocking] consider naming the heartbeat directory\n"
+                )
+            }
+        ]
         self.threads: dict[str, Any] = {"data": {}}
 
     def api_user(self) -> str:
@@ -405,6 +431,9 @@ def test_pipeline_run_records_real_stage_sessions(prepared: PipelineFixture) -> 
     # not be read must abort rather than record a guess.
     orphan = FakeHerdr(SESSION_IDS)
     orphan.session_ids = {}
+    # Its own starting state: the run above left `current_stage` at 6, and a loop that
+    # correctly skips finished stages would otherwise have nothing left to do here.
+    prepared.write_state()
     result = run_pipeline(
         run_id=RUN_ID,
         state_json=prepared.state_json,
@@ -715,3 +744,30 @@ def test_gate_client_protocol_is_satisfied_by_the_real_client() -> None:
     """`run_pipeline` takes a `GhClient`, and stage 4 needs a `pr create` on it — a
     protocol without that method would only fail at 03:00, in production."""
     assert hasattr(GhClient, "pr_create")
+
+
+def test_pipeline_run_preserves_preflight_state_keys(prepared: PipelineFixture) -> None:
+    """`write_state_json` replaces the file wholesale, so every `commit` this loop makes
+    has to write back phase A's whole record — not just the fields it manages.
+
+    `artifact_paths.report` is the one that bites: phase A records the run's terminal
+    report path, `ps._resolve_report_path` trusts it first, and
+    `pipeline_watchdog._candidate_report_paths` reads it to tell a finished run from a
+    stalled one. Dropping it would leave the watchdog guessing at two fallback filenames
+    while the run is in flight, and the fields this loop does manage would look perfect
+    the whole time."""
+    client = _client(polls_per_stage=2)
+
+    outcome, _used_client, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok"
+    state = json.loads(prepared.state_json.read_text())
+    assert state["artifact_paths"]["report"] == str(prepared.report)
+    assert state["artifact_paths"]["spec"].endswith("spec.md")
+    # And a key this loop knows nothing about survives too, so adding one to the
+    # pre-flight does not require adding a field to _State for it to be kept.
+    state["unrelated_future_key"] = {"kept": True}
+    prepared.state_json.write_text(json.dumps(state))
+    _run(prepared, client=_client(polls_per_stage=2))
+    reread = json.loads(prepared.state_json.read_text())
+    assert reread["unrelated_future_key"] == {"kept": True}

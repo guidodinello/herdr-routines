@@ -1,0 +1,3 @@
+# Stage 1 — Plan + draft spec
+
+Read `docs/plan-v1.md` for context. Produce `spec.md` v1 at `$WT/docs/pipeline/runs/$RUN_ID/spec.md` (create the directory first: `mkdir -p "$WT/docs/pipeline/runs/$RUN_ID"` — this path is per-run on purpose, not `$WT/spec.md`: every run writing to the same root-level path is what caused PR #29's merge conflict against PR #28, both full-file rewrites of one shared path — G-15) with: problem, approach, files touched, risks. Keep it concise but complete. Commit before settling: `git -C "$WT" add docs/pipeline/runs/$RUN_ID/spec.md && git commit -m "spec: v1 for $RUN_ID"`.

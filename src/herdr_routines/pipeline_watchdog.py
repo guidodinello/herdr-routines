@@ -142,7 +142,7 @@ def validate_stage_sessions(
     # Reuse is legal only where STAGES says it is: stage 6 reuses stage 3's id. Any other
     # repetition means two independent stages shared one conversation.
     reuse_allowed: dict[str, str] = {
-        spec.reuses_stage: str(spec.stage)
+        str(spec.reuses_stage): str(spec.stage)
         for spec in expected
         if spec.reuses_stage is not None
     }

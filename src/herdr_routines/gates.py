@@ -19,6 +19,7 @@ from the same ``run_checks`` machinery as ``auto_fix.py``, not exposed as a CLI 
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -377,39 +378,56 @@ def _run_bounded(argv: Sequence[str], *, timeout_s: float) -> tuple[int, str, st
 
 
 def run_gate1(
-    repo_path: Path, *, runner: Callable[..., tuple[int, str, str]] | None = None
+    repo_path: Path,
+    spec: Path,
+    *,
+    runner: Callable[..., tuple[int, str, str]] | None = None,
 ) -> GateVerdict:
-    """Issue exists, is unclaimed and still open — the check that stops a night's work
-    being spent on something a human closed or claimed in the meantime.
+    """Stage 1's spec exists, is non-trivial, sits on a pipeline branch, and is
+    committed — `orchestrator-prompt.md` G-1 verbatim.
 
-    The claim is `status: open` plus no `claimed_by:` line, matching
-    `pick_feature.pick_issue` (issue 054) so this can never pass a run that pick would
-    have skipped. Read with plain text matching rather than a YAML parser on purpose:
-    the issue file is a template this repo controls, and a parse error in a single issue
-    must fail this gate loudly rather than silently select a feature."""
-    del runner  # gate 1 is pure filesystem work; no subprocess to bound
-    issue_files = sorted(repo_path.glob("docs/process/issues/*.md"))
-    if not issue_files:
-        return GateVerdict(passed=False, reason="no issue files found")
+    The commit check is the one that has bitten: an uncommitted spec.md means stage 2
+    reviews a file that is not on the branch, so the review and the implementation end
+    up looking at different documents. `git log -1 -- <spec>` returning nothing is the
+    proof that no commit touched it."""
+    run = runner or _run_bounded
 
-    open_issues: list[Path] = []
-    for path in issue_files:
-        try:
-            text = path.read_text()
-        except OSError as e:
-            return GateVerdict(passed=False, reason=f"could not read {path.name}: {e}")
-        if not _frontmatter_has(text, "status", "open"):
-            continue
-        if _frontmatter_field(text, "claimed_by") is not None:
-            continue
-        open_issues.append(path)
+    def git(*args: str) -> tuple[int, str, str]:
+        return run(["git", "-C", str(repo_path), *args], timeout_s=60)
 
-    if not open_issues:
+    try:
+        text = spec.read_text()
+    except OSError as e:
+        return GateVerdict(passed=False, reason=f"spec not readable at {spec}: {e}")
+    if not text.strip():
+        return GateVerdict(passed=False, reason=f"spec is empty: {spec}")
+    if len(text.splitlines()) <= 2:
         return GateVerdict(
             passed=False,
-            reason="no open unclaimed issue in docs/process/issues",
+            reason=f"spec is {len(text.splitlines())} line(s); gate 1 requires > 2",
         )
-    return GateVerdict(passed=True, reason=f"feature: {open_issues[0].stem}")
+
+    code, stdout, stderr = git("rev-parse", "--abbrev-ref", "HEAD")
+    if code != 0:
+        return GateVerdict(
+            passed=False, reason=f"git rev-parse HEAD failed: {stderr.strip()}"
+        )
+    branch = stdout.strip()
+    if not branch.startswith("auto/pipeline-"):
+        return GateVerdict(
+            passed=False, reason=f"HEAD is {branch!r}, not an auto/pipeline-* branch"
+        )
+
+    try:
+        rel = spec.relative_to(repo_path)
+    except ValueError:
+        rel = spec
+    code, stdout, _stderr = git("log", "--oneline", "-1", "--", str(rel))
+    if code != 0 or not stdout.strip():
+        return GateVerdict(
+            passed=False, reason=f"spec is not committed on {branch}: {rel}"
+        )
+    return GateVerdict(passed=True)
 
 
 def _frontmatter_block(text: str) -> str | None:
@@ -435,80 +453,76 @@ def _frontmatter_has(text: str, field: str, value: str) -> bool:
     return _frontmatter_field(text, field) == value
 
 
-def run_gate2(
-    repo_path: Path, *, runner: Callable[..., tuple[int, str, str]] | None = None
-) -> GateVerdict:
-    """Worktree is clean, on the expected branch, synced with origin, and has no
-    unpushed commits. Each of those has bitten a real run: a dirty tree means the PR
-    would carry whatever was in the working directory, an unsynced base means the
-    pipeline fixes last night's already-fixed problem, and an unpushed commit means the
-    agent's work is only on this host until someone pushes by hand.
+def run_gate2(spec: Path) -> GateVerdict:
+    """Stage 2's spec v2 carries the structure the rest of the pipeline relies on — the
+    `## Acceptance criteria` block stage 3 and gate 3 read, the `## Changelog`
+    documenting the v1->v2 delta, and both tier words plus the confidence token.
 
-    Uses `git status --porcelain`, which reports untracked files too (`-uno` would let a
-    stray scratch file into the PR)."""
-    run = runner or _run_bounded
+    `-qw` for the tier words, not a substring: the prose this replaces used `rg -qw
+    "blocking"` precisely because a substring test also matches "non-blocking", making
+    the check pass without either tier ever being written (G-2).
 
-    def git(*args: str) -> tuple[int, str, str]:
-        return run(["git", "-C", str(repo_path), *args], timeout_s=60)
+    Reads the file rather than shelling out to `rg`, which is safe here precisely
+    because every pattern is a fixed literal with no metacharacters — a regex built
+    from spec text would not be."""
+    try:
+        text = spec.read_text()
+    except OSError as e:
+        return GateVerdict(passed=False, reason=f"spec not readable at {spec}: {e}")
 
-    code, stdout, stderr = git("status", "--porcelain")
-    if code != 0:
-        return GateVerdict(passed=False, reason=f"git status failed: {stderr.strip()}")
-    if stdout.strip():
-        first = stdout.strip().splitlines()[0]
-        return GateVerdict(passed=False, reason=f"worktree is dirty: {first}")
-
-    code, stdout, stderr = git("rev-parse", "--abbrev-ref", "HEAD")
-    if code != 0:
+    if not re.search(r"^## Acceptance criteria", text, re.MULTILINE):
+        return GateVerdict(passed=False, reason="spec has no `## Acceptance criteria`")
+    if not re.search(r"^## Changelog", text, re.MULTILINE):
+        return GateVerdict(passed=False, reason="spec has no `## Changelog` section")
+    for word in ("blocking", "non-blocking"):
+        if not re.search(rf"\b{re.escape(word)}\b", text):
+            return GateVerdict(
+                passed=False, reason=f"spec never uses the {word!r} tier word"
+            )
+    if "confidence:" not in text:
         return GateVerdict(
-            passed=False, reason=f"git rev-parse HEAD failed: {stderr.strip()}"
-        )
-    branch = stdout.strip()
-    if not branch.startswith("auto/pipeline-"):
-        return GateVerdict(
-            passed=False, reason=f"not on a pipeline branch (on {branch!r})"
-        )
-
-    code, _, stderr = git("fetch", "origin", "--quiet")
-    if code != 0:
-        return GateVerdict(passed=False, reason=f"git fetch failed: {stderr.strip()}")
-
-    code, stdout, stderr = git(
-        "rev-list", "--left-right", "--count", "HEAD...@{upstream}"
-    )
-    if code != 0:
-        return GateVerdict(
-            passed=False,
-            reason=f"no upstream to compare against: {stderr.strip()}",
-        )
-    ahead, _, behind = (part.strip() for part in stdout.split()[:2]) + ("",)[:0]
-    if int(ahead or 0) > 0:
-        return GateVerdict(
-            passed=False, reason=f"{ahead} unpushed commit(s) on {branch}"
-        )
-    if int(behind or 0) > 0:
-        return GateVerdict(
-            passed=False,
-            reason=f"branch is {behind} commit(s) behind its upstream",
+            passed=False, reason="spec has no `confidence:` token on any criterion"
         )
     return GateVerdict(passed=True)
 
 
-def run_gate4(gh: GhClient, *, owner: str, repo: str, branch: str) -> GateVerdict:
+def run_gate4(
+    gh: GhClient, *, owner: str, repo: str, branch: str, pr: int | None = None
+) -> GateVerdict:
     """The PR stage 4 opened is live and pointed at this run's branch.
 
-    `gh pr create` exits 0 after printing a URL, and it exits 0 for a PR that a
-    same-run re-invocation has already opened — so exit code alone cannot prove a PR
-    exists, and cannot prove it is the one this run means. Re-reading the branch's
-    open PR and checking its head is the only check that survives both."""
-    procs = gh.pr_list(owner=owner, repo=repo, state="open", limit=100)
-    matches = [pr for pr in procs if str(pr.get("headRefName", "")) == branch]
-    if not matches:
-        return GateVerdict(passed=False, reason=f"no open PR with head {branch!r}")
-    numbers = sorted(int(pr["number"]) for pr in matches if "number" in pr)
-    if not numbers:
-        return GateVerdict(passed=False, reason=f"open PR on {branch!r} has no number")
-    return GateVerdict(passed=True, reason=f"PR #{numbers[-1]}")
+    `gh pr create` exits 0 after printing a URL, and it exits 0 for a PR a re-invocation
+    has already opened — so its exit code alone cannot prove a PR exists, and cannot
+    prove it is the one this run means. Re-reading the recorded PR and checking both its
+    state and its head is the only check that survives both cases.
+
+    The failure reason names the head that *was* observed. "no PR with head X" and "PR
+    Y exists with head Z" are different bugs — a stale PR number, a wrong branch pushed,
+    a leftover PR from an earlier run — and collapsing them into one message would send
+    the morning triage to the wrong one."""
+    if pr is None:
+        return GateVerdict(
+            passed=False,
+            reason=f"no PR number recorded for branch {branch!r}",
+        )
+    try:
+        view = gh.pr_view(owner=owner, repo=repo, number=pr)
+    except RuntimeError as e:
+        return GateVerdict(passed=False, reason=f"gh pr view {pr} failed: {e}")
+
+    state = view.get("state")
+    if state != "OPEN":
+        return GateVerdict(
+            passed=False,
+            reason=f"PR #{pr} is {state or 'in an unknown state'}, not OPEN",
+        )
+    head = view.get("headRefName")
+    if head != branch:
+        return GateVerdict(
+            passed=False,
+            reason=f"PR #{pr} head is {head!r}, expected {branch!r}",
+        )
+    return GateVerdict(passed=True, reason=f"PR #{pr} on {branch}")
 
 
 def _pr_bodies(view: Mapping[str, object]) -> list[str]:
@@ -565,6 +579,11 @@ def run_gate5(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
 # implementer's own-tree check, and Gate CI is the authoritative one for a PR.
 GATE_STAGE_CHOICES: tuple[str, ...] = ("1", "2", "4", "5", "6", "ci")
 
+# The gates that read a PR, and therefore the only ones that need `--pr` and a resolved
+# GitHub owner/repo. Kept next to `GATE_STAGE_CHOICES` so the CLI's argument handling and
+# the dispatcher's own requirement checks are reading one list, not two that can drift.
+PR_GATE_STAGES: frozenset[str] = frozenset({"4", "5", "6", "ci"})
+
 
 def run_stage_gate(
     stage: str,
@@ -573,21 +592,38 @@ def run_stage_gate(
     gh: GhClient,
     owner: str,
     repo: str,
+    spec: Path | None = None,
     pr: int | None = None,
     branch: str | None = None,
     runner: Callable[..., tuple[int, str, str]] | None = None,
 ) -> GateVerdict:
     """Dispatch one gate by its CLI stage token. Raises `ValueError` for an unknown token
-    so the CLI can exit 2 rather than reporting an unrun gate as a pass."""
+    or a missing requirement, so the CLI can exit 2 / the pipeline can abort rather than
+    reporting an unrun gate as a pass.
+
+    The requirements are per-gate rather than uniform on purpose: gates 1 and 2 need only
+    a checkout and a spec, gate 4 only a branch, and 5/6/ci a PR. A single
+    `pr: int` on the signature would force the caller to invent a PR number for gates that
+    have no PR yet — which is how an unset value silently becomes gate 0's input.
+
+    The spec's sketch was `run_stage_gate(stage, *, cwd, run_id, state, gh, owner,
+    repo)`; `cwd`/`run_id`/`state` are unpacked into `repo_path`/`spec`/`pr`/`branch`
+    here instead of taken as a blob, because the CLI's caller has no `state` to hand
+    (that is the point of the command) and unpacking at the edge keeps each gate's real
+    requirements visible at its own signature."""
     token = stage.strip().lower()
     if token == "1":
-        return run_gate1(repo_path, runner=runner)
+        if spec is None:
+            raise ValueError("gate 1 requires the spec path")
+        return run_gate1(repo_path, spec, runner=runner)
     if token == "2":
-        return run_gate2(repo_path, runner=runner)
+        if spec is None:
+            raise ValueError("gate 2 requires the spec path")
+        return run_gate2(spec)
     if token == "4":
         if branch is None:
             raise ValueError("gate 4 requires the branch the PR was opened from")
-        return run_gate4(gh, owner=owner, repo=repo, branch=branch)
+        return run_gate4(gh, owner=owner, repo=repo, branch=branch, pr=pr)
     if token == "5":
         if pr is None:
             raise ValueError("gate 5 requires a PR number")
@@ -603,3 +639,70 @@ def run_stage_gate(
     raise ValueError(
         f"unknown gate stage {stage!r} (expected one of {', '.join(GATE_STAGE_CHOICES)})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Gate 3's mechanical half — existence, not greenness
+# ---------------------------------------------------------------------------
+
+# `Test: <name>` on its own line, the shape stage 2 is required to write.
+_TEST_LINE_RE = re.compile(
+    r"^\s*Test:\s*`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?\s*$", re.MULTILINE
+)
+
+
+def gate3_test_names(
+    spec_text: str,
+) -> list[str]:
+    """Every acceptance-criterion test name the spec names, in order, de-duplicated.
+
+    The names are written by stage 2 and read by stage 3, gate 3 and `pipeline_run`
+    alike, so the extraction is one function rather than a `grep "Test:"` copied into
+    each. Backticked names are unwrapped because both spellings are in the wild and a
+    backtick left in would make the `rg -F` existence check pass against a file that
+    only mentions the name inside a backticked sentence."""
+    names: list[str] = []
+    for match in _TEST_LINE_RE.finditer(spec_text):
+        name = match.group("name")
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def gate3_test_names_present(
+    spec_text: str,
+    *,
+    repo_path: Path,
+    runner: Callable[..., tuple[int, str, str]] | None = None,
+) -> GateVerdict:
+    """Every `Test: <name>` in the spec exists somewhere under `tests/`.
+
+    Existence first, green second (G-2), and fixed-string only: `-F` because a test
+    name is an identifier, and letting the name be a regex would let `test_a.*` pass
+    the existence check while matching no test. Scoped to `tests/` rather than the spec
+    directory, for the same reason the prose gate is: a spec that merely repeats its own
+    test names must not satisfy this.
+
+    Deliberately *not* the lint/pytest half of gate 3 — that stays prose (see this
+    module's docstring). This function is the part that is mechanical enough to stop
+    trusting a model with it."""
+    run = runner or _run_bounded
+    names = gate3_test_names(spec_text)
+    if not names:
+        return GateVerdict(
+            passed=False, reason="spec names no acceptance tests (`Test: <name>` lines)"
+        )
+    missing = [
+        name
+        for name in names
+        if run(["rg", "-F", "-q", "--", name, str(repo_path / "tests")], timeout_s=30)[
+            0
+        ]
+        != 0
+    ]
+    if missing:
+        return GateVerdict(
+            passed=False,
+            reason=f"acceptance test(s) not found under tests/: {', '.join(missing)}",
+        )
+    return GateVerdict(passed=True, reason=f"{len(names)} acceptance test(s) present")
