@@ -53,6 +53,7 @@ from herdr_routines.history import (
 )
 from herdr_routines.pipeline_watchdog import (
     default_worktrees_root,
+    find_inflight_runs,
     host_rebooted_after_state_write,
     pipeline_state_json_path,
     system_boot_epoch,
@@ -1765,7 +1766,7 @@ def _process_pipeline_job(
 
     open_run = _open_pipeline_run(history_path, job.name)
     if open_run is not None:
-        if _live_agent_exists(client, job):
+        if _pipeline_run_is_live(client, job):
             return f"{job.name}: skipped (already running)", False
 
         assert open_run.run_id is not None
@@ -2149,6 +2150,42 @@ def _live_agent_exists(client: HerdrClient, job: Job) -> bool:
         log.warning("%s: could not query live agents, proceeding: %s", job.name, e)
         return False
     return status in LIVE_AGENT_STATUSES
+
+
+def _pipeline_run_is_live(client: HerdrClient, job: Job) -> bool:
+    """Is a pipeline run still in flight — the pipeline's cross-process overlap guard.
+
+    Two checks, either sufficient:
+
+    - a live `rt-<name>` agent, which is what this used to be and still is for any run
+      that has not yet reached phase B's `pipeline-run`;
+    - a `state.json` with no terminal report yet, enumerated by
+      `pipeline_watchdog.find_inflight_runs`.
+
+    The second is the load-bearing one now. Issue 056 removed the orchestrator agent, and
+    that agent's name was what the old check looked up — so with no orchestrator there is
+    no `rt-<name>` agent to find, the guard could never fire again, and a second night
+    would launch on top of a live one. `find_inflight_runs` is literally "a `state.json`
+    with no terminal report yet", which is the condition `_live_agent_exists` was
+    approximating: it is written by the run itself, from the start of the run, and so
+    exists for the whole window the guard needs to cover.
+
+    Fails open on a HerdrCliError (unreachable server), matching `_live_agent_exists`:
+    the history/flock check above remains the primary guard."""
+    if _live_agent_exists(client, job):
+        return True
+    try:
+        in_flight = find_inflight_runs(default_worktrees_root(), default_reports_dir())
+    except (OSError, HerdrCliError) as e:
+        log.warning("%s: could not enumerate in-flight pipeline runs: %s", job.name, e)
+        return False
+    if in_flight:
+        log.info(
+            "%s: a pipeline run is already in flight (%s)",
+            job.name,
+            ", ".join(run.run_id for run in in_flight),
+        )
+    return bool(in_flight)
 
 
 def _pr_worker_is_live(client: HerdrClient, job_name: str, pr_number: int) -> bool:

@@ -46,6 +46,30 @@ def _stub_ensure_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pipeline_worktrees_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Point `tick`'s worktrees root at this test's tmp_path.
+
+    Issue 056's overlap guard reads `pipeline_watchdog.find_inflight_runs` to decide
+    whether a run is already going, and that enumerates
+    `~/.herdr/worktrees/herdr-routines/auto-pipeline-*/state.json`. Before that, nothing in
+    tick's dispatch path touched the filesystem outside the state dir, so tests here ran
+    green while reading the real `$HOME` — and would start failing on any developer
+    machine that happened to have a pipeline run in flight.
+
+    Redirected per-test rather than by `monkeypatch.setenv("HOME", ...)`: the root is a
+    function of `Path.home()` captured at call time, and pinning it directly is what makes
+    the path a test can compute without duplicating HOME's layout rules."""
+    monkeypatch.setattr(
+        "herdr_routines.tick.default_worktrees_root",
+        lambda *args, **kwargs: (
+            tmp_path / "home" / ".herdr" / "worktrees" / "herdr-routines"
+        ),
+    )
+
+
 def make_job(tmp_path: Path, **overrides: Any) -> Job:
     # Built directly, then `replace`d: a defaults dict splatted into Job() widens to
     # dict[str, object] and fails the typecheck gate on every field.

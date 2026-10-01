@@ -1,9 +1,13 @@
 """Doc-contract tests for pane-lifecycle v2 close-and-resume (20260825T021919Z).
 
-Same spirit as test_plugin_manifest.py: grep the two pipeline authority docs
-and the proposal for required content. Criteria are intentionally doc-level —
-the feature is an orchestrator-prompt convention, not src behavior (Option C
-deferred, design.md).
+Mostly doc-level, in the spirit of test_plugin_manifest.py: grep the two pipeline
+authority docs and the proposal for required content.
+
+Issue 056 phase B promoted the feature from convention to code. The two criteria that
+used to be satisfied by the orchestrator prompt's prose — per-stage pane close on
+gate-pass, and stage 6's close-then-resume — are now `pipeline_run`'s behaviour, so those
+two tests read `src/herdr_routines/pipeline_run.py` instead. The rest stay doc-level:
+design.md is still where the contract is written down.
 """
 
 from pathlib import Path
@@ -11,6 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DESIGN = REPO_ROOT / "docs" / "pipeline" / "design.md"
 PROMPT = REPO_ROOT / "docs" / "pipeline" / "orchestrator-prompt.md"
+PIPELINE_RUN = REPO_ROOT / "src" / "herdr_routines" / "pipeline_run.py"
 PROPOSAL = REPO_ROOT / "docs" / "pipeline" / "pane-lifecycle-v2-proposal.md"
 
 
@@ -43,37 +48,39 @@ def test_design_doc_documents_session_resume_mechanism() -> None:
     assert "herdr agent start pl-6-" in text
 
 
-def test_orchestrator_prompt_includes_pane_close_step() -> None:
-    """Criterion 3: orchestrator-prompt.md's worker spawn template includes a close-pane step."""
-    text = _read(PROMPT)
-    assert "close this worker's pane once its gate passes" in text.lower()
-    # Must be in the spawn template section, not only in cleanup
-    assert "Worker spawn template" in text
-    # The close should be tied to gate-pass + handoff confirmed on disk
-    assert "gate passes" in text
-    # Ensure the step mentions herdr pane/tab close
-    assert "herdr pane close" in text
+def test_pipeline_run_closes_each_stage_pane_after_its_gate() -> None:
+    """Criterion 3: a stage's pane is closed once that stage's gate passes, not only at
+    end of run. Was prose in the prompt's worker-spawn template; now `pipeline_run`'s
+    per-stage finally-block."""
+    text = _read(PIPELINE_RUN)
+    # The close is scoped to one stage's pane, through the same client that started it.
+    assert "_close_pane(client, pane_id)" in text
+    # ...and it happens inside the per-stage function on the gate path, right after the
+    # verdict rather than in a run-wide sweep at the end. Position is the assertion:
+    # the close follows the gate call and is guarded on `pane_id`, so a stage with no
+    # agent (stage 4) closes nothing and a failed gate closes before reporting.
+    gate_idx = text.index("verdict = _gate_for_stage")
+    close_idx = text.index("if pane_id is not None:", gate_idx)
+    assert gate_idx < close_idx
 
 
-def test_orchestrator_prompt_stage6_uses_session_resume() -> None:
-    """Criterion 4: orchestrator-prompt stage 6 uses herdr agent start ... -s <session_id> against fresh pane."""
-    text = _read(PROMPT)
-    # Stage 6 header must exist
-    assert "Stage 6" in text
-    # Must use the new resume form, not the old prompt-against-held-pane
-    assert "herdr agent start pl-6-" in text
-    assert "-s <session_id>" in text
-    assert "fresh pane" in text
-    # Must explicitly forbid the old hold-open form
-    assert (
-        "herdr agent prompt pl-3-" not in text or "Do not" in text
-    )  # allow mention only if negated
-    # Strong check: stage 6 section should contain -s and fresh pane together
-    # Find stage 6 slice
-    idx = text.index("Stage 6")
-    slice6 = text[idx : idx + 3000]
-    assert "-s <session_id>" in slice6
-    assert "fresh pane" in slice6
+def test_pipeline_run_stage6_resumes_the_stage3_session() -> None:
+    """Criterion 4: stage 6 resumes stage 3's real session id with
+    `agent_start(..., session_id=...)` against a fresh pane, rather than prompting a pane
+    held open since stage 3."""
+    text = _read(PIPELINE_RUN)
+    # The resume is a real parameter on the start call, not a string in a prompt.
+    assert "session_id=resume_session," in text
+    # ...and that value is read out of the session the run recorded for the reused
+    # stage, so it is the stage-3 id and not a fresh one. A missing id aborts rather
+    # than silently starting a blank session that would pass the layout check anyway.
+    assert "resume_session" in text
+    assert "resume_session_missing" in text
+    assert "reuses_stage" in text
+    # The layout is the reason it works: stage 6 repeats stage 3's session id.
+    assert "reuses_stage" in _read(
+        REPO_ROOT / "src" / "herdr_routines" / "pipeline_stages.py"
+    )
 
 
 def test_proposal_doc_marked_implemented() -> None:

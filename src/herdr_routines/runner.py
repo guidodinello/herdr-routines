@@ -481,13 +481,18 @@ def _start_agent_reaping_stale_collision(
     job: Job,
     *,
     pane_id: str,
+    session_id: str | None = None,
 ) -> bool:
     """Start `job.agent_name` on `pane_id`. If the start fails because a prior run's
     blocked/unknown agent still holds the name (issue 051 — nothing answers a cron job's
     blocked prompt, so it wedges every subsequent run), force-close that agent's pane and
     retry the start exactly once. Returns True iff a stale agent was reaped. Propagates
     the start error unchanged when the collision is not reapable (agent still working, or
-    the retry also failed) — the caller's existing failure handling takes it from there."""
+    the retry also failed) — the caller's existing failure handling takes it from there.
+
+    `session_id` is threaded through the same `partial` (issue 056 §8) so the reaped-retry
+    resumes a conversation rather than starting cold; routine jobs never pass one, but the
+    parameter has to live here or a caller that did would silently start a fresh session."""
     start = partial(
         client.agent_start,
         name=job.agent_name,
@@ -495,6 +500,7 @@ def _start_agent_reaping_stale_collision(
         pane_id=pane_id,
         start_timeout_ms=job.start_timeout_ms,
         model=job.model,
+        session_id=session_id,
     )
     try:
         start()
