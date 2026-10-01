@@ -61,6 +61,13 @@ Hardcoded stages (mirrors spec §3, stages mirror
 | 5 | Code review | separate session (code-review skill) — **v1 single `opencode/big-pickle` primary** (measured 1/7, 5 high-sev uniques `pr4:106`); **v2 fan-out `hy3-free` + `x-preview-f-free` 2-tie** (`opencode-e2e:19`) | PR number | posted review | review posted (blocking allowed) |
 | 6 | Address comments | same agent as stages 3–4, prompted with review digest + `gh pr view --comments` (preserves code context; audit gap 8) | review findings | fixes + `gh api` thread-resolve + replies | gate 6: no unresolved blocking threads (or replies on every blocking finding per Gates) |
 
+> **Current models live in `src/herdr_routines/pipeline_stages.py` (`STAGES`), not this
+> table** — the column above is the original design. As of 2026-10-01 (both
+> `muse-spark-1.2-contributor-free` and `x-preview-f-free` were withdrawn): stages 1–2
+> `opencode/muse-spark-1.3-contributor-free`, stages 3/6 `opencode/big-pickle`, stage 5
+> `opencode/nemotron-3-ultra-free` (a different family from the author). `pipeline-prepare`
+> fails the night before claiming an issue if `opencode models` no longer lists one.
+
 Stage rules copied from spec §3: tests before code (stage 3 done = every
 acceptance test exists and passes), comment-addressal capped at 2 iterations +
 **wait-for-comments 60 min** (audit gap 13: previously unspecified `spec:51`) —

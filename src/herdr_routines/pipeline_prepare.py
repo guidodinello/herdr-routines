@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +39,7 @@ from herdr_routines.pick_feature import (
     ReclaimedPick,
     select_and_claim_feature,
 )
+from herdr_routines.pipeline_stages import STAGES
 from herdr_routines.repos import _fetch_and_fast_forward
 
 log = get_logger(__name__)
@@ -52,6 +55,29 @@ SHARED_WORKSPACE_ENV = {"HERDR_ENV": "1"}
 EXIT_PREPARED = 0
 EXIT_FAILURE = 1
 EXIT_NO_FEATURE = 3
+
+OPENCODE_MODELS_TIMEOUT_S = 60
+
+
+def opencode_models() -> set[str]:
+    """Every `provider/model` id `opencode models` lists on this host. Raises
+    `RuntimeError` if the listing cannot be produced (binary missing, non-zero exit,
+    timeout) — the caller must treat that as "unverifiable", not as "all present"."""
+    try:
+        proc = subprocess.run(
+            ["opencode", "models"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=OPENCODE_MODELS_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"opencode models: {e}") from e
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"opencode models exited {proc.returncode}: {proc.stderr.strip()}"
+        )
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +111,7 @@ def prepare_run(
     worktrees_root: Path | None = None,
     reports_dir: Path | None = None,
     now: datetime | None = None,
+    available_models: Callable[[], set[str]] = opencode_models,
 ) -> PrepareResult:
     """Sync, pick, create the worktree+workspace, write `state.json`. Never raises: a
     failure is a `PrepareResult` plus a terminal report at `report`, which is the file
@@ -165,6 +192,28 @@ def prepare_run(
     except RuntimeError as e:
         log.error("pipeline-prepare: repo sync failed for %s: %s", repo_parent, e)
         return _failed("sync_failed", "failed (repo_sync_failed)", str(e))
+
+    # 1b. every stage model is one opencode still lists. Free models are withdrawn or
+    # renamed without notice (2026-10-01: muse-spark-1.2-contributor-free and
+    # x-preview-f-free both vanished), and a stage that cannot start its model fails
+    # hours into the night after the issue is claimed. Checked before the claim so a
+    # bad model costs a report and nothing else. Membership only — a listed model whose
+    # free quota is gone is the stage loop's quota fast-fail to catch.
+    stage_models = sorted({spec.model for spec in STAGES if spec.model is not None})
+    try:
+        listed = available_models()
+    except RuntimeError as e:
+        log.error("pipeline-prepare: could not list opencode models: %s", e)
+        return _failed("prepare_failed", "failed (stage_models_unverifiable)", str(e))
+    missing = [model for model in stage_models if model not in listed]
+    if missing:
+        log.error("pipeline-prepare: stage model(s) not offered: %s", missing)
+        return _failed(
+            "prepare_failed",
+            "failed (stage_model_unavailable)",
+            "opencode no longer lists stage model(s) "
+            f"{', '.join(missing)} — update pipeline_stages.STAGES",
+        )
 
     # 2. pick + claim (out of tree; the issue file is never edited).
     try:
