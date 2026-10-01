@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shlex
 import subprocess
 import textwrap
@@ -23,6 +24,11 @@ log = logging.getLogger(__name__)
 
 FAILING_CI_STATES = frozenset({"FAILURE", "ERROR", "TIMED_OUT"})
 TIMEOUT_EXIT_CODE = 124
+
+# The branch every pipeline PR is opened against (the pipeline's human merge gate is
+# `main`; `pipeline-launch.sh` never pushed elsewhere). A module constant rather than a
+# parameter because there is exactly one caller (stage 4) and one correct answer.
+DEFAULT_PR_BASE = "main"
 # Only count real fix attempts toward the retry budget — skipped records the tick
 # appends each time a PR exceeds max_attempts must not increment the counter,
 # otherwise a fixed-then-broken PR is permanently abandoned (review finding F).
@@ -56,6 +62,23 @@ class GhClient(Protocol):
         """Return the check runs reported for one commit (REST shape: lowercase
         ``status``/``conclusion``). Raises ``RuntimeError`` when the query fails —
         callers must treat that as "unverifiable", not as "green"."""
+        ...
+
+    def pr_review_comments(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[dict[str, object]]:
+        """Every inline review comment on the PR (REST ``pulls/{n}/comments``). Raises
+        ``RuntimeError`` when the query fails. Gate 5 needs this because the
+        ``code-review`` skill puts its ``[blocking]`` tags on inline comments, which
+        ``gh pr view --json comments,reviews`` never returns."""
+        ...
+
+    def pr_create(
+        self, *, owner: str, repo: str, branch: str, title: str, body: str
+    ) -> int:
+        """Open a PR from ``branch`` and return its number. Raises ``RuntimeError`` on
+        any failure — stage 4 of the pipeline (issue 056 phase C) turns that into a
+        gate-4 failure hours later, so it must never be a silent no-op."""
         ...
 
 
@@ -139,8 +162,12 @@ class RealGhClient:
                 str(number),
                 "--repo",
                 f"{owner}/{repo}",
+                # `state`/`url` for stage 4's gate 4 (issue 056 phase C), which has to
+                # confirm the PR it just opened is the live one on the right head;
+                # `comments`/`reviews` for gate 5's tier-label check. Both are additive:
+                # `statusCheckRollup` is still there for the CI gate.
                 "--json",
-                "statusCheckRollup,headRefName",
+                "statusCheckRollup,headRefName,state,url,comments,reviews",
             ]
         )
         if exit_code != 0:
@@ -149,6 +176,69 @@ class RealGhClient:
             return json.loads(stdout)
         except json.JSONDecodeError:
             return {}
+
+    def pr_review_comments(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[dict[str, object]]:
+        """`--paginate --slurp` so a PR with more than one page of inline comments comes
+        back as one JSON array of per-page arrays, which is flattened here."""
+        exit_code, stdout, stderr = self._run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{owner}/{repo}/pulls/{number}/comments",
+            ]
+        )
+        if exit_code != 0:
+            raise RuntimeError(
+                f"gh api pulls/{number}/comments failed: {stderr.strip()}"
+            )
+        try:
+            pages = json.loads(stdout)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(pages, list):
+            return []
+        return [
+            c
+            for page in pages
+            for c in (page if isinstance(page, list) else [])
+            if isinstance(c, dict)
+        ]
+
+    def pr_create(
+        self, *, owner: str, repo: str, branch: str, title: str, body: str
+    ) -> int:
+        """`gh pr create` and parse the PR number back out of the URL gh prints.
+
+        `gh pr create` has no machine-readable output mode; it prints the new PR's
+        URL on stdout, so the number is read from that rather than predicted (the same
+        "never invent an id" rule `herdr.py` follows for every id it hands back)."""
+        exit_code, stdout, stderr = self._run(
+            [
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                f"{owner}/{repo}",
+                "--base",
+                DEFAULT_PR_BASE,
+                "--head",
+                branch,
+                "--title",
+                title,
+                "--body",
+                body,
+            ]
+        )
+        if exit_code != 0:
+            raise RuntimeError(f"gh pr create failed: {stderr.strip()}")
+        match = re.search(r"/pull/(\d+)", stdout)
+        if match is None:
+            raise RuntimeError(f"gh pr create printed no PR url: {stdout.strip()!r}")
+        return int(match.group(1))
 
     def graphql(self, query: str, **variables: str) -> dict[str, object]:
         argv = ["gh", "api", "graphql"]

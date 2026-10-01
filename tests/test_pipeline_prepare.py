@@ -28,6 +28,7 @@ from herdr_routines.pipeline_prepare import (
     _write_state_json,
     prepare_run,
     render_prepared_values,
+    write_terminal_report,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -866,12 +867,22 @@ def test_pipeline_prepare_never_raises_on_an_unwritable_report_path(
 def test_phase_b_and_c_filed_as_follow_on_issue_056() -> None:
     """Acceptance criterion 14, as a doc contract: flipping 054 to `done` without filing
     the remaining phases would retire them from the backlog with only a `gate:` line
-    nobody reads, leaving the feature 1/3 shipped and looking complete."""
+    nobody reads, leaving the feature 1/3 shipped and looking complete.
+
+    What the criterion protects is that phases B and C stay *tracked* — so once 056 was
+    itself implemented and closed, "still open" stopped being the right thing to assert
+    and would have failed for the right outcome. What it must keep protecting is that the
+    issue exists, carries its own criteria and test names rather than being emptied out
+    at close, and that 054 still points at it."""
     follow_on = ISSUES_DIR / "056-orchestrator-stage-loop-in-code.md"
     assert follow_on.exists(), "issue 056 (phases B and C) must exist"
     follow_on_text = follow_on.read_text()
-    assert "status: open" in follow_on_text
-    # 056 carries the phase B and C criteria (and their test names) from 054.
+    # A terminal status, not an abandoned one: `open` would mean the phases were still
+    # claimed but not done, and `in_progress` would mean nobody finished them.
+    assert "status: done" in follow_on_text
+    assert "status: open" not in follow_on_text
+    # 056 carries the phase B and C criteria (and their test names) from 054 — closing
+    # it must not have emptied it.
     for test_name in (
         "test_pipeline_run_records_real_stage_sessions",
         "test_pipeline_run_aborts_on_gate_failure",
@@ -891,3 +902,23 @@ def test_phase_b_and_c_filed_as_follow_on_issue_056() -> None:
         ISSUES_DIR / "052-pipeline-launches-with-no-feature-to-build.md"
     ).read_text()
     assert "status: done" in superseded
+
+
+def test_write_terminal_report_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §8: a crash mid-write must not leave a torn report — tick would file it as
+    `interrupted_unknown`, and being non-empty it defeats the launcher's backstop. The
+    previous report survives and no tmp file is left behind."""
+    report = tmp_path / "report.md"
+    write_terminal_report(report, run_id="r", outcome="ok", lines=["first"])
+
+    def boom(src: object, dst: object) -> None:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="disk gone"):
+        write_terminal_report(report, run_id="r", outcome="failed", lines=["second"])
+
+    assert "## Outcome: ok" in report.read_text()
+    assert [p.name for p in tmp_path.iterdir()] == ["report.md"]

@@ -34,9 +34,10 @@ from herdr_routines.config import (
 )
 from herdr_routines.digest import digest_now
 from herdr_routines.gates import (
+    GATE_STAGE_CHOICES,
+    PR_GATE_STAGES,
     remote_owner_and_repo,
-    run_ci_gate,
-    run_gate6,
+    run_stage_gate,
 )
 from herdr_routines.gc import run_gc, run_gc_delete
 from herdr_routines.herdr import HerdrClient, HerdrCliError
@@ -56,6 +57,7 @@ from herdr_routines.pipeline_prepare import (
     prepare_run,
     render_prepared_values,
 )
+from herdr_routines.pipeline_run import EXIT_PARTIAL_OR_FAILED, run_pipeline
 from herdr_routines.pipeline_watchdog import (
     default_heartbeat_dir,
     default_worktrees_root,
@@ -69,6 +71,7 @@ from herdr_routines.reports_prune import (
 )
 from herdr_routines.repos import _fetch_and_fast_forward
 from herdr_routines.runner import (
+    DEFAULT_FAILURE_MARKERS,
     build_dry_run_argv,
     default_reports_dir,
     execute_run,
@@ -90,6 +93,12 @@ from herdr_routines.tick import (
 from herdr_routines.tmp_hygiene import reap_tmp
 
 log = get_logger(__name__)
+
+# Shared with `pipeline_run`'s contract (0 ok, 1 partial/failed) and argparse's own usage
+# code. A gate given a missing requirement returns 2, not 1: nothing was checked, and
+# filing "failed" in tick history for a typo is the wrong signal.
+EXIT_OK = 0
+EXIT_USAGE = 2
 
 
 def default_log_path() -> Path:
@@ -314,10 +323,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument(
         "--stage",
         required=True,
-        choices=["ci", "6"],
-        help="which gate to run: 'ci' polls PR checks, '6' checks reply coverage",
+        choices=list(GATE_STAGE_CHOICES),
+        help="which gate to run: 1/2 check the run's own artifacts, 4 the recorded PR, "
+        "5 its reviews, 6 reply coverage, 'ci' the PR checks",
     )
-    p_gate.add_argument("--pr", type=int, required=True, help="PR number to gate")
+    p_gate.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        help="PR number — required for stages 4, 5, 6 and 'ci', which all read a PR",
+    )
+    p_gate.add_argument(
+        "--spec",
+        type=Path,
+        default=None,
+        help="run spec to check — required for stages 1 and 2, which read no PR",
+    )
+    p_gate.add_argument(
+        "--branch",
+        default=None,
+        help="branch the PR under test was opened from — required for stage 4, which "
+        "confirms the PR is the run's own and still open",
+    )
     p_gate.add_argument(
         "--repo",
         type=Path,
@@ -428,6 +455,43 @@ def _build_parser() -> argparse.ArgumentParser:
         f"(default: {DEFAULT_ISSUES_DIR})",
     )
     p_prepare.set_defaults(handler=_cmd_pipeline_prepare)
+
+    p_pipeline_run = sub.add_parser(
+        "pipeline-run",
+        help="run the prepared pipeline's stages in order, gating each — the stage loop "
+        "that used to be an orchestrator agent (issue 056 phase B)",
+    )
+    p_pipeline_run.add_argument(
+        "--run-id", required=True, help="bare UTC timestamp, e.g. 20260930T050000Z"
+    )
+    p_pipeline_run.add_argument(
+        "--state-json",
+        type=Path,
+        required=True,
+        help="the state.json pipeline-prepare wrote; the run's single source of truth "
+        "for worktree, branch, feature source and deadline",
+    )
+    p_pipeline_run.add_argument(
+        "--report",
+        type=Path,
+        required=True,
+        help="terminal-report path, written on every outcome (tick reconciles from it)",
+    )
+    p_pipeline_run.add_argument(
+        "--prompts-dir",
+        type=Path,
+        required=True,
+        help="directory holding the stage prompt files named in pipeline_stages.STAGES",
+    )
+    p_pipeline_run.add_argument(
+        "--failure-marker",
+        action="append",
+        default=None,
+        help="text to watch each stage's screen for (repeatable; default: "
+        "'Free usage exceeded'). Two consecutive sightings of the same marker end the "
+        "run as failed (quota_exhausted) instead of waiting out the deadline",
+    )
+    p_pipeline_run.set_defaults(handler=_cmd_pipeline_run)
 
     p_refine = sub.add_parser(
         "refine-issue",
@@ -963,30 +1027,57 @@ def _cmd_run_pipeline(job, args: argparse.Namespace, *, now: datetime) -> int:
 
 
 def _cmd_gate(args: argparse.Namespace) -> int:
-    repo_path = args.repo or Path.cwd()
-    try:
-        owner, name = remote_owner_and_repo(repo_path)
-    except RuntimeError as e:
-        print(f"gate {args.stage}: could not resolve owner/repo: {e}", file=sys.stderr)
-        return 1
+    """Dispatch one stage gate.
 
-    gh = RealGhClient()
+    Each gate's requirements differ, and the CLI mirrors that instead of flattening it
+    into one "everything is required" surface: `--pr` and the GitHub owner/repo are
+    resolved only for the stages that read a PR (4, 5, 6, ci), so gates 1 and 2 — which
+    inspect the checkout and the spec — are not made to fail by a checkout with no
+    origin. A missing requirement is a usage error (2), not a gate failure (1): nothing
+    was checked, so reporting "failed" would put a break in history for a typo.
+    """
+    stage = args.stage
+    if stage in PR_GATE_STAGES:
+        if args.pr is None:
+            print(f"gate {stage}: --pr is required for this stage", file=sys.stderr)
+            return EXIT_USAGE
+        try:
+            owner, name = remote_owner_and_repo(args.repo or Path.cwd())
+        except RuntimeError as e:
+            print(f"gate {stage}: could not resolve owner/repo: {e}", file=sys.stderr)
+            return EXIT_FAILURE
+    else:
+        if args.spec is None:
+            print(f"gate {stage}: --spec is required for this stage", file=sys.stderr)
+            return EXIT_USAGE
+        # Gates 1 and 2 never read owner/repo; they only need a checkout and a spec.
+        owner = name = ""
+
     try:
-        if args.stage == "ci":
-            verdict = run_ci_gate(gh, owner=owner, repo=name, pr=args.pr)
-        else:
-            verdict = run_gate6(gh, owner=owner, repo=name, pr=args.pr)
+        verdict = run_stage_gate(
+            stage,
+            repo_path=args.repo or Path.cwd(),
+            gh=RealGhClient(),
+            owner=owner,
+            repo=name,
+            spec=args.spec,
+            pr=args.pr,
+            branch=args.branch,
+        )
+    except ValueError as e:
+        print(f"gate {stage}: {e}", file=sys.stderr)
+        return EXIT_USAGE
     except RuntimeError as e:
-        print(f"gate {args.stage} failed: {e}", file=sys.stderr)
-        log.error("gate %s: fail (PR #%d): %s", args.stage, args.pr, e)
-        return 1
+        print(f"gate {stage} failed: {e}", file=sys.stderr)
+        log.error("gate %s: fail (PR #%s): %s", stage, args.pr, e)
+        return EXIT_FAILURE
 
     if verdict.passed:
-        log.info("gate %s: pass (PR #%d)", args.stage, args.pr)
-        return 0
-    print(f"gate {args.stage} failed: {verdict.reason}", file=sys.stderr)
-    log.error("gate %s: fail (PR #%d): %s", args.stage, args.pr, verdict.reason)
-    return 1
+        log.info("gate %s: pass (PR #%s)", stage, args.pr)
+        return EXIT_OK
+    print(f"gate {stage} failed: {verdict.reason}", file=sys.stderr)
+    log.error("gate %s: fail (PR #%s): %s", stage, args.pr, verdict.reason)
+    return EXIT_FAILURE
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
@@ -1220,6 +1311,36 @@ def _cmd_pipeline_prepare(args: argparse.Namespace) -> int:
         args.report,
     )
     return EXIT_FAILURE
+
+
+def _cmd_pipeline_run(args: argparse.Namespace) -> int:
+    """Mirrors `pipeline-prepare`'s exit-code contract: 0 ok, 1 partial/failed, 2 usage.
+
+    Two non-zero codes for one command is deliberate and is the contract the launcher
+    branches on: a healthy night that built nothing is `prepare`'s 3 and never reaches
+    here, so anything non-zero out of `pipeline-run` is a real break for tick to file.
+    `run_pipeline` never raises, so this cannot return 1 by accident from an escaped
+    exception — the report is written first, every path."""
+    result = run_pipeline(
+        run_id=args.run_id,
+        state_json=args.state_json,
+        report=args.report,
+        prompts_dir=args.prompts_dir,
+        failure_markers=tuple(args.failure_marker or DEFAULT_FAILURE_MARKERS),
+    )
+    if result.outcome == "ok":
+        log.info(
+            "pipeline-run: run %s finished ok; report at %s", args.run_id, args.report
+        )
+        return EXIT_OK
+    log.error(
+        "pipeline-run: run %s finished %s (%s); report at %s",
+        args.run_id,
+        result.outcome,
+        result.reason or "no reason recorded",
+        args.report,
+    )
+    return EXIT_PARTIAL_OR_FAILED
 
 
 def _cmd_refine_issue(args: argparse.Namespace) -> int:

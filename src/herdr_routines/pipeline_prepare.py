@@ -325,10 +325,20 @@ def _ensure_shared_workspace(client: HerdrClient, *, cwd: str, label: str) -> st
     return client.workspace_create(cwd=cwd, label=label, env=SHARED_WORKSPACE_ENV)
 
 
-def _write_state_json(path: Path, payload: dict[str, Any]) -> None:
+def write_state_json(path: Path, payload: dict[str, Any]) -> None:
     """Atomic write: tmpfile in the *same directory* (so `os.replace` is a same-filesystem
     rename, not a copy), then the rename. A reader therefore never observes a partially
-    written `state.json` (G-9), and a failure part-way leaves no file at `path` at all."""
+    written `state.json` (G-9), and a failure part-way leaves no file at `path` at all.
+
+    Public since issue 056: `pipeline_run` advances `state.json` after every stage, and
+    the atomicity guarantee is the whole point of this function — a second copy of the
+    tmp+rename dance in `pipeline_run` would be free to lose it."""
+    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """The tmp+rename shared by `write_state_json` and `write_terminal_report`, so the
+    two files tick reads cannot drift apart on atomicity."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
@@ -336,27 +346,47 @@ def _write_state_json(path: Path, payload: dict[str, Any]) -> None:
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+            handle.write(text)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
 
 
-def _write_terminal_report(
-    path: Path, *, run_id: str, outcome: str, lines: list[str]
+def write_terminal_report(
+    path: Path,
+    *,
+    run_id: str,
+    outcome: str,
+    lines: list[str],
+    title: str = "pipeline-prepare report",
 ) -> None:
     """One writer for the report marker, used by every non-`ok` path. The `## Outcome:`
     line goes immediately after the title — the "near the top, trivial to `grep -m1`"
-    rule the orchestrator prompt documents — so it can never drift between them."""
+    rule the orchestrator prompt documents — so it can never drift between them.
+
+    Public since issue 056 for the same reason as `write_state_json`: `pipeline_run` writes
+    the terminal report on every abort/partial path, and the `## Outcome:` line's position
+    is what `tick._classify_pipeline_outcome` greps for. `title` stays a parameter rather
+    than being hardcoded to one writer's name because pipeline_prepare and pipeline_run are
+    two different failure sources writing to the same file path, and a report that names
+    the wrong one is the first thing a human reads at 5am."""
     body = [
-        f"# Pipeline run {run_id} — pipeline-prepare report",
+        f"# Pipeline run {run_id} — {title}",
         "",
         f"## Outcome: {outcome}",
         "",
         *lines,
         "",
     ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(body))
+    # Atomic, like `write_state_json`: tick reconciles the run from this file, so a torn
+    # write would read as `outcome_marker_missing` / `interrupted_unknown` and, being
+    # non-empty, would also defeat the launcher's `[ ! -s "$REPORT" ]` backstop.
+    _atomic_write_text(path, "\n".join(body))
+
+
+# Pre-issue-056 private names, kept as aliases so the ~20 existing call sites and
+# tests/test_pipeline_prepare.py's import keep working without a rename sweep. New code
+# must use the public names.
+_write_state_json = write_state_json
+_write_terminal_report = write_terminal_report

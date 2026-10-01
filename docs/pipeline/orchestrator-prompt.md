@@ -1,192 +1,53 @@
-# Pipeline Orchestrator — Prompt (POC v1)
+# Pipeline Orchestrator — Prompt (retired)
 
-You are the **overnight feature-pipeline orchestrator** for `herdr-routines` (see `docs/pipeline/design.md` and `docs/pipeline/spec.md` — those are the authority; this prompt is the executable checklist).
+**This prompt is no longer executed.** Issue 056 moved the overnight pipeline's stage
+loop out of prose and into code. `scripts/pipeline-launch.sh` no longer starts an
+orchestrator agent; it runs the pre-flight (`pipeline-prepare`) and then hands the run to
+`herdr-routines pipeline-run` (`src/herdr_routines/pipeline_run.py`).
 
-## Mission
+Nothing below is a live instruction. It is kept because the design rationale in
+`design.md`, the audits under `docs/process/audits/` and the issue files all cite this
+document by line number, and because it is the clearest statement of *what the loop is
+for* — which is the thing that has to survive the port.
 
-Turn a **one-paragraph feature idea** into a **reviewed PR overnight** through 6 fresh-context worker sessions, all on one shared worktree+branch, gates checked with `rg`/`gh`/`jq` (not vibes). Human gate stays at merge. You spawn workers via `herdr` CLI, poll with detached `--wait`, checkpoint `state.json`, and write `$PIPELINE_REPORT` regardless of outcome.
+## What moved where
 
-## Inputs you will receive
+| was here | is now |
+| --- | --- |
+| the worker-spawn template (`herdr agent start` … `--wait`) | `pipeline_run._run_agent_stage` + `wait_loop.prompt_with_watchdog` |
+| "Stage Details", stages 1–6 | `docs/pipeline/stages/stage-{1,2,3,5,6}.md`, invoked from `pipeline_stages.STAGES` |
+| the stage table (model, prompt file, layout) | `pipeline_stages.STAGES` |
+| the prose gates 1–5 | `gates.run_stage_gate`, invoked per stage by `pipeline_run` |
+| "record `agent_session.value` in `state.json`" | `pipeline_run` writes `state_sessions` on every poll |
+| deadline, quota-marker and resume handling | `pipeline_run.run_pipeline` (deadline between stages, `wait_loop` quota markers, `herdr.agent_start(session_id=…)` resume for stage 6) |
+| pane close per stage | `pipeline_run`, immediately after the stage's gate passes |
+| "always write `$PIPELINE_REPORT`" | `pipeline_run` writes the terminal report on every path; the launcher stubs one only if the run was killed first |
+| overlap guard on the `rt-<name>` agent | `tick._pipeline_run_is_live`, on an in-flight `state.json` |
 
-- `FEATURE_IDEA`: the feature to build, already picked and claimed for you. It is one
-  `KEY=VALUE` line in the values block at the end of this prompt; a literal `\n` in it
-  is an escaped newline, so read it as a single line and unescape it. Do not re-pick it
-  and do not substitute your own idea.
-- `FEATURE_SOURCE`: `docs/process/issues/<file>` — the issue this run picked, the same
-  path recorded as `state.json`'s `feature_source`. The pick's claim is out-of-tree
-  (issue 041 — `$REPO_PARENT` stays a clean mirror of `origin/main`), and `--mark-in-progress`
-  reclaims any stale claim past its lease (issue 040: a prior run that died before opening
-  a PR must not orphan the issue it picked forever). Any `reclaimed stale claim: ...`
-  line the pre-flight wrote into `$PIPELINE_REPORT` says an issue went back in the pool —
-  carry it into your own report if you rewrite it. This only covers picking *which*
-  Now-horizon item to build; it does not make the pipeline self-scheduling — a human (or
-  `systemd-run --on-calendar`, launcher-side) still decides *when* a run happens. **The
-  implementing PR carries the issue's `status: done` flip** (stage 3 commits `status: open` →
-  `done` on the issue file — the issue file itself was never touched by the pick, so this is the
-  first edit to it — and it lands on `main` atomically exactly when the PR merges; merging the PR
-  *is* what closes the issue, this is the only place the flip happens, never a separate manual
-  post-merge step).
-- `RUN_ID`: e.g. `20260824T020000Z` (UTC). If not provided, derive `date -u +%Y%m%dT%H%M%SZ`.
-- `REPO_PARENT`: parent clone path, e.g. `~/.local/state/herdr-routines/repos/herdr-routines`
-- `$PIPELINE_REPORT`: path for your final report, e.g. `~/.local/state/herdr-routines/reports/<run_id>.md`
-- `WT`, `BRANCH`, `SHARED_WS`, `STATE_JSON`: the shared worktree, its branch, the shared
-  workspace and the state file — all already created (below)
+The gates were the reason to do this. Prose gates were interpreted and relaxed — gate 5 was
+explicitly relaxed once already (`design.md:241`) because the skill never emitted a
+literal `confidence:` token — and a ported gate that is not itself under test just moves
+the relaxation somewhere harder to see.
 
-## Prerequisite (already done for you — do not redo it)
+## Why the stage prompts are separate files
 
-**The pre-flight ran before you were started.** `scripts/pipeline-launch.sh` called
-`uv run herdr-routines pipeline-prepare` first, which synced `$REPO_PARENT` to
-`origin/main`, picked and claimed the feature, created the shared worktree/branch and
-the shared workspace (with `--env HERDR_ENV=1`), wrote `$WT/state.json`, and printed the
-resolved values into the `KEY=VALUE` block at the end of this prompt:
+Each stage's *instruction to the model* is still prose, because that is what a model reads.
+Only the machinery around it — when to start, what to name the session, when to consider
+the stage finished, which gate decides whether to continue — is code. The stage prompt
+files are substituted with values read from `state.json` at run time; they never compute
+anything about the run themselves.
 
-| Key | What it is |
-|---|---|
-| `FEATURE_IDEA` / `FEATURE_SOURCE` / `ISSUE_ID` | the picked feature and its issue file |
-| `WT` | the shared worktree — your cwd and every worker's |
-| `BRANCH` | `auto/pipeline-$RUN_ID`, the run's one branch |
-| `SHARED_WS` | the shared workspace (already forked with `HERDR_ENV=1`, so your `herdr` calls do not settle `blocked` — design:98) |
-| `STATE_JSON` | `$WT/state.json`, already written: `current_stage: 0`, `stage_sessions: {}`, `feature_source`, `deadline_epoch` |
+## First manual run checklist (still applies)
 
-`deadline_epoch` in `state.json` is the `DEADLINE_EPOCH` value given at the end of this
-prompt: **copy that integer exactly — do not compute, round or re-derive it** (tick
-computes it from the real launch time + the job's `deadline_ms`, and the watchdog reads
-tick's value, not yours). You own `state.json` from here: update `current_stage` and
-`stage_sessions` as the run progresses, writing via `tmpfile && mv` (atomic rename — G-9).
-Never re-run the pre-flight, never re-create the worktree or the workspace, never
-re-sync the parent clone, and never re-pick a different feature.
-
-`stage_sessions` (G-17): record `agent_session.value` for **every** stage's worker as it spawns — `"1": "<session_id>"`, `"2": "<session_id>"`, etc. — not just the reused `pl-3` worker (G-16 already does that one). This is what Gate 2i (and any future stage-independence gate) compares against to confirm a stage actually ran in its own session rather than reusing a prior stage's.
-
-**This is now enforced in code, not just a gate you self-check.** `tick`'s reconcile (`herdr_routines.pipeline_watchdog.validate_stage_sessions`) reads this map when your run reports `## Outcome: ok` and **overrides the run to `failed` (`stage_independence_unverified`)** if it finds a placeholder id (anything containing `fake`/`stub`/`todo`/…), an id that isn't a real `ses_…` value, the same session reused across two stages, or fewer entries than the stage you reached. Real distinct `agent_session.value` per stage, or the run does not count — do not write `ses_..._fake1` / `ses_placeholder` / a copied id to move on.
-
-**Invoke `herdr-routines` as `uv run herdr-routines` everywhere below.** It is not
-installed as a standalone binary on the pipeline hosts (no `uv tool install`, not on
-`PATH`) — it is the project in `$REPO_PARENT`/`$WT`, run exactly the way the systemd
-units do (`deploy/systemd/*.service`: `uv run herdr-routines …`). A bare `herdr-routines`
-call fails with command-not-found, and the orchestrator then wanders off probing
-`~/.local/bin` for a launcher and wedges on a permission prompt (issue 050).
-
-Host prerequisites (signing key, allowlist, tools like `rg`) are configured **outside this prompt** per [`setup.md`](setup.md) — do not attempt to install tools or change git/gh config mid-run; if a gate fails on a missing tool, abort with report noting the gap. Write a heartbeat line (`echo "stage N poll $(date -u +%H:%M:%SZ)" >> /tmp/pipeline_resume_$RUN_ID.log`) each poll cycle so a silent orchestrator death is diagnosable (first run: wS:p1 killed between stages 4→5, no error, only `herdr-server.log agent → None`).
-
-## Worker spawn template (use for every stage — no exceptions, G-17)
-
-**You are the orchestrator, not a worker.** Every stage below must run as its own
-`pl-<N>-<run_id>` agent via this template — never author a stage's content
-yourself in your own session, even when it feels faster (it isn't a real
-shortcut: stages exist as separate sessions specifically so e.g. stage 2's
-review is independent of stage 1's authoring — collapsing them defeats that
-even if the resulting file looks identical). Each stage's gate now includes an
-explicit check that the right agent/session actually ran it (G-17 below) —
-skipping spawn is a gate-content failure, not a style choice.
-
-For stage `N` with harness `MODEL`:
-
-```sh
-# 1. Start agent (unique name pl-<N>-<RUN_ID>, except stage 6 uses pl-6 with -s <session_id> resume — design:192 G-16)
-herdr agent start "pl-${N}-${RUN_ID}" --kind opencode --pane "$WT_PANE" --timeout 120000 -- -m "<MODEL>"
-#   where $WT_PANE = pane of $SHARED_WS with cwd $WT (get via herdr workspace get $SHARED_WS | jq -r '.result.root_pane.pane_id')
-#   If interactive_ready not true within 120s, treat as start timeout → timeout backstop.
-#   For stage 6: herdr agent start "pl-6-${RUN_ID}" --kind opencode --pane "$FRESH_PANE" --timeout 120000 -- -m "<MODEL>" -s <session_id>
-#   where <session_id> is pl-3's agent_session.value captured in state.json/history (G-16 verified 2026-08-25: -s <session_id> true resume)
-
-# 2. Prompt (stage-specific prompt file/section below) — detached --wait is the v1 polling primitive (design:123):
-nohup herdr agent prompt "pl-${N}-${RUN_ID}" "$(cat <<'EOF'
-<stage prompt — see Stage Details>
-EOF
-)" --wait --timeout <STAGE_TIMEOUT_MS> > "/tmp/pl-${N}-${RUN_ID}.result.json" 2>&1 &
-#   Then sleep in 3–5 min chunks checking for the result file:
-for i in $(seq 1 30); do sleep 180; test -f "/tmp/pl-${N}-${RUN_ID}.result.json" && break; herdr agent get "pl-${N}-${RUN_ID}" | grep -q '"agent_status":"idle"' && break; done
-#   Fall back to herdr agent get only near timeout (design:123). If opencode bash cannot background nohup & (G-8 empirical), fall back to plain blocking: herdr agent prompt ... --wait --timeout <ms> (no &).
-
-# 3. Handle settle mapping (design:171): idle/done → success, blocked → needs-human (abort + report), unknown → interrupted_unknown (abort). On settle-timeout, do one visible-screen read for quota reaping:
-herdr agent read "pl-${N}-${RUN_ID}" --source visible --lines 200 | rg -q "Free usage exceeded" && echo "quota_exhausted" >> "$PIPELINE_REPORT"
-#   corresponds to reaping:88 DEFAULT_FAILURE_MARKERS and design:150.
-
-# 4. Start-race retry: if submission returned EmptyResponse (agent_not_ready, ~5s in), retry the prompt once with 5s delay, never resend on settle-timeout (runner.py #15, design:164).
-
-# 5. Close this worker's pane once its gate passes (G-16, pane-lifecycle v2) — unless it's the reused worker:
-#   After gate checks pass and handoff (commit + state.json atomic update) is confirmed on disk, close this worker's pane:
-#     herdr pane close <pane_id_of_this_worker>  # or herdr tab close <tab_id>
-#   For the reused worker (pl-3, reused by stage 6): close its pane too after stage 4's gate, but save its agent_session.value to state.json so stage 6 can resume via -s <session_id>.
-#   At most 2 opencode processes resident at any point (orchestrator + active stage). End-of-run cleanup remains as final sweep.
-```
-
-Per-worker timeouts: stage 1/2 `3600000` (60m), stage 3 `5400000` (90m), stage 5 `3600000` (60m, real review was 39m52s `design:171`), `start_timeout_ms 120000` for all. Orchestrator enforces, not just `--wait`.
-
-## Stage Details (hardcoded workflow — design:45)
-
-Execute sequentially. After each stage, run its **gate commands** (design:205) and update `state.json:current_stage` atomically. On any gate-content failure, **abort** (do not open PR off failed spec, do not address off failed review — spec:57) and write partial `$PIPELINE_REPORT`.
-
-### Stage 1 — Plan + draft spec
-- **Harness:** `opencode/muse-spark-1.2-contributor-free` (pi-2 e2e: muse excels at spec `opencode-e2e:15`, was `claude`)
-- **Input:** `FEATURE_IDEA` paragraph
-- **Prompt:** "Read `docs/plan-v1.md` for context. Produce `spec.md` v1 at `$WT/docs/pipeline/runs/$RUN_ID/spec.md` (create the directory first: `mkdir -p \"$WT/docs/pipeline/runs/$RUN_ID\"` — this path is per-run **on purpose**, not `$WT/spec.md`: every run writing to the same root-level path is what caused PR #29's merge conflict against PR #28, both full-file rewrites of one shared path — G-15) with: problem, approach, files touched, risks. Keep it concise but complete. Commit before settling: `git -C \"$WT\" add docs/pipeline/runs/$RUN_ID/spec.md && git commit -m \"spec: v1 for $RUN_ID\"`."
-- **Gate 1:** `test -s "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && test $(wc -l < "$WT/docs/pipeline/runs/$RUN_ID/spec.md") -gt 2 && git -C "$WT" rev-parse --abbrev-ref HEAD | grep -q "^auto/pipeline-" && git -C "$WT" log --oneline -1 -- "docs/pipeline/runs/$RUN_ID/spec.md" | grep -q .` (design:207, G-4 fix)
-- **Gate 1i (process fidelity, G-17):** `herdr agent list | jq -e --arg n "pl-1-$RUN_ID" '[.result.agents[] | select(.name==$n)] | length==1'` — a distinct `pl-1-$RUN_ID` agent must have run this stage; if you (the orchestrator) wrote `spec.md` yourself instead of spawning it, this fails and the stage is not done — go back and spawn it for real, do not paper over with a passing content gate.
-
-### Stage 2 — Spec review + update (adds acceptance criteria)
-- **Harness:** `opencode/muse-spark-1.2-contributor-free` **fresh session** (same model family, different session — independence via sessions not model family; `ox planning bad` `opencode-e2e:17` makes ox a poor spec reviewer; was `big-pickle`)
-- **Input:** `spec.md` v1 (committed)
-- **Prompt:** "Review `$WT/docs/pipeline/runs/$RUN_ID/spec.md` v1. Produce spec v2 with an added `## Acceptance criteria` section: numbered items, each ends `Test: <name>` (exact test name). Also add `## Changelog v1→v2` inside the same file describing changes, and ensure `blocking`/`non-blocking` and `confidence:` tiers are present. Commit: `git -C \"$WT\" add docs/pipeline/runs/$RUN_ID/spec.md && git commit -m \"spec: v2 acceptance for $RUN_ID\"`."
-- **Gate 2:** `rg -c "Test:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` counts `N` (orchestrator counts); `rg -q "^## Acceptance criteria" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "^## Changelog" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -qw "blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -qw "non-blocking" "$WT/docs/pipeline/runs/$RUN_ID/spec.md" && rg -q "confidence:" "$WT/docs/pipeline/runs/$RUN_ID/spec.md"` (design:208, G-2 fix: `-w` avoids tautology)
-- **Gate 2i (process fidelity, G-17):** `herdr agent list | jq -e --arg n "pl-2-$RUN_ID" '[.result.agents[] | select(.name==$n)] | length==1'` **and** its `agent_session.value` differs from `pl-1-$RUN_ID`'s recorded session id in `state.json` — stage 2's whole purpose is an independent reviewer, not the stage-1 author re-reading its own work in the same session. Same failure handling as Gate 1i.
-
-### Stage 3 — Implement (tests before code)
-- **Harness:** `opencode/x-preview-f-free` (= `ox-alpha-free`, alias `opencode-e2e:17`, 1M ctx, coding best — was generic `opencode`)
-- **Input:** `spec.md` v2; the picked issue file (`state.json.feature_source`)
-- **Prompt:** "Implement the feature described in `$WT/docs/pipeline/runs/$RUN_ID/spec.md` spec v2 on branch `auto/pipeline-$RUN_ID` (already checked out at `$WT`). Author **every test** named in `## Acceptance criteria` (each `Test: <name>`) before considering done. Run locally, and fix everything before considering done: `uv run ruff format --check . && uv run ruff check . && uv run pytest -q` — CI runs all three (issue 034: a pytest-only local gate let PR #81 open with a ruff-format regression CI then caught alone). Commit incrementally with conventional messages. After implementation, flip the picked issue `docs/process/issues/<file>` `status:` to `done` and commit it: `git -C \"$WT\" add docs/process/issues/<file> && git commit -m \"chore: mark issue NN done (merging this PR closes it)\"`. Do not push yet."
-- **Gate 3:** extract `Test: <name>` lines → for each `<name>`: `rg -F -q -- "<name>" "$WT/tests"` (fixed-string `-F`, scoped to `tests/` not the spec directory — G-2) then `uv run ruff format --check . && uv run ruff check . && uv run pytest -q` passes. Existence first, green second. This is a command the implementer runs against their own tree, prose by design (issue 034) — the authoritative check is Gate CI below, which the orchestrator itself computes off the opened PR, in code it can't silently rewrite.
-
-### Stage 4 — Open PR
-- **Harness:** same agent as stage 3 (preserve context)
-- **Prompt:** "Push branch and open PR: `git -C \"$WT\" push -u origin auto/pipeline-$RUN_ID && gh pr create --repo <owner>/<repo> --base main --head auto/pipeline-$RUN_ID --title \"feat: <feature> ($RUN_ID)\" --body \"Implements $WT/docs/pipeline/runs/$RUN_ID/spec.md spec v2; acceptance tests: <list>. Closes issue NN — the `status: done` flip rides this PR and lands on main on merge.\"` . Record PR number to `state.json:pr_number`."
-- **Gate 4:** the PR exists **and** the implementing branch carries the issue-close commit (orchestrator verifies — the flip is done by the implementer in stage 3, but whether it's actually committed is enforced here, since "merging closes the issue" only becomes real once the PR is open):
-  - `gh pr view <n> --repo <owner>/<repo> --json state,url,headRefName | jq -e '.headRefName=="auto/pipeline-'$RUN_ID'"'` (PR exists on the right branch)
-  - `git -C "$WT" status --porcelain docs/process/issues/<file>` is empty (flip committed, nothing dangling) **and** `git -C "$WT" show HEAD:docs/process/issues/<file> | rg -q '^status: done$'` (issue file committed as `done` on the branch)
-- **Gate CI (issue 034):** once the PR is open, run `uv run herdr-routines gate --stage ci --pr <n>` from `$WT`. This is the authoritative CI check — Gate 3 only proved the implementer's local tree was clean, not that CI agrees. The command polls `gh pr view --json statusCheckRollup` until every check is non-pending (bounded to ~10 minutes so a stuck check can't eat the deadline), fails on any `FAILURE` conclusion, and tolerates `SKIPPED`/`NEUTRAL`. Exit 0 = pass. **Do not** inline the `gh`/`jq` equivalent yourselves — this gate is code (`src/herdr_routines/gates.py`), not a filter you reproduce, precisely so it can't be silently substituted (see Gate 6's history below). On failure, do **not** abort the pipeline — carry the failure into stage 6 as a must-fix item alongside the review threads, since a lint slip is exactly what stage 6 exists to clean up.
-
-### Stage 5 — Code review (quality gate)
-- **Harness:** `opencode/big-pickle` **single primary reviewer v1** (measured 1/7, 5 high-sev uniques `pr4:106`); fan-out `hy3-free` + `x-preview-f-free` 2-tie is **v2** (`opencode-e2e:19`, dedup `pr4:45` not yet built, so keep single)
-- **Input:** PR number
-- **Prompt:** "Run the code-review skill against PR `<n>` (skill at `fitted/.claude/skills/code-review` or global `~/.config/opencode/skills/code-review/`). Use 5-reviewer skill in single-session mode for v1; full 5-reviewer fan-out is v2 if needed. Ensure output contains structured `blocking`/`non-blocking` tier labels."
-- **Gate 5:** `gh pr view <n> --json comments,reviews | jq -e 'any(.comments[].body // empty; test("blocking")) or any(.reviews[].body // empty; test("blocking"))'` — checks the skill's tier structure is present (relaxed after first real run: skill posts no literal `confidence:` token; design Gates table row 5).
-
-### Stage 6 — Address comments
-- **Harness:** **reuse stage-3 session via close-then-resume (G-16)** via `herdr agent start pl-6-$RUN_ID --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` where `<session_id>` is `pl-3`'s `agent_session.value` already captured in `state.json`/history (verified 2026-08-25 `-s <session_id>` true resume, not a fork; `agent_session.value` on resumed agent matched original). **Do not** use `herdr agent prompt pl-3-$RUN_ID ...` against a pane held open since stage 3 — that pane was closed after stage 4's gate per G-16 per-stage pane close; reopen against a fresh pane with `-s <session_id>` instead of holding open idle from stage 3 through stage 6. Alternative fresh `pl-6-$RUN_ID` seeded with `git diff main...HEAD` + `gh pr view --comments` remains fallback if `-s` resume fails or context burn.
-- **Input:** review findings (`gh pr view <n> --json comments,reviews`)
-- **Prompt:** "Run the `address-pr-comments` skill against PR `<n>`. The skill fetches all unresolved inline review threads, assesses their validity, fixes valid ones, commits and pushes, then replies to every thread with the outcome. Cap 2 iterations, plus 60-min wait-for-comments polling (see below)."
-- **Gate 6 (issue 035):** run `uv run herdr-routines gate --stage 6 --pr <n>` from `$WT`. **Do not** hand-roll the `gh api graphql`/`jq` equivalent — that is exactly what went wrong on PR #81: the prose gate's literal `test("blocking")` filter matches `"non-blocking"` by substring, the orchestrator silently substituted a stricter `\[blocking\]` regex instead of flagging the bug, and nothing detected the swap. The gate is now real code (`src/herdr_routines/gates.py`), invoked by exit code, not reproduced. It measures **reply coverage** — every unresolved review thread must carry at least one reply (`comments.totalCount >= 2`) — as an independent check alongside "no unresolved thread is tagged `[blocking]`" (matched on the literal bracketed form, so `[non-blocking]` can never satisfy it by substring). Exit 0 = pass.
-- **Wait-for-comments:** poll `gh pr view --json comments` (or `reviews`) every **5 min** for 60 min after stage 5 settles; gate on review's `blocking` findings, not arbitrary human comments later; after 60 min with no review, abort with partial report (G-12). Spec leakage: `docs/pipeline/runs/$RUN_ID/spec.md` commits ride the PR — prefix spec commits `spec:` so reviewers can filter.
-
-## Pipeline deadline, quota, resume, cleanup
-
-- **Deadline:** `deadline_epoch` in `state.json` = the `DEADLINE_EPOCH` you were given (launch + 7h, computed by tick). Between stages, check `date +%s` vs `deadline_epoch`; when exceeded, **wait for in-flight `--wait` to return** (do not kill mid-implementation), then skip remaining stages and write partial `$PIPELINE_REPORT` + `herdr notification show --sound request` (design:146, G-7).
-- **Quota reaping:** on any settle-timeout, `herdr agent read <worker> --source visible --lines 200 | rg -q "Free usage exceeded"` → report `quota_exhausted` not bare timeout (`reaping:88`). Orchestrator self-death remains silent (no report) — morning checklist: no report file ⇒ `systemctl --user status` + `herdr agent list` (design:150, G-4).
-- **Resume:** write `state.json` atomically (`tmp && mv`). On relaunch, `herdr agent list | jq -r '.result.agents[] | select(.name | startswith("pl-")) | "\(.name) \(.agent_status)"'` (not `rg` on JSON — G-9), derive orphan stage from agent name suffix when `state.json` lags spawn, adopt `working` worker if stage matches else `herdr pane close` (G-9). **G-16:** a closed-but-resumable worker ("not found live, but session ID in state.json — reopen by `-s <session_id>`") is now expected per-stage close, not only crash-recovery; capture `agent_session.value` for `pl-3` in `state.json`/history so stage 6 can `herdr agent start pl-6-… -s <session_id>` against a fresh pane.
-- **Cleanup:** after `$PIPELINE_REPORT` mirrored to `~/.local/state/herdr-routines/reports/<run_id>.md` and commits are on `auto/pipeline-<run_id>`, close each worker's **tab/pane** (`herdr tab close`/`pane`) — **do not** `herdr workspace close` the shared workspace nor `herdr worktree remove` the shared worktree (would destroy branch to keep) — G-10. **Per-stage pane close on gate-pass (not only end-of-run) (G-16):** close this worker's pane once its gate passes (handoff commit + `state.json` update confirmed on disk) for every worker except the reused one; for the reused worker (`pl-3`) close after stage 4 but save `agent_session.value` for `pl-6` resume via `-s <session_id>`. End-of-run cleanup is a final sweep for any still-open pane. Keep branch for manual GC per `roadmap:77`. `gc` retains an `auto/pipeline-*` branch only while it is unmerged, has an open PR, or belongs to an in-flight run — once none of those hold it is collectable like any other `auto/*` branch (issue 039; the older blanket "`gc` must exclude `auto/pipeline-*`" rule is superseded). `gc --delete` still excludes every `auto/pipeline-*` branch unconditionally.
-
-## Failure semantics
-
-Any gate-content failure → abort pipeline, never open PR off failed spec, never address off failed review (`spec:57`). `retry_stage` allowed **only** for `EmptyResponse` start-race once and infra-flavoured transient test failures once; every other failure is `abort` + report (`design:218`).
-
-## Final report
-
-Always write `$PIPELINE_REPORT` (and mirror to `~/.local/state/herdr-routines/reports/<run_id>.md`) with stage-by-stage status, artifacts, PR number, gate outputs, where it stopped and why, and whether fan-out dedup is still needed. Fire `herdr notification show` on terminal state.
-
-**Always emit an explicit `## Outcome:` line, on every terminal branch** (issue 026): this is the one machine-readable contract `tick` reconciles a dispatched pipeline run's history record from — `tick` never blocks on this run and only learns it finished by parsing this line out of the report.
-
-- `## Outcome: ok` — completed all stages, PR open/reviewed per the gates above (design:168's "completed" case).
-- `## Outcome: failed` — aborted on a gate-content failure (`spec:57`) or any other non-deadline failure.
-- `## Outcome: partial (deadline exceeded)` — the run hit `deadline_epoch` and stopped remaining stages (the case already documented above: "wait for in-flight `--wait` to return, then skip remaining stages and write partial `$PIPELINE_REPORT`", design:146, G-7). `tick` treats this as failed-but-tolerated: the partial report is expected, not a silent-death signal.
-
-Put the line near the top of the report, right after the title, so it is trivial to `grep -m1`.
-
-## First manual run checklist (before overnight)
-
-1. Ensure `~/.config/opencode/opencode.json` allowlist (transcribed from `deploy/opencode.pipeline.json` — the tracked source of truth, per [`setup.md`](setup.md) §4) + `GH_TOKEN` valid on Pi (dry-run one stage, confirm no `blocked`).
-2. Empirically verify on Pi opencode: (a) `nohup herdr agent prompt --wait &` persists across bash calls (G-8), (b) GraphQL `reviewThreads` query shape for gate 6 (G-1).
-3. Keep feature trivial (e.g. add a `--version` flag) to bound blast radius (`design:257`) — dogfood is `herdr-routines` itself.
+1. `~/.config/opencode/opencode.json` allowlist (source of truth:
+   `deploy/opencode.pipeline.json`, see [`setup.md`](setup.md) §4) plus a valid `GH_TOKEN`
+   on the host. Both are now hard requirements: stage 4 pushes and opens the PR with no
+   model in the loop (issue 056 risk 4).
+2. Keep the dogfood feature trivial to bound blast radius (`design.md:257`).
 
 ---
-Pin pi-2 e2e interim model table here for reference: `1 muse-spark plan/spec / 2 muse-spark fresh spec review / 3 ox-alpha-free implement / 5 big-pickle primary single (fan-out hy3+x-preview is v2) / 6 ox fixes + muse GH ops` (`opencode-e2e-workflow-recommendations.md:13`, measured `pr4:106`).
+
+Historical model table (from the v1 prompt, for reference):
+`1 muse-spark plan/spec / 2 muse-spark fresh spec review / 3 ox-alpha-free implement /
+5 big-pickle primary / 6 ox fixes + muse GH ops`
+(`opencode-e2e-workflow-recommendations.md:13`). These remain in `pipeline_stages.STAGES`.

@@ -435,6 +435,19 @@ def test_validate_stage_sessions_flags_missing_entries() -> None:
     assert issue is not None and "unverified" in issue
 
 
+def test_validate_stage_sessions_flags_a_bogus_key_padding_a_missing_stage() -> None:
+    """Right count, wrong stages: stage 2 recorded nothing, key "9" maps to no stage."""
+    padded = {
+        "current_stage": 2,
+        "stage_sessions": {
+            "1": "ses_f9f8186e3ffeY07GblyzaVJP01",
+            "9": "ses_f9f7ee0e7ffeEXZ9pkSIMNPhmC",
+        },
+    }
+    issue = validate_stage_sessions(padded)
+    assert issue is not None and "stage(s) 2" in issue
+
+
 def test_validate_stage_sessions_flags_missing_field() -> None:
     assert validate_stage_sessions({"current_stage": 3}) is not None
 
