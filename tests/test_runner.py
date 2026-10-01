@@ -121,7 +121,9 @@ class ScriptedClient:
         self.calls.append("tab_create")
         return self.pane_id
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+    def agent_start(
+        self, *, name, kind, pane_id, start_timeout_ms, model=None, session_id=None
+    ):
         self.calls.append("agent_start")
         self.started_with_model = model
         if self.raise_on == "agent_start":

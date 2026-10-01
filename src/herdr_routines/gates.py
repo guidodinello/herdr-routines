@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import subprocess
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -341,3 +341,265 @@ def run_gate6(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
     data = gh.graphql(GATE6_REVIEW_THREADS_QUERY, owner=owner, repo=repo, pr=str(pr))
     threads = _parse_review_threads(data)
     return evaluate_gate6(threads)
+
+
+# ---------------------------------------------------------------------------
+# Gates 1, 2, 4, 5 — issue 056 phase B, the checks the orchestrator prompt used to
+# describe in prose. Same reason as gates 6/CI above: prose is advisory, and an agent
+# told "run this check" can run a different one and still report success.
+# ---------------------------------------------------------------------------
+
+# Every long-running agent command goes through this wrapper so an external `timeout`
+# (exit 124) is always distinguishable from the command's own non-zero exit. Copied from
+# runner's `_subprocess_runner`, kept here rather than imported because gates must be
+# callable without a Job and this module's whole job is to be the leaf an agent can only
+# invoke.
+SUBPROCESS_TIMEOUT_GRACE_S = 5.0
+
+
+def _run_bounded(argv: Sequence[str], *, timeout_s: float) -> tuple[int, str, str]:
+    """Run `argv` with a hard wall-clock bound; 124 on overrun, never an exception for
+    the overrun itself (a `TimeoutExpired` here would abort the gate's caller instead of
+    producing the verdict the pipeline acts on)."""
+    try:
+        proc = subprocess.run(
+            list(argv),
+            capture_output=True,
+            text=True,
+            timeout=timeout_s + SUBPROCESS_TIMEOUT_GRACE_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{' '.join(argv)}: timed out after {timeout_s:.0f}s"
+    except OSError as e:
+        return 127, "", f"{' '.join(argv)}: {e}"
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_gate1(
+    repo_path: Path, *, runner: Callable[..., tuple[int, str, str]] | None = None
+) -> GateVerdict:
+    """Issue exists, is unclaimed and still open — the check that stops a night's work
+    being spent on something a human closed or claimed in the meantime.
+
+    The claim is `status: open` plus no `claimed_by:` line, matching
+    `pick_feature.pick_issue` (issue 054) so this can never pass a run that pick would
+    have skipped. Read with plain text matching rather than a YAML parser on purpose:
+    the issue file is a template this repo controls, and a parse error in a single issue
+    must fail this gate loudly rather than silently select a feature."""
+    del runner  # gate 1 is pure filesystem work; no subprocess to bound
+    issue_files = sorted(repo_path.glob("docs/process/issues/*.md"))
+    if not issue_files:
+        return GateVerdict(passed=False, reason="no issue files found")
+
+    open_issues: list[Path] = []
+    for path in issue_files:
+        try:
+            text = path.read_text()
+        except OSError as e:
+            return GateVerdict(passed=False, reason=f"could not read {path.name}: {e}")
+        if not _frontmatter_has(text, "status", "open"):
+            continue
+        if _frontmatter_field(text, "claimed_by") is not None:
+            continue
+        open_issues.append(path)
+
+    if not open_issues:
+        return GateVerdict(
+            passed=False,
+            reason="no open unclaimed issue in docs/process/issues",
+        )
+    return GateVerdict(passed=True, reason=f"feature: {open_issues[0].stem}")
+
+
+def _frontmatter_block(text: str) -> str | None:
+    """The YAML frontmatter block's text, or None when the file has none."""
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    return None if end == -1 else text[3:end]
+
+
+def _frontmatter_field(text: str, field: str) -> str | None:
+    block = _frontmatter_block(text)
+    if block is None:
+        return None
+    for line in block.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == field:
+            return value.strip().strip("\"'") or None
+    return None
+
+
+def _frontmatter_has(text: str, field: str, value: str) -> bool:
+    return _frontmatter_field(text, field) == value
+
+
+def run_gate2(
+    repo_path: Path, *, runner: Callable[..., tuple[int, str, str]] | None = None
+) -> GateVerdict:
+    """Worktree is clean, on the expected branch, synced with origin, and has no
+    unpushed commits. Each of those has bitten a real run: a dirty tree means the PR
+    would carry whatever was in the working directory, an unsynced base means the
+    pipeline fixes last night's already-fixed problem, and an unpushed commit means the
+    agent's work is only on this host until someone pushes by hand.
+
+    Uses `git status --porcelain`, which reports untracked files too (`-uno` would let a
+    stray scratch file into the PR)."""
+    run = runner or _run_bounded
+
+    def git(*args: str) -> tuple[int, str, str]:
+        return run(["git", "-C", str(repo_path), *args], timeout_s=60)
+
+    code, stdout, stderr = git("status", "--porcelain")
+    if code != 0:
+        return GateVerdict(passed=False, reason=f"git status failed: {stderr.strip()}")
+    if stdout.strip():
+        first = stdout.strip().splitlines()[0]
+        return GateVerdict(passed=False, reason=f"worktree is dirty: {first}")
+
+    code, stdout, stderr = git("rev-parse", "--abbrev-ref", "HEAD")
+    if code != 0:
+        return GateVerdict(
+            passed=False, reason=f"git rev-parse HEAD failed: {stderr.strip()}"
+        )
+    branch = stdout.strip()
+    if not branch.startswith("auto/pipeline-"):
+        return GateVerdict(
+            passed=False, reason=f"not on a pipeline branch (on {branch!r})"
+        )
+
+    code, _, stderr = git("fetch", "origin", "--quiet")
+    if code != 0:
+        return GateVerdict(passed=False, reason=f"git fetch failed: {stderr.strip()}")
+
+    code, stdout, stderr = git(
+        "rev-list", "--left-right", "--count", "HEAD...@{upstream}"
+    )
+    if code != 0:
+        return GateVerdict(
+            passed=False,
+            reason=f"no upstream to compare against: {stderr.strip()}",
+        )
+    ahead, _, behind = (part.strip() for part in stdout.split()[:2]) + ("",)[:0]
+    if int(ahead or 0) > 0:
+        return GateVerdict(
+            passed=False, reason=f"{ahead} unpushed commit(s) on {branch}"
+        )
+    if int(behind or 0) > 0:
+        return GateVerdict(
+            passed=False,
+            reason=f"branch is {behind} commit(s) behind its upstream",
+        )
+    return GateVerdict(passed=True)
+
+
+def run_gate4(gh: GhClient, *, owner: str, repo: str, branch: str) -> GateVerdict:
+    """The PR stage 4 opened is live and pointed at this run's branch.
+
+    `gh pr create` exits 0 after printing a URL, and it exits 0 for a PR that a
+    same-run re-invocation has already opened — so exit code alone cannot prove a PR
+    exists, and cannot prove it is the one this run means. Re-reading the branch's
+    open PR and checking its head is the only check that survives both."""
+    procs = gh.pr_list(owner=owner, repo=repo, state="open", limit=100)
+    matches = [pr for pr in procs if str(pr.get("headRefName", "")) == branch]
+    if not matches:
+        return GateVerdict(passed=False, reason=f"no open PR with head {branch!r}")
+    numbers = sorted(int(pr["number"]) for pr in matches if "number" in pr)
+    if not numbers:
+        return GateVerdict(passed=False, reason=f"open PR on {branch!r} has no number")
+    return GateVerdict(passed=True, reason=f"PR #{numbers[-1]}")
+
+
+def _pr_bodies(view: Mapping[str, object]) -> list[str]:
+    """Every comment and review body `gh pr view --json comments,reviews` returns.
+
+    Both surfaces, because gate 5 checks that the review *skill* ran: a reviewer that
+    posted its findings as a review leaves them in `reviews`, and one that commented
+    inline leaves them in `comments`."""
+    bodies: list[str] = []
+    for key in ("comments", "reviews"):
+        entries = view.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("body"), str):
+                bodies.append(entry["body"])
+    return bodies
+
+
+def run_gate5(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
+    """The review skill's `blocking`/`non-blocking` tier structure is present.
+
+    Anchored on the literal bracketed ``[blocking]``, never a substring test. The prompt's
+    original check was ``test("blocking")``, which ``[non-blocking]`` satisfies — the
+    exact false positive issue 035 exists to kill, and the reason `BLOCKING_TAG` above is
+    a bracketed constant. A review that only ever writes `[non-blocking]` has not labelled
+    a blocking tier, so it is not evidence the skill's structure ran.
+
+    Note this is deliberately *stricter* than the prose it replaces: prose asked for
+    "at least one ``[blocking]`` or ``[non-blocking]`` label", which `[non-blocking]`
+    alone satisfies, and so keeps the bug. See the spec's note on the prose/acceptance-
+    criteria conflict."""
+    view = gh.pr_view(owner=owner, repo=repo, number=pr)
+    bodies = _pr_bodies(view)
+    if not bodies:
+        return GateVerdict(
+            passed=False,
+            reason=f"PR #{pr} has no review or comment to check for tier labels",
+        )
+    if any(BLOCKING_TAG in body for body in bodies):
+        return GateVerdict(passed=True)
+    return GateVerdict(
+        passed=False,
+        reason=(
+            f"no {BLOCKING_TAG} tier label in any of PR #{pr}'s "
+            f"{len(bodies)} review/comment body/bodies — the review skill's tier "
+            f"structure is unproven"
+        ),
+    )
+
+
+# CLI-visible stage numbers. Gate 3 is prose by design (see this module's docstring and
+# GATE3_LINT_TEST_CHECKS), so "3" is absent on purpose: gate 3's verdict is the
+# implementer's own-tree check, and Gate CI is the authoritative one for a PR.
+GATE_STAGE_CHOICES: tuple[str, ...] = ("1", "2", "4", "5", "6", "ci")
+
+
+def run_stage_gate(
+    stage: str,
+    *,
+    repo_path: Path,
+    gh: GhClient,
+    owner: str,
+    repo: str,
+    pr: int | None = None,
+    branch: str | None = None,
+    runner: Callable[..., tuple[int, str, str]] | None = None,
+) -> GateVerdict:
+    """Dispatch one gate by its CLI stage token. Raises `ValueError` for an unknown token
+    so the CLI can exit 2 rather than reporting an unrun gate as a pass."""
+    token = stage.strip().lower()
+    if token == "1":
+        return run_gate1(repo_path, runner=runner)
+    if token == "2":
+        return run_gate2(repo_path, runner=runner)
+    if token == "4":
+        if branch is None:
+            raise ValueError("gate 4 requires the branch the PR was opened from")
+        return run_gate4(gh, owner=owner, repo=repo, branch=branch)
+    if token == "5":
+        if pr is None:
+            raise ValueError("gate 5 requires a PR number")
+        return run_gate5(gh, owner=owner, repo=repo, pr=pr)
+    if token == "6":
+        if pr is None:
+            raise ValueError("gate 6 requires a PR number")
+        return run_gate6(gh, owner=owner, repo=repo, pr=pr)
+    if token == "ci":
+        if pr is None:
+            raise ValueError("gate ci requires a PR number")
+        return run_ci_gate(gh, owner=owner, repo=repo, pr=pr)
+    raise ValueError(
+        f"unknown gate stage {stage!r} (expected one of {', '.join(GATE_STAGE_CHOICES)})"
+    )

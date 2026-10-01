@@ -81,6 +81,15 @@ class FakeGhClient:
             raise RuntimeError(f"gh pr view {number} failed")
         return self.pr_views.get(number, {})
 
+    def pr_create(
+        self, *, owner: str, repo: str, branch: str, title: str, body: str
+    ) -> int:
+        self.calls.append(f"pr_create:{branch}")
+        if self.raise_on == "pr_create":
+            raise RuntimeError("gh pr create failed")
+        self.prs.append({"number": 4242, "headRefName": branch})
+        return 4242
+
     def graphql(self, query: str, **variables: str) -> dict[str, object]:
         self.calls.append("graphql")
         if self.raise_on == "graphql":
@@ -114,7 +123,9 @@ class FakeFullClient:
     def worktree_create(self, *, cwd, branch, base, label=None):
         return "w1:p1"
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+    def agent_start(
+        self, *, name, kind, pane_id, start_timeout_ms, model=None, session_id=None
+    ):
         self._registered[name] = "working"
 
     def agent_interactive_ready(self, target):

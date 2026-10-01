@@ -9,13 +9,16 @@ from __future__ import annotations
 
 from herdr_routines.auto_fix import GhClient, RealGhClient
 from herdr_routines.gates import (
+    BLOCKING_TAG,
     GATE3_LINT_TEST_CHECKS,
+    GATE_STAGE_CHOICES,
     ReviewThread,
     evaluate_ci_checks,
     evaluate_commit_checks,
     evaluate_gate6,
     gate3_result,
     run_ci_gate,
+    run_gate5,
     run_gate6,
 )
 from tests.test_auto_fix import FakeGhClient as AutoFixFakeGhClient
@@ -45,6 +48,7 @@ class FakeGhClient:
         self.pr_view_calls = 0
         self.graphql_calls = 0
         self.check_runs_calls: list[str] = []
+        self.created_prs: list[dict[str, str]] = []
 
     def api_user(self) -> str:
         return "testuser"
@@ -53,6 +57,12 @@ class FakeGhClient:
         self, *, owner: str, repo: str, state: str, limit: int
     ) -> list[dict[str, object]]:
         return []
+
+    def pr_create(
+        self, *, owner: str, repo: str, branch: str, title: str, body: str
+    ) -> int:
+        self.created_prs.append({"branch": branch, "title": title, "body": body})
+        return 9001
 
     def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
         self.pr_view_calls += 1
@@ -412,3 +422,57 @@ def test_gh_client_fakes_implement_commit_check_runs() -> None:
     ]
     assert gates_fake.check_runs_calls == ["abc"]
     assert AutoFixFakeGhClient().commit_check_runs(owner="o", repo="r", sha="abc") == []
+
+
+# ---------------------------------------------------------------------------
+# Gate 5 — the review skill's tier structure (issue 056 phase B, criterion 9)
+# ---------------------------------------------------------------------------
+
+
+def test_gate5_rejects_nonblocking_only_review() -> None:
+    """The gate exists to prove the review skill's `blocking`/`non-blocking` tier
+    structure is actually present. Ported verbatim from the prompt's
+    `test("blocking")`, `[non-blocking]` satisfies it by substring — which is exactly
+    the false positive issue 035 exists to kill, and `BLOCKING_TAG = "[blocking]"`
+    exists precisely so a substring match can never stand in for the tier label.
+
+    So the check is anchored on the literal bracketed form: a review that only ever
+    writes `[non-blocking]` has not labelled a blocking tier, and must fail."""
+    only_non_blocking = FakeGhClient(
+        pr_views=[{"reviews": [{"body": "### non-blocking\n[non-blocking] tidy this"}]}]
+    )
+    verdict = run_gate5(only_non_blocking, owner="o", repo="r", pr=7)
+    assert verdict.passed is False
+    assert verdict.reason is not None and BLOCKING_TAG in verdict.reason
+
+    # A real tier-structured review passes, and the check reads both surfaces
+    # `gh pr view --json comments,reviews` returns.
+    structured = FakeGhClient(
+        pr_views=[
+            {
+                "comments": [{"body": "### blocking\n[blocking] gate 5 is wrong"}],
+                "reviews": [{"body": "### non-blocking\n[non-blocking] rename this"}],
+            }
+        ]
+    )
+    assert run_gate5(structured, owner="o", repo="r", pr=7).passed is True
+
+    # The bare word, unbracketed, is the substring trap itself: not a tier label.
+    unbracketed = FakeGhClient(
+        pr_views=[{"reviews": [{"body": "this is blocking-ish, probably fine"}]}]
+    )
+    assert run_gate5(unbracketed, owner="o", repo="r", pr=7).passed is False
+
+    # No review at all is not a pass either.
+    assert (
+        run_gate5(FakeGhClient(pr_views=[{}]), owner="o", repo="r", pr=7).passed
+        is False
+    )
+
+
+def test_gate5_is_not_a_cli_stage() -> None:
+    """Gate 3 stays prose by design (issue 034), so `3` must never appear in the
+    CLI's `--stage` choices — its lint/pytest verdict is the implementer's own-tree
+    check, with Gate CI as the authoritative one."""
+    assert "3" not in GATE_STAGE_CHOICES
+    assert set(GATE_STAGE_CHOICES) == {"1", "2", "4", "5", "6", "ci"}

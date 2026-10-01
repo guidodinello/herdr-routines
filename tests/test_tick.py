@@ -149,7 +149,9 @@ class FakeFullClient:
     def worktree_create(self, *, cwd, branch, base, label=None):
         return "w1:p1"
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+    def agent_start(
+        self, *, name, kind, pane_id, start_timeout_ms, model=None, session_id=None
+    ):
         self._registered[name] = "working"
 
     def agent_interactive_ready(self, target):
@@ -263,7 +265,9 @@ class FakeClient:
         self._worktree_branches.add(branch)
         return "w1:p1"
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+    def agent_start(
+        self, *, name, kind, pane_id, start_timeout_ms, model=None, session_id=None
+    ):
         self._maybe_raise("agent_start")
         self._last_model = model
 
@@ -449,7 +453,9 @@ class ReapsStaleAgentClient(FakeClient):
         self._starts = 0
         self.closed_panes: list[str] = []
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+    def agent_start(
+        self, *, name, kind, pane_id, start_timeout_ms, model=None, session_id=None
+    ):
         self._starts += 1
         if self._starts == 1:
             raise HerdrCliError(
@@ -887,7 +893,9 @@ class FakePrDispatchClient:
     def tab_create(self, *, cwd, label=None):
         return "w1:p1"
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+    def agent_start(
+        self, *, name, kind, pane_id, start_timeout_ms, model=None, session_id=None
+    ):
         self._registered[name] = "working"
 
     def agent_interactive_ready(self, target):
@@ -1969,6 +1977,61 @@ def test_pipeline_skipped_while_agent_live(
     assert outcome.summaries == ("nightly-pipeline: skipped (already running)",)
 
 
+def test_tick_pipeline_overlap_guard_survives_without_orchestrator_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 056 phase B removed the orchestrator agent, which is exactly the agent
+    `pipeline-launch.sh` documented the overlap guard as depending on: with no
+    `rt-<name>` agent registered, `_live_agent_exists` can never fire again and a
+    second night launches on top of a live one. The guard has to be re-anchored on the
+    thing that still exists — a `state.json` with no terminal report yet."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    # No orchestrator agent exists any more: `agent_statuses` has nothing to find.
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    dispatched = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    assert dispatched.summaries[0].startswith("nightly-pipeline: dispatched")
+
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = str(running.run_id).removeprefix(f"{job.name}-")
+    state_path = (
+        Path(tmp_path / "home" / ".herdr" / "worktrees" / "herdr-routines")
+        / f"auto-pipeline-{bare_run_id}"
+        / "state.json"
+    )
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "run_id": bare_run_id,
+                "current_stage": 3,
+                "pr_number": None,
+                "deadline_epoch": int(t1.timestamp()) + 25_200,
+                "feature_source": "docs/process/issues/056-x.md",
+                "artifact_paths": {"report": str(tmp_path / "nope.md")},
+                "stage_sessions": {},
+            }
+        )
+    )
+
+    t2 = t1 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: skipped (already running)",)
+    # The run is still in flight: nothing was reconciled away while it lived.
+    assert read_job(history_path, job.name)[-1].state == "running"
+
+
 # ---------------------------------------------------------------------------
 # Issue 036: worktree collision, dropped reason/error, agent-name builders
 # ---------------------------------------------------------------------------
@@ -1994,7 +2057,9 @@ class FakeFixWorkerClient:
         self.tab_create_cwd = cwd
         return "w1:p1"
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+    def agent_start(
+        self, *, name, kind, pane_id, start_timeout_ms, model=None, session_id=None
+    ):
         pass
 
     def agent_interactive_ready(self, target):
@@ -2546,7 +2611,9 @@ class TailTrackingFixClient:
         self.calls.append("tab_create")
         return "w1:p1"
 
-    def agent_start(self, *, name, kind, pane_id, start_timeout_ms, model=None):
+    def agent_start(
+        self, *, name, kind, pane_id, start_timeout_ms, model=None, session_id=None
+    ):
         self.calls.append("agent_start")
 
     def agent_interactive_ready(self, target):

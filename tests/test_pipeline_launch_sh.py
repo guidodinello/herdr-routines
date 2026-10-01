@@ -458,3 +458,41 @@ def test_launcher_forwards_same_deadline_to_prepare(tmp_path: Path) -> None:
     # The prompt is multi-line, so these are substrings of the whole log, not lines.
     assert f"--deadline-epoch {deadline}" in log
     assert f"DEADLINE_EPOCH: {deadline}" in log
+
+
+# -- issue 056 phase B: the launcher hands the whole stage loop to code -------------
+
+
+def test_launcher_runs_pipeline_run_and_stages_dir_is_complete(tmp_path: Path) -> None:
+    """Phase B deletes the orchestrator agent, its workspace and the bash marker-poll
+    loop (a third copy of runner.py's wait loop) from the launcher, and replaces them
+    with one `pipeline-run` call. Two things have to hold together, because a missing
+    one only shows up hours later: the launcher must start no agent at all, and every
+    prompt file `STAGES` names must exist — a missing file would abort at stage 1,
+    after the whole night had already been prepared."""
+    _report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
+
+    log = call_log.read_text()
+    assert "pipeline-run" in log
+    # Nothing that starts a model: no orchestrator agent, no prompt, no workspace.
+    assert "agent start" not in log
+    assert "agent prompt" not in log
+    assert "workspace create" not in log
+    # The values it does need are on the flag surface, and the deadline reaches
+    # `pipeline-run` as the single value tick computed.
+    assert "--run-id" in log
+    assert "--state-json" in log
+    assert "--report" in log
+    assert "--prompts-dir" in log
+    assert "--failure-marker Free usage exceeded" in log
+
+    # The workflow table and the prompt files it names cannot disagree.
+    from herdr_routines.pipeline_stages import STAGES
+
+    stages_dir = REPO_ROOT / "docs" / "pipeline" / "stages"
+    assert stages_dir.is_dir()
+    for spec in STAGES:
+        if spec.prompt_file is None:
+            assert spec.model is None
+            continue
+        assert (stages_dir / spec.prompt_file).is_file(), spec.prompt_file

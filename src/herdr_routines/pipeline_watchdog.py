@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,6 +58,7 @@ from logger import get_logger
 
 from herdr_routines.herdr import HerdrClient, HerdrCliError
 from herdr_routines.history import read_all
+from herdr_routines.pipeline_stages import STAGES, StageSpec
 
 log = get_logger(__name__)
 
@@ -96,7 +97,6 @@ _FABRICATED_MARKERS = (
     "sample",
     "mock",
 )
-_MAX_PIPELINE_STAGE = 6
 
 
 def system_boot_epoch(proc_stat: Path = Path("/proc/stat")) -> float | None:
@@ -112,14 +112,19 @@ def system_boot_epoch(proc_stat: Path = Path("/proc/stat")) -> float | None:
     return None
 
 
-def validate_stage_sessions(raw_state: Mapping[str, object]) -> str | None:
-    """Reason string if `state.json`'s `stage_sessions` shows the 6-fresh-session
-    contract (design.md G-17) was not honored; None if it looks genuine.
+def validate_stage_sessions(
+    raw_state: Mapping[str, object], *, expected: Sequence[StageSpec] = STAGES
+) -> str | None:
+    """Reason string if `state.json`'s `stage_sessions` shows the G-17 layout contract was
+    not honored; None if it looks genuine.
 
-    A legitimate run records one distinct real session id per stage it reached. A run
-    that reused one session across stages, wrote placeholder ids, or simply didn't
-    record a stage cannot be shown to have run that stage independently — and
-    "unverifiable" is treated as "failed" here on purpose (the whole point of the gate)."""
+    A legitimate run records one real session id per stage that ran an agent. Two stages
+    legitimately share: stage 4 runs no agent (no session id), and stage 6 resumes stage
+    3's session on purpose — both are declared in `STAGES` rather than special-cased here,
+    so `pipeline_run` (which writes the ids) and this gate (which audits them) read the
+    same table and cannot disagree. Everything else — a reused session across independent
+    stages, a placeholder id, a stage that never recorded one — is unprovable independence,
+    and "unverifiable" is treated as "failed" here on purpose."""
     sessions = raw_state.get("stage_sessions")
     if not isinstance(sessions, dict) or not sessions:
         return "stage_sessions is missing or empty"
@@ -133,17 +138,42 @@ def validate_stage_sessions(raw_state: Mapping[str, object]) -> str | None:
     for value in values:
         if not _SESSION_ID_RE.match(value):
             return f"stage_sessions entry is not a real session id ({value!r})"
-    if len(set(values)) != len(values):
-        return (
-            "stage_sessions reuses one session across stages (stages not independent)"
-        )
+
+    # Reuse is legal only where STAGES says it is: stage 6 reuses stage 3's id. Any other
+    # repetition means two independent stages shared one conversation.
+    reuse_allowed: dict[str, str] = {
+        spec.reuses_stage: str(spec.stage)
+        for spec in expected
+        if spec.reuses_stage is not None
+    }
+    seen: dict[str, str] = {}
+    for key, value in sessions.items():
+        owner = seen.get(value)
+        if owner is None:
+            seen[value] = str(key)
+            continue
+        if reuse_allowed.get(owner) != str(key):
+            return (
+                f"stage_sessions reuses one session across stages {owner} and {key} "
+                f"(stages not independent)"
+            )
+
     current_stage = raw_state.get("current_stage")
     if isinstance(current_stage, int) and not isinstance(current_stage, bool):
-        expected = min(current_stage, _MAX_PIPELINE_STAGE)
-        if len(values) < expected:
+        reached = min(current_stage, len(expected))
+        # Count the stages in the reached prefix that must have their own id — stages with
+        # no model record none, and a reused stage's id is counted once against its owner.
+        required = len(
+            {
+                spec.reuses_stage if spec.reuses_stage is not None else spec.stage
+                for spec in expected[:reached]
+                if spec.model is not None
+            }
+        )
+        if len(values) < required:
             return (
                 f"stage_sessions records {len(values)} session(s) but the run reached "
-                f"stage {current_stage} — {expected - len(values)} stage(s) unverified"
+                f"stage {current_stage} — {required - len(values)} stage(s) unverified"
             )
     return None
 

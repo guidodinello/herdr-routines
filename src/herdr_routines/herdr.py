@@ -363,6 +363,7 @@ class HerdrClient:
         pane_id: str,
         start_timeout_ms: int,
         model: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         args = build_agent_start_args(
             name=name,
@@ -370,6 +371,7 @@ class HerdrClient:
             pane_id=pane_id,
             start_timeout_ms=start_timeout_ms,
             model=model,
+            session_id=session_id,
         )
         self._call(args, timeout_s=start_timeout_ms / 1000 + 10)
 
@@ -691,9 +693,18 @@ def build_agent_start_args(
     pane_id: str,
     start_timeout_ms: int,
     model: str | None = None,
+    session_id: str | None = None,
 ) -> list[str]:
     """Builds the `agent start` argv (without the leading `herdr` binary). Shared by
-    `HerdrClient.agent_start` and `runner.build_dry_run_argv` so the two can't drift."""
+    `HerdrClient.agent_start` and `runner.build_dry_run_argv` so the two can't drift.
+
+    `session_id` emits `-s <id>`, the documented resume form (`docs/pipeline/design.md`'s
+    stage 6), so an operator can pick up a wedged stage-6 pane's conversation in their own
+    terminal. It is appended inside the `model is not None` branch on purpose: that branch
+    is the only one emitting the `--` separator the model's own flags follow, and `-m <model>
+    -s <session_id>` has to reach opencode as one argument list after it. A `session_id`
+    with no `model` is rejected rather than silently dropped — there is no separator-less
+    documented form to put it after, and emitting one would be a guess."""
     args = [
         "agent",
         "start",
@@ -713,6 +724,14 @@ def build_agent_start_args(
                 f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
             )
         args += ["--", flag, model]
+        if session_id is not None:
+            args += ["-s", session_id]
+    elif session_id is not None:
+        raise ValueError(
+            f"agent_start(session_id={session_id!r}) requires a model: the documented "
+            f"resume form is `-m <model> -s <session_id>`, which only exists after the "
+            f"`--` separator emitted for a model flag"
+        )
     return args
 
 
