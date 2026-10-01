@@ -22,22 +22,41 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPO_ROOT / "scripts" / "pipeline-launch.sh"
 
-# A stand-in for `uv run herdr-routines pipeline-prepare` (issue 054 phase A). The
-# launcher calls the real thing on a real host; here the pre-flight is the thing under
-# test, so it is stubbed and its argv is logged to the same call log as herdr's. That
-# makes "prepare ran before the agent started" and "the deadline reached prepare
-# unchanged" assertable from one ordered log.
+# A stand-in for `uv run herdr-routines pipeline-prepare` (issue 054 phase A) and, since
+# issue 056 phase B, `uv run herdr-routines pipeline-run`. The launcher calls the real
+# things on a real host; here both are stubbed and their argv is logged to the same call
+# log as herdr's, so "prepare ran before the run started" and "the deadline reached
+# prepare unchanged" are assertable from one ordered log.
 #
 # FAKE_PREPARE_RC is prepare's exit code (0 prepared, 3 no feature, 1 failed);
-# FAKE_PREPARE_VALUES is the KEY=VALUE stdout the launcher appends to the prompt.
+# FAKE_PREPARE_VALUES is the KEY=VALUE stdout the launcher parses.
+# FAKE_PIPELINE_RUN_RC / FAKE_PIPELINE_RUN_WRITES_REPORT stand in for the run itself: by
+# default it exits 0 *without* writing a report, which is exactly the killed-mid-run
+# shape the launcher's backstop exists for.
 FAKE_UV = """#!/bin/bash
 echo "uv $*" >> "$FAKE_HERDR_CALL_LOG"
-if [ "$2 $3" != "herdr-routines pipeline-prepare" ]; then
-  echo "fake uv: unexpected command: $*" >&2
-  exit 99
-fi
-printf '%s\n' "$FAKE_PREPARE_VALUES"
-exit "${FAKE_PREPARE_RC:-0}"
+case "$2 $3" in
+  "herdr-routines pipeline-prepare")
+    printf '%s\\n' "$FAKE_PREPARE_VALUES"
+    exit "${FAKE_PREPARE_RC:-0}"
+    ;;
+  "herdr-routines pipeline-run")
+    if [ "${FAKE_PIPELINE_RUN_WRITES_REPORT:-0}" = "1" ]; then
+      report=""
+      prev=""
+      for arg in "$@"; do
+        if [ "$prev" = "--report" ]; then report="$arg"; fi
+        prev="$arg"
+      done
+      printf '## Outcome: ok\\nreal report\\n' > "$report"
+    fi
+    exit "${FAKE_PIPELINE_RUN_RC:-0}"
+    ;;
+  *)
+    echo "fake uv: unexpected command: $*" >&2
+    exit 99
+    ;;
+esac
 """
 
 PREPARED_VALUES = """FEATURE_IDEA=Issue 001 (herdr-routines issue 001, docs/process/issues/001-foo.md).\n\n## Description\n\nDo the thing.
@@ -110,6 +129,8 @@ def _run_launcher(
     deadline_epoch: str | None = None,
     prepare_rc: int = 0,
     prepare_values: str = PREPARED_VALUES,
+    pipeline_run_rc: int = 0,
+    pipeline_run_writes_report: bool = False,
 ) -> tuple[Path, Path]:
     """Runs the real launcher script against the fake herdr CLI above. Returns
     (report_path, call_log_path)."""
@@ -151,6 +172,8 @@ def _run_launcher(
         "PIPELINE_LAUNCH_POLL_INTERVAL_S": str(poll_interval_s),
         "FAKE_PREPARE_RC": str(prepare_rc),
         "FAKE_PREPARE_VALUES": prepare_values,
+        "FAKE_PIPELINE_RUN_RC": str(pipeline_run_rc),
+        "FAKE_PIPELINE_RUN_WRITES_REPORT": "1" if pipeline_run_writes_report else "0",
     }
     if tail_sequence is not None:
         sequence_path = tmp_path / "tail_sequence.txt"
@@ -181,184 +204,131 @@ def _run_launcher(
     return report_path, call_log
 
 
-def test_launcher_captures_tail_on_blocked(tmp_path: Path) -> None:
-    tail_text = "orchestrator is waiting on a permission prompt it never got"
-    report_path, _call_log = _run_launcher(
-        tmp_path, settle_status="blocked", tail_text=tail_text
-    )
-
-    run_id = report_path.stem.removeprefix("pipeline-")
-    tail_file = report_path.parent / f"{run_id}.tail.txt"
-    assert tail_file.exists()
-    assert tail_text in tail_file.read_text()
+# -- issue 056 phase B: the launcher hands the whole stage loop to code --------------
+#
+# What the launcher still owns is small: run the pre-flight, honour its exit code, make
+# one `pipeline-run` call, and never leave the run without a report. Everything the old
+# tests asserted about a settle status, a captured screen tail and a bash marker-poll
+# loop is gone with the orchestrator, and the tests below assert what replaced it.
 
 
-def test_launcher_writes_failed_outcome_stub(tmp_path: Path) -> None:
-    report_path, _call_log = _run_launcher(
-        tmp_path, settle_status="blocked", tail_text="stuck here"
-    )
+def test_launcher_runs_pipeline_run_after_prepare(tmp_path: Path) -> None:
+    """Phase A's guarantee, restated for the new successor: nothing the stage loop needs
+    is produced by a model, so the pre-flight has already written `state.json` before
+    `pipeline-run` is invoked."""
+    _report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
 
-    assert report_path.exists()
+    lines = call_log.read_text().splitlines()
+    prepare_idx = next(i for i, line in enumerate(lines) if "pipeline-prepare" in line)
+    run_idx = next(i for i, line in enumerate(lines) if "pipeline-run" in line)
+    assert prepare_idx < run_idx, "prepare must run before pipeline-run"
+    prepare_argv = lines[prepare_idx]
+    for flag in ("--run-id", "--repo-parent", "--deadline-epoch"):
+        assert flag in prepare_argv
+
+
+def test_launcher_passes_the_prepared_state_json_to_pipeline_run(
+    tmp_path: Path,
+) -> None:
+    """The prepared `KEY=VALUE` block is machine-parsed, not read by a model: the one
+    value that has to cross the shell boundary is the path of the state file, which
+    carries worktree, branch, workspace, feature source and deadline already."""
+    _report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
+
+    log = call_log.read_text()
+    assert "--state-json" in log
+    assert "auto-pipeline-T000000000000/state.json" in log
+
+
+def test_launcher_stubs_a_failed_report_when_pipeline_run_writes_none(
+    tmp_path: Path,
+) -> None:
+    """`pipeline-run` writes the report on every path it controls, so an empty one after
+    it exits means the process was killed before it got there. Tick reconciles from that
+    file, so without this stub the run stays "running" in history until the watchdog
+    reaps it hours later. This used to be conditional on the orchestrator settling badly;
+    with no orchestrator there is nothing to condition on."""
+    report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
+
+    log = call_log.read_text()
+    assert "pipeline-run" in log
+    assert report_path.exists(), "an empty report after pipeline-run must be stubbed"
     report_text = report_path.read_text()
     assert "## Outcome: failed" in report_text
-    assert "blocked" in report_text
-    # Points a human at the captured evidence, not just "it failed".
-    assert ".tail.txt" in report_text
+    assert "notification show" in log
 
 
-def test_launcher_does_not_overwrite_an_existing_report(tmp_path: Path) -> None:
-    """The orchestrator's own report always wins over the launcher's best-effort stub."""
-    report_path, _call_log = _run_launcher(
+def test_launcher_does_not_overwrite_a_real_report(tmp_path: Path) -> None:
+    """A report with real content always wins over the launcher's best-effort stub."""
+    report_path, call_log = _run_launcher(
         tmp_path,
-        settle_status="blocked",
-        tail_text="stuck here",
+        settle_status="idle",
         report_precontent="## Outcome: ok\nreal report\n",
     )
 
     assert report_path.read_text() == "## Outcome: ok\nreal report\n"
+    assert "notification show" not in call_log.read_text()
 
 
-def test_launcher_leaves_report_and_tail_alone_on_idle_settle(tmp_path: Path) -> None:
-    """The happy path (idle/done) must not fire the blocked/unknown branch at all."""
-    report_path, _call_log = _run_launcher(
-        tmp_path, settle_status="idle", tail_text="should never be read"
-    )
-
-    run_id = report_path.stem.removeprefix("pipeline-")
-    tail_file = report_path.parent / f"{run_id}.tail.txt"
-    assert not report_path.exists()
-    assert not tail_file.exists()
-
-
-def test_launcher_closes_pane_after_capture(tmp_path: Path) -> None:
-    """The pane is still closed on every exit path (the leak fix stays) — but only after
-    the tail capture, so the trap never destroys evidence before it's written."""
-    _report_path, call_log = _run_launcher(
-        tmp_path, settle_status="blocked", tail_text="stuck here"
-    )
-
-    lines = call_log.read_text().splitlines()
-    read_calls = [i for i, line in enumerate(lines) if line.startswith("agent read")]
-    close_calls = [i for i, line in enumerate(lines) if line.startswith("pane close")]
-    assert read_calls, "expected a visible-tail capture call"
-    assert close_calls, "expected the cleanup trap to close the pane"
-    assert max(read_calls) < min(close_calls)
-
-
-def test_launcher_fails_fast_on_quota_exhaustion_marker(tmp_path: Path) -> None:
-    """The actual bug this fixes: a provider's quota dialog (e.g. "Free usage exceeded
-    ... retrying in 11h 59m") never changes the agent's herdr-visible state away from
-    "working", so a plain blocking `--wait` sits for the entire --wait-timeout-ms before
-    noticing. The launcher must instead end the run within a couple of poll intervals."""
+def test_launcher_skips_pipeline_run_when_no_feature(tmp_path: Path) -> None:
+    """Issue 052, still the launcher's job: an empty backlog costs no run at all.
+    `pipeline-prepare` exits 3, which becomes a successful exit (0) — a healthy skip,
+    not a break tick should report."""
     report_path, call_log = _run_launcher(
-        tmp_path,
-        settle_status="working",
-        tail_text="Free usage exceeded, subscribe to Go [retrying in 11h 59m]",
-        prompt_sleep_s=5,
-        poll_interval_s=0.2,
-        wait_timeout_ms="600000",
+        tmp_path, settle_status="idle", prepare_rc=3, prepare_values=""
     )
 
-    report_text = report_path.read_text()
-    assert "## Outcome: failed (quota_exhausted)" in report_text
-    assert "fallback_model" in report_text  # points a human/tick at the actual remedy
-
-    read_calls = [
-        line
-        for line in call_log.read_text().splitlines()
-        if line.startswith("agent read")
-    ]
-    # Two consecutive 0.2s polls confirm the marker; ending near-instantly means far
-    # fewer reads than the ~25 a full 5s prompt_sleep_s at this poll interval would give.
-    assert len(read_calls) <= 5
+    log = call_log.read_text()
+    assert "pipeline-prepare" in log
+    assert "pipeline-run" not in log
+    # prepare already wrote the terminal report; the launcher must not stub over it.
+    assert not report_path.exists()
 
 
-def test_launcher_requires_two_consecutive_marker_sightings(tmp_path: Path) -> None:
-    """A single sighting of the marker (a transient screen tear/partial render) must not
-    end the run — only two consecutive polls with the SAME marker do, mirroring
-    runner.py's _prompt_with_watchdog stability gate."""
-    report_path, _call_log = _run_launcher(
-        tmp_path,
-        settle_status="working",
-        prompt_sleep_s=1.0,
-        poll_interval_s=0.2,
-        tail_sequence=[
-            "Free usage exceeded",
-            "clean screen, agent working normally",
-            "clean screen, agent working normally",
-            "clean screen, agent working normally",
-            "clean screen, agent working normally",
-        ],
+def test_launcher_propagates_a_prepare_failure(tmp_path: Path) -> None:
+    """A pre-flight that could not sync, claim or create the worktree must not fall
+    through into a run that has nothing to work from — and must not write a second
+    report over prepare's own. `pipeline-prepare` writes its terminal report on both its
+    non-zero paths precisely so this script has nothing left to say about them."""
+    report_path, call_log = _run_launcher(
+        tmp_path, settle_status="idle", prepare_rc=1, prepare_values=""
     )
 
-    report_text = report_path.read_text()
-    assert "## Outcome: failed" in report_text
-    assert "quota_exhausted" not in report_text
+    log = call_log.read_text()
+    assert "pipeline-prepare" in log
+    assert "pipeline-run" not in log
+    # The fake prepare writes no report of its own here; the launcher's job is to add
+    # nothing, not to invent one.
+    assert not report_path.exists()
+
+
+def test_launcher_forwards_failure_markers_to_pipeline_run(tmp_path: Path) -> None:
+    """Quota exhaustion is detected inside the shared wait loop now, so the markers are
+    forwarded rather than scanned for in bash — one implementation, not two copies."""
+    _report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
+
+    assert "--failure-marker Free usage exceeded" in call_log.read_text()
 
 
 def test_launcher_matches_a_custom_failure_marker(tmp_path: Path) -> None:
-    """--failure-marker (as `tick._build_pipeline_launch_argv` passes from a job's
-    `failure_markers` config) is what the launcher actually watches for — not a
-    hardcoded string."""
-    report_path, _call_log = _run_launcher(
-        tmp_path,
-        settle_status="working",
-        tail_text="CUSTOM_PROVIDER_QUOTA_DIALOG",
-        prompt_sleep_s=5,
-        poll_interval_s=0.2,
-        failure_markers=("CUSTOM_PROVIDER_QUOTA_DIALOG",),
-        wait_timeout_ms="600000",
+    _report_path, call_log = _run_launcher(
+        tmp_path, settle_status="idle", failure_markers=("Custom quota wall",)
     )
 
-    assert "## Outcome: failed (quota_exhausted)" in report_path.read_text()
+    log = call_log.read_text()
+    assert "--failure-marker Custom quota wall" in log
+    assert "Free usage exceeded" not in log
 
 
-def test_launcher_custom_failure_marker_replaces_default(tmp_path: Path) -> None:
-    """A job-supplied --failure-marker list replaces the default wholesale (matches
-    job.failure_markers' documented semantics in config.py) — the default "Free usage
-    exceeded" text must not match once a job supplies its own marker list."""
-    report_path, _call_log = _run_launcher(
-        tmp_path,
-        settle_status="working",
-        tail_text="Free usage exceeded, subscribe to Go",
-        prompt_sleep_s=0.6,
-        poll_interval_s=0.2,
-        failure_markers=("SOME_OTHER_MARKER",),
-    )
-
-    report_text = report_path.read_text()
-    assert "## Outcome: failed" in report_text
-    assert "quota_exhausted" not in report_text
-
-
-def test_pipeline_launcher_captures_visible_tail_on_failure(tmp_path: Path) -> None:
-    """AC 7: Pipeline launcher captures visible --lines 200 to sibling
-    ${RUN_ID}.tail.txt before pane close on non-idle/done settle."""
-    tail_text = "orchestrator stuck on quota modal"
-    report_path, call_log = _run_launcher(
-        tmp_path, settle_status="unknown", tail_text=tail_text
-    )
-
-    run_id = report_path.stem.removeprefix("pipeline-")
-    tail_file = report_path.parent / f"{run_id}.tail.txt"
-    assert tail_file.exists()
-    assert tail_text in tail_file.read_text()
-
-    # Verify visible source and 200-line bound in the call log.
-    lines = call_log.read_text().splitlines()
-    read_calls = [l for l in lines if l.startswith("agent read")]
-    assert any("--source visible" in l for l in read_calls)
-    assert any("--lines 200" in l for l in read_calls)
-
-
-def test_launcher_hands_orchestrator_tick_computed_deadline(tmp_path: Path) -> None:
-    """The deadline reaches the orchestrator as a value to copy, not a sum to compute:
-    a fallback model once computed it a year in the past (2026-09-28)."""
+def test_launcher_hands_pipeline_run_the_tick_computed_deadline(tmp_path: Path) -> None:
+    """One deadline, computed once, and it reaches prepare verbatim — the 2026-09-28
+    bug was a caller recomputing it as a year in the past. `pipeline-run` then reads it
+    out of `state.json` rather than taking it as a flag."""
     _, call_log = _run_launcher(
         tmp_path, settle_status="idle", deadline_epoch="1790597715"
     )
 
-    assert "DEADLINE_EPOCH: 1790597715" in call_log.read_text()
+    assert "--deadline-epoch 1790597715" in call_log.read_text()
 
 
 def test_launcher_computes_deadline_when_tick_passes_none(tmp_path: Path) -> None:
@@ -370,97 +340,9 @@ def test_launcher_computes_deadline_when_tick_passes_none(tmp_path: Path) -> Non
     )
     after = int(time.time())
 
-    match = re.search(r"DEADLINE_EPOCH: (\d+)", call_log.read_text())
+    match = re.search(r"--deadline-epoch (\d+)", call_log.read_text())
     assert match is not None
     assert before + 3600 <= int(match.group(1)) <= after + 3600
-
-
-# -- issue 054 phase A: the pre-flight runs in code, before any agent exists -------------
-
-
-def test_launcher_prepares_before_starting_the_orchestrator(tmp_path: Path) -> None:
-    """The whole point of phase A: nothing the orchestrator needs to trust is produced by
-    a model. Sync, pick, worktree, workspace and `state.json` are all written before
-    `herdr agent start` appears in the log, so a run that cannot be prepared never starts
-    an agent to fail at stage 1."""
-    _report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
-
-    lines = call_log.read_text().splitlines()
-    prepare_idx = next(i for i, line in enumerate(lines) if "pipeline-prepare" in line)
-    start_idx = next(
-        i for i, line in enumerate(lines) if line.startswith("agent start")
-    )
-    assert prepare_idx < start_idx, (
-        "prepare must run before the agent starts; log was:\n" + call_log.read_text()
-    )
-    # And prepare got the run's real identity, not placeholder values.
-    prepare_argv = lines[prepare_idx]
-    assert "--run-id" in prepare_argv
-    assert "--repo-parent" in prepare_argv
-    assert "--deadline-epoch" in prepare_argv
-
-
-def test_launcher_appends_prepared_values_to_the_prompt_header(tmp_path: Path) -> None:
-    """The values prepare resolved are appended to the prompt header as-is, next to
-    RUN_ID/REPO_PARENT/DEADLINE_EPOCH, so the orchestrator copies them instead of
-    recomputing them. Appending (not substituting) keeps `--prompt-file` working for a
-    custom prompt file."""
-    _report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
-
-    # The fake herdr logs `agent prompt <name> <prompt> ...`. The prompt is multi-line
-    # (body + header + prepared values), so match against the whole log, not one line.
-    prompt = call_log.read_text()
-    assert "agent prompt" in prompt
-    assert "do the thing" in prompt  # the --prompt-file body survived
-    assert "RUN_ID:" in prompt
-    assert "DEADLINE_EPOCH:" in prompt
-    for key in (
-        "FEATURE_IDEA",
-        "FEATURE_SOURCE",
-        "ISSUE_ID",
-        "WT",
-        "BRANCH",
-        "SHARED_WS",
-        "STATE_JSON",
-    ):
-        assert f"{key}=" in prompt, f"prepared value {key} missing from the prompt"
-    # Appended *after* the header, not replacing it.
-    assert prompt.index("DEADLINE_EPOCH:") < prompt.index("FEATURE_IDEA=")
-
-
-def test_launcher_skips_agent_when_no_feature(tmp_path: Path) -> None:
-    """Issue 052, the part the pre-flight now owns: an empty backlog must cost no agent.
-    `pipeline-prepare` exits 3 in that case, which the launcher turns into a successful
-    exit (0) — a healthy skip, not a break tick should report."""
-    report_path, call_log = _run_launcher(
-        tmp_path, settle_status="idle", prepare_rc=3, prepare_values=""
-    )
-
-    assert "pipeline-prepare" in call_log.read_text()
-    # No agent, no workspace, no prompt: nothing that costs a model or a pane.
-    assert "agent start" not in call_log.read_text()
-    assert "workspace create" not in call_log.read_text()
-    assert "agent prompt" not in call_log.read_text()
-    # prepare already wrote the terminal report; the launcher must not stub over it.
-    assert not report_path.exists()
-
-
-def test_launcher_forwards_same_deadline_to_prepare(tmp_path: Path) -> None:
-    """One deadline, computed once. prepare writes it into `state.json` and the prompt
-    header carries the same number, so the value the watchdog trusts and the value the
-    orchestrator is told cannot drift apart (the 2026-09-28 reap)."""
-    deadline = "1790597715"
-    _report_path, call_log = _run_launcher(
-        tmp_path, settle_status="idle", deadline_epoch=deadline
-    )
-
-    log = call_log.read_text()
-    # The prompt is multi-line, so these are substrings of the whole log, not lines.
-    assert f"--deadline-epoch {deadline}" in log
-    assert f"DEADLINE_EPOCH: {deadline}" in log
-
-
-# -- issue 056 phase B: the launcher hands the whole stage loop to code -------------
 
 
 def test_launcher_runs_pipeline_run_and_stages_dir_is_complete(tmp_path: Path) -> None:
