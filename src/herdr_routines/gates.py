@@ -659,7 +659,7 @@ def gate3_test_names(
     The names are written by stage 2 and read by stage 3, gate 3 and `pipeline_run`
     alike, so the extraction is one function rather than a `grep "Test:"` copied into
     each. Backticked names are unwrapped because both spellings are in the wild and a
-    backtick left in would make the `rg -F` existence check pass against a file that
+    backtick left in would make the fixed-string existence check pass against a file that
     only mentions the name inside a backticked sentence."""
     names: list[str] = []
     for match in _TEST_LINE_RE.finditer(spec_text):
@@ -673,33 +673,31 @@ def gate3_test_names_present(
     spec_text: str,
     *,
     repo_path: Path,
-    runner: Callable[..., tuple[int, str, str]] | None = None,
 ) -> GateVerdict:
     """Every `Test: <name>` in the spec exists somewhere under `tests/`.
 
-    Existence first, green second (G-2), and fixed-string only: `-F` because a test
-    name is an identifier, and letting the name be a regex would let `test_a.*` pass
-    the existence check while matching no test. Scoped to `tests/` rather than the spec
-    directory, for the same reason the prose gate is: a spec that merely repeats its own
-    test names must not satisfy this.
+    Existence first, green second (G-2), and fixed-string only: a test name is an
+    identifier, and letting the name be a regex would let `test_a.*` pass the existence
+    check while matching no test. Scoped to `tests/` rather than the spec directory, for
+    the same reason the prose gate is: a spec that merely repeats its own test names
+    must not satisfy this. Plain Python rather than `rg`, so the verdict does not depend
+    on which binaries the host happens to have on PATH (CI has no `rg`).
 
     Deliberately *not* the lint/pytest half of gate 3 — that stays prose (see this
     module's docstring). This function is the part that is mechanical enough to stop
     trusting a model with it."""
-    run = runner or _run_bounded
     names = gate3_test_names(spec_text)
     if not names:
         return GateVerdict(
             passed=False, reason="spec names no acceptance tests (`Test: <name>` lines)"
         )
-    missing = [
-        name
-        for name in names
-        if run(["rg", "-F", "-q", "--", name, str(repo_path / "tests")], timeout_s=30)[
-            0
-        ]
-        != 0
+    tests_dir = repo_path / "tests"
+    texts = [
+        path.read_text(errors="replace")
+        for path in sorted(tests_dir.rglob("*"))
+        if path.is_file() and "__pycache__" not in path.parts
     ]
+    missing = [name for name in names if not any(name in text for text in texts)]
     if missing:
         return GateVerdict(
             passed=False,

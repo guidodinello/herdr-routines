@@ -730,9 +730,7 @@ def _gate_for_stage(
         # Gate 3's lint/pytest half stays prose (issue 034: Gate CI below is
         # authoritative for a PR). The mechanical half — every acceptance test named in
         # the spec exists under tests/ — is a command, so it runs in code.
-        return gate3_test_names_present(
-            spec_text, repo_path=state.worktree, runner=runner
-        )
+        return gate3_test_names_present(spec_text, repo_path=state.worktree)
     if spec.stage == 4:
         head = run_stage_gate(
             "4",

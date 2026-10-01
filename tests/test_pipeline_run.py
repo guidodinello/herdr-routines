@@ -296,6 +296,18 @@ class FakeGh:
     def graphql(self, query: str, **variables: str) -> dict[str, object]:
         return self.threads
 
+    # The rest of the GhClient protocol: nothing on the stage-loop path calls these.
+
+    def pr_list(
+        self, *, owner: str, repo: str, state: str, limit: int
+    ) -> list[dict[str, object]]:
+        raise NotImplementedError
+
+    def commit_check_runs(
+        self, *, owner: str, repo: str, sha: str
+    ) -> list[dict[str, object]]:
+        raise NotImplementedError
+
 
 class PipelineFixture:
     """A prepared run: real bare origin, real branch, real committed spec + issue."""
@@ -394,7 +406,7 @@ def _run(
         report=prepared.report,
         prompts_dir=prepared.prompts_dir,
         failure_markers=("Free usage exceeded",),
-        client=client,
+        client=client,  # type: ignore[arg-type]
         gh=gh,
         heartbeat_dir=prepared.heartbeat_dir,
         runner=_git_runner,
@@ -439,7 +451,7 @@ def test_pipeline_run_records_real_stage_sessions(prepared: PipelineFixture) -> 
         state_json=prepared.state_json,
         report=prepared.report,
         prompts_dir=prepared.prompts_dir,
-        client=orphan,
+        client=orphan,  # type: ignore[arg-type]
         gh=FakeGh(),
         heartbeat_dir=prepared.heartbeat_dir,
         runner=_git_runner,
@@ -713,7 +725,7 @@ def test_pipeline_run_never_raises_on_a_broken_state_file(tmp_path: Path) -> Non
         state_json=missing,
         report=tmp_path / "reports" / f"pipeline-{RUN_ID}.md",
         prompts_dir=REPO_ROOT / "docs" / "pipeline" / "stages",
-        client=_client(),
+        client=_client(),  # type: ignore[arg-type]
         gh=FakeGh(),
         runner=_git_runner,
     )

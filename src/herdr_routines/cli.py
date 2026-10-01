@@ -1050,7 +1050,8 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         if args.spec is None:
             print(f"gate {stage}: --spec is required for this stage", file=sys.stderr)
             return EXIT_USAGE
-        owner = name = None
+        # Gates 1 and 2 never read owner/repo; they only need a checkout and a spec.
+        owner = name = ""
 
     try:
         verdict = run_stage_gate(
@@ -1329,10 +1330,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
     )
     if result.outcome == "ok":
         log.info(
-            "pipeline-run: run %s finished ok (PR #%s); report at %s",
-            args.run_id,
-            result.pr_number,
-            args.report,
+            "pipeline-run: run %s finished ok; report at %s", args.run_id, args.report
         )
         return EXIT_OK
     log.error(
