@@ -22,6 +22,31 @@ from herdr_routines.herdr import (
     build_agent_start_args,
 )
 from herdr_routines.repos import ensure_repo
+from herdr_routines.wait_loop import (
+    PROMPT_RETRY_DELAYS_S,
+    WATCHDOG_POLL_INTERVAL_S,
+    prompt_with_watchdog,
+)
+from herdr_routines.wait_loop import (
+    error_body_code as _error_body_code,
+)
+from herdr_routines.wait_loop import (
+    is_retryable_prompt_error as _is_retryable_prompt_error,
+)
+from herdr_routines.wait_loop import (
+    is_settle_timeout as _is_settle_timeout,
+)
+from herdr_routines.wait_loop import (
+    matched_failure_marker as _matched_failure_marker,
+)
+
+__all__ = [
+    "PROMPT_RETRY_DELAYS_S",
+    "WATCHDOG_POLL_INTERVAL_S",
+    "_error_body_code",
+    "_is_retryable_prompt_error",
+    "_is_settle_timeout",
+]
 
 log = logging.getLogger(__name__)
 
@@ -35,14 +60,10 @@ SUCCESS_AGENT_STATUSES = frozenset({"idle", "done"})
 # accept typed input. Module-level so tests can zero it out.
 READY_POLL_INTERVAL_S = 1.0
 
-# Retries for the prompt send itself. `interactive_ready` only means the TUI is drawn — the
-# agent's session backend can still reject the first prompt seconds later (server-side
-# EmptyResponse, observed ~3s and ~10s after start on herdr 0.8.2/0.8.x). Only such provably-
-# early server rejections are retried (see _is_retryable_prompt_error); everything else is
-# terminal, because unknown-or-proven delivery plus a resend would double-prompt the agent and
-# duplicate the run's side effects (branch/report written twice). Module-level so tests can
-# adjust or zero it out.
-PROMPT_RETRY_DELAYS_S = (5.0, 15.0)
+# Retries for the prompt send itself, and how often the mid-run watchdog polls the visible
+# screen, now live in `wait_loop` (issue 056 §4 — one copy, shared with `pipeline_run`).
+# They are re-exported here under their original names because they are module-level test
+# seams for the routine-job path, which is what every existing test monkeypatches.
 
 # Screen markers scanned once after a failed prompt wait (docs/failure-reaping.md §3.2). The
 # first observed wedge cause: OpenCode's free-tier limit renders a "Free usage exceeded" modal
@@ -50,11 +71,6 @@ PROMPT_RETRY_DELAYS_S = (5.0, 15.0)
 # tuple wholesale (config.py); markers appearing verbatim in the job's own prompt are skipped —
 # the visible screen contains the prompt echo, so scanning would self-match.
 DEFAULT_FAILURE_MARKERS: tuple[str, ...] = ("Free usage exceeded",)
-
-# How often the mid-run watchdog (failure-reaping phase 2) polls the visible screen while
-# the prompt child waits. Mirrors herdr.py's PROMPT_WATCHDOG_POLL_S default; module-level so
-# tests can adjust it, same style as READY_POLL_INTERVAL_S.
-WATCHDOG_POLL_INTERVAL_S = 30.0
 
 # Bound for the one-shot no_report nudge (issue 032): a settled idle/done agent that wrote no
 # (or an empty) $ROUTINE_REPORT is nudged once, on the same still-open agent, to write it. This
@@ -123,44 +139,6 @@ def _dir_size_h(path: Path) -> str:
     return f"{size:.1f}G"
 
 
-def _error_body_code(e: HerdrCliError) -> str | None:
-    """The parsed error body's error.code when it is a string, else None. Never raises: both
-    callers run inside except blocks, where crashing on a malformed body (e.g. a flat
-    {"error": "timeout"}) would mask the original failure."""
-    body = e.error_body
-    if not isinstance(body, dict):
-        return None
-    error = body.get("error")
-    if not isinstance(error, dict):
-        return None
-    code = error.get("code")
-    return code if isinstance(code, str) else None
-
-
-def _is_settle_timeout(e: HerdrCliError) -> bool:
-    """True when the prompt was delivered but the agent didn't settle within timeout_ms
-    (herdr exits 1 with a JSON body, code "timeout"). Resending in that case would double-prompt.
-    Any malformed body conservatively classifies as not-a-settle-timeout rather than raising —
-    see _error_body_code."""
-    return _error_body_code(e) == "timeout"
-
-
-def _is_retryable_prompt_error(e: HerdrCliError) -> bool:
-    """True only for provably-early server rejections: herdr exited 1 with a parsed JSON error
-    body whose error.code is present and is not "timeout" (the session-not-ready EmptyResponse).
-    Everything else raises immediately:
-      - exit 124 (_subprocess_runner wrapper timeout): herdr ran past timeout_ms + grace, so
-        the prompt was almost certainly delivered;
-      - exit 0 shape errors (_extract_status): delivery AND settle already succeeded — only
-        the response JSON was unexpected;
-      - exit 1 without a parseable body or without an error.code: delivery state unknown.
-    Resending in any terminal case risks duplicating the run's side effects."""
-    if e.exit_code != 1 or not isinstance(e.error_body, dict):
-        return False
-    code = _error_body_code(e)
-    return code is not None and code != "timeout"
-
-
 def _prompt_with_watchdog(
     client: HerdrClient,
     *,
@@ -171,57 +149,24 @@ def _prompt_with_watchdog(
     markers: tuple[str, ...],
     prompt_text: str,
 ) -> str:
-    """agent_prompt_wait_with_watchdog with bounded retries over provably-early
-    session-not-ready failures — the same whitelist phase 1's _prompt_with_retry enforced
-    (see _is_retryable_prompt_error): settle timeouts, wrapper subprocess timeouts and shape
-    errors raise immediately, because delivery is proven or likely and a resend would
-    double-prompt the agent. While each attempt waits, the visible screen is polled every
-    WATCHDOG_POLL_INTERVAL_S and scanned via _matched_failure_marker; only the SAME marker
-    on two consecutive polls (stability gate against transient screen tear / partial
-    renders) confirms the wedge and kills the delivered child. A watchdog kill is terminal
-    and never retried — one delivery, one terminal record — so it propagates immediately as
-    PromptWatchdogKilled for execute_run's fast-fail classification. Poll reads that fail
-    are inert (the callback sees "", which matches nothing). Raises the last error if every
-    attempt fails. `target` is the agent name; `job_name` only labels log lines."""
-    previous_hit: str | None = None
+    """Thin wrapper over `wait_loop.prompt_with_watchdog` (issue 056 §4: the loop moved
+    out of this module so `pipeline_run` shares exactly one copy, and `runner`'s
+    behaviour is unchanged). Retained as a named seam for the routine-job tests.
 
-    def scan(screen_text: str) -> str | None:
-        nonlocal previous_hit
-        marker = _matched_failure_marker(screen_text, markers, prompt_text)
-        if marker is None:
-            previous_hit = None
-            return None
-        if previous_hit == marker:
-            # second consecutive sighting of the same marker — stable, kill
-            return marker
-        previous_hit = marker
-        return None
-
-    delays = (None, *PROMPT_RETRY_DELAYS_S)
-    for i, delay in enumerate(delays):
-        if delay is not None:
-            time.sleep(delay)
-            log.info(
-                "%s: retrying prompt (attempt %d/%d)", job_name, i + 1, len(delays)
-            )
-        try:
-            return client.agent_prompt_wait_with_watchdog(
-                target=target,
-                text=text,
-                timeout_ms=timeout_ms,
-                poll_interval_s=WATCHDOG_POLL_INTERVAL_S,
-                on_poll=scan,
-            )
-        except PromptWatchdogKilled:
-            # Terminal by construction (no error_body → never retryable anyway); re-raised
-            # explicitly so the double-prompt audit stays a one-line proof.
-            raise
-        except HerdrCliError as e:
-            if not _is_retryable_prompt_error(e) or i == len(delays) - 1:
-                raise
-    raise AssertionError(
-        "unreachable"
-    )  # for the type checker; loop always returns/raises
+    `retry_delays_s=PROMPT_RETRY_DELAYS_S` reads this module's global at call time, so
+    the long-standing `monkeypatch.setattr("herdr_routines.runner.PROMPT_RETRY_DELAYS_S", ...)`
+    test seam keeps working unchanged — every one of those tests exists to collapse the
+    backoff to zero, and silently ignoring the patch would make them assert nothing."""
+    return prompt_with_watchdog(
+        client,
+        job_name=job_name,
+        target=target,
+        text=text,
+        timeout_ms=timeout_ms,
+        markers=markers,
+        prompt_text=prompt_text,
+        retry_delays_s=PROMPT_RETRY_DELAYS_S,
+    )
 
 
 def _wait_for_agent_ready(
@@ -248,20 +193,6 @@ def _wait_for_agent_ready(
         if time.monotonic() >= deadline:
             return False, last_error
         time.sleep(READY_POLL_INTERVAL_S)
-
-
-def _matched_failure_marker(
-    screen_text: str, markers: tuple[str, ...], prompt_text: str
-) -> str | None:
-    """The first marker visible on screen and not verbatim in the job's own prompt (the
-    visible screen contains the prompt echo — docs/failure-reaping.md §3.2's false-positive
-    guard). Empty screens match nothing."""
-    if not screen_text:
-        return None
-    for marker in markers:
-        if marker and marker in screen_text and marker not in prompt_text:
-            return marker
-    return None
 
 
 def _capture_visible_tail(
