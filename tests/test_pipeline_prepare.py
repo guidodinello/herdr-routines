@@ -13,12 +13,13 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import pytest
 
-from herdr_routines import cli
+from herdr_routines import cli, pipeline_prepare
 from herdr_routines.claims import load_claims
 from herdr_routines.herdr import HerdrClient, HerdrCliError, WorktreeInfo
 from herdr_routines.pipeline_prepare import (
@@ -30,6 +31,7 @@ from herdr_routines.pipeline_prepare import (
     render_prepared_values,
     write_terminal_report,
 )
+from herdr_routines.pipeline_stages import STAGES
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ISSUES_DIR = REPO_ROOT / "docs" / "process" / "issues"
@@ -235,10 +237,28 @@ class _PrepareKwargs(TypedDict):
     claims_path: Path
     worktrees_root: Path
     reports_dir: Path
+    available_models: Callable[[], set[str]] | None
+
+
+def _all_stage_models() -> set[str]:
+    """An `opencode models` listing that offers every stage model."""
+    return {spec.model for spec in STAGES if spec.model is not None}
+
+
+@pytest.fixture(autouse=True)
+def _stub_opencode_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The CLI-level tests reach the default lister; CI has no `opencode` binary, and a
+    # dev box's real catalogue must not decide a test either.
+    monkeypatch.setattr(pipeline_prepare, "opencode_models", _all_stage_models)
 
 
 def _prepare_kwargs(
-    tmp_path: Path, *, parent: Path, base: str, client: FakeHerdr | None = None
+    tmp_path: Path,
+    *,
+    parent: Path,
+    base: str,
+    client: FakeHerdr | None = None,
+    available_models: Callable[[], set[str]] = _all_stage_models,
 ) -> _PrepareKwargs:
     return _PrepareKwargs(
         run_id=RUN_ID,
@@ -252,6 +272,7 @@ def _prepare_kwargs(
         claims_path=tmp_path / "claims.json",
         worktrees_root=tmp_path / "worktrees",
         reports_dir=tmp_path / "reports",
+        available_models=available_models,
     )
 
 
@@ -922,3 +943,54 @@ def test_write_terminal_report_is_atomic(
 
     assert "## Outcome: ok" in report.read_text()
     assert [p.name for p in tmp_path.iterdir()] == ["report.md"]
+
+
+# --- stage models: a withdrawn free model fails the night before the claim -------------
+
+
+def test_pipeline_prepare_fails_before_claim_when_a_stage_model_is_gone(
+    tmp_path: Path, no_open_prs: None
+) -> None:
+    """2026-10-01: two stage models vanished from opencode's free tier. Prepare must stop
+    with a report naming the model, before claiming the issue or creating a worktree."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+    gone = "opencode/big-pickle"
+    client = FakeHerdr(tmp_path / "worktrees")
+
+    result = prepare_run(
+        **_prepare_kwargs(
+            tmp_path,
+            parent=parent,
+            base=base,
+            client=client,
+            available_models=lambda: _all_stage_models() - {gone},
+        )
+    )
+
+    assert result.outcome == "prepare_failed"
+    report = (tmp_path / "reports" / f"pipeline-{RUN_ID}.md").read_text()
+    assert "stage_model_unavailable" in report
+    assert gone in report
+    assert load_claims(tmp_path / "claims.json") == {}
+    assert client.calls == []
+
+
+def test_pipeline_prepare_fails_when_models_cannot_be_listed(
+    tmp_path: Path, no_open_prs: None
+) -> None:
+    """An `opencode models` that cannot run is "unverifiable", never "all present"."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+
+    def broken() -> set[str]:
+        raise RuntimeError("opencode models: [Errno 2] No such file or directory")
+
+    result = prepare_run(
+        **_prepare_kwargs(tmp_path, parent=parent, base=base, available_models=broken)
+    )
+
+    assert result.outcome == "prepare_failed"
+    report = (tmp_path / "reports" / f"pipeline-{RUN_ID}.md").read_text()
+    assert "stage_models_unverifiable" in report
+    assert load_claims(tmp_path / "claims.json") == {}

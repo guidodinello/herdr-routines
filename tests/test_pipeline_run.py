@@ -706,11 +706,13 @@ def test_stages_table_matches_the_prompt_files_on_disk() -> None:
 def test_stages_declare_the_documented_models_and_timeouts() -> None:
     by_stage = {s.stage: s for s in STAGES}
 
-    assert by_stage[1].model == "opencode/muse-spark-1.2-contributor-free"
-    assert by_stage[2].model == "opencode/muse-spark-1.2-contributor-free"
-    assert by_stage[3].model == "opencode/x-preview-f-free"
+    assert by_stage[1].model == "opencode/muse-spark-1.3-contributor-free"
+    assert by_stage[2].model == "opencode/muse-spark-1.3-contributor-free"
+    assert by_stage[3].model == "opencode/big-pickle"
     assert by_stage[4].model is None
-    assert by_stage[5].model == "opencode/big-pickle"
+    assert by_stage[5].model == "opencode/nemotron-3-ultra-free"
+    # The reviewer is never the author's model (independent review).
+    assert by_stage[5].model != by_stage[3].model
     assert by_stage[6].reuses_stage == 3
     assert all(s.start_timeout_ms == 120_000 for s in STAGES)
     assert by_stage[1].timeout_ms == by_stage[2].timeout_ms == 3_600_000

@@ -33,7 +33,7 @@ class StageSpec:
 STAGES: tuple[StageSpec, ...] = (
     StageSpec(
         stage=1,
-        model="opencode/muse-spark-1.2-contributor-free",
+        model="opencode/muse-spark-1.3-contributor-free",
         prompt_file="stage-1.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -41,7 +41,7 @@ STAGES: tuple[StageSpec, ...] = (
     ),
     StageSpec(
         stage=2,
-        model="opencode/muse-spark-1.2-contributor-free",
+        model="opencode/muse-spark-1.3-contributor-free",
         prompt_file="stage-2.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -49,7 +49,7 @@ STAGES: tuple[StageSpec, ...] = (
     ),
     StageSpec(
         stage=3,
-        model="opencode/x-preview-f-free",
+        model="opencode/big-pickle",
         prompt_file="stage-3.md",
         timeout_ms=90 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -65,7 +65,8 @@ STAGES: tuple[StageSpec, ...] = (
     ),
     StageSpec(
         stage=5,
-        model="opencode/big-pickle",
+        # A different model family from stage 3's author, so the review is independent.
+        model="opencode/nemotron-3-ultra-free",
         prompt_file="stage-5.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -73,7 +74,7 @@ STAGES: tuple[StageSpec, ...] = (
     ),
     StageSpec(
         stage=6,
-        model="opencode/x-preview-f-free",
+        model="opencode/big-pickle",
         prompt_file="stage-6.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
