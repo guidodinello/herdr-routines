@@ -64,6 +64,15 @@ class GhClient(Protocol):
         callers must treat that as "unverifiable", not as "green"."""
         ...
 
+    def pr_review_comments(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[dict[str, object]]:
+        """Every inline review comment on the PR (REST ``pulls/{n}/comments``). Raises
+        ``RuntimeError`` when the query fails. Gate 5 needs this because the
+        ``code-review`` skill puts its ``[blocking]`` tags on inline comments, which
+        ``gh pr view --json comments,reviews`` never returns."""
+        ...
+
     def pr_create(
         self, *, owner: str, repo: str, branch: str, title: str, body: str
     ) -> int:
@@ -167,6 +176,37 @@ class RealGhClient:
             return json.loads(stdout)
         except json.JSONDecodeError:
             return {}
+
+    def pr_review_comments(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[dict[str, object]]:
+        """`--paginate --slurp` so a PR with more than one page of inline comments comes
+        back as one JSON array of per-page arrays, which is flattened here."""
+        exit_code, stdout, stderr = self._run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{owner}/{repo}/pulls/{number}/comments",
+            ]
+        )
+        if exit_code != 0:
+            raise RuntimeError(
+                f"gh api pulls/{number}/comments failed: {stderr.strip()}"
+            )
+        try:
+            pages = json.loads(stdout)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(pages, list):
+            return []
+        return [
+            c
+            for page in pages
+            for c in (page if isinstance(page, list) else [])
+            if isinstance(c, dict)
+        ]
 
     def pr_create(
         self, *, owner: str, repo: str, branch: str, title: str, body: str

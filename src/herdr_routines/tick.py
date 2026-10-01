@@ -52,10 +52,13 @@ from herdr_routines.history import (
     read_job,
 )
 from herdr_routines.pipeline_watchdog import (
+    default_heartbeat_dir,
     default_worktrees_root,
     find_inflight_runs,
     host_rebooted_after_state_write,
+    is_stalled,
     pipeline_state_json_path,
+    recorded_pipeline_deadlines,
     system_boot_epoch,
     validate_stage_sessions,
 )
@@ -1768,7 +1771,7 @@ def _process_pipeline_job(
 
     open_run = _open_pipeline_run(history_path, job.name)
     if open_run is not None:
-        if _pipeline_run_is_live(client, job):
+        if _pipeline_run_is_live(client, job, history_path, now=now):
             return f"{job.name}: skipped (already running)", False
 
         assert open_run.run_id is not None
@@ -2154,7 +2157,9 @@ def _live_agent_exists(client: HerdrClient, job: Job) -> bool:
     return status in LIVE_AGENT_STATUSES
 
 
-def _pipeline_run_is_live(client: HerdrClient, job: Job) -> bool:
+def _pipeline_run_is_live(
+    client: HerdrClient, job: Job, history_path: Path, *, now: datetime
+) -> bool:
     """Is a pipeline run still in flight — the pipeline's cross-process overlap guard.
 
     Two checks, either sufficient:
@@ -2162,7 +2167,9 @@ def _pipeline_run_is_live(client: HerdrClient, job: Job) -> bool:
     - a live `rt-<name>` agent, which is what this used to be and still is for any run
       that has not yet reached phase B's `pipeline-run`;
     - a `state.json` with no terminal report yet, enumerated by
-      `pipeline_watchdog.find_inflight_runs`.
+      `pipeline_watchdog.find_inflight_runs` and *not* stalled per
+      `pipeline_watchdog.is_stalled` (host rebooted since the last state write, or past
+      deadline + grace with a quiet heartbeat).
 
     The second is the load-bearing one now. Issue 056 removed the orchestrator agent, and
     that agent's name was what the old check looked up — so with no orchestrator there is
@@ -2172,12 +2179,31 @@ def _pipeline_run_is_live(client: HerdrClient, job: Job) -> bool:
     approximating: it is written by the run itself, from the start of the run, and so
     exists for the whole window the guard needs to cover.
 
+    The stalled filter is what stops this failing closed forever: a run hard-killed before
+    it could write its report (SIGKILL, OOM, reboot) leaves a `state.json` with no report,
+    and pipeline worktrees are never GC'd, so without it that directory would read as
+    in-flight on every later night. It reuses the watchdog's own staleness rule rather
+    than a second one, so "dead" means the same thing to both; the deadline comes from
+    tick's recorded history, as the watchdog's does, never from the model-written copy.
+
     Fails open on a HerdrCliError (unreachable server), matching `_live_agent_exists`:
     the history/flock check above remains the primary guard."""
     if _live_agent_exists(client, job):
         return True
     try:
-        in_flight = find_inflight_runs(default_worktrees_root(), default_reports_dir())
+        boot_epoch = system_boot_epoch()
+        heartbeat_dir = default_heartbeat_dir()
+        in_flight = [
+            run
+            for run in find_inflight_runs(
+                default_worktrees_root(),
+                default_reports_dir(),
+                recorded_pipeline_deadlines(history_path),
+            )
+            if not is_stalled(
+                run, now=now, heartbeat_dir=heartbeat_dir, boot_epoch=boot_epoch
+            )
+        ]
     except (OSError, HerdrCliError) as e:
         log.warning("%s: could not enumerate in-flight pipeline runs: %s", job.name, e)
         return False

@@ -265,6 +265,8 @@ class FakeGh:
             }
         ]
         self.threads: dict[str, Any] = {"data": {}}
+        # Set to make gate 5's inline-comment fetch fail the way an expired token does.
+        self.inline_comments_error: str | None = None
 
     def api_user(self) -> str:
         return "tester"
@@ -307,6 +309,13 @@ class FakeGh:
         self, *, owner: str, repo: str, sha: str
     ) -> list[dict[str, object]]:
         raise NotImplementedError
+
+    def pr_review_comments(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[dict[str, object]]:
+        if self.inline_comments_error is not None:
+            raise RuntimeError(self.inline_comments_error)
+        return []
 
 
 class PipelineFixture:
@@ -487,6 +496,24 @@ def test_pipeline_run_aborts_on_gate_failure(prepared: PipelineFixture) -> None:
     assert "gate 4" in report_text
     assert "auto/pipeline-some-other-run" in report_text
     assert client.notifications  # the human is told, not just the report
+
+
+def test_pipeline_run_turns_a_gh_error_in_a_gate_into_a_failed_report(
+    prepared: PipelineFixture,
+) -> None:
+    """`run_pipeline` never raises: a `RuntimeError` from gate 5's `gh` call (expired
+    token, rate limit) must become a failed outcome with the terminal report written,
+    not an escaped exception that leaves only the launcher's generic backstop stub."""
+    gh = FakeGh()
+    gh.inline_comments_error = "gh api pulls/42/comments failed: HTTP 401 (auth)"
+
+    outcome, _, _ = _run(prepared, gh=gh)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "gate_5_failed"
+    report_text = prepared.report.read_text()
+    assert "## Outcome: failed" in report_text
+    assert "HTTP 401" in report_text
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ from herdr_routines.pipeline_prepare import (
     _write_state_json,
     prepare_run,
     render_prepared_values,
+    write_terminal_report,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -901,3 +902,23 @@ def test_phase_b_and_c_filed_as_follow_on_issue_056() -> None:
         ISSUES_DIR / "052-pipeline-launches-with-no-feature-to-build.md"
     ).read_text()
     assert "status: done" in superseded
+
+
+def test_write_terminal_report_is_atomic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §8: a crash mid-write must not leave a torn report — tick would file it as
+    `interrupted_unknown`, and being non-empty it defeats the launcher's backstop. The
+    previous report survives and no tmp file is left behind."""
+    report = tmp_path / "report.md"
+    write_terminal_report(report, run_id="r", outcome="ok", lines=["first"])
+
+    def boom(src: object, dst: object) -> None:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError, match="disk gone"):
+        write_terminal_report(report, run_id="r", outcome="failed", lines=["second"])
+
+    assert "## Outcome: ok" in report.read_text()
+    assert [p.name for p in tmp_path.iterdir()] == ["report.md"]

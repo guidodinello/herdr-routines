@@ -923,15 +923,22 @@ def run_pipeline(
         except (OSError, ValueError, TypeError) as e:
             return finish("failed", "state_unreadable", error=str(e), stage=spec.stage)
 
-        verdict = _gate_for_stage(
-            spec,
-            state,
-            gh=gh_client,
-            owner=owner,
-            repo=repo,
-            spec_text=spec_text,
-            runner=run,
-        )
+        # A gate's `gh` call raises RuntimeError on any non-zero exit (expired token, rate
+        # limit, network). Gate 4 catches its own; gates 5/6 do not, and an escape here
+        # would break this function's never-raises contract and skip the terminal report
+        # (spec §8) — so an unreachable gate is a failed gate, with the error as reason.
+        try:
+            verdict = _gate_for_stage(
+                spec,
+                state,
+                gh=gh_client,
+                owner=owner,
+                repo=repo,
+                spec_text=spec_text,
+                runner=run,
+            )
+        except RuntimeError as e:
+            verdict = GateVerdict(passed=False, reason=f"gate could not run: {e}")
         if not verdict.passed:
             if pane_id is not None:
                 _close_pane(client, pane_id)
@@ -969,14 +976,19 @@ def run_pipeline(
             # Gate CI does not abort the run: a lint slip is exactly what stage 6 exists
             # to clean up, and the prompt is explicit that a CI failure rides into stage 6
             # as a must-fix item rather than ending the night.
-            ci = run_stage_gate(
-                "ci",
-                repo_path=state.worktree,
-                gh=gh_client,
-                owner=owner,
-                repo=repo,
-                pr=state.pr_number,
-            )
+            try:
+                ci = run_stage_gate(
+                    "ci",
+                    repo_path=state.worktree,
+                    gh=gh_client,
+                    owner=owner,
+                    repo=repo,
+                    pr=state.pr_number,
+                )
+            except RuntimeError as e:
+                # Same never-raises contract as the stage gate above; and since a CI
+                # failure is non-fatal anyway, an unreachable CI gate must not be fatal.
+                ci = GateVerdict(passed=False, reason=f"gate could not run: {e}")
             if not ci.passed:
                 log.warning("pipeline %s: Gate CI: %s", run_id, ci.reason)
 

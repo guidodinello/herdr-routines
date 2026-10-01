@@ -333,6 +333,12 @@ def write_state_json(path: Path, payload: dict[str, Any]) -> None:
     Public since issue 056: `pipeline_run` advances `state.json` after every stage, and
     the atomicity guarantee is the whole point of this function — a second copy of the
     tmp+rename dance in `pipeline_run` would be free to lose it."""
+    _atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """The tmp+rename shared by `write_state_json` and `write_terminal_report`, so the
+    two files tick reads cannot drift apart on atomicity."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
@@ -340,8 +346,7 @@ def write_state_json(path: Path, payload: dict[str, Any]) -> None:
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+            handle.write(text)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
@@ -374,8 +379,10 @@ def write_terminal_report(
         *lines,
         "",
     ]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(body))
+    # Atomic, like `write_state_json`: tick reconciles the run from this file, so a torn
+    # write would read as `outcome_marker_missing` / `interrupted_unknown` and, being
+    # non-empty, would also defeat the launcher's `[ ! -s "$REPORT" ]` backstop.
+    _atomic_write_text(path, "\n".join(body))
 
 
 # Pre-issue-056 private names, kept as aliases so the ~20 existing call sites and

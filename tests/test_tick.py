@@ -2056,6 +2056,61 @@ def test_tick_pipeline_overlap_guard_survives_without_orchestrator_agent(
     assert read_job(history_path, job.name)[-1].state == "running"
 
 
+def test_pipeline_guard_ignores_a_stalled_in_flight_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run hard-killed before it wrote its report leaves a `state.json` with no report
+    in a worktree nothing GCs. The overlap guard must not read that as in flight forever:
+    once the run is past deadline + grace with a quiet heartbeat (the watchdog's own
+    `is_stalled` rule), it stops blocking the pipeline."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(
+        "herdr_routines.tick.default_heartbeat_dir", lambda: tmp_path / "no-heartbeats"
+    )
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    (job.repo / ".git").mkdir(parents=True, exist_ok=True)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakePipelineClient()
+    monkeypatch.setattr(
+        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    t1 = t0 + timedelta(minutes=1)
+    run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+    running = next(r for r in read_job(history_path, job.name) if r.state == "running")
+    bare_run_id = str(running.run_id).removeprefix(f"{job.name}-")
+    state_path = (
+        tmp_path
+        / "home"
+        / ".herdr"
+        / "worktrees"
+        / "herdr-routines"
+        / f"auto-pipeline-{bare_run_id}"
+        / "state.json"
+    )
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "run_id": bare_run_id,
+                "current_stage": 3,
+                "deadline_epoch": int(t1.timestamp()) + 25_200,
+                "artifact_paths": {"report": str(tmp_path / "nope.md")},
+                "stage_sessions": {},
+            }
+        )
+    )
+
+    # A day later: far past any deadline, no heartbeat log, no report.
+    t2 = t1 + timedelta(days=1)
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries != ("nightly-pipeline: skipped (already running)",)
+
+
 # ---------------------------------------------------------------------------
 # Issue 036: worktree collision, dropped reason/error, agent-name builders
 # ---------------------------------------------------------------------------

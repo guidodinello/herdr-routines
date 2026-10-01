@@ -198,6 +198,11 @@ class FakeGh:
             raise RuntimeError(self.error)
         return list(self.checks)
 
+    def pr_review_comments(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[dict[str, object]]:
+        return []
+
     def api_user(self) -> str:
         return "testuser"
 

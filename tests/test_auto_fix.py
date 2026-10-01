@@ -109,6 +109,11 @@ class FakeGhClient:
             raise RuntimeError("gh api check-runs failed")
         return self.check_runs.get(sha, [])
 
+    def pr_review_comments(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[dict[str, object]]:
+        return []
+
 
 class FakeFullClient:
     """Enough of HerdrClient for run_tick to complete an auto-fix job end-to-end."""

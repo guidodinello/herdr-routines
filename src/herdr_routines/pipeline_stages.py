@@ -81,11 +81,3 @@ STAGES: tuple[StageSpec, ...] = (
         reuses_stage=3,
     ),
 )
-
-
-def expected_session_layout(*, current_stage: int) -> tuple[StageSpec, ...]:
-    """The subset of stage specs relevant to validating session layout."""
-    if current_stage < 1:
-        return ()
-    limit = min(current_stage, len(STAGES))
-    return STAGES[:limit]

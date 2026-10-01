@@ -528,9 +528,9 @@ def run_gate4(
 def _pr_bodies(view: Mapping[str, object]) -> list[str]:
     """Every comment and review body `gh pr view --json comments,reviews` returns.
 
-    Both surfaces, because gate 5 checks that the review *skill* ran: a reviewer that
-    posted its findings as a review leaves them in `reviews`, and one that commented
-    inline leaves them in `comments`."""
+    Conversation comments and review summaries only — NOT inline review comments, which
+    `gh pr view` omits entirely (its `reviews` rows for them have empty bodies). Those
+    are fetched separately in `run_gate5`."""
     bodies: list[str] = []
     for key in ("comments", "reviews"):
         entries = view.get(key)
@@ -557,6 +557,13 @@ def run_gate5(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
     criteria conflict."""
     view = gh.pr_view(owner=owner, repo=repo, number=pr)
     bodies = _pr_bodies(view)
+    # The `code-review` skill posts every finding as an inline comment prefixed
+    # `**[blocking]**`; its review-summary body carries no tier tag at all. Without this
+    # fetch the gate fails on every PR that skill reviewed (verified on PR #137).
+    for comment in gh.pr_review_comments(owner=owner, repo=repo, number=pr):
+        body = comment.get("body")
+        if isinstance(body, str):
+            bodies.append(body)
     if not bodies:
         return GateVerdict(
             passed=False,

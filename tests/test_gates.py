@@ -41,7 +41,9 @@ class FakeGhClient:
         pr_views: list[dict[str, object]] | None = None,
         review_threads: dict[str, object] | None = None,
         check_runs: list[dict[str, object]] | None = None,
+        inline_comments: list[dict[str, object]] | None = None,
     ) -> None:
+        self._inline_comments = list(inline_comments or [])
         self._pr_views = list(pr_views or [])
         self._review_threads = review_threads or {"data": {}}
         self._check_runs = list(check_runs or [])
@@ -79,6 +81,11 @@ class FakeGhClient:
     ) -> list[dict[str, object]]:
         self.check_runs_calls.append(sha)
         return list(self._check_runs)
+
+    def pr_review_comments(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[dict[str, object]]:
+        return list(self._inline_comments)
 
 
 def _fake_runner(exit_codes: dict[str, int]):
@@ -468,6 +475,17 @@ def test_gate5_rejects_nonblocking_only_review() -> None:
         run_gate5(FakeGhClient(pr_views=[{}]), owner="o", repo="r", pr=7).passed
         is False
     )
+
+
+def test_gate5_reads_blocking_labels_from_inline_review_comments() -> None:
+    """The `code-review` skill posts findings as inline comments (`**[blocking]**`) and
+    a summary review body with no tier tag; `gh pr view --json comments,reviews` carries
+    neither the inline bodies nor a tagged review, so the gate must fetch them itself."""
+    gh = FakeGhClient(
+        pr_views=[{"reviews": [{"body": "Found 1 blocking issue(s)."}, {"body": ""}]}],
+        inline_comments=[{"body": "**[blocking]** this is wrong"}],
+    )
+    assert run_gate5(gh, owner="o", repo="r", pr=7).passed is True
 
 
 def test_gate5_is_not_a_cli_stage() -> None:

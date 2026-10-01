@@ -161,19 +161,22 @@ def validate_stage_sessions(
     current_stage = raw_state.get("current_stage")
     if isinstance(current_stage, int) and not isinstance(current_stage, bool):
         reached = min(current_stage, len(expected))
-        # Count the stages in the reached prefix that must have their own id — stages with
-        # no model record none, and a reused stage's id is counted once against its owner.
-        required = len(
-            {
-                spec.reuses_stage if spec.reuses_stage is not None else spec.stage
-                for spec in expected[:reached]
-                if spec.model is not None
-            }
-        )
-        if len(values) < required:
+        # Every independent stage that ran an agent must have recorded *its own* id,
+        # keyed by its stage number. A count would let a key that maps to no stage pad
+        # over a stage that recorded nothing. Stage 4 (no model) records none, and a
+        # reused stage shares its owner's id, so neither is required to have a key.
+        missing = [
+            spec.stage
+            for spec in expected[:reached]
+            if spec.model is not None
+            and spec.reuses_stage is None
+            and str(spec.stage) not in sessions
+        ]
+        if missing:
             return (
-                f"stage_sessions records {len(values)} session(s) but the run reached "
-                f"stage {current_stage} — {required - len(values)} stage(s) unverified"
+                f"stage_sessions has no session for stage(s) "
+                f"{', '.join(map(str, missing))} but the run reached stage "
+                f"{current_stage} — {len(missing)} stage(s) unverified"
             )
     return None
 
