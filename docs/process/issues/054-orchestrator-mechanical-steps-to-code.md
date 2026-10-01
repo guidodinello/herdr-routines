@@ -4,7 +4,7 @@ title: "move the orchestrator's mechanical steps into code; agents keep only the
 status: done
 priority: high
 area: pipeline
-gate: phases B and C (the stage loop and stage 4 in code) are tracked in issue 055
+gate: phases B and C (the stage loop and stage 4 in code) are tracked in issue 056
 ---
 
 ## Description
@@ -145,7 +145,7 @@ the same function. No agent is needed for stage 4.
 
 - **2026-09-30:** phase A shipped as `herdr-routines pipeline-prepare` (see
   `src/herdr_routines/pipeline_prepare.py` and `docs/pipeline/runs/20260930T050000Z`),
-  which also closes 052. Phases B and C were filed as issue 055, which now carries
+  which also closes 052. Phases B and C were filed as issue 056, which now carries
   acceptance criteria 4–9; this issue is `done` for phase A.
 - **2026-09-29:** filed after the 09-28 run, where the fallback model computed
   `deadline_epoch` a year off and the watchdog reaped a live run. The deadline was

@@ -863,15 +863,15 @@ def test_pipeline_prepare_never_raises_on_an_unwritable_report_path(
 # --- AC 14: the follow-on issue exists before 054 is closed ------------------------------
 
 
-def test_phase_b_and_c_filed_as_follow_on_issue_055() -> None:
+def test_phase_b_and_c_filed_as_follow_on_issue_056() -> None:
     """Acceptance criterion 14, as a doc contract: flipping 054 to `done` without filing
     the remaining phases would retire them from the backlog with only a `gate:` line
     nobody reads, leaving the feature 1/3 shipped and looking complete."""
-    follow_on = ISSUES_DIR / "055-orchestrator-stage-loop-in-code.md"
-    assert follow_on.exists(), "issue 055 (phases B and C) must exist"
+    follow_on = ISSUES_DIR / "056-orchestrator-stage-loop-in-code.md"
+    assert follow_on.exists(), "issue 056 (phases B and C) must exist"
     follow_on_text = follow_on.read_text()
     assert "status: open" in follow_on_text
-    # 055 carries the phase B and C criteria (and their test names) from 054.
+    # 056 carries the phase B and C criteria (and their test names) from 054.
     for test_name in (
         "test_pipeline_run_records_real_stage_sessions",
         "test_pipeline_run_aborts_on_gate_failure",
@@ -880,12 +880,12 @@ def test_phase_b_and_c_filed_as_follow_on_issue_055() -> None:
         "test_pipeline_run_quota_marker_fast_fails",
         "test_pipeline_stage4_opens_pr_without_agent",
     ):
-        assert test_name in follow_on_text, f"055 lost acceptance test {test_name}"
+        assert test_name in follow_on_text, f"056 lost acceptance test {test_name}"
     assert "pipeline-run" in follow_on_text
 
     picked = (ISSUES_DIR / "054-orchestrator-mechanical-steps-to-code.md").read_text()
     assert "status: done" in picked
-    assert "gate:" in picked and "055" in picked.split("gate:", 1)[1].splitlines()[0]
+    assert "gate:" in picked and "056" in picked.split("gate:", 1)[1].splitlines()[0]
 
     superseded = (
         ISSUES_DIR / "052-pipeline-launches-with-no-feature-to-build.md"
