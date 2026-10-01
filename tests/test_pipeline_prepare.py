@@ -19,7 +19,7 @@ from typing import Any, TypedDict, cast
 
 import pytest
 
-from herdr_routines import cli
+from herdr_routines import cli, pipeline_prepare
 from herdr_routines.claims import load_claims
 from herdr_routines.herdr import HerdrClient, HerdrCliError, WorktreeInfo
 from herdr_routines.pipeline_prepare import (
@@ -237,12 +237,19 @@ class _PrepareKwargs(TypedDict):
     claims_path: Path
     worktrees_root: Path
     reports_dir: Path
-    available_models: Callable[[], set[str]]
+    available_models: Callable[[], set[str]] | None
 
 
 def _all_stage_models() -> set[str]:
     """An `opencode models` listing that offers every stage model."""
     return {spec.model for spec in STAGES if spec.model is not None}
+
+
+@pytest.fixture(autouse=True)
+def _stub_opencode_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The CLI-level tests reach the default lister; CI has no `opencode` binary, and a
+    # dev box's real catalogue must not decide a test either.
+    monkeypatch.setattr(pipeline_prepare, "opencode_models", _all_stage_models)
 
 
 def _prepare_kwargs(

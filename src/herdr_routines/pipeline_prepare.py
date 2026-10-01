@@ -111,7 +111,7 @@ def prepare_run(
     worktrees_root: Path | None = None,
     reports_dir: Path | None = None,
     now: datetime | None = None,
-    available_models: Callable[[], set[str]] = opencode_models,
+    available_models: Callable[[], set[str]] | None = None,
 ) -> PrepareResult:
     """Sync, pick, create the worktree+workspace, write `state.json`. Never raises: a
     failure is a `PrepareResult` plus a terminal report at `report`, which is the file
@@ -201,7 +201,8 @@ def prepare_run(
     # free quota is gone is the stage loop's quota fast-fail to catch.
     stage_models = sorted({spec.model for spec in STAGES if spec.model is not None})
     try:
-        listed = available_models()
+        # Looked up at call time (not bound as the default) so tests can stub it.
+        listed = (available_models or opencode_models)()
     except RuntimeError as e:
         log.error("pipeline-prepare: could not list opencode models: %s", e)
         return _failed("prepare_failed", "failed (stage_models_unverifiable)", str(e))
