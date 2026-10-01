@@ -49,6 +49,12 @@ Verify: `git -C <repo> commit --allow-empty -m test -S && git log --show-signatu
 (GitHub-side verification is what matters; local display may need
 `gpg.ssh.allowedSignersFile` and can be ignored.)
 
+Config alone cannot stop an agent from committing unsigned (`git -c
+commit.gpgsign=false commit` overrides it — PR #140), so after every worktree-job run
+`runner.execute_run` re-signs any unsigned commits on the pushed branch with this key
+and force-pushes (`signing.resign_unsigned_branch`; recorded as `resigned_commits` in
+history). It is a no-op in a clone without `commit.gpgsign=true`.
+
 ## 3. Install tools the gates use (per host)
 
 Gate commands use `rg` (ripgrep), `jq`, `gh` (authed), `git`, and the repo's test
