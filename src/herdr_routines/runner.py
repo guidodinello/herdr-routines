@@ -22,6 +22,7 @@ from herdr_routines.herdr import (
     build_agent_start_args,
 )
 from herdr_routines.repos import ensure_repo
+from herdr_routines.signing import ResignError, resign_unsigned_branch
 
 log = logging.getLogger(__name__)
 
@@ -454,6 +455,9 @@ class RunOutcome:
     duration_seconds: float | None = None
     session_id: str | None = None
     nudged: bool = False  # issue 032: a no_report settle got one follow-up prompt
+    resigned_commits: int = (
+        0  # unsigned commits on the pushed branch, re-signed after run
+    )
     diagnosis: dict[str, str | bool] | None = None  # issue 027: /tmp disk diagnosis
     reaped_stale_agent: bool = (
         False  # issue 051: force-closed a prior run's blocked agent
@@ -881,6 +885,18 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         session_id = _capture_session_id(client, job.agent_name)
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)
 
+    # An agent can push unsigned commits however the clone is configured (`git -c
+    # commit.gpgsign=false` overrides it — PR #140), and the rulesets then block the merge.
+    # Re-sign in code after the agent is done; best-effort, never fails the run.
+    resigned_commits = 0
+    if branch is not None:
+        try:
+            resigned_commits = resign_unsigned_branch(
+                job.repo, branch=branch, base=job.base
+            )
+        except (ResignError, OSError, subprocess.TimeoutExpired) as e:
+            log.warning("%s: could not re-sign %s: %s", job.name, branch, e)
+
     if not report_written or report_bytes == 0:
         # Direct response to the research repo's standing pattern that unattended scheduled
         # runs fail silently and plausibly (docs/plan-v1.md §6): a clean settle with no report,
@@ -890,7 +906,14 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             reason="no_report",
             session_id=session_id,
             nudged=nudged,
+            resigned_commits=resigned_commits,
             **common,
         )
 
-    return RunOutcome(state="done", session_id=session_id, nudged=nudged, **common)
+    return RunOutcome(
+        state="done",
+        session_id=session_id,
+        nudged=nudged,
+        resigned_commits=resigned_commits,
+        **common,
+    )

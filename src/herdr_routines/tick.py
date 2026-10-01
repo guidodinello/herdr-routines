@@ -1263,6 +1263,8 @@ def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
         extra["error"] = outcome.error
     if outcome.nudged:
         extra["nudged"] = True
+    if outcome.resigned_commits:
+        extra["resigned_commits"] = outcome.resigned_commits
     if outcome.reaped_stale_agent:
         extra["reaped_stale_agent"] = True
     return extra
