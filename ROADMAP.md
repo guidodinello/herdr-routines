@@ -217,7 +217,8 @@ files 2026-08-27.
   diffs against last report → spawn a fix worker only for new/regressed
   findings. Maps onto issue 025's gate model ("all checks pass → free"). Its
   prerequisite, the 025 design, merged in PR #56, so this is ready to refine.
-  2026-08-30 brainstorm.
+  2026-08-30 brainstorm. →
+  [`057`](docs/process/issues/057-audit-skills-as-report-diff-gate-jobs.md)
 - **Release/update strategy for herdr-routines + plugins** — `done` for the
   runner: it fast-forwards itself to CI-green `main` nightly (self-update
   timer, [`053`](docs/process/issues/053-runner-checkout-self-update.md)),
