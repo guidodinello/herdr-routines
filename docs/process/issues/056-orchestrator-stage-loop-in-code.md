@@ -1,7 +1,7 @@
 ---
 id: "056"
 title: "orchestrator stage loop and PR stage in code (issue 054 phases B and C)"
-status: open
+status: done
 priority: high
 area: pipeline
 gate: phase A (issue 054) shipped and ran a full overnight; phase B and C can then be split into their own PRs
