@@ -13,7 +13,12 @@ from pathlib import Path
 
 import pytest
 
-from herdr_routines.signing import ResignError, is_signed, resign_unsigned_branch
+from herdr_routines.signing import (
+    ResignError,
+    is_signed,
+    resign_local_commits,
+    resign_unsigned_branch,
+)
 
 pytestmark = pytest.mark.skipif(
     shutil.which("ssh-keygen") is None, reason="needs ssh-keygen for an SSH signing key"
@@ -121,3 +126,45 @@ def test_branch_with_merge_commit_is_not_rewritten(clone: Path) -> None:
     with pytest.raises(ResignError, match="merge commits"):
         resign_unsigned_branch(clone, branch=BRANCH, base="main")
     assert _origin_commits(clone) == before
+
+
+# --- resign_local_commits: the pipeline's stage 4, before its first push ---------------
+
+
+def _unpushed_branch(clone: Path, name: str) -> None:
+    """A fresh local branch off origin/main with one unsigned commit, never pushed."""
+    _git(clone, "switch", "--quiet", "-c", name, "origin/main")
+    (clone / "local").write_text("local\n")
+    _git(clone, "add", "local")
+    _git(clone, "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "local")
+
+
+def test_local_commits_are_resigned_in_place(clone: Path) -> None:
+    _unpushed_branch(clone, "auto/pipeline-x")
+    tree_before = _git(clone, "rev-parse", "HEAD^{tree}")
+    assert not is_signed(clone, "HEAD")
+
+    assert resign_local_commits(clone, base="main") == 1
+
+    assert is_signed(clone, "HEAD")
+    assert _git(clone, "rev-parse", "HEAD^{tree}") == tree_before
+    assert _git(clone, "branch", "--show-current") == "auto/pipeline-x"
+    assert _git(clone, "rev-list", "--count", "origin/main..HEAD") == "1"
+
+
+def test_local_resign_refuses_a_dirty_worktree(clone: Path) -> None:
+    _unpushed_branch(clone, "auto/pipeline-x")
+    head = _git(clone, "rev-parse", "HEAD")
+    (clone / "local").write_text("edited, not committed\n")
+
+    with pytest.raises(ResignError, match="uncommitted changes"):
+        resign_local_commits(clone, base="main")
+    assert _git(clone, "rev-parse", "HEAD") == head
+
+
+def test_local_resign_without_signing_config_is_a_noop(clone: Path) -> None:
+    _unpushed_branch(clone, "auto/pipeline-x")
+    _git(clone, "config", "--unset", "commit.gpgsign")
+
+    assert resign_local_commits(clone, base="main") == 0
+    assert not is_signed(clone, "HEAD")

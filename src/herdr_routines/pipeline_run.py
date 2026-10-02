@@ -58,6 +58,11 @@ from herdr_routines.pipeline_watchdog import (
     validate_stage_sessions,
 )
 from herdr_routines.runner import SUCCESS_AGENT_STATUSES
+from herdr_routines.signing import (
+    ResignError,
+    resign_local_commits,
+    resign_unsigned_branch,
+)
 from herdr_routines.wait_loop import prompt_with_watchdog
 
 log = get_logger(__name__)
@@ -87,6 +92,10 @@ _REPORT_OUTCOME: dict[tuple[Outcome, str | None], str] = {
 # How long a git/gh command may take inside a stage. Long enough for a push of a real
 # branch, short enough that the deadline check still runs on a human timescale.
 GIT_TIMEOUT_S = 300.0
+
+# The branch every pipeline run is cut from (pipeline_prepare's default base) — needed
+# here only to know which commits are the run's own when re-signing them.
+PIPELINE_BASE = "main"
 
 
 class _Abort(Exception):
@@ -527,7 +536,16 @@ def _open_pr(
 
     Push before create, always: `gh pr create` refuses a branch that is not on the remote,
     and the failure mode of doing it the other way round is a PR that silently does not
-    exist."""
+    exist.
+
+    Re-signs the stage agents' commits first: no clone config can stop an agent running
+    `git -c commit.gpgsign=false commit` (PR #140), and the ruleset blocks an unsigned PR
+    at merge. Nothing is on origin yet, so this needs no force-push. Best-effort — an
+    unsigned push still leaves a PR for stage 5 to review."""
+    try:
+        resign_local_commits(state.worktree, base=PIPELINE_BASE)
+    except (ResignError, OSError, subprocess.TimeoutExpired) as e:
+        log.warning("pipeline %s: could not re-sign before push: %s", state.run_id, e)
     code, _stdout, stderr = runner(
         ["git", "-C", str(state.worktree), "push", "-u", "origin", state.branch],
         timeout_s=GIT_TIMEOUT_S,
@@ -992,4 +1010,16 @@ def run_pipeline(
             if not ci.passed:
                 log.warning("pipeline %s: Gate CI: %s", run_id, ci.reason)
 
-    return finish("ok", None, lines=["all stages green"])
+    # Stage 6's agent commits and pushes its own fixes, after stage 4's local re-sign —
+    # so check origin once more, now that no stage will write to the branch again.
+    lines = ["all stages green"]
+    try:
+        resigned = resign_unsigned_branch(
+            state.worktree, branch=state.branch, base=PIPELINE_BASE
+        )
+    except (ResignError, OSError, subprocess.TimeoutExpired) as e:
+        log.warning("pipeline %s: could not re-sign %s: %s", run_id, state.branch, e)
+    else:
+        if resigned:
+            lines.append(f"re-signed {resigned} unsigned commit(s) on {state.branch}")
+    return finish("ok", None, lines=lines)

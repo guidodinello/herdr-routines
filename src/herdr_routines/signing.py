@@ -54,6 +54,56 @@ def is_signed(repo: Path, sha: str) -> bool:
     return any(line.startswith("gpgsig") for line in header.splitlines())
 
 
+def _signing_configured(repo: Path) -> bool:
+    return _git(repo, "config", "--get", "commit.gpgsign").stdout.strip() == "true"
+
+
+def _unsigned_commits(repo: Path, base_ref: str, tip: str, *, label: str) -> list[str]:
+    """The unsigned commits in ``base_ref..tip``. Raises ``ResignError`` if there are some
+    and the range also holds merge commits: replaying a merge would flatten it, so such a
+    branch is reported rather than rewritten."""
+    shas = _git_ok(repo, "rev-list", f"{base_ref}..{tip}").split()
+    unsigned = [sha for sha in shas if not is_signed(repo, sha)]
+    if unsigned and _git_ok(repo, "rev-list", "--merges", f"{base_ref}..{tip}").strip():
+        raise ResignError(
+            f"{label} has {len(unsigned)} unsigned commit(s) but contains merge "
+            "commits; not rewriting it"
+        )
+    return unsigned
+
+
+def resign_local_commits(worktree: Path, *, base: str) -> int:
+    """Re-sign, in place, every unsigned commit on the branch checked out at ``worktree``
+    since ``origin/<base>``. Returns how many were unsigned (0 = nothing done).
+
+    For a branch that is not on origin yet — the pipeline's stage 4 calls this just before
+    its push, so the rewrite needs no force-push and the worktree stays the source of
+    truth for the stages after it. Same no-op and merge-commit rules as
+    ``resign_unsigned_branch``; refuses a worktree with uncommitted changes, which a
+    rebase would not run over. Raises ``ResignError`` if a git step fails."""
+    if not _signing_configured(worktree):
+        return 0
+    remote_base = f"refs/remotes/origin/{base}"
+    _git_ok(worktree, "fetch", "--quiet", "origin", f"+refs/heads/{base}:{remote_base}")
+    unsigned = _unsigned_commits(worktree, remote_base, "HEAD", label=str(worktree))
+    if not unsigned:
+        return 0
+    # Tracked changes only: state.json lives untracked in the pipeline worktree.
+    if _git_ok(worktree, "status", "--porcelain", "--untracked-files=no").strip():
+        raise ResignError(
+            f"{worktree} has {len(unsigned)} unsigned commit(s) and uncommitted "
+            "changes; not rewriting it"
+        )
+    merge_base = _git_ok(worktree, "merge-base", remote_base, "HEAD").strip()
+    _git_ok(worktree, "rebase", "--quiet", "--force-rebase", "-S", merge_base)
+    log.warning(
+        "re-sign: %s had %d unsigned commit(s); re-signed locally",
+        worktree,
+        len(unsigned),
+    )
+    return len(unsigned)
+
+
 def resign_unsigned_branch(repo: Path, *, branch: str, base: str) -> int:
     """Re-sign every unsigned commit on ``origin/<branch>`` since ``origin/<base>`` and
     force-push the result. Returns how many commits were unsigned (0 = nothing done).
@@ -65,7 +115,7 @@ def resign_unsigned_branch(repo: Path, *, branch: str, base: str) -> int:
     is leased on the tip just inspected, so a concurrent push wins over this rewrite.
 
     Raises ``ResignError`` if a git step fails."""
-    if _git(repo, "config", "--get", "commit.gpgsign").stdout.strip() != "true":
+    if not _signing_configured(repo):
         return 0
     remote_branch = f"refs/remotes/origin/{branch}"
     remote_base = f"refs/remotes/origin/{base}"
@@ -83,15 +133,9 @@ def resign_unsigned_branch(repo: Path, *, branch: str, base: str) -> int:
         return 0
 
     tip = _git_ok(repo, "rev-parse", remote_branch).strip()
-    shas = _git_ok(repo, "rev-list", f"{remote_base}..{tip}").split()
-    unsigned = [sha for sha in shas if not is_signed(repo, sha)]
+    unsigned = _unsigned_commits(repo, remote_base, tip, label=branch)
     if not unsigned:
         return 0
-    if _git_ok(repo, "rev-list", "--merges", f"{remote_base}..{tip}").strip():
-        raise ResignError(
-            f"{branch} has {len(unsigned)} unsigned commit(s) but contains merge "
-            "commits; not rewriting it"
-        )
 
     merge_base = _git_ok(repo, "merge-base", remote_base, tip).strip()
     # A detached throwaway worktree: the run's own worktree still has `branch` checked
