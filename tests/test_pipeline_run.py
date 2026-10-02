@@ -104,7 +104,10 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 def _init_bare_git_repo(path: Path) -> None:
     subprocess.run(
-        ["git", "init", "--bare", str(path)], capture_output=True, text=True, check=True
+        ["git", "init", "--bare", "--initial-branch=main", str(path)],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     tmp = path.parent / f".bare-init-{path.name}"
     subprocess.run(
@@ -812,3 +815,44 @@ def test_pipeline_run_preserves_preflight_state_keys(prepared: PipelineFixture) 
     _run(prepared, client=_client(polls_per_stage=2))
     reread = json.loads(prepared.state_json.read_text())
     assert reread["unrelated_future_key"] == {"kept": True}
+
+
+# ---------------------------------------------------------------------------
+# Re-signing: an agent's `git -c commit.gpgsign=false` commit must not reach the PR
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+def test_pipeline_pushes_signed_commits_when_the_clone_signs(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixture's stage commits are unsigned, like PR #140's. With the clone set up
+    per docs/pipeline/setup.md, what reaches origin must be signed."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    key = prepared.tmp_path / "signing"
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True
+    )
+    for k, v in {
+        "gpg.format": "ssh",
+        "user.signingkey": f"{key}.pub",
+        "commit.gpgsign": "true",
+    }.items():
+        _git(prepared.worktree, "config", k, v)
+
+    outcome, _client, _gh = _run(prepared)
+
+    assert outcome.outcome == "ok", outcome
+    _git(prepared.worktree, "fetch", "--quiet", "origin")
+    pushed = _git(
+        prepared.worktree, "rev-list", f"origin/main..origin/{BRANCH}"
+    ).stdout.split()
+    assert pushed
+    for sha in pushed:
+        header = _git(prepared.worktree, "cat-file", "commit", sha).stdout.split(
+            "\n\n"
+        )[0]
+        assert "\ngpgsig" in header, f"{sha} reached origin unsigned"
+    # Signed before the first push (stage 4), not repaired by force-push at the end:
+    # the end-of-run check found nothing left to do.
+    assert "re-signed" not in prepared.report.read_text()
