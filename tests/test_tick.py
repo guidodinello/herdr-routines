@@ -30,7 +30,9 @@ from herdr_routines.history import (
 )
 from herdr_routines.tick import (
     _classify_pipeline_outcome,
+    _is_job_agent,
     _live_agent_exists,
+    _reap_agents_of_rebooted_run,
     run_tick,
 )
 
@@ -2952,3 +2954,93 @@ def test_pipeline_skip_reason_does_not_reopen_a_retry() -> None:
         "failed",
         "quota_exhausted",
     )
+
+
+# -- reaping a dead run's agents that herdr restored after a reboot (2026-10-01) ---------
+
+
+class FakeReapClient:
+    def __init__(self, agents: dict[str, tuple[str, str]]) -> None:
+        self.agents = agents
+        self.closed: list[str] = []
+
+    def agent_panes_by_status(self) -> dict[str, tuple[str, str]]:
+        return self.agents
+
+    def pane_close(self, pane_id: str) -> None:
+        self.closed.append(pane_id)
+
+
+BOOT = datetime(2026, 10, 1, 7, 8, 11, tzinfo=UTC)
+RESTORED = {
+    "rt-babysit-prs": ("blocked", "w1:p1"),
+    "rt-babysit-prs-pr141-7bab327ef94": ("blocked", "w2G:pF"),
+    "rt-babysit-prs-gate-0a1b2c3d": ("blocked", "w3:p1"),
+    "rt-babysit-prs-nightly": ("blocked", "w4:p1"),  # a different job
+    "pl-1-20261001t050000z": ("blocked", "w6E:p1"),  # the watchdog's, not tick's
+}
+
+
+def _stale(ts: datetime) -> HistoryRecord:
+    return HistoryRecord(
+        ts=ts, job="babysit-prs", state="running", run_id="babysit-prs-20261001T070000Z"
+    )
+
+
+def test_is_job_agent_matches_own_and_worker_names_only(tmp_path: Path) -> None:
+    job = make_job(tmp_path, name="babysit-prs", workspace="worktree")
+    assert _is_job_agent("rt-babysit-prs", job)
+    assert _is_job_agent("rt-babysit-prs-pr141-7bab327ef94", job)
+    assert _is_job_agent("rt-babysit-prs-pr7", job)
+    assert _is_job_agent("rt-babysit-prs-gate-0a1b2c3d", job)
+    assert not _is_job_agent("rt-babysit-prs-nightly", job)
+    assert not _is_job_agent("rt-babysit", job)
+    assert not _is_job_agent("pl-1-20261001t050000z", job)
+
+
+def test_reap_closes_a_pre_boot_runs_agents(tmp_path: Path) -> None:
+    job = make_job(tmp_path, name="babysit-prs", workspace="worktree")
+    client = FakeReapClient(RESTORED)
+
+    reaped = _reap_agents_of_rebooted_run(
+        client,  # type: ignore[arg-type]
+        job,
+        _stale(BOOT - timedelta(minutes=7)),
+        boot_epoch=BOOT.timestamp(),
+    )
+
+    assert reaped == [
+        "rt-babysit-prs",
+        "rt-babysit-prs-gate-0a1b2c3d",
+        "rt-babysit-prs-pr141-7bab327ef94",
+    ]
+    assert sorted(client.closed) == ["w1:p1", "w2G:pF", "w3:p1"]
+
+
+@pytest.mark.parametrize(
+    ("workspace", "started", "boot_epoch"),
+    [
+        # Started after the boot: the host did not reboot under it — a blocked agent
+        # may be a human's to inspect.
+        ("worktree", BOOT + timedelta(minutes=5), BOOT.timestamp()),
+        # Boot time unreadable: can't tell, so don't touch anything.
+        ("worktree", BOOT - timedelta(minutes=7), None),
+        # Root mode: the pane is the ambient workspace.
+        ("root", BOOT - timedelta(minutes=7), BOOT.timestamp()),
+    ],
+)
+def test_reap_leaves_agents_alone_unless_the_host_rebooted_under_the_run(
+    tmp_path: Path, workspace: str, started: datetime, boot_epoch: float | None
+) -> None:
+    job = make_job(tmp_path, name="babysit-prs", workspace=workspace)
+    client = FakeReapClient(RESTORED)
+
+    reaped = _reap_agents_of_rebooted_run(
+        client,  # type: ignore[arg-type]
+        job,
+        _stale(started),
+        boot_epoch=boot_epoch,
+    )
+
+    assert reaped == []
+    assert client.closed == []

@@ -186,6 +186,12 @@ def _process_gated_job(
         history_path, job.name, timeout_ms=job.timeout_ms, now=now
     )
     if stale is not None:
+        stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
+        reaped = _reap_agents_of_rebooted_run(
+            client, job, stale, boot_epoch=system_boot_epoch()
+        )
+        if reaped:
+            stale_extra["reaped_agents"] = reaped
         append(
             history_path,
             HistoryRecord(
@@ -193,7 +199,7 @@ def _process_gated_job(
                 job=job.name,
                 state="interrupted_unknown",
                 run_id=stale.run_id,
-                extra={"reason": "stale_running_record"},
+                extra=stale_extra,
             ),
         )
 
@@ -1307,6 +1313,12 @@ def _process_job(
         history_path, job.name, timeout_ms=job.timeout_ms, now=now
     )
     if stale is not None:
+        stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
+        reaped = _reap_agents_of_rebooted_run(
+            client, job, stale, boot_epoch=system_boot_epoch()
+        )
+        if reaped:
+            stale_extra["reaped_agents"] = reaped
         append(
             history_path,
             HistoryRecord(
@@ -1314,7 +1326,7 @@ def _process_job(
                 job=job.name,
                 state="interrupted_unknown",
                 run_id=stale.run_id,
-                extra={"reason": "stale_running_record"},
+                extra=stale_extra,
             ),
         )
 
@@ -2139,6 +2151,66 @@ def _notify_gate(job: Job, kind: str) -> bool:
     if job.notify_policy == "on-finding":
         return kind in ("failure", "finding")
     return kind == "failure"  # "on-failure"
+
+
+# What follows `rt-<job>` in a worker agent name: auto_fix's `build_worker_agent_name`
+# (`-pr<n>` or `-pr<n>-<tail>`) and `build_gate_worker_agent_name` (`-gate-<hash>`).
+_WORKER_NAME_SUFFIX_RE = re.compile(r"-pr\d+(?:-[0-9a-z]+)?|-gate-[0-9a-f]+")
+
+
+def _is_job_agent(name: str, job: Job) -> bool:
+    """`name` is this job's own agent or one of the per-PR / gate workers it spawned.
+    Anchored on the worker suffix shapes, so job `babysit-prs` never claims an agent of a
+    job named `babysit-prs-nightly`. Lowercased because herdr lowercases agent names."""
+    name, agent = name.lower(), job.agent_name.lower()
+    if name == agent:
+        return True
+    return name.startswith(agent) and bool(
+        _WORKER_NAME_SUFFIX_RE.fullmatch(name.removeprefix(agent))
+    )
+
+
+def _reap_agents_of_rebooted_run(
+    client: HerdrClient, job: Job, stale: HistoryRecord, *, boot_epoch: float | None
+) -> list[str]:
+    """Close the agents a run left behind when the host rebooted under it; return their
+    names. herdr restores every pane's agent at boot, reporting `blocked`, so a run whose
+    tick died with the host comes back as opencode processes nobody will ever prompt
+    again — ~550 MB each, pinning 2.2 GB of the Pi's 4 GB on 2026-10-01. Per-PR worker
+    names carry the run id, so the reap-on-name-collision path never sees them.
+
+    Only for a run that started before the current boot: a stale run on a host that did
+    not reboot may have a blocked agent a human is meant to inspect. Never for a root-mode
+    job, whose pane is the ambient workspace. Best-effort: herdr errors are logged."""
+    if job.workspace == "root" or boot_epoch is None:
+        return []
+    if stale.ts.timestamp() >= boot_epoch:
+        return []
+    try:
+        agents = client.agent_panes_by_status()
+    except HerdrCliError as e:
+        log.warning("%s: could not list agents to reap: %s", job.name, e)
+        return []
+    reaped: list[str] = []
+    for name, (_status, pane_id) in sorted(agents.items()):
+        if not _is_job_agent(name, job):
+            continue
+        try:
+            client.pane_close(pane_id)
+        except HerdrCliError as e:
+            log.warning(
+                "%s: could not close pane %s of %s: %s", job.name, pane_id, name, e
+            )
+            continue
+        reaped.append(name)
+    if reaped:
+        log.warning(
+            "%s: run %s predates the last boot; closed its restored agents %s",
+            job.name,
+            stale.run_id,
+            reaped,
+        )
+    return reaped
 
 
 def _live_agent_exists(client: HerdrClient, job: Job) -> bool:

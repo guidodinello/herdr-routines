@@ -688,6 +688,43 @@ def test_live_pipeline_agent_panes_excludes_settled_agent() -> None:
     assert client.live_pipeline_agent_panes(run_id) == {}
 
 
+def test_pipeline_agent_panes_includes_blocked_but_not_other_runs_or_rt() -> None:
+    """The post-reboot sweep: a herdr-restored agent reports `blocked`, and must be
+    found; another run's pl- agent and a routine rt- agent must not."""
+    run_id = "20261001T050000Z"
+    body = {
+        "result": {
+            "agents": [
+                {
+                    "name": f"pl-1-{run_id}".lower(),
+                    "agent_status": "blocked",
+                    "pane_id": "w6E:p1",
+                },
+                {
+                    "name": f"pl-5-{run_id}".lower(),
+                    "agent_status": "working",
+                    "pane_id": "w6E:p4",
+                },
+                {
+                    "name": "pl-1-20260930t050000z",
+                    "agent_status": "blocked",
+                    "pane_id": "w5:p1",
+                },
+                {
+                    "name": "rt-babysit-prs-pr141-7bab327ef94",
+                    "agent_status": "blocked",
+                    "pane_id": "w2G:pF",
+                },
+            ]
+        }
+    }
+    client = HerdrClient(runner=FakeRunner([ok(body)]))
+    assert client.pipeline_agent_panes(run_id) == {
+        f"pl-1-{run_id}".lower(): "w6E:p1",
+        f"pl-5-{run_id}".lower(): "w6E:p4",
+    }
+
+
 def test_live_pipeline_agent_panes_excludes_non_pl_agent() -> None:
     run_id = "20260903T050016Z"
     body = {

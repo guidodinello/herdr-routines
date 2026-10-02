@@ -543,7 +543,16 @@ def run_watchdog(
         )
         killed_agents: dict[str, str] = {}
         try:
-            panes = client.live_pipeline_agent_panes(run.run_id)
+            # A worker left running is closed only while `working`: a `blocked` one is
+            # normally left open for a human. Not after a reboot — herdr restores every
+            # pane's agent at boot as `blocked`, so a dead run's pl- agents come back as
+            # resurrected processes holding ~550 MB each (2026-10-01: four of them pinned
+            # 2.2 GB of the Pi's 4 GB), and nobody is coming to inspect them.
+            panes = (
+                client.pipeline_agent_panes(run.run_id)
+                if host_rebooted
+                else client.live_pipeline_agent_panes(run.run_id)
+            )
         except HerdrCliError as e:
             log.warning(
                 "%s: could not list agents, skipping this cycle: %s", run.run_id, e

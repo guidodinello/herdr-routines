@@ -640,6 +640,39 @@ class HerdrClient:
         lowercases agent names on registration — see ps.py's `build_ps_rows`). Empty dict
         when nothing matches; raises HerdrCliError on an unexpected response shape like
         its settled_agent_* siblings."""
+        return {
+            name: pane_id
+            for name, (status, pane_id) in self.pipeline_agent_panes_by_status(
+                run_id
+            ).items()
+            if status in LIVE_AGENT_STATUSES
+        }
+
+    def pipeline_agent_panes(self, run_id: str) -> dict[str, str]:
+        """Every registered `pl-<N>-<run_id>` agent mapped to its pane_id, whatever its
+        status. For a run known to be dead because the host rebooted under it: herdr
+        restores a pane's agent at boot (reporting `blocked`), and those resurrected
+        agents hold memory forever unless closed — see `live_pipeline_agent_panes` for
+        the name scoping."""
+        return {
+            name: pane_id
+            for name, (_status, pane_id) in self.pipeline_agent_panes_by_status(
+                run_id
+            ).items()
+        }
+
+    def pipeline_agent_panes_by_status(self, run_id: str) -> dict[str, tuple[str, str]]:
+        """`pl-<N>-<run_id>` agent name -> (agent_status, pane_id)."""
+        lowered_run_id = run_id.lower()
+        return {
+            name: entry
+            for name, entry in self.agent_panes_by_status().items()
+            if name.lower().startswith("pl-") and lowered_run_id in name.lower()
+        }
+
+    def agent_panes_by_status(self) -> dict[str, tuple[str, str]]:
+        """Every registered agent name -> (agent_status, pane_id). Raises HerdrCliError on
+        an unexpected response shape like its settled_agent_* siblings."""
         body = self._call(["agent", "list"], timeout_s=10)
         result = body.get("result")
         if not isinstance(result, dict):
@@ -651,22 +684,20 @@ class HerdrClient:
             raise HerdrCliError(
                 f"unexpected herdr agent response shape: {body!r}", exit_code=0
             )
-        lowered_run_id = run_id.lower()
-        panes: dict[str, str] = {}
+        panes: dict[str, tuple[str, str]] = {}
         for agent in agents:
             if not isinstance(agent, dict):
                 continue
             name = agent.get("name")
             status = agent.get("agent_status")
             pane_id = agent.get("pane_id")
-            if not (isinstance(name, str) and isinstance(status, str)):
-                continue
-            if not name.lower().startswith("pl-") or lowered_run_id not in name.lower():
-                continue
-            if status not in LIVE_AGENT_STATUSES:
-                continue
-            if isinstance(pane_id, str) and pane_id:
-                panes[name] = pane_id
+            if (
+                isinstance(name, str)
+                and isinstance(status, str)
+                and isinstance(pane_id, str)
+                and pane_id
+            ):
+                panes[name] = (status, pane_id)
         return panes
 
     def workspace_close(self, workspace_id: str) -> None:

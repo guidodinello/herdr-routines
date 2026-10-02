@@ -32,9 +32,12 @@ NOW = datetime(2026, 9, 3, 12, 0, 0, tzinfo=UTC)
 @dataclass
 class FakeWatchdogClient:
     """Fake HerdrClient surface run_watchdog actually uses: live_pipeline_agent_panes,
-    pane_close, notification_show."""
+    pipeline_agent_panes, pane_close, notification_show. `panes_by_run` are `working`
+    agents; `blocked_panes_by_run` are registered but not working (e.g. restored by herdr
+    at boot), so only `pipeline_agent_panes` returns them."""
 
     panes_by_run: dict[str, dict[str, str]] = field(default_factory=dict)
+    blocked_panes_by_run: dict[str, dict[str, str]] = field(default_factory=dict)
     raise_on_list: bool = False
     closed_panes: list[str] = field(default_factory=list)
     notifications: list[tuple[str, str | None, str]] = field(default_factory=list)
@@ -43,6 +46,14 @@ class FakeWatchdogClient:
         if self.raise_on_list:
             raise HerdrCliError("server unreachable", exit_code=1)
         return self.panes_by_run.get(run_id, {})
+
+    def pipeline_agent_panes(self, run_id: str) -> dict[str, str]:
+        if self.raise_on_list:
+            raise HerdrCliError("server unreachable", exit_code=1)
+        return {
+            **self.panes_by_run.get(run_id, {}),
+            **self.blocked_panes_by_run.get(run_id, {}),
+        }
 
     def pane_close(self, pane_id: str) -> None:
         self.closed_panes.append(pane_id)
@@ -504,6 +515,63 @@ def test_run_watchdog_fails_fast_on_host_reboot(tmp_path: Path) -> None:
     assert "host_rebooted_mid_run: true" in report
     title, _body, _sound = client.notifications[0]
     assert "host rebooted mid-run" in title
+
+
+def test_run_watchdog_closes_agents_herdr_restored_after_a_reboot(
+    tmp_path: Path,
+) -> None:
+    """2026-10-01: after the reboot herdr restored pl-1 and pl-5 as `blocked`, and they
+    held ~1.1 GB until closed by hand. A dead run's agents go, whatever their status."""
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "tmp"
+    heartbeat_dir.mkdir()
+    state_path = write_state_json(
+        worktrees_root, deadline_epoch=int(NOW.timestamp()) + 6 * 3600
+    )
+    os.utime(state_path, (NOW.timestamp() - 1800, NOW.timestamp() - 1800))
+    restored = {f"pl-1-{RUN_ID.lower()}": "w6E:p1", f"pl-5-{RUN_ID.lower()}": "w6E:p4"}
+    client = FakeWatchdogClient(blocked_panes_by_run={RUN_ID: restored})
+
+    run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        now=NOW,
+        boot_epoch=NOW.timestamp() - 300,
+    )
+
+    assert sorted(client.closed_panes) == ["w6E:p1", "w6E:p4"]
+    report = (reports_dir / f"pipeline-{RUN_ID}.md").read_text()
+    assert f"pl-1-{RUN_ID.lower()}" in report
+
+
+def test_run_watchdog_leaves_a_blocked_agent_open_without_a_reboot(
+    tmp_path: Path,
+) -> None:
+    """Past the deadline but no reboot: a `blocked` worker is a human's to inspect, not
+    the watchdog's to close — only `working` ones are killed."""
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "tmp"
+    heartbeat_dir.mkdir()
+    write_state_json(worktrees_root, deadline_epoch=int(NOW.timestamp()) - 3 * 3600)
+    client = FakeWatchdogClient(
+        blocked_panes_by_run={RUN_ID: {f"pl-3-{RUN_ID.lower()}": "w1:p3"}}
+    )
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        now=NOW,
+        boot_epoch=NOW.timestamp() - 30 * 24 * 3600,
+    )
+
+    assert len(actions) == 1
+    assert client.closed_panes == []
 
 
 # -- tick's recorded deadline wins over state.json ------------------------------------------
