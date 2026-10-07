@@ -160,14 +160,19 @@ echo "=== dispatching pipeline-run: run_id=$RUN_ID state=$STATE_JSON prompts=$PR
 RUN_RC=0
 # The failure markers are the launcher's only remaining opinion about the run: quota
 # exhaustion is detected inside the wait loop (runner.wait_loop), so they are forwarded
-# verbatim rather than scanned for here. Unquoted expansion is what turns the repeated
-# `--failure-marker VALUE` pairs into separate argv entries; the array is never empty
-# (it defaults above), so `set -u` cannot bite.
-# shellcheck disable=SC2046
+# verbatim rather than scanned for here. Each marker must stay ONE argv entry: the default
+# ("Free usage exceeded") contains spaces, and an unquoted `$(printf ...)` expansion
+# word-split it into three, which argparse rejected with exit 2 every night from
+# 2026-10-02 to 2026-10-07. The array is never empty (it defaults above), so `set -u`
+# cannot bite.
+MARKER_ARGS=()
+for marker in "${FAILURE_MARKERS[@]}"; do
+  MARKER_ARGS+=(--failure-marker "$marker")
+done
 uv run herdr-routines pipeline-run \
   --run-id "$RUN_ID" --state-json "$STATE_JSON" \
   --report "$REPORT" --prompts-dir "$PROMPTS_DIR" \
-  $(printf -- '--failure-marker %s ' "${FAILURE_MARKERS[@]}") || RUN_RC=$?
+  "${MARKER_ARGS[@]}" || RUN_RC=$?
 echo "=== pipeline-run exited $RUN_RC (run_id=$RUN_ID report=$REPORT) ==="
 
 # Backstop. This used to be conditional on the orchestrator settling somewhere other than

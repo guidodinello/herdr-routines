@@ -33,6 +33,11 @@ LAUNCHER = REPO_ROOT / "scripts" / "pipeline-launch.sh"
 # FAKE_PIPELINE_RUN_RC / FAKE_PIPELINE_RUN_WRITES_REPORT stand in for the run itself: by
 # default it exits 0 *without* writing a report, which is exactly the killed-mid-run
 # shape the launcher's backstop exists for.
+#
+# `pipeline-run`'s argv is also written one entry per line to `<call log>.run-argv`: the
+# space-joined `$*` line can't tell `--failure-marker "Free usage exceeded"` (one entry)
+# from the word-split `--failure-marker Free usage exceeded` (three), which is exactly
+# the bug that failed every nightly run from 2026-10-02 to 2026-10-07.
 FAKE_UV = """#!/bin/bash
 echo "uv $*" >> "$FAKE_HERDR_CALL_LOG"
 case "$2 $3" in
@@ -41,6 +46,7 @@ case "$2 $3" in
     exit "${FAKE_PREPARE_RC:-0}"
     ;;
   "herdr-routines pipeline-run")
+    printf '%s\\n' "$@" > "$FAKE_HERDR_CALL_LOG.run-argv"
     if [ "${FAKE_PIPELINE_RUN_WRITES_REPORT:-0}" = "1" ]; then
       report=""
       prev=""
@@ -302,22 +308,30 @@ def test_launcher_propagates_a_prepare_failure(tmp_path: Path) -> None:
     assert not report_path.exists()
 
 
+def _pipeline_run_marker_args(call_log: Path) -> list[str]:
+    """Every value that followed a `--failure-marker` in `pipeline-run`'s real argv."""
+    argv = Path(f"{call_log}.run-argv").read_text().splitlines()
+    return [argv[i + 1] for i, arg in enumerate(argv) if arg == "--failure-marker"]
+
+
 def test_launcher_forwards_failure_markers_to_pipeline_run(tmp_path: Path) -> None:
     """Quota exhaustion is detected inside the shared wait loop now, so the markers are
-    forwarded rather than scanned for in bash — one implementation, not two copies."""
+    forwarded rather than scanned for in bash — one implementation, not two copies.
+    The default marker contains spaces and must reach `pipeline-run` as ONE argument:
+    word-split, argparse rejects the stray words and the run dies with exit 2."""
     _report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
 
-    assert "--failure-marker Free usage exceeded" in call_log.read_text()
+    assert _pipeline_run_marker_args(call_log) == ["Free usage exceeded"]
 
 
 def test_launcher_matches_a_custom_failure_marker(tmp_path: Path) -> None:
     _report_path, call_log = _run_launcher(
-        tmp_path, settle_status="idle", failure_markers=("Custom quota wall",)
+        tmp_path,
+        settle_status="idle",
+        failure_markers=("Custom quota wall", "Rate limited"),
     )
 
-    log = call_log.read_text()
-    assert "--failure-marker Custom quota wall" in log
-    assert "Free usage exceeded" not in log
+    assert _pipeline_run_marker_args(call_log) == ["Custom quota wall", "Rate limited"]
 
 
 def test_launcher_hands_pipeline_run_the_tick_computed_deadline(tmp_path: Path) -> None:
