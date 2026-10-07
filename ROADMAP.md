@@ -54,9 +54,9 @@ In progress or ready to build; no real-run evidence required.
   keep only the judgment stages. Supersedes issue 052 and the "Code-level
   pipeline gates" Parking Lot item. →
   [`054`](docs/process/issues/054-orchestrator-mechanical-steps-to-code.md)
-- **Orchestrator stage loop and stage 4 in code** — `open`, `high`. Phases B
-  and C of 054: the stage loop and stage 4 (push + PR) move out of the
-  orchestrator session. →
+- **Orchestrator stage loop and stage 4 in code** — `done` (PR #141),
+  `high`. Phases B and C of 054: the stage loop and stage 4 (push + PR) moved
+  out of the orchestrator session into `pipeline-run`. →
   [`056`](docs/process/issues/056-orchestrator-stage-loop-in-code.md)
 
 Done (kept as `status: done` issue files for history): plugin manifest
