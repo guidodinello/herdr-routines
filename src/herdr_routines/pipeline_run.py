@@ -63,7 +63,7 @@ from herdr_routines.signing import (
     resign_local_commits,
     resign_unsigned_branch,
 )
-from herdr_routines.wait_loop import prompt_with_watchdog
+from herdr_routines.wait_loop import PROMPT_RETRY_DELAYS_S, prompt_with_watchdog
 
 log = get_logger(__name__)
 
@@ -646,12 +646,14 @@ def _run_agent_stage(
             markers=failure_markers,
             prompt_text=prompt,
             on_poll_hook=_heartbeat_hook(heartbeat, spec.stage, clock),
-            # No start-race retry here: the wait loop's retry exists for a session
-            # backend rejecting the *first* prompt seconds after start, and every stage
-            # prompt has already been delivered once by the time it would apply. A
-            # resend of a 90-minute implementation prompt would double the run's side
-            # effects, which is the cost the retry whitelist exists to avoid.
-            retry_delays_s=(),
+            # Every stage prompt IS a just-started agent's first prompt, which is exactly
+            # the start race this retry exists for: herdr rejects it with
+            # `agent_prompt_stalled` ("no observed state change ... status is idle") when
+            # opencode isn't ready yet, which failed run 20261008T003531Z's stage 1 39 s
+            # in. The whitelist (`is_retryable_prompt_error`) only resends on such
+            # provably-early rejections, never after a delivery, so a long stage is not
+            # double-prompted. Read at call time so tests can collapse the backoff.
+            retry_delays_s=PROMPT_RETRY_DELAYS_S,
         )
     except PromptWatchdogKilled as e:
         _close_pane(client, pane_id)
