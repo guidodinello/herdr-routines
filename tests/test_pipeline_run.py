@@ -476,6 +476,36 @@ def test_pipeline_run_records_real_stage_sessions(prepared: PipelineFixture) -> 
         assert "stage_sessions" not in text
 
 
+class SpecWritingHerdr(FakeHerdr):
+    """A FakeHerdr whose stage-1 agent writes the spec, as the real stage-1 prompt
+    instructs — for a run that starts the way `pipeline-prepare` leaves it: with a
+    `spec.md` path in `state.json` but no file at it yet."""
+
+    def __init__(self, spec_path: Path) -> None:
+        super().__init__(SESSION_IDS)
+        self.spec_path = spec_path
+
+    def agent_prompt_wait_with_watchdog(self, *, target: str, **kwargs: Any) -> str:
+        if int(target.split("-")[1]) == 1:
+            self.spec_path.parent.mkdir(parents=True, exist_ok=True)
+            self.spec_path.write_text(SPEC_BODY)
+        return super().agent_prompt_wait_with_watchdog(target=target, **kwargs)
+
+
+def test_pipeline_run_starts_stage_1_before_the_spec_exists(
+    prepared: PipelineFixture,
+) -> None:
+    """Stage 1 writes the spec, so the loop must not require it before stage 1. It did,
+    and every nightly run died as `spec_unreadable` before any agent was started."""
+    spec_path = Path(prepared.state()["artifact_paths"]["spec"])
+    spec_path.unlink()
+
+    outcome, client, _gh = _run(prepared, client=SpecWritingHerdr(spec_path))
+
+    assert outcome.outcome == "ok", outcome
+    assert client.started[0]["name"] == f"pl-1-{RUN_ID}".lower()
+
+
 # ---------------------------------------------------------------------------
 # 2. a failing gate aborts before the next stage, with a report naming it
 # ---------------------------------------------------------------------------
