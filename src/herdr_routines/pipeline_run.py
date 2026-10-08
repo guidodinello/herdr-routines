@@ -892,10 +892,16 @@ def run_pipeline(
             )
 
         log.info("pipeline %s: stage %d", run_id, spec.stage)
-        try:
-            spec_text = state.spec.read_text()
-        except OSError as e:
-            return finish("failed", "spec_unreadable", error=str(e), stage=spec.stage)
+        # Stage 1 is what writes the spec, so it can only be read from stage 2 on. Reading
+        # it before stage 1 failed every run as `spec_unreadable` before any agent started
+        # (2026-10-07); only gate 3 and stage 4's PR body consume it.
+        if spec.stage > 1:
+            try:
+                spec_text = state.spec.read_text()
+            except OSError as e:
+                return finish(
+                    "failed", "spec_unreadable", error=str(e), stage=spec.stage
+                )
 
         pane_id: str | None = None
         try:
