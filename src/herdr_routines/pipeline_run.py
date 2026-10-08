@@ -588,7 +588,7 @@ def _run_agent_stage(
     runner: Callable[..., tuple[int, str, str]],
     clock: Callable[[], float],
 ) -> str:
-    """Start one stage's agent, record its real session id, prompt it, wait for settle.
+    """Start one stage's agent, prompt it, wait for settle, record its real session id.
 
     Returns the pane id so the caller can close it once the gate has passed (G-16:
     close on gate-pass, not only at end of run — and never hold stage 3's pane open from
@@ -627,28 +627,6 @@ def _run_agent_stage(
     except (HerdrCliError, OSError, ValueError) as e:
         _close_pane(client, pane_id)
         raise _Abort("agent_start_failed", detail=str(e)) from e
-
-    # Read the id the started agent really reported, before the prompt, and record it
-    # before anything downstream can depend on it (spec §5). A session id that cannot be
-    # read aborts the stage: writing a placeholder is exactly what made G-17's gate
-    # necessary in the first place.
-    try:
-        session_id = client.agent_session_id(agent_name)
-    except (HerdrCliError, OSError) as e:
-        _close_pane(client, pane_id)
-        raise _Abort("session_id_unreadable", detail=str(e)) from e
-    if not session_id:
-        _close_pane(client, pane_id)
-        raise _Abort(
-            "session_id_unreadable",
-            detail=f"{agent_name} reported no agent_session.value",
-        )
-
-    state = state.commit(
-        state_json,
-        current_stage=spec.stage,
-        stage_sessions={**state.stage_sessions, str(spec.stage): session_id},
-    )
 
     prompt = _read_prompt(
         prompts_dir,
@@ -696,6 +674,34 @@ def _run_agent_stage(
             reason or "interrupted_unknown",
             detail=f"stage {spec.stage} settled {status!r}",
         )
+
+    # Read the id the agent really reported and record it before the gate or any later
+    # stage can depend on it (spec §5). This has to come AFTER the prompt: opencode
+    # creates its session on the first prompt, so a just-started agent reports no
+    # `agent_session` at all (measured on the Pi 2026-10-08; reading it before the
+    # prompt failed every run's stage 1 as `session_id_unreadable`). `current_stage`
+    # is committed together with the id so the watchdog's in-flight
+    # `validate_stage_sessions` never sees a reached stage without its session, and a
+    # same-RUN_ID relaunch redoes an interrupted stage rather than skipping it. An id
+    # that cannot be read still aborts: writing a placeholder is exactly what made
+    # G-17's gate necessary in the first place.
+    try:
+        session_id = client.agent_session_id(agent_name)
+    except (HerdrCliError, OSError) as e:
+        _close_pane(client, pane_id)
+        raise _Abort("session_id_unreadable", detail=str(e)) from e
+    if not session_id:
+        _close_pane(client, pane_id)
+        raise _Abort(
+            "session_id_unreadable",
+            detail=f"{agent_name} reported no agent_session.value",
+        )
+
+    state.commit(
+        state_json,
+        current_stage=spec.stage,
+        stage_sessions={**state.stage_sessions, str(spec.stage): session_id},
+    )
     return pane_id
 
 
