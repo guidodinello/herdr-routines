@@ -548,7 +548,7 @@ def test_pipeline_run_retries_a_stage_prompt_rejected_while_the_agent_starts(
     monkeypatch.setattr("herdr_routines.pipeline_run.PROMPT_RETRY_DELAYS_S", (0.0,))
     client = StallingFirstPromptHerdr()
 
-    outcome, client, _gh = _run(prepared, client=client)
+    outcome, _client, _gh = _run(prepared, client=client)
 
     assert outcome.outcome == "ok", outcome
     assert client.stalled[0] == f"pl-1-{RUN_ID}".lower()
