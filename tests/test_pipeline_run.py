@@ -513,6 +513,50 @@ def test_pipeline_run_starts_stage_1_before_the_spec_exists(
     assert client.started[0]["name"] == f"pl-1-{RUN_ID}".lower()
 
 
+class StallingFirstPromptHerdr(FakeHerdr):
+    """A FakeHerdr whose agents reject their first prompt the way herdr did on the Pi for
+    run 20261008T003531Z, while opencode was still starting: exit 1 with
+    `agent_prompt_stalled`, and nothing delivered."""
+
+    def __init__(self) -> None:
+        super().__init__(SESSION_IDS)
+        self.stalled: list[str] = []
+
+    def agent_prompt_wait_with_watchdog(self, *, target: str, **kwargs: Any) -> str:
+        if target not in self.stalled:
+            self.stalled.append(target)
+            raise HerdrCliError(
+                "herdr server error running agent prompt",
+                exit_code=1,
+                error_body={
+                    "error": {
+                        "code": "agent_prompt_stalled",
+                        "message": "agent prompt produced no observed state change "
+                        "within 5000 ms; status is idle",
+                    }
+                },
+            )
+        return super().agent_prompt_wait_with_watchdog(target=target, **kwargs)
+
+
+def test_pipeline_run_retries_a_stage_prompt_rejected_while_the_agent_starts(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every stage prompt is a just-started agent's first prompt, so the start race the
+    wait loop retries for routine jobs applies to every stage. With no retry, stage 1
+    failed `stage_prompt_failed` 39 s into a real run."""
+    monkeypatch.setattr("herdr_routines.pipeline_run.PROMPT_RETRY_DELAYS_S", (0.0,))
+    client = StallingFirstPromptHerdr()
+
+    outcome, client, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    assert client.stalled[0] == f"pl-1-{RUN_ID}".lower()
+    # One delivered prompt per agent stage, despite each one's first attempt stalling.
+    delivered = [target for target, _text in client.prompts]
+    assert len(delivered) == len(set(delivered)) == 5
+
+
 # ---------------------------------------------------------------------------
 # 2. a failing gate aborts before the next stage, with a report naming it
 # ---------------------------------------------------------------------------
