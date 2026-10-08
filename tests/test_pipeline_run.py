@@ -167,6 +167,7 @@ class FakeHerdr:
         self.polls = 0
         self._next_pane = 0
         self._resumed: dict[str, str] = {}
+        self._prompted: set[str] = set()
 
     # -- panes -----------------------------------------------------------------
 
@@ -204,6 +205,11 @@ class FakeHerdr:
             self._resumed[name] = session_id
 
     def agent_session_id(self, target: str) -> str | None:
+        # opencode creates its session on the first prompt: a just-started agent reports
+        # no `agent_session` at all (measured on the Pi 2026-10-08). A fake that answered
+        # right after `agent_start` is what hid a stage loop reading the id too early.
+        if target not in self._prompted:
+            return None
         if target in self._resumed:
             return self._resumed[target]
         for stage, session_id in self.session_ids.items():
@@ -221,6 +227,7 @@ class FakeHerdr:
         on_poll: Callable[[str], str | None] | None = None,
     ) -> str:
         self.prompts.append((target, text))
+        self._prompted.add(target)
         stage = int(target.split("-")[1])
         screens = self.screens.get(stage, [""])
         for index in range(self.polls_per_stage):
