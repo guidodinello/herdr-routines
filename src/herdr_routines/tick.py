@@ -40,10 +40,10 @@ from herdr_routines.auto_fix import (
 )
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.findings import (
-    SEVERITY_RANK,
     Ledger,
     apply_diff,
     diff_findings,
+    dispatch_pool,
     ledger_path,
     load_findings_manifest_full,
     load_ledger,
@@ -312,23 +312,15 @@ def _process_audit_job(
 # sample keeps one bad night from bloating every history line.
 _AUDIT_SUPPRESSED_ID_CAP = 20
 
-# gate -> notification kind (see _notify_gate's four-tier policy).
+# gate -> notification kind (see _notify_gate's four-tier policy). Phase A records
+# `fix_pending` (the set a worker would get); phase B/058 adds `fix_dispatched`.
 _AUDIT_GATE_NOTIFY_KIND = {
     "baseline": "finding",
-    "fix_dispatched": "finding",
+    "fix_pending": "finding",
     "suppressed": "finding",
     "passed": "success",
     "failed": "failure",
 }
-
-
-def _audit_order_key(finding: Any) -> tuple[int, str, str, str]:
-    return (
-        -SEVERITY_RANK.get(finding.severity, 0),
-        finding.location,
-        finding.kind,
-        finding.id,
-    )
 
 
 def _render_audit_report(
@@ -378,7 +370,7 @@ def _render_audit_report(
             disposition = "unknown"
         flags = []
         if finding.id in dispatched:
-            flags.append("dispatched")
+            flags.append("would dispatch")
         if finding.id in suppressed:
             flags.append("suppressed")
         flag_text = f" ({', '.join(flags)})" if flags else ""
@@ -489,19 +481,30 @@ def _audit_phase_a(
             and entry.attempts >= job.max_attempts_per_target
         ]
         suppressed_set = set(suppressed_ids)
-        ordered = sorted((*diff.new, *diff.regressed), key=_audit_order_key)
-        candidates = [f.id for f in ordered if f.id not in suppressed_set]
+        candidates = [
+            f.id for f in dispatch_pool(diff, ledger) if f.id not in suppressed_set
+        ]
         dispatched_ids = candidates[: job.max_findings_per_dispatch]
         if dispatched_ids:
-            gate = "fix_dispatched"
+            gate = "fix_pending"
         elif suppressed_ids:
             gate = "suppressed"
         else:
             gate = "passed"
 
     base_ledger = ledger if ledger is not None else Ledger(job=job.name, entries={})
+    # Phase A dispatches nothing, so it consumes no budget: the dispatch set is recorded
+    # in the report and `extra` only. A baseline adoption queues nothing either.
+    queued_ids = (
+        [] if gate == "baseline" else [f.id for f in (*diff.new, *diff.regressed)]
+    )
     updated = apply_diff(
-        base_ledger, diff, now=now, run_id=run_id, dispatched_ids=dispatched_ids
+        base_ledger,
+        diff,
+        now=now,
+        run_id=run_id,
+        queued_ids=queued_ids,
+        dispatched_ids=[],
     )
     updated = prune_ledger(updated, now=now, retention_days=job.ledger_retention_days)
     save_ledger(ledger_p, updated)
@@ -521,7 +524,7 @@ def _audit_phase_a(
 
     if gate == "baseline":
         body = f"baseline adopted ({adopted} findings)"
-    elif gate == "fix_dispatched":
+    elif gate == "fix_pending":
         body = f"{len(dispatched_ids)} to fix, {len(suppressed_ids)} suppressed"
     elif gate == "suppressed":
         body = f"{len(suppressed_ids)} suppressed at budget"

@@ -7,17 +7,20 @@
 # not re-open a PR every week.
 #
 # Ship off: this is the reference example, not a job that should start running the night
-# it is deployed. Flip enabled: true once type-health emits a findings manifest.
+# it is deployed. Phase A (issue 057) does not run the audit yet — it only diffs a manifest
+# that already exists — so enabling it before phase B/058 makes every fire fail with
+# `findings_manifest_invalid`. Flip enabled: true once phase B runs the audit.
 enabled: false
 cron: "0 4 * * 1" # Mondays 04:00
-repo: /home/guido/projects/fitted
+repo: /home/guido/.local/state/herdr-routines/repos/fitted
 workspace: worktree # required for kind: audit (the fix worker edits source)
 base: development
 kind: audit
 
-# Exactly one of skill/command. `skill` names the audit skill; `command` would run a
-# shell command whose stdout is the audit. Both write $ROUTINE_REPORT (the human report)
-# and $ROUTINE_FINDINGS (the machine manifest, <reports_dir>/<run_id>-findings.json).
+# Exactly one of skill/command. `skill` names the audit skill an agent runs; `command` is
+# a cheap synchronous command that writes the manifest itself (its exit code is not the
+# gate). Either way the manifest lands at $ROUTINE_FINDINGS
+# (<reports_dir>/<run_id>-findings.json).
 audit:
   skill: type-health
   timeout_ms: 1800000 # the audit's own budget (30 min)
@@ -26,10 +29,11 @@ audit:
 agent_kind: opencode
 model: null
 
-# Dispatch budget: at most this many findings per cycle, most severe first. The rest wait.
+# Dispatch budget: at most this many findings per cycle, most severe first. The rest stay
+# queued in the ledger for the next cycle.
 max_findings_per_dispatch: 10
-# Per-target retry budget; a finding at this many attempts is suppressed (reported, never
-# re-dispatched) until it changes.
+# Per-finding retry budget, across cycles; a finding at this many attempts is suppressed
+# (reported, never re-dispatched). Attempts survive a resolve-then-reappear.
 max_attempts_per_target: 3
 # Resolved-ledger entries older than this are pruned. Open entries are never pruned.
 ledger_retention_days: 90
@@ -37,6 +41,7 @@ ledger_retention_days: 90
 # first night establishes the backlog instead of opening a PR for all of it.
 adopt_baseline: true
 
+catch_up_minutes: 720 # weekly cron: a long catch-up window is the point
 on_missed: log
 # Clean night = done/passed, no notification under on-finding; a gate that found something
 # still notifies.

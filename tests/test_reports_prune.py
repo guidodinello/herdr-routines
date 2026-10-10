@@ -239,8 +239,13 @@ def test_prune_reports_survives_per_entry_error(
 # `tempfile.mkstemp` scratch file it created itself in `_write_state_json`, removed only on
 # the failure path so a partial write never becomes `state.json`. It cannot name a report
 # or a history roll, and it deletes nothing on the success path.
+#
+# findings.py (issue 057 phase A) is reviewed and allowed on the same terms: its only
+# unlink is the `<job>.json.tmp` sibling `save_ledger` wrote itself, removed only when
+# `os.replace` fails. It never touches the ledger, a report, or a history roll.
 _DELETE_CALL_RE = re.compile(r"\.(?:unlink|rmdir)\(|\bos\.remove\(|\bshutil\.rmtree\(")
 _EXPECTED_DELETERS = {
+    "findings.py",
     "gc.py",
     "pipeline_prepare.py",
     "reports_prune.py",

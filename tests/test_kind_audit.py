@@ -333,7 +333,7 @@ def test_cold_start_adopts_baseline_without_dispatch(
     )
     assert failed2 is False
     rec2 = _last_record(history, job2.name)
-    assert rec2.extra["gate"] == "fix_dispatched"
+    assert rec2.extra["gate"] == "fix_pending"
     assert len(rec2.extra["dispatched_ids"]) == 2
     assert client2.dispatch_calls == 0
 
@@ -586,7 +586,7 @@ def test_phase_a_records_dispatch_set_without_dispatching(
     new_id = finding_id("type-health", "missing-return-type", "new.php")
     assert list(rec.extra["dispatched_ids"]) == [new_id]
     assert list(rec.extra["suppressed_ids"]) == [suppressed_id]
-    assert rec.extra["gate"] == "fix_dispatched"
+    assert rec.extra["gate"] == "fix_pending"
 
     # The full dispatch set is in the report too.
     report_path = Path(rec.extra["report_path"])
@@ -597,6 +597,13 @@ def test_phase_a_records_dispatch_set_without_dispatching(
     # No agent, no pane, no worktree.
     assert client.dispatch_calls == 0
     assert not (tmp_path / ".worktrees").exists()
+
+    # Recording is not dispatching: no budget consumed, but the finding stays owed a fix.
+    ledger = load_ledger(ledger_path(job.name))
+    assert ledger is not None
+    assert ledger.entries[new_id].attempts == 0
+    assert ledger.entries[new_id].last_dispatched_run is None
+    assert ledger.entries[new_id].queued
 
     # _process_job routes kind: audit to _process_audit_job.
     called: dict[str, bool] = {}

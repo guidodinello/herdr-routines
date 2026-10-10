@@ -17,6 +17,7 @@ from herdr_routines.findings import (
     LedgerEntry,
     apply_diff,
     diff_findings,
+    dispatch_pool,
     finding_id,
     ledger_path,
     load_findings_manifest,
@@ -170,7 +171,14 @@ def test_diff_classifies_new_regressed_resolved() -> None:
     assert {f.id for f in diff.unchanged} == {"b"}
     assert diff.resolved == ("c",)
 
-    out = apply_diff(ledger, diff, now=NOW, run_id="run1", dispatched_ids=["a", "d"])
+    out = apply_diff(
+        ledger,
+        diff,
+        now=NOW,
+        run_id="run1",
+        queued_ids=["a", "d", "e"],
+        dispatched_ids=["a", "d"],
+    )
     # The reappeared (resolved -> new) finding keeps its original first_seen.
     assert out.entries["d"].first_seen == "2020-01-01T00:00:00Z"
     assert out.entries["d"].state == "open"
@@ -220,7 +228,14 @@ def test_ledger_write_ahead_consumes_budget_on_failed_dispatch(
     diff = diff_findings(findings, ledger, check="c")
 
     # Only f1 is dispatched; f2 (suppressed/over cap) must stay untouched.
-    written = apply_diff(ledger, diff, now=NOW, run_id="run1", dispatched_ids=["f1"])
+    written = apply_diff(
+        ledger,
+        diff,
+        now=NOW,
+        run_id="run1",
+        queued_ids=["f1", "f2"],
+        dispatched_ids=["f1"],
+    )
     assert written.entries["f1"].attempts == 1
     assert written.entries["f1"].last_dispatched_run == "run1"
     assert written.entries["f2"].attempts == 0
@@ -241,6 +256,46 @@ def test_ledger_write_ahead_consumes_budget_on_failed_dispatch(
     assert reloaded is not None
     assert reloaded.entries["f1"].attempts == 1
     assert reloaded.entries["f2"].attempts == 0
+
+
+def test_unfixed_findings_stay_in_the_dispatch_pool(tmp_path: Path) -> None:
+    """A finding that was capped out, or whose fix did not land, is "unchanged" on the
+    next cycle — it must stay owed a fix rather than silently joining the backlog."""
+    findings = [Finding(f"f{i}", "k", "high", f"{i}.php", "s") for i in range(3)]
+    empty = Ledger(job="j", entries={})
+    diff = diff_findings(findings, empty, check="c")
+    ids = [f.id for f in findings]
+    # Cycle 1: cap of 2 -> f0, f1 dispatched; f2 capped out.
+    led = apply_diff(
+        empty, diff, now=NOW, run_id="r1", queued_ids=ids, dispatched_ids=ids[:2]
+    )
+    save_ledger(tmp_path / "l.json", led)
+    led = load_ledger(tmp_path / "l.json")
+    assert led is not None and all(e.queued for e in led.entries.values())
+
+    # Cycle 2: nothing got fixed. All three are unchanged and all three are still owed.
+    diff2 = diff_findings(findings, led, check="c")
+    assert len(diff2.unchanged) == 3
+    assert [f.id for f in dispatch_pool(diff2, led)] == ids
+
+    # A baseline adoption records debt without queueing it.
+    adopted = apply_diff(
+        empty, diff, now=NOW, run_id="r1", queued_ids=[], dispatched_ids=[]
+    )
+    assert dispatch_pool(diff_findings(findings, adopted, check="c"), adopted) == ()
+
+    # Resolve clears the queue; a reappearance re-queues it and keeps its attempts, so a
+    # flapping fix cannot earn a fresh budget.
+    gone = diff_findings(findings[1:], led, check="c")
+    led = apply_diff(led, gone, now=NOW, run_id="r2", queued_ids=[], dispatched_ids=[])
+    assert led.entries["f0"].state == "resolved" and not led.entries["f0"].queued
+    back = diff_findings(findings, led, check="c")
+    assert [f.id for f in back.new] == ["f0"]
+    led = apply_diff(
+        led, back, now=NOW, run_id="r3", queued_ids=["f0"], dispatched_ids=["f0"]
+    )
+    assert led.entries["f0"].attempts == 2
+    assert led.entries["f0"].queued
 
 
 # -- AC 11 --------------------------------------------------------------------------

@@ -242,8 +242,8 @@ def test_job_kind_is_literal() -> None:
 
 
 def test_valid_job_kinds_widened() -> None:
-    """AC 6 supplement: VALID_JOB_KINDS contains the three values."""
-    assert VALID_JOB_KINDS == frozenset({"routine", "gated", "pipeline"})
+    """AC 6 supplement: VALID_JOB_KINDS contains every kind (audit: issue 057)."""
+    assert VALID_JOB_KINDS == frozenset({"routine", "gated", "pipeline", "audit"})
 
 
 # -- AC 7: re-keyed discriminators behave identically ---------------------------

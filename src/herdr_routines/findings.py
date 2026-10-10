@@ -86,6 +86,10 @@ class LedgerEntry:
     resolved_at: str | None = None
     attempts: int = 0
     last_dispatched_run: str | None = None
+    # Owed a fix: set when the finding first appears as new/regressed outside a baseline
+    # adoption, cleared on resolve. Without it a finding that was capped out or whose fix
+    # did not land reads as "unchanged" next cycle and silently joins the backlog.
+    queued: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,31 +254,45 @@ def diff_findings(
     )
 
 
+def dispatch_pool(diff: FindingDiff, ledger: Ledger | None) -> tuple[Finding, ...]:
+    """Every finding owed a fix this cycle, most severe first: new and regressed, plus
+    unchanged ones still queued from an earlier cycle (capped out, or a fix that did not
+    land). Callers apply the attempt budget and the per-dispatch cap on top."""
+    entries = ledger.entries if ledger is not None else {}
+    carried = (
+        f for f in diff.unchanged if (e := entries.get(f.id)) is not None and e.queued
+    )
+    return tuple(sorted((*diff.new, *diff.regressed, *carried), key=_order_key))
+
+
 def apply_diff(
     ledger: Ledger,
     diff: FindingDiff,
     *,
     now: datetime,
     run_id: str,
+    queued_ids: Iterable[str],
     dispatched_ids: Iterable[str],
 ) -> Ledger:
     """Fold a diff into the ledger, consuming the budget for exactly the dispatched
     IDs (write-ahead: callers save before dispatch, so a dispatch that raises has
-    still consumed its attempt). Suppressed/unchanged entries are untouched."""
+    still consumed its attempt). Suppressed/unchanged entries keep their attempts.
+
+    ``queued_ids`` marks findings as owed a fix until they resolve (empty on a
+    baseline adoption, which records debt without queueing it)."""
+    queued = set(queued_ids)
     dispatched = set(dispatched_ids)
     stamp = _iso(now)
     entries = dict(ledger.entries)
 
     for finding in (*diff.new, *diff.regressed, *diff.unchanged):
         old = ledger.entries.get(finding.id)
-        if old is None or old.state == "resolved":
-            # A fresh occurrence: reset the budget, but keep first_seen so the
-            # regression signal survives a resolve.
-            base_attempts = 0
-            first_seen = old.first_seen if old is not None else stamp
-        else:
-            base_attempts = old.attempts
-            first_seen = old.first_seen
+        # A resolved finding that comes back keeps first_seen and its attempts: a fix
+        # that keeps getting reverted must not earn a fresh budget every time it flaps.
+        # Pruning a long-resolved entry is what eventually resets it.
+        first_seen = old.first_seen if old is not None else stamp
+        base_attempts = old.attempts if old is not None else 0
+        was_queued = old is not None and old.state == "open" and old.queued
         attempts = base_attempts + (1 if finding.id in dispatched else 0)
         last_run = (
             run_id
@@ -291,13 +309,14 @@ def apply_diff(
             resolved_at=None,
             attempts=attempts,
             last_dispatched_run=last_run,
+            queued=was_queued or finding.id in queued,
         )
 
     for fid in diff.resolved:
         old = ledger.entries.get(fid)
         if old is None:
             continue
-        entries[fid] = replace(old, state="resolved", resolved_at=stamp)
+        entries[fid] = replace(old, state="resolved", resolved_at=stamp, queued=False)
 
     return Ledger(
         job=ledger.job,
@@ -370,6 +389,7 @@ def _ledger_to_dict(ledger: Ledger) -> dict[str, object]:
                 "resolved_at": entry.resolved_at,
                 "attempts": entry.attempts,
                 "last_dispatched_run": entry.last_dispatched_run,
+                "queued": entry.queued,
             }
             for fid, entry in ledger.entries.items()
         },
@@ -411,6 +431,9 @@ def _entry_from_dict(raw: object) -> LedgerEntry | None:
     last_dispatched_run = raw.get("last_dispatched_run")
     if last_dispatched_run is not None and not isinstance(last_dispatched_run, str):
         return None
+    queued = raw.get("queued", False)
+    if not isinstance(queued, bool):
+        return None
     return LedgerEntry(
         kind=kind,
         location=location,
@@ -421,6 +444,7 @@ def _entry_from_dict(raw: object) -> LedgerEntry | None:
         resolved_at=resolved_at,
         attempts=attempts,
         last_dispatched_run=last_dispatched_run,
+        queued=queued,
     )
 
 
