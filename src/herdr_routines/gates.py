@@ -652,9 +652,12 @@ def run_stage_gate(
 # Gate 3's mechanical half — existence, not greenness
 # ---------------------------------------------------------------------------
 
-# `Test: <name>` on its own line, the shape stage 2 is required to write.
+# `Test: <name>` ending a line, the shape stage 2 is told to write ("each ends `Test:
+# <name>`"). Not only on a line of its own: run 20261010T174659Z's stage 2 wrote every
+# criterion as one line, `1. [blocking] ... — confidence: high — Test: test_x`, and an
+# own-line-only pattern read that spec as naming no tests at all.
 _TEST_LINE_RE = re.compile(
-    r"^\s*Test:\s*`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?\s*$", re.MULTILINE
+    r"(?:^|\s)Test:\s*`?(?P<name>[A-Za-z_][A-Za-z0-9_]*)`?\s*$", re.MULTILINE
 )
 
 
