@@ -270,8 +270,9 @@ def test_unfixed_findings_stay_in_the_dispatch_pool(tmp_path: Path) -> None:
         empty, diff, now=NOW, run_id="r1", queued_ids=ids, dispatched_ids=ids[:2]
     )
     save_ledger(tmp_path / "l.json", led)
-    led = load_ledger(tmp_path / "l.json")
-    assert led is not None and all(e.queued for e in led.entries.values())
+    reloaded = load_ledger(tmp_path / "l.json")
+    assert reloaded is not None and all(e.queued for e in reloaded.entries.values())
+    led = reloaded
 
     # Cycle 2: nothing got fixed. All three are unchanged and all three are still owed.
     diff2 = diff_findings(findings, led, check="c")
