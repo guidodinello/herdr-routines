@@ -742,24 +742,34 @@ ZEN_BAD_REQUEST = {
 }
 
 
+class ErrorsOnce:
+    """A `session_export` whose `session_id` ends in a provider error until it has been
+    read once — the real shape, since a resumed session's last message is then the
+    fallback model's own turn. Every other session exports clean."""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.exported: list[str] = []
+
+    def __call__(self, session_id: str) -> str:
+        self.exported.append(session_id)
+        first = self.exported.count(session_id) == 1
+        failed = session_id == self.session_id and first
+        return _export(error=ZEN_BAD_REQUEST if failed else None)
+
+
 def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_provider_error(
     prepared: PipelineFixture,
 ) -> None:
     """Run 20261010T050000Z: Zen 400'd stage 3 mid-implementation, herdr settled the
     pane `blocked`, and the night ended `stage_blocked`. A provider error is now one
     resume of the same session on the stage's fallback model, not the end of the run."""
-    exported: list[str] = []
-
-    def export(session_id: str) -> str:
-        exported.append(session_id)
-        return _export(error=ZEN_BAD_REQUEST)
-
+    export = ErrorsOnce(SESSION_IDS[3])
     client = _client(settles={3: ["blocked", "idle"]})
 
     outcome, client, _gh = _run(prepared, client=client, session_export=export)
 
     assert outcome.outcome == "ok", outcome
-    assert exported == [SESSION_IDS[3]]
     stage3 = [c for c in client.started if c["name"] == f"pl-3-{RUN_ID}".lower()]
     assert [(c["model"], c["session_id"]) for c in stage3] == [
         ("opencode/big-pickle", None),
@@ -796,6 +806,49 @@ def test_pipeline_run_does_not_fall_back_on_a_blocked_stage_without_a_provider_e
     assert client.closed_panes
 
 
+def test_pipeline_run_falls_back_when_a_provider_error_settles_idle(
+    prepared: PipelineFixture,
+) -> None:
+    """Nothing guarantees a provider error settles `blocked`. An `idle` settle on a
+    half-done stage 3 would pass gate 3, which only checks the tests exist — so the
+    session is read on every settle, not only a failed one."""
+    outcome, client, _gh = _run(prepared, session_export=ErrorsOnce(SESSION_IDS[3]))
+
+    assert outcome.outcome == "ok", outcome
+    resumed = [c for c in client.started if c["model"] == AUTHOR_FALLBACK_MODEL]
+    assert [(c["name"], c["session_id"]) for c in resumed] == [
+        (f"pl-3-{RUN_ID}".lower(), SESSION_IDS[3])
+    ]
+    assert "resumed its session on" in prepared.report.read_text()
+
+
+class SessionReadFailsHerdr(FakeHerdr):
+    """`agent get` failing outright, the way a herdr server restart would."""
+
+    def agent_session_id(self, target: str) -> str | None:
+        raise HerdrCliError("herdr server unreachable", exit_code=1)
+
+
+def test_pipeline_run_keeps_its_never_raises_contract_when_the_session_is_unreadable(
+    prepared: PipelineFixture,
+) -> None:
+    """An unreadable session means "no fallback", not an escaped exception: the stage's
+    own settle decides, and the report is still written."""
+    client = SessionReadFailsHerdr(SESSION_IDS, settles={1: ["blocked"]})
+
+    outcome, client, _gh = _run(
+        prepared,
+        client=client,
+        session_export=lambda _id: _export(error=ZEN_BAD_REQUEST),
+    )
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "stage_blocked"
+    assert len(client.started) == 1
+    assert client.closed_panes
+    assert "## Outcome: failed" in prepared.report.read_text()
+
+
 def test_pipeline_run_reports_the_fallback_when_it_also_fails(
     prepared: PipelineFixture,
 ) -> None:
@@ -804,9 +857,7 @@ def test_pipeline_run_reports_the_fallback_when_it_also_fails(
     client = _client(settles={3: ["blocked", "blocked"]})
 
     outcome, client, _gh = _run(
-        prepared,
-        client=client,
-        session_export=lambda _id: _export(error=ZEN_BAD_REQUEST),
+        prepared, client=client, session_export=ErrorsOnce(SESSION_IDS[3])
     )
 
     assert outcome.outcome == "failed"

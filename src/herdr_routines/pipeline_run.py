@@ -642,32 +642,36 @@ def _run_agent_stage(
 
     pane_id, status = attempt(model=spec.model, session_id=resume_session, text=prompt)
     note: str | None = None
-    ok, reason = _settle_outcome(status)
-    if not ok and spec.fallback_model:
-        failed_session = client.agent_session_id(agent_name)
-        exported = session_export(failed_session) if failed_session else None
-        provider_error = _session_api_error(exported) if exported else None
-        if failed_session and provider_error:
-            # Resume the same session rather than start a fresh one: the failed model
-            # usually left edits in the shared worktree, and a new session dropped onto
-            # half-done work it has no memory of would redo or undo it. The same id is
-            # also what stage 6 resumes, so stage 3's record stays one session.
-            _close_pane(client, pane_id)
-            note = (
-                f"stage {spec.stage}: {spec.model} failed with a provider error "
-                f"({provider_error}); resumed its session on {spec.fallback_model}"
+    # Checked on every settle, not only a failed one: run 20261010T050000Z's provider
+    # error happened to settle `blocked`, but nothing guarantees it, and an `idle`
+    # settle on a half-done stage 3 would sail through gate 3 (it only checks that the
+    # acceptance tests exist, and the stage writes those first).
+    failed_session, provider_error = (
+        _provider_error(client, agent_name, session_export)
+        if spec.fallback_model
+        else (None, None)
+    )
+    if spec.fallback_model and failed_session and provider_error:
+        # Resume the same session rather than start a fresh one: the failed model
+        # usually left edits in the shared worktree, and a new session dropped onto
+        # half-done work it has no memory of would redo or undo it. The same id is
+        # also what stage 6 resumes, so stage 3's record stays one session.
+        _close_pane(client, pane_id)
+        note = (
+            f"stage {spec.stage}: {spec.model} failed with a provider error "
+            f"({provider_error}); resumed its session on {spec.fallback_model}"
+        )
+        log.warning("pipeline %s: %s", run_id, note)
+        try:
+            pane_id, status = attempt(
+                model=spec.fallback_model,
+                session_id=failed_session,
+                text=FALLBACK_CONTINUE_PROMPT,
             )
-            log.warning("pipeline %s: %s", run_id, note)
-            try:
-                pane_id, status = attempt(
-                    model=spec.fallback_model,
-                    session_id=failed_session,
-                    text=FALLBACK_CONTINUE_PROMPT,
-                )
-            except _Abort as abort:
-                abort.lines.insert(0, note)
-                raise
-            ok, reason = _settle_outcome(status)
+        except _Abort as abort:
+            abort.lines.insert(0, note)
+            raise
+    ok, reason = _settle_outcome(status)
     if not ok:
         _close_pane(client, pane_id)
         raise _Abort(
@@ -806,6 +810,25 @@ def _session_api_error(export_json: str) -> str | None:
     data = error.get("data")
     data = data if isinstance(data, dict) else {}
     return f"{data.get('statusCode', '?')}: {data.get('message', 'no message')}"
+
+
+def _provider_error(
+    client: HerdrClient,
+    agent_name: str,
+    session_export: Callable[[str], str | None],
+) -> tuple[str | None, str | None]:
+    """(session id, provider error) for a settled stage agent; either is None when it
+    cannot be read. Never raises — an unreadable session means "no fallback", and the
+    stage's own settle status decides the outcome as it did before fallbacks existed."""
+    try:
+        session_id = client.agent_session_id(agent_name)
+    except (HerdrCliError, OSError) as e:
+        log.warning("could not read %s's session id: %s", agent_name, e)
+        return None, None
+    if not session_id:
+        return None, None
+    exported = session_export(session_id)
+    return session_id, _session_api_error(exported) if exported else None
 
 
 def _opencode_export(session_id: str) -> str | None:
