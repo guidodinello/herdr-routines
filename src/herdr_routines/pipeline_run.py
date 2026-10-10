@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -92,6 +93,9 @@ _REPORT_OUTCOME: dict[tuple[Outcome, str | None], str] = {
 # How long a git/gh command may take inside a stage. Long enough for a push of a real
 # branch, short enough that the deadline check still runs on a human timescale.
 GIT_TIMEOUT_S = 300.0
+
+# Bounds a hung `opencode export`, which only runs once a stage has already failed.
+OPENCODE_EXPORT_TIMEOUT_S = 120.0
 
 # The branch every pipeline run is cut from (pipeline_prepare's default base) — needed
 # here only to know which commits are the run's own when re-signing them.
@@ -585,21 +589,21 @@ def _run_agent_stage(
     failure_markers: Sequence[str],
     client: HerdrClient,
     heartbeat: Path,
-    runner: Callable[..., tuple[int, str, str]],
+    session_export: Callable[[str], str | None],
     clock: Callable[[], float],
-) -> str:
+) -> tuple[str, str | None]:
     """Start one stage's agent, prompt it, wait for settle, record its real session id.
 
     Returns the pane id so the caller can close it once the gate has passed (G-16:
     close on gate-pass, not only at end of run — and never hold stage 3's pane open from
-    stage 4 through stage 6, which is what made the resume a fork instead of a resume).
+    stage 4 through stage 6, which is what made the resume a fork instead of a resume),
+    plus a report line when the stage only finished on its fallback model.
 
     Raises `_Abort` for every failure, having already closed the pane: a pane left open
     by a crashed stage is a live agent the next tick's reconcile has to adopt or reap,
     and the whole point of closing per-stage is that there is nothing to reap."""
     assert spec.model is not None, "caller must route model=None stages to _open_pr"
     agent_name = _stage_agent_name(spec.stage, run_id)
-    pane_id = _open_pane(client, state, spec, agent_name)
 
     resume_session = (
         state.stage_sessions.get(str(spec.reuses_stage))
@@ -614,20 +618,6 @@ def _run_agent_stage(
                 f"is not in state.json — there is nothing to resume"
             ),
         )
-
-    try:
-        client.agent_start(
-            name=agent_name,
-            kind=STAGE_AGENT_KIND,
-            pane_id=pane_id,
-            start_timeout_ms=spec.start_timeout_ms,
-            model=spec.model,
-            session_id=resume_session,
-        )
-    except (HerdrCliError, OSError, ValueError) as e:
-        _close_pane(client, pane_id)
-        raise _Abort("agent_start_failed", detail=str(e)) from e
-
     prompt = _read_prompt(
         prompts_dir,
         spec,
@@ -636,45 +626,58 @@ def _run_agent_stage(
         ),
     )
 
-    try:
-        status = prompt_with_watchdog(
-            client,
-            job_name=f"pipeline-stage-{spec.stage}",
-            target=agent_name,
-            text=prompt,
-            timeout_ms=spec.timeout_ms,
-            markers=failure_markers,
-            prompt_text=prompt,
-            on_poll_hook=_heartbeat_hook(heartbeat, spec.stage, clock),
-            # Every stage prompt IS a just-started agent's first prompt, which is exactly
-            # the start race this retry exists for: herdr rejects it with
-            # `agent_prompt_stalled` ("no observed state change ... status is idle") when
-            # opencode isn't ready yet, which failed run 20261008T003531Z's stage 1 39 s
-            # in. The whitelist (`is_retryable_prompt_error`) only resends on such
-            # provably-early rejections, never after a delivery, so a long stage is not
-            # double-prompted. Read at call time so tests can collapse the backoff.
-            retry_delays_s=PROMPT_RETRY_DELAYS_S,
+    def attempt(*, model: str, session_id: str | None, text: str) -> tuple[str, str]:
+        return _start_and_prompt(
+            spec,
+            state,
+            client=client,
+            agent_name=agent_name,
+            model=model,
+            session_id=session_id,
+            text=text,
+            failure_markers=failure_markers,
+            heartbeat=heartbeat,
+            clock=clock,
         )
-    except PromptWatchdogKilled as e:
-        _close_pane(client, pane_id)
-        raise _Abort(
-            "quota_exhausted",
-            detail=str(e),
-            lines=[
-                f"failure marker confirmed on screen for stage {spec.stage}",
-                "the pane was closed; the next tick may retry with a fallback model",
-            ],
-        ) from e
-    except (HerdrCliError, OSError) as e:
-        _close_pane(client, pane_id)
-        raise _Abort("stage_prompt_failed", detail=str(e)) from e
 
+    pane_id, status = attempt(model=spec.model, session_id=resume_session, text=prompt)
+    note: str | None = None
+    # Checked on every settle, not only a failed one: run 20261010T050000Z's provider
+    # error happened to settle `blocked`, but nothing guarantees it, and an `idle`
+    # settle on a half-done stage 3 would sail through gate 3 (it only checks that the
+    # acceptance tests exist, and the stage writes those first).
+    failed_session, provider_error = (
+        _provider_error(client, agent_name, session_export)
+        if spec.fallback_model
+        else (None, None)
+    )
+    if spec.fallback_model and failed_session and provider_error:
+        # Resume the same session rather than start a fresh one: the failed model
+        # usually left edits in the shared worktree, and a new session dropped onto
+        # half-done work it has no memory of would redo or undo it. The same id is
+        # also what stage 6 resumes, so stage 3's record stays one session.
+        _close_pane(client, pane_id)
+        note = (
+            f"stage {spec.stage}: {spec.model} failed with a provider error "
+            f"({provider_error}); resumed its session on {spec.fallback_model}"
+        )
+        log.warning("pipeline %s: %s", run_id, note)
+        try:
+            pane_id, status = attempt(
+                model=spec.fallback_model,
+                session_id=failed_session,
+                text=FALLBACK_CONTINUE_PROMPT,
+            )
+        except _Abort as abort:
+            abort.lines.insert(0, note)
+            raise
     ok, reason = _settle_outcome(status)
     if not ok:
         _close_pane(client, pane_id)
         raise _Abort(
             reason or "interrupted_unknown",
             detail=f"stage {spec.stage} settled {status!r}",
+            lines=[note] if note else None,
         )
 
     # Read the id the agent really reported and record it before the gate or any later
@@ -704,7 +707,157 @@ def _run_agent_stage(
         current_stage=spec.stage,
         stage_sessions={**state.stage_sessions, str(spec.stage): session_id},
     )
-    return pane_id
+    return pane_id, note
+
+
+def _start_and_prompt(
+    spec: StageSpec,
+    state: _State,
+    *,
+    client: HerdrClient,
+    agent_name: str,
+    model: str,
+    session_id: str | None,
+    text: str,
+    failure_markers: Sequence[str],
+    heartbeat: Path,
+    clock: Callable[[], float],
+) -> tuple[str, str]:
+    """Open a pane, start `agent_name` on `model` (resuming `session_id` if given), send
+    `text`, and return (pane id, settled status). Closes the pane before any `_Abort`."""
+    pane_id = _open_pane(client, state, spec, agent_name)
+    try:
+        client.agent_start(
+            name=agent_name,
+            kind=STAGE_AGENT_KIND,
+            pane_id=pane_id,
+            start_timeout_ms=spec.start_timeout_ms,
+            model=model,
+            session_id=session_id,
+        )
+    except (HerdrCliError, OSError, ValueError) as e:
+        _close_pane(client, pane_id)
+        raise _Abort("agent_start_failed", detail=str(e)) from e
+
+    try:
+        status = prompt_with_watchdog(
+            client,
+            job_name=f"pipeline-stage-{spec.stage}",
+            target=agent_name,
+            text=text,
+            timeout_ms=spec.timeout_ms,
+            markers=failure_markers,
+            prompt_text=text,
+            on_poll_hook=_heartbeat_hook(heartbeat, spec.stage, clock),
+            # Every stage prompt IS a just-started agent's first prompt, which is exactly
+            # the start race this retry exists for: herdr rejects it with
+            # `agent_prompt_stalled` ("no observed state change ... status is idle") when
+            # opencode isn't ready yet, which failed run 20261008T003531Z's stage 1 39 s
+            # in. The whitelist (`is_retryable_prompt_error`) only resends on such
+            # provably-early rejections, never after a delivery, so a long stage is not
+            # double-prompted. Read at call time so tests can collapse the backoff.
+            retry_delays_s=PROMPT_RETRY_DELAYS_S,
+        )
+    except PromptWatchdogKilled as e:
+        _close_pane(client, pane_id)
+        raise _Abort(
+            "quota_exhausted",
+            detail=str(e),
+            lines=[
+                f"failure marker confirmed on screen for stage {spec.stage}",
+                "the pane was closed; the next tick may retry with a fallback model",
+            ],
+        ) from e
+    except (HerdrCliError, OSError) as e:
+        _close_pane(client, pane_id)
+        raise _Abort("stage_prompt_failed", detail=str(e)) from e
+    return pane_id, status
+
+
+# Sent to a stage's session after it is resumed on `StageSpec.fallback_model`. The
+# session already holds the stage's real prompt and everything done so far, so this only
+# has to say why the model changed and that the task is unchanged.
+FALLBACK_CONTINUE_PROMPT = (
+    "Your previous model call failed with a provider error, and this session has been "
+    "resumed on a different model. Continue the same task from where it stopped: check "
+    "the worktree (`git status`, `git diff`) for what is already done, then finish the "
+    "stage exactly as originally instructed."
+)
+
+
+def _session_api_error(export_json: str) -> str | None:
+    """`"<status>: <message>"` when an `opencode export` document's last message ended
+    in a provider `APIError`, else None.
+
+    Read from the session record rather than the screen. herdr filed run
+    20261010T050000Z's stage 3 as `blocked` after Zen answered 400 `Bad Request`, which
+    is indistinguishable from a permission prompt by status alone; the export says which
+    it was (`info.error = {"name": "APIError", "data": {"statusCode": 400, ...}}`). A
+    screen marker would not do: this repo's own source carries the error strings, and a
+    stage that reads it would put them on screen."""
+    try:
+        doc = json.loads(export_json)
+    except json.JSONDecodeError:
+        return None
+    messages = doc.get("messages") if isinstance(doc, dict) else None
+    if not isinstance(messages, list) or not messages:
+        return None
+    last = messages[-1]
+    info = last.get("info") if isinstance(last, dict) else None
+    error = info.get("error") if isinstance(info, dict) else None
+    if not isinstance(error, dict) or error.get("name") != "APIError":
+        return None
+    data = error.get("data")
+    data = data if isinstance(data, dict) else {}
+    return f"{data.get('statusCode', '?')}: {data.get('message', 'no message')}"
+
+
+def _provider_error(
+    client: HerdrClient,
+    agent_name: str,
+    session_export: Callable[[str], str | None],
+) -> tuple[str | None, str | None]:
+    """(session id, provider error) for a settled stage agent; either is None when it
+    cannot be read. Never raises — an unreadable session means "no fallback", and the
+    stage's own settle status decides the outcome as it did before fallbacks existed."""
+    try:
+        session_id = client.agent_session_id(agent_name)
+    except (HerdrCliError, OSError) as e:
+        log.warning("could not read %s's session id: %s", agent_name, e)
+        return None, None
+    if not session_id:
+        return None, None
+    exported = session_export(session_id)
+    return session_id, _session_api_error(exported) if exported else None
+
+
+def _opencode_export(session_id: str) -> str | None:
+    """`opencode export <session_id>`'s output, or None if it could not be read.
+
+    Written to a file, never a pipe: piped, opencode 1.18.35 exits before its stdout
+    drains and the JSON comes back cut short — 260954, 293690 and 293690 characters of a
+    1304882-character export on three consecutive runs on the Pi (2026-10-10), so the
+    last message, the one this is read for, is exactly what goes missing."""
+    with tempfile.TemporaryFile("w+") as out:
+        try:
+            proc = subprocess.run(
+                ["opencode", "export", session_id],
+                stdout=out,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=OPENCODE_EXPORT_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning("opencode export %s failed: %s", session_id, e)
+            return None
+        if proc.returncode != 0:
+            log.warning(
+                "opencode export %s failed: %s", session_id, proc.stderr.strip()
+            )
+            return None
+        out.seek(0)
+        return out.read()
 
 
 def _open_pane(
@@ -801,6 +954,7 @@ def run_pipeline(
     gh: GhClient | None = None,
     heartbeat_dir: Path | None = None,
     runner: Callable[..., tuple[int, str, str]] | None = None,
+    session_export: Callable[[str], str | None] = _opencode_export,
     clock: Callable[[], float] = time.time,
 ) -> RunOutcome:
     """Run `STAGES` in order, gating each, and return what happened.
@@ -828,7 +982,7 @@ def run_pipeline(
         stage: int | None = None,
         lines: Sequence[str] = (),
     ) -> RunOutcome:
-        detail = [*lines]
+        detail = [*notes, *lines]
         if stage is not None:
             detail.append(f"last stage: {stage}")
         if error:
@@ -874,6 +1028,9 @@ def run_pipeline(
     run_id = state.run_id or run_id
     heartbeat = heartbeat_log_path(heartbeat_dir, run_id)
     spec_text = ""
+    # One line per stage that only finished on its fallback model, carried into the
+    # terminal report whatever the outcome: a fallback is a degraded night either way.
+    notes: list[str] = []
 
     try:
         owner, repo = remote_owner_and_repo(state.worktree)
@@ -924,7 +1081,7 @@ def run_pipeline(
                 )
                 state = state.commit(state_json, pr_number=pr_number)
             else:
-                pane_id = _run_agent_stage(
+                pane_id, note = _run_agent_stage(
                     spec,
                     state,
                     run_id=run_id,
@@ -934,9 +1091,11 @@ def run_pipeline(
                     failure_markers=failure_markers,
                     client=client,
                     heartbeat=heartbeat,
-                    runner=run,
+                    session_export=session_export,
                     clock=clock,
                 )
+                if note:
+                    notes.append(note)
                 # Re-read rather than carry a returned copy: the stage already wrote this
                 # file, and `state.json` is also what the watchdog and `tick`'s reconcile
                 # read while the run is in flight. Carrying a pre-stage copy forward would

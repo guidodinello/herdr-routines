@@ -35,8 +35,13 @@ import pytest
 from herdr_routines import tick
 from herdr_routines.auto_fix import GhClient
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
-from herdr_routines.pipeline_run import RunOutcome, run_pipeline
-from herdr_routines.pipeline_stages import STAGES
+from herdr_routines.pipeline_run import (
+    FALLBACK_CONTINUE_PROMPT,
+    RunOutcome,
+    _session_api_error,
+    run_pipeline,
+)
+from herdr_routines.pipeline_stages import AUTHOR_FALLBACK_MODEL, STAGES
 from herdr_routines.pipeline_watchdog import (
     heartbeat_log_path,
     validate_stage_sessions,
@@ -146,6 +151,8 @@ class FakeHerdr:
     caller expresses by mapping 6 to the same value. `screens` scripts the visible
     screen per stage: a list is fed to `on_poll` one entry per poll and then repeats
     its last entry, so the two-consecutive-poll stability gate is exercised for real.
+    `settles` scripts the settled status per stage, one entry per prompt to that stage
+    (a fallback resume is a second prompt), falling back to `settle_status`.
     """
 
     def __init__(
@@ -153,11 +160,13 @@ class FakeHerdr:
         session_ids: dict[int, str],
         *,
         settle_status: str = "idle",
+        settles: dict[int, list[str]] | None = None,
         screens: dict[int, list[str]] | None = None,
         polls_per_stage: int = 3,
     ) -> None:
         self.session_ids = session_ids
         self.settle_status = settle_status
+        self.settles = {stage: list(seq) for stage, seq in (settles or {}).items()}
         self.screens = screens or {}
         self.polls_per_stage = polls_per_stage
         self.started: list[dict[str, Any]] = []
@@ -242,6 +251,8 @@ class FakeHerdr:
                     marker=marker,
                     screen_text=screen,
                 )
+        if self.settles.get(stage):
+            return self.settles[stage].pop(0)
         return self.settle_status
 
     def pane_close(self, pane_id: str) -> None:
@@ -416,6 +427,7 @@ def _run(
     client: FakeHerdr | None = None,
     gh: FakeGh | None = None,
     clock: Callable[[], float] | None = None,
+    session_export: Callable[[str], str | None] = lambda _session_id: None,
 ) -> tuple[RunOutcome, FakeHerdr, FakeGh]:
     client = client or FakeHerdr(SESSION_IDS)
     gh = gh or FakeGh()
@@ -429,6 +441,7 @@ def _run(
         gh=gh,
         heartbeat_dir=prepared.heartbeat_dir,
         runner=_git_runner,
+        session_export=session_export,
         clock=clock or time.time,
     )
     return outcome, client, gh
@@ -688,6 +701,202 @@ def test_pipeline_run_quota_marker_fast_fails(prepared: PipelineFixture) -> None
     ]
     # The wedged pane is reaped, so the next tick does not see a live worker.
     assert client.closed_panes
+
+
+def _export(*, error: dict[str, Any] | None) -> str:
+    """An `opencode export` document in the shape the Pi's opencode 1.18.35 produced for
+    run 20261010T050000Z's stage 3 session (trimmed to the keys read here): the last
+    message is the assistant turn the provider rejected, with `info.error` set."""
+    last_info: dict[str, Any] = {
+        "role": "assistant",
+        "modelID": "big-pickle",
+        "providerID": "opencode",
+        "time": {"created": 1791609260233},
+        "tokens": {"input": 0, "output": 0, "reasoning": 0},
+    }
+    if error is not None:
+        last_info["error"] = error
+    return json.dumps(
+        {
+            "info": {"id": SESSION_IDS[3], "title": "New session"},
+            "messages": [
+                {
+                    "info": {"role": "assistant", "modelID": "big-pickle"},
+                    "parts": [{"type": "tool", "tool": "read"}],
+                },
+                {"info": last_info, "parts": []},
+            ],
+        }
+    )
+
+
+ZEN_BAD_REQUEST = {
+    "name": "APIError",
+    "data": {
+        "message": 'Bad Request: {"model":"big-pickle"}',
+        "statusCode": 400,
+        "isRetryable": False,
+        "responseBody": '{"model":"big-pickle"}',
+        "metadata": {"url": "https://opencode.ai/zen/v1/chat/completions"},
+    },
+}
+
+
+class ErrorsOnce:
+    """A `session_export` whose `session_id` ends in a provider error until it has been
+    read once — the real shape, since a resumed session's last message is then the
+    fallback model's own turn. Every other session exports clean."""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.exported: list[str] = []
+
+    def __call__(self, session_id: str) -> str:
+        self.exported.append(session_id)
+        first = self.exported.count(session_id) == 1
+        failed = session_id == self.session_id and first
+        return _export(error=ZEN_BAD_REQUEST if failed else None)
+
+
+def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_provider_error(
+    prepared: PipelineFixture,
+) -> None:
+    """Run 20261010T050000Z: Zen 400'd stage 3 mid-implementation, herdr settled the
+    pane `blocked`, and the night ended `stage_blocked`. A provider error is now one
+    resume of the same session on the stage's fallback model, not the end of the run."""
+    export = ErrorsOnce(SESSION_IDS[3])
+    client = _client(settles={3: ["blocked", "idle"]})
+
+    outcome, client, _gh = _run(prepared, client=client, session_export=export)
+
+    assert outcome.outcome == "ok", outcome
+    stage3 = [c for c in client.started if c["name"] == f"pl-3-{RUN_ID}".lower()]
+    assert [(c["model"], c["session_id"]) for c in stage3] == [
+        ("opencode/big-pickle", None),
+        (AUTHOR_FALLBACK_MODEL, SESSION_IDS[3]),
+    ]
+    # The resume is told why the model changed, not re-sent the whole stage prompt.
+    stage3_prompts = [t for n, t in client.prompts if n == f"pl-3-{RUN_ID}".lower()]
+    assert stage3_prompts[1] == FALLBACK_CONTINUE_PROMPT
+    # One session for stage 3 either way, so stage 6 still resumes the work it did.
+    assert prepared.state()["stage_sessions"]["3"] == SESSION_IDS[3]
+    assert prepared.state()["stage_sessions"]["6"] == SESSION_IDS[3]
+    report_text = prepared.report.read_text()
+    assert "## Outcome: ok" in report_text
+    assert f"resumed its session on {AUTHOR_FALLBACK_MODEL}" in report_text
+    assert "400: Bad Request" in report_text
+
+
+def test_pipeline_run_does_not_fall_back_on_a_blocked_stage_without_a_provider_error(
+    prepared: PipelineFixture,
+) -> None:
+    """`blocked` is also a real permission prompt, which another model would hit just
+    the same. Only an `APIError` in the session record earns the fallback."""
+    client = _client(settles={3: ["blocked"]})
+
+    outcome, client, _gh = _run(
+        prepared, client=client, session_export=lambda _id: _export(error=None)
+    )
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "stage_blocked"
+    assert [c["model"] for c in client.started if c["name"].startswith("pl-3-")] == [
+        "opencode/big-pickle"
+    ]
+    assert client.closed_panes
+
+
+def test_pipeline_run_falls_back_when_a_provider_error_settles_idle(
+    prepared: PipelineFixture,
+) -> None:
+    """Nothing guarantees a provider error settles `blocked`. An `idle` settle on a
+    half-done stage 3 would pass gate 3, which only checks the tests exist — so the
+    session is read on every settle, not only a failed one."""
+    outcome, client, _gh = _run(prepared, session_export=ErrorsOnce(SESSION_IDS[3]))
+
+    assert outcome.outcome == "ok", outcome
+    resumed = [c for c in client.started if c["model"] == AUTHOR_FALLBACK_MODEL]
+    assert [(c["name"], c["session_id"]) for c in resumed] == [
+        (f"pl-3-{RUN_ID}".lower(), SESSION_IDS[3])
+    ]
+    assert "resumed its session on" in prepared.report.read_text()
+
+
+class SessionReadFailsHerdr(FakeHerdr):
+    """`agent get` failing outright, the way a herdr server restart would."""
+
+    def agent_session_id(self, target: str) -> str | None:
+        raise HerdrCliError("herdr server unreachable", exit_code=1)
+
+
+def test_pipeline_run_keeps_its_never_raises_contract_when_the_session_is_unreadable(
+    prepared: PipelineFixture,
+) -> None:
+    """An unreadable session means "no fallback", not an escaped exception: the stage's
+    own settle decides, and the report is still written."""
+    client = SessionReadFailsHerdr(SESSION_IDS, settles={1: ["blocked"]})
+
+    outcome, _client, _gh = _run(
+        prepared,
+        client=client,
+        session_export=lambda _id: _export(error=ZEN_BAD_REQUEST),
+    )
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "stage_blocked"
+    assert len(client.started) == 1
+    assert client.closed_panes
+    assert "## Outcome: failed" in prepared.report.read_text()
+
+
+def test_pipeline_run_reports_the_fallback_when_it_also_fails(
+    prepared: PipelineFixture,
+) -> None:
+    """One fallback, never a chain: a stage that fails on its fallback too ends the run,
+    and the report says the fallback was tried."""
+    client = _client(settles={3: ["blocked", "blocked"]})
+
+    outcome, client, _gh = _run(
+        prepared, client=client, session_export=ErrorsOnce(SESSION_IDS[3])
+    )
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "stage_blocked"
+    assert len([c for c in client.started if c["name"].startswith("pl-3-")]) == 2
+    report_text = prepared.report.read_text()
+    assert f"resumed its session on {AUTHOR_FALLBACK_MODEL}" in report_text
+
+
+@pytest.mark.parametrize(
+    ("document", "expected"),
+    [
+        (_export(error=ZEN_BAD_REQUEST), '400: Bad Request: {"model":"big-pickle"}'),
+        (_export(error=None), None),
+        # An aborted turn is not the provider's fault; another model would not help.
+        (_export(error={"name": "MessageAbortedError", "data": {}}), None),
+        (json.dumps({"info": {}, "messages": []}), None),
+        ("not json", None),
+    ],
+    ids=["api-error", "no-error", "aborted", "no-messages", "not-json"],
+)
+def test_session_api_error_reads_the_last_message_error(
+    document: str, expected: str | None
+) -> None:
+    assert _session_api_error(document) == expected
+
+
+def test_stage_fallbacks_stay_off_zen_and_keep_the_review_independent() -> None:
+    by_stage = {s.stage: s for s in STAGES}
+    agent_stages = [s for s in STAGES if s.model is not None]
+
+    assert all(s.fallback_model for s in agent_stages)
+    # A fallback on the same provider as its primary would share its bad night.
+    assert all(not s.fallback_model.startswith("opencode/") for s in agent_stages)  # type: ignore[union-attr]
+    # Whichever model writes the code, the reviewer's family is a different one.
+    author_models = {by_stage[3].model, by_stage[3].fallback_model}
+    reviewer_models = {by_stage[5].model, by_stage[5].fallback_model}
+    assert all("nemotron" in m for m in reviewer_models)  # type: ignore[operator]
+    assert not any("nemotron" in m for m in author_models)  # type: ignore[operator]
 
 
 # ---------------------------------------------------------------------------
