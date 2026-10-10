@@ -67,6 +67,9 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > `opencode/muse-spark-1.3-contributor-free`, stages 3/6 `opencode/big-pickle`, stage 5
 > `opencode/nemotron-3-ultra-free` (a different family from the author). `pipeline-prepare`
 > fails the night before claiming an issue if `opencode models` no longer lists one.
+> Each agent stage also has a `fallback_model` off Zen (authors `nvidia/moonshotai/kimi-k3`,
+> reviewer `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`): when a stage's session ends
+> in a provider `APIError`, `pipeline-run` resumes that session once on the fallback.
 
 Stage rules copied from spec §3: tests before code (stage 3 done = every
 acceptance test exists and passes), comment-addressal capped at 2 iterations +

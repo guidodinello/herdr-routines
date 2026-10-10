@@ -19,6 +19,9 @@ class StageSpec:
     - `isolation` is the G-17 layout category: `independent`, `none` (model=None),
       or `reused` (stage 6 reuses stage 3).
     - `reuses_stage` is the stage number whose session id is reused, if any.
+    - `fallback_model` is what `pipeline_run` resumes the stage's session on, once, when
+      `model`'s provider rejects a call mid-stage (an opencode `APIError`). A different
+      provider from `model`, so one provider's bad night is not the run's.
     """
 
     stage: int
@@ -28,7 +31,17 @@ class StageSpec:
     start_timeout_ms: int
     isolation: Literal["independent", "none", "reused"]
     reuses_stage: int | None = None
+    fallback_model: str | None = None
 
+
+# Not on OpenCode Zen, where every primary model lives: Zen's free models route to
+# whichever upstream it picks, and one of those 400'd stage 3 mid-implementation on
+# 2026-10-10. kimi-k3 is not deepseek (big-pickle's upstream that night) nor nemotron,
+# so a fallback author is still a different family from stage 5's reviewer.
+AUTHOR_FALLBACK_MODEL = "nvidia/moonshotai/kimi-k3"
+# The reviewer's own family on another provider: independence from the author is about
+# the model family, which a provider switch does not change.
+REVIEWER_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 
 STAGES: tuple[StageSpec, ...] = (
     StageSpec(
@@ -38,6 +51,7 @@ STAGES: tuple[StageSpec, ...] = (
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
         isolation="independent",
+        fallback_model=AUTHOR_FALLBACK_MODEL,
     ),
     StageSpec(
         stage=2,
@@ -46,6 +60,7 @@ STAGES: tuple[StageSpec, ...] = (
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
         isolation="independent",
+        fallback_model=AUTHOR_FALLBACK_MODEL,
     ),
     StageSpec(
         stage=3,
@@ -54,6 +69,7 @@ STAGES: tuple[StageSpec, ...] = (
         timeout_ms=90 * 60 * 1000,
         start_timeout_ms=120_000,
         isolation="independent",
+        fallback_model=AUTHOR_FALLBACK_MODEL,
     ),
     StageSpec(
         stage=4,
@@ -71,6 +87,7 @@ STAGES: tuple[StageSpec, ...] = (
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
         isolation="independent",
+        fallback_model=REVIEWER_FALLBACK_MODEL,
     ),
     StageSpec(
         stage=6,
@@ -80,5 +97,6 @@ STAGES: tuple[StageSpec, ...] = (
         start_timeout_ms=120_000,
         isolation="reused",
         reuses_stage=3,
+        fallback_model=AUTHOR_FALLBACK_MODEL,
     ),
 )
