@@ -649,3 +649,5 @@ it.*
   file closing with criteria it looks like it skipped. (e) Added a "Follow-up, not in
   this issue" note giving the skill-side `id` hardening an explicit owner and a
   reason to wait for real ledger data before scoping it.
+- **2026-10-10:** phase A merged (PR #156). Phase B filed as
+  [058](058-audit-fix-worker.md) from criteria 17-22.

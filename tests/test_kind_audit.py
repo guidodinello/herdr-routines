@@ -36,7 +36,6 @@ from herdr_routines.findings import (
 )
 from herdr_routines.history import read_job
 from herdr_routines.runner import substitute_prompt
-from herdr_routines.tick import _audit_phase_a
 
 NOW = datetime(2026, 10, 10, 4, 0, 0, tzinfo=UTC)
 RUN_ID = "audit-type-health-20261010T040000Z"
@@ -121,7 +120,8 @@ def _write_manifest(
 
 
 class _FakeAuditClient:
-    """Records notifications; phase A must never dispatch an agent or start a pane."""
+    """Records notifications. The diff step never starts a pane itself: dispatch goes
+    through `_dispatch_audit_fix`, which these tests replace with `_FixRecorder`."""
 
     def __init__(self) -> None:
         self.notifications: list[tuple[str, str | None, str]] = []
@@ -139,6 +139,32 @@ class _FakeAuditClient:
     def agent_start(self, *_a: Any, **_k: Any) -> None:
         self.dispatch_calls += 1
         raise AssertionError("phase A must not dispatch an agent")
+
+
+def _diff_step(
+    job: Job, history_path: Path, *, client: Any, now: datetime, run_id: str
+) -> tuple[str, bool]:
+    """Phases 2-3 of an audit cycle, with phase 1 (the audit) stood in for by a manifest
+    the test wrote itself."""
+    return tick._diff_and_fix(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        run_id=run_id,
+        paths=tick._AuditPaths.for_run(job.name, run_id),
+    )
+
+
+class _FixRecorder:
+    """Stands in for `_dispatch_audit_fix`: records each dispatch, settles idle."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, job: Job, **kwargs: Any) -> Any:
+        self.calls.append([f.id for f in kwargs["findings"]])
+        return tick._AgentRun(final_agent_status="idle")
 
 
 def _last_record(history_path: Path, job_name: str) -> Any:
@@ -253,7 +279,7 @@ def test_manifest_validation_fails_closed(
     # The tick records the failure and dispatches nothing.
     job = _audit_job(tmp_path)
     client = _FakeAuditClient()
-    summary, failed = _audit_phase_a(
+    summary, failed = _diff_step(
         job,
         tmp_path / "history.jsonl",
         client=client,  # type: ignore[arg-type]
@@ -298,7 +324,7 @@ def test_cold_start_adopts_baseline_without_dispatch(
     client = _FakeAuditClient()
     history = tmp_path / "history.jsonl"
 
-    summary, failed = _audit_phase_a(
+    summary, failed = _diff_step(
         job,
         history,
         client=client,  # type: ignore[arg-type]
@@ -319,12 +345,13 @@ def test_cold_start_adopts_baseline_without_dispatch(
     assert len(ledger.entries) == 2
     assert all(e.state == "open" and e.attempts == 0 for e in ledger.entries.values())
 
-    # adopt_baseline: false on a cold start produces a dispatch set (still no dispatch
-    # in phase A — the set is recorded, not acted on).
+    # adopt_baseline: false on a cold start dispatches immediately.
     ledger_path(job.name).unlink()
     job2 = _audit_job(tmp_path, adopt_baseline=False)
     client2 = _FakeAuditClient()
-    _summary2, failed2 = _audit_phase_a(
+    fix = _FixRecorder()
+    monkeypatch.setattr(tick, "_dispatch_audit_fix", fix)
+    _summary2, failed2 = _diff_step(
         job2,
         history,
         client=client2,  # type: ignore[arg-type]
@@ -333,9 +360,9 @@ def test_cold_start_adopts_baseline_without_dispatch(
     )
     assert failed2 is False
     rec2 = _last_record(history, job2.name)
-    assert rec2.extra["gate"] == "fix_pending"
+    assert rec2.extra["gate"] == "fix_dispatched"
     assert len(rec2.extra["dispatched_ids"]) == 2
-    assert client2.dispatch_calls == 0
+    assert len(fix.calls) == 1 and len(fix.calls[0]) == 2
 
 
 # -- AC 8 ---------------------------------------------------------------------------
@@ -357,7 +384,7 @@ def test_corrupt_ledger_fails_closed_without_rebaseline(
 
     client = _FakeAuditClient()
     history = tmp_path / "history.jsonl"
-    summary, failed = _audit_phase_a(
+    summary, failed = _diff_step(
         job,
         history,
         client=client,  # type: ignore[arg-type]
@@ -422,7 +449,7 @@ def test_suppressed_finding_stops_redispatch(
 
     client = _FakeAuditClient()
     history = tmp_path / "history.jsonl"
-    summary, failed = _audit_phase_a(
+    summary, failed = _diff_step(
         job,
         history,
         client=client,  # type: ignore[arg-type]
@@ -440,7 +467,7 @@ def test_suppressed_finding_stops_redispatch(
     assert client.dispatch_calls == 0
 
     # Not re-dispatched next cycle, and the budget is not incremented.
-    _summary2, failed2 = _audit_phase_a(
+    _summary2, failed2 = _diff_step(
         job,
         history,
         client=client,  # type: ignore[arg-type]
@@ -467,7 +494,7 @@ def test_clean_audit_night_is_silent(
 
     client = _FakeAuditClient()
     history = tmp_path / "history.jsonl"
-    _summary, failed = _audit_phase_a(
+    _summary, failed = _diff_step(
         job,
         history,
         client=client,  # type: ignore[arg-type]
@@ -528,7 +555,7 @@ def test_shipped_audit_job_config_validates() -> None:
 # -- AC 16 --------------------------------------------------------------------------
 
 
-def test_phase_a_records_dispatch_set_without_dispatching(
+def test_report_and_extra_record_the_full_dispatch_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
@@ -573,7 +600,9 @@ def test_phase_a_records_dispatch_set_without_dispatching(
 
     client = _FakeAuditClient()
     history = tmp_path / "history.jsonl"
-    _summary, failed = _audit_phase_a(
+    fix = _FixRecorder()
+    monkeypatch.setattr(tick, "_dispatch_audit_fix", fix)
+    _summary, failed = _diff_step(
         job,
         history,
         client=client,  # type: ignore[arg-type]
@@ -586,7 +615,8 @@ def test_phase_a_records_dispatch_set_without_dispatching(
     new_id = finding_id("type-health", "missing-return-type", "new.php")
     assert list(rec.extra["dispatched_ids"]) == [new_id]
     assert list(rec.extra["suppressed_ids"]) == [suppressed_id]
-    assert rec.extra["gate"] == "fix_pending"
+    assert rec.extra["gate"] == "fix_dispatched"
+    assert fix.calls == [[new_id]]
 
     # The full dispatch set is in the report too.
     report_path = Path(rec.extra["report_path"])
@@ -594,15 +624,11 @@ def test_phase_a_records_dispatch_set_without_dispatching(
     assert new_id in report
     assert suppressed_id in report
 
-    # No agent, no pane, no worktree.
-    assert client.dispatch_calls == 0
-    assert not (tmp_path / ".worktrees").exists()
-
-    # Recording is not dispatching: no budget consumed, but the finding stays owed a fix.
+    # The dispatched finding consumed one attempt and stays owed a fix until it resolves.
     ledger = load_ledger(ledger_path(job.name))
     assert ledger is not None
-    assert ledger.entries[new_id].attempts == 0
-    assert ledger.entries[new_id].last_dispatched_run is None
+    assert ledger.entries[new_id].attempts == 1
+    assert ledger.entries[new_id].last_dispatched_run == RUN_ID
     assert ledger.entries[new_id].queued
 
     # _process_job routes kind: audit to _process_audit_job.

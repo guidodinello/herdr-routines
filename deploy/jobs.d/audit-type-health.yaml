@@ -1,15 +1,13 @@
-# kind: audit (issue 057) — a report-diff gate job.
+# kind: audit (issues 057, 058) — a report-diff gate job.
 #
-# An audit job schedules an audit skill/command, parses the findings manifest it writes
-# to $ROUTINE_FINDINGS, and diffs it against the per-job ledger at
-# <state>/findings/audit-type-health.json. It dispatches a fix worker only for findings
-# that are *new* or *regressed* since last cycle — so a stable, pre-existing backlog does
-# not re-open a PR every week.
+# Each cycle runs the audit in a throwaway worktree at `base`, parses the findings
+# manifest it writes to $ROUTINE_FINDINGS, and diffs it against the per-job ledger at
+# <state>/findings/audit-type-health.json. It dispatches one fix worker (one branch, one
+# PR) only for findings that are *new*, *regressed*, or still owed a fix from an earlier
+# cycle — so a stable, pre-existing backlog does not re-open a PR every week.
 #
-# Ship off: this is the reference example, not a job that should start running the night
-# it is deployed. Phase A (issue 057) does not run the audit yet — it only diffs a manifest
-# that already exists — so enabling it before phase B/058 makes every fire fail with
-# `findings_manifest_invalid`. Flip enabled: true once phase B runs the audit.
+# Ships off: it opens PRs on the operator's behalf. The first enabled run only adopts a
+# baseline (see adopt_baseline); PRs start from the second.
 enabled: false
 cron: "0 4 * * 1" # Mondays 04:00
 repo: /home/guido/.local/state/herdr-routines/repos/fitted
@@ -17,17 +15,20 @@ workspace: worktree # required for kind: audit (the fix worker edits source)
 base: development
 kind: audit
 
-# Exactly one of skill/command. `skill` names the audit skill an agent runs; `command` is
-# a cheap synchronous command that writes the manifest itself (its exit code is not the
-# gate). Either way the manifest lands at $ROUTINE_FINDINGS
-# (<reports_dir>/<run_id>-findings.json).
+# Exactly one of skill/command. `skill` names the audit skill an agent runs; the engine's
+# prompt tells it the manifest format, so the skill needs no changes. `command` is a cheap
+# synchronous command that writes the manifest itself — $ROUTINE_FINDINGS is substituted
+# into it and exported — and its exit code is not the gate (only 127, "not found", fails).
+# Either way the manifest lands at <reports_dir>/<run_id>-findings.json.
 audit:
   skill: type-health
   timeout_ms: 1800000 # the audit's own budget (30 min)
 
-# The fix worker (Phase B/058) inherits the job's agent fields.
+# The audit agent and the fix worker both use the job's agent fields. `prompt` overrides
+# the audit prompt and `fix_prompt` the fix prompt; empty means engine-injected.
 agent_kind: opencode
 model: null
+timeout_ms: 2700000 # the fix worker's budget (45 min)
 
 # Dispatch budget: at most this many findings per cycle, most severe first. The rest stay
 # queued in the ledger for the next cycle.

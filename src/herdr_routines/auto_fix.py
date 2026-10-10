@@ -14,10 +14,12 @@ import re
 import shlex
 import subprocess
 import textwrap
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from herdr_routines.findings import Finding
 from herdr_routines.history import read_job
 
 log = logging.getLogger(__name__)
@@ -616,6 +618,9 @@ class CheckResult:
     output: str = ""
     error: str | None = None
     timed_out: bool = False
+    # The raw exit code of a command check (None for pr_health). An audit command reads
+    # it directly: only 127 (binary missing) is a failure there, not "non-zero".
+    exit_code: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,6 +705,7 @@ def run_checks(
                     output=output.strip(),
                     timed_out=timed_out,
                     error=f"exit code {exit_code}" if not passed else None,
+                    exit_code=exit_code,
                 )
             )
             continue
@@ -769,6 +775,124 @@ def build_gate_worker_agent_name(job_name: str, run_id: str) -> str:
     short_hash = hashlib.sha1(run_id.encode()).hexdigest()[:8]
     raw = f"rt-{job_name}-gate-{short_hash}"
     return raw[:32]
+
+
+def build_audit_agent_name(job_name: str, run_id: str) -> str:
+    """Agent name for an audit agent: rt-<job>-au<hash>, the hash shortened to fit the
+    32-char NAME_RE cap (2 hex chars for a 24-char job name, never zero)."""
+    prefix = f"rt-{job_name}-au"
+    budget = max(32 - len(prefix), 1)
+    return f"{prefix}{hashlib.sha1(run_id.encode()).hexdigest()[: min(budget, 8)]}"[:32]
+
+
+# The manifest shape an audit must write (issue 057, "The findings manifest"). Spelled
+# out in the prompt because no audit skill emits it on its own yet.
+_MANIFEST_EXAMPLE = """\
+{
+  "version": 1,
+  "check": "<skill or tool name>",
+  "findings": [
+    {
+      "id": "<optional stable id, e.g. a rule id + symbol>",
+      "kind": "<finding category>",
+      "severity": "low | medium | high",
+      "location": "<path/to/file.ext:line>",
+      "summary": "<one line>"
+    }
+  ]
+}"""
+
+
+def build_audit_prompt(
+    *, skill: str, base: str, report_path: str, findings_path: str
+) -> str:
+    """The engine-injected prompt for an audit agent (`audit.skill`)."""
+    return textwrap.dedent("""\
+        Run the `{skill}` skill against this repository. You are in a fresh worktree
+        checked out at `{base}`.
+
+        This is a read-only audit. Do NOT edit source files, commit, push, create a
+        branch, or open a PR. A separate worker fixes findings later.
+
+        Write two files when the audit is done:
+
+        1. A human-readable Markdown report to: {report_path}
+        2. A machine-readable findings manifest to: {findings_path}
+           It must be valid JSON in exactly this shape:
+
+        {manifest}
+
+           - `severity` must be one of low, medium, high.
+           - `kind`, `location` and `summary` are required, non-empty strings.
+           - Include every finding. An empty `findings` list means the audit is clean.
+           - Write the manifest even when there are no findings.
+
+        Bounded work: finish the audit, write both files, then stop.
+    """).format(
+        skill=skill,
+        base=base,
+        report_path=report_path,
+        findings_path=findings_path,
+        manifest=textwrap.indent(_MANIFEST_EXAMPLE, "   "),
+    )
+
+
+def build_audit_fix_prompt(
+    *,
+    job_name: str,
+    check: str,
+    base: str,
+    branch: str,
+    report_path: str,
+    findings: Sequence[Finding],
+    recheck: str,
+) -> str:
+    """The engine-injected prompt for an audit fix worker: build_base_fix_prompt's
+    sibling, carrying the finding table instead of gate output. `recheck` is how to
+    re-run the audit, so the worker can enumerate every instance behind a derived ID
+    (same kind + same file collapse to one ID)."""
+    table = "\n".join(
+        f"| `{f.id}` | {f.severity} | {f.kind} | `{f.location}` | {f.summary} |"
+        for f in findings
+    )
+    return textwrap.dedent("""\
+        You are fixing findings from the `{check}` audit on `{base}`. Work in the
+        checked-out worktree.
+
+        Job: {job_name}
+        Base: {base}
+        Branch: {branch}
+        Report: {report_path}
+
+        Findings to fix (most severe first):
+
+        | id | severity | kind | location | summary |
+        |----|----------|------|----------|---------|
+        {table}
+
+        One finding can stand for several instances: a finding without a stable id is
+        keyed by kind and file, not line. Re-run the audit to list every instance:
+        {recheck}
+
+        Instructions:
+        1. Fix every instance of each finding above. Do not fix unrelated findings.
+        2. Re-run the audit and confirm these findings are gone.
+        3. Commit your changes with a descriptive message.
+        4. Create the branch `{branch}` and push it.
+        5. Open a PR targeting {base} with `gh pr create --base {base}`.
+
+        Write a summary of what you fixed (and anything you could not) to: {report_path}
+
+        Bounded work: complete the fix and push, then stop.
+    """).format(
+        check=check,
+        base=base,
+        job_name=job_name,
+        branch=branch,
+        report_path=report_path,
+        table=table,
+        recheck=recheck,
+    )
 
 
 def attempt_count_for_gate_branch(

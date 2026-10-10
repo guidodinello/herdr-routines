@@ -210,14 +210,15 @@ files 2026-08-27.
   has no self-clearing gate: a content marker plus a per-`owner/repo#N` attempt
   budget is what makes it a finite loop. 2026-08-30 brainstorm. →
   [`055`](docs/process/issues/055-review-me-prs-across-repos.md)
-- **Audit skills as report→diff gate jobs** — `done` (Phase A, 2026-10-10). New
-  `kind: audit` jobs schedule an audit skill/command, parse the findings manifest
-  it writes to `$ROUTINE_FINDINGS`, and diff it against a per-job ledger: a fix
-  worker is dispatched only for *new* or *regressed* findings, so a stable
-  pre-existing backlog never re-opens a PR. Phase A lands the config + manifest
-  contract + the pure diff/ledger half (`findings.py`) and a record-only tick —
-  no dispatch yet. Phase B (the fix worker, worktree + pane wiring) is
-  [`058`](docs/process/issues/058-audit-fix-worker.md). Turns fitted's audit
+- **Audit skills as report→diff gate jobs** — `done` (Phase A and B, 2026-10-10).
+  New `kind: audit` jobs run an audit skill/command in a throwaway worktree, parse
+  the findings manifest it writes to `$ROUTINE_FINDINGS`, and diff it against a
+  per-job ledger: one fix worker is dispatched only for *new*, *regressed* or
+  still-queued findings, so a stable pre-existing backlog never re-opens a PR.
+  Phase A (PR #156) landed the config, manifest contract and the diff/ledger half
+  (`findings.py`); phase B,
+  [`058`](docs/process/issues/058-audit-fix-worker.md), runs the audit and
+  dispatches the fix worker. Turns fitted's audit
   skills (`type-health`, `ui-ux-review`, `accessibility-review`, `fix-ignores`,
   `discover-conventions`, `improve-codebase-architecture`, `api-gap-audit`) into
   scheduled jobs. Builds on issue 025's gate model ("all checks pass → free").
