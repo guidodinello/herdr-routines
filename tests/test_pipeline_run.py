@@ -674,31 +674,68 @@ def test_pipeline_run_partial_on_deadline(prepared: PipelineFixture) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 5. a quota marker ends the run as failed (quota_exhausted)
+# 5. a quota marker resumes the stage on its fallback model
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_run_quota_marker_fast_fails(prepared: PipelineFixture) -> None:
-    client = _client(
-        screens={2: ["Free usage exceeded, subscribe to Go [retrying in 11h 59m]"]}
-    )
+class SessionReadFailsHerdr(FakeHerdr):
+    """`agent get` failing outright, the way a herdr server restart would."""
+
+    def agent_session_id(self, target: str) -> str | None:
+        raise HerdrCliError("herdr server unreachable", exit_code=1)
+
+
+QUOTA_SCREEN = "Free usage exceeded, subscribe to Go [retrying in 11h 59m]"
+
+
+def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_quota_marker(
+    prepared: PipelineFixture,
+) -> None:
+    """A quota wedge is a stage-level fallback, like a provider error. It used to end the
+    run for tick to relaunch with `fallback_model`, which the launcher ignored, so the
+    relaunch reran every stage on the same exhausted Zen models."""
+    # Stage 2's screen shows the marker on every poll of every attempt, the way a
+    # resumed session re-rendering its own history could. The fallback still finishes,
+    # which only holds if its attempt is not watched for Zen's quota text.
+    client = _client(screens={2: [QUOTA_SCREEN]})
 
     outcome, client, _gh = _run(prepared, client=client)
 
+    assert outcome.outcome == "ok", outcome
+    stage2 = [c for c in client.started if c["name"] == f"pl-2-{RUN_ID}".lower()]
+    assert [(c["model"], c["session_id"]) for c in stage2] == [
+        ("opencode/muse-spark-1.3-contributor-free", None),
+        (AUTHOR_FALLBACK_MODEL, SESSION_IDS[2]),
+    ]
+    # The wedged pane is closed before its session is resumed in a new one.
+    assert stage2[0]["pane_id"] in client.closed_panes
+    stage2_prompts = [t for n, t in client.prompts if n == f"pl-2-{RUN_ID}".lower()]
+    assert stage2_prompts[1] == FALLBACK_CONTINUE_PROMPT
+    assert prepared.state()["stage_sessions"]["2"] == SESSION_IDS[2]
+    report_text = prepared.report.read_text()
+    assert "quota exhausted" in report_text
+    assert f"resumed its session on {AUTHOR_FALLBACK_MODEL}" in report_text
+
+
+def test_pipeline_run_quota_marker_fails_the_run_when_the_session_is_unreadable(
+    prepared: PipelineFixture,
+) -> None:
+    """With no session id there is nothing to resume, so the run fast-fails as
+    `quota_exhausted` instead of waiting the stage out."""
+    client = SessionReadFailsHerdr(SESSION_IDS, screens={1: [QUOTA_SCREEN]})
+
+    outcome, _client, _gh = _run(prepared, client=client)
+
     assert outcome.outcome == "failed"
     assert outcome.reason == "quota_exhausted"
-    # The exact reason string `tick._process_pipeline_job` gates its fallback_model
-    # retry on, produced from the run's own report.
     report_text = prepared.report.read_text()
     assert "## Outcome: failed (quota_exhausted)" in report_text
+    assert "failure marker confirmed on screen for stage 1" in report_text
     assert tick._classify_pipeline_outcome(report_text) == (
         "failed",
         "quota_exhausted",
     )
-    # It fast-failed rather than waiting stage 2 out: stage 3 was never started.
-    assert [call["name"] for call in client.started] == [
-        f"pl-{n}-{RUN_ID}".lower() for n in (1, 2)
-    ]
+    assert [call["name"] for call in client.started] == [f"pl-1-{RUN_ID}".lower()]
     # The wedged pane is reaped, so the next tick does not see a live worker.
     assert client.closed_panes
 
@@ -820,13 +857,6 @@ def test_pipeline_run_falls_back_when_a_provider_error_settles_idle(
         (f"pl-3-{RUN_ID}".lower(), SESSION_IDS[3])
     ]
     assert "resumed its session on" in prepared.report.read_text()
-
-
-class SessionReadFailsHerdr(FakeHerdr):
-    """`agent get` failing outright, the way a herdr server restart would."""
-
-    def agent_session_id(self, target: str) -> str | None:
-        raise HerdrCliError("herdr server unreachable", exit_code=1)
 
 
 def test_pipeline_run_keeps_its_never_raises_contract_when_the_session_is_unreadable(

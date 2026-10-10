@@ -272,6 +272,13 @@ for tests:
 entry §9 added (`openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`) — no config change was
 needed to enable this, only the tick/launcher plumbing above.
 
+**Superseded (2026-10-10):** the orchestrator agent and the bash watchdog are gone (issue 056
+phase B moved the stage loop into `pipeline-run`), and the stage models are pinned in
+`pipeline_stages.py`, so the relaunch's `--model` reached nothing and it reran every stage on
+the same exhausted Zen models. A confirmed quota marker now resumes that stage's session on
+its `StageSpec.fallback_model`, inside the run, and tick no longer relaunches a
+`quota_exhausted` pipeline run. `job.fallback_model` is inert for `kind: pipeline`.
+
 ## Appendix: 2026-08-23 incident timeline
 
 - 05:30:14 fitted-implementer starts; prompt attempt 2/3 at 05:30:28 (early EmptyResponse

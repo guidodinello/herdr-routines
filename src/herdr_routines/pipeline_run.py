@@ -83,8 +83,8 @@ Outcome = Literal["ok", "partial", "failed"]
 
 # The exact strings `tick._classify_pipeline_outcome` parses. `reason` is folded into the
 # marker line because the classifier matches on the whole parenthetical — emitting a bare
-# `## Outcome: failed` for a quota wedge would file it as `orchestrator_failed` and lose
-# the signal `_process_pipeline_job` retries `fallback_model` on.
+# `## Outcome: failed` for a quota wedge would file it as `orchestrator_failed`, and the
+# morning history would lose that it was quota, not the pipeline.
 _REPORT_OUTCOME: dict[tuple[Outcome, str | None], str] = {
     ("partial", "partial_deadline"): "partial (deadline exceeded)",
     ("failed", "quota_exhausted"): "failed (quota_exhausted)",
@@ -432,6 +432,12 @@ def _run_bounded(argv: Sequence[str], *, timeout_s: float) -> tuple[int, str, st
 # ---------------------------------------------------------------------------
 
 
+# Not a herdr agent status: what `_start_and_prompt` returns when the failure-marker
+# watchdog killed the prompt, so the quota wedge flows through the same fallback check
+# and settle mapping as a real settle.
+QUOTA_KILLED_STATUS = "quota_exhausted"
+
+
 def _settle_outcome(status: str) -> tuple[bool, str | None]:
     """Map a settled agent status onto (continue?, reason).
 
@@ -448,6 +454,8 @@ def _settle_outcome(status: str) -> tuple[bool, str | None]:
         return True, None
     if status == "blocked":
         return False, "stage_blocked"
+    if status == QUOTA_KILLED_STATUS:
+        return False, "quota_exhausted"
     return False, "interrupted_unknown"
 
 
@@ -626,7 +634,9 @@ def _run_agent_stage(
         ),
     )
 
-    def attempt(*, model: str, session_id: str | None, text: str) -> tuple[str, str]:
+    def attempt(
+        *, model: str, session_id: str | None, text: str, markers: Sequence[str]
+    ) -> tuple[str, str]:
         return _start_and_prompt(
             spec,
             state,
@@ -635,19 +645,24 @@ def _run_agent_stage(
             model=model,
             session_id=session_id,
             text=text,
-            failure_markers=failure_markers,
+            failure_markers=markers,
             heartbeat=heartbeat,
             clock=clock,
         )
 
-    pane_id, status = attempt(model=spec.model, session_id=resume_session, text=prompt)
+    pane_id, status = attempt(
+        model=spec.model,
+        session_id=resume_session,
+        text=prompt,
+        markers=failure_markers,
+    )
     note: str | None = None
     # Checked on every settle, not only a failed one: run 20261010T050000Z's provider
     # error happened to settle `blocked`, but nothing guarantees it, and an `idle`
     # settle on a half-done stage 3 would sail through gate 3 (it only checks that the
     # acceptance tests exist, and the stage writes those first).
     failed_session, provider_error = (
-        _provider_error(client, agent_name, session_export)
+        _fallback_cause(client, agent_name, status, session_export)
         if spec.fallback_model
         else (None, None)
     )
@@ -658,15 +673,20 @@ def _run_agent_stage(
         # also what stage 6 resumes, so stage 3's record stays one session.
         _close_pane(client, pane_id)
         note = (
-            f"stage {spec.stage}: {spec.model} failed with a provider error "
-            f"({provider_error}); resumed its session on {spec.fallback_model}"
+            f"stage {spec.stage}: {spec.model} failed ({provider_error}); "
+            f"resumed its session on {spec.fallback_model}"
         )
         log.warning("pipeline %s: %s", run_id, note)
         try:
+            # No failure markers: they are Zen's quota text, the fallbacks are off Zen
+            # by construction, and a resumed session can re-render its own history —
+            # the primary's "Free usage exceeded" included — which two polls would read
+            # as the fallback's own wedge and kill it seconds in.
             pane_id, status = attempt(
                 model=spec.fallback_model,
                 session_id=failed_session,
                 text=FALLBACK_CONTINUE_PROMPT,
+                markers=(),
             )
         except _Abort as abort:
             abort.lines.insert(0, note)
@@ -674,10 +694,13 @@ def _run_agent_stage(
     ok, reason = _settle_outcome(status)
     if not ok:
         _close_pane(client, pane_id)
+        lines = [note] if note else []
+        if status == QUOTA_KILLED_STATUS:
+            lines.append(f"failure marker confirmed on screen for stage {spec.stage}")
         raise _Abort(
             reason or "interrupted_unknown",
             detail=f"stage {spec.stage} settled {status!r}",
-            lines=[note] if note else None,
+            lines=lines or None,
         )
 
     # Read the id the agent really reported and record it before the gate or any later
@@ -724,7 +747,11 @@ def _start_and_prompt(
     clock: Callable[[], float],
 ) -> tuple[str, str]:
     """Open a pane, start `agent_name` on `model` (resuming `session_id` if given), send
-    `text`, and return (pane id, settled status). Closes the pane before any `_Abort`."""
+    `text`, and return (pane id, settled status). Closes the pane before any `_Abort`.
+
+    A confirmed failure marker is returned as `QUOTA_KILLED_STATUS` with the pane still
+    open, not raised: the caller has to read the agent's session id to resume it on the
+    stage's fallback model, and a closed pane takes the agent, and the id, with it."""
     pane_id = _open_pane(client, state, spec, agent_name)
     try:
         client.agent_start(
@@ -759,15 +786,8 @@ def _start_and_prompt(
             retry_delays_s=PROMPT_RETRY_DELAYS_S,
         )
     except PromptWatchdogKilled as e:
-        _close_pane(client, pane_id)
-        raise _Abort(
-            "quota_exhausted",
-            detail=str(e),
-            lines=[
-                f"failure marker confirmed on screen for stage {spec.stage}",
-                "the pane was closed; the next tick may retry with a fallback model",
-            ],
-        ) from e
+        log.warning("stage %d: %s", spec.stage, e)
+        return pane_id, QUOTA_KILLED_STATUS
     except (HerdrCliError, OSError) as e:
         _close_pane(client, pane_id)
         raise _Abort("stage_prompt_failed", detail=str(e)) from e
@@ -778,7 +798,8 @@ def _start_and_prompt(
 # session already holds the stage's real prompt and everything done so far, so this only
 # has to say why the model changed and that the task is unchanged.
 FALLBACK_CONTINUE_PROMPT = (
-    "Your previous model call failed with a provider error, and this session has been "
+    "Your previous model call failed with a provider error or ran out of quota, and "
+    "this session has been "
     "resumed on a different model. Continue the same task from where it stopped: check "
     "the worktree (`git status`, `git diff`) for what is already done, then finish the "
     "stage exactly as originally instructed."
@@ -812,14 +833,17 @@ def _session_api_error(export_json: str) -> str | None:
     return f"{data.get('statusCode', '?')}: {data.get('message', 'no message')}"
 
 
-def _provider_error(
+def _fallback_cause(
     client: HerdrClient,
     agent_name: str,
+    status: str,
     session_export: Callable[[str], str | None],
 ) -> tuple[str | None, str | None]:
-    """(session id, provider error) for a settled stage agent; either is None when it
-    cannot be read. Never raises — an unreadable session means "no fallback", and the
-    stage's own settle status decides the outcome as it did before fallbacks existed."""
+    """(session id, why the stage's model failed) for a settled stage agent; the cause is
+    None when the model did not fail, and either is None when it cannot be read: a quota
+    kill (`status`) or a provider error in the session record. Never raises — an
+    unreadable session means "no fallback", and the stage's own settle status decides
+    the outcome as it did before fallbacks existed."""
     try:
         session_id = client.agent_session_id(agent_name)
     except (HerdrCliError, OSError) as e:
@@ -827,6 +851,8 @@ def _provider_error(
         return None, None
     if not session_id:
         return None, None
+    if status == QUOTA_KILLED_STATUS:
+        return session_id, "quota exhausted"
     exported = session_export(session_id)
     return session_id, _session_api_error(exported) if exported else None
 

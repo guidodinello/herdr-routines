@@ -69,7 +69,9 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > fails the night before claiming an issue if `opencode models` no longer lists one.
 > Each agent stage also has a `fallback_model` off Zen (authors `nvidia/moonshotai/kimi-k3`,
 > reviewer `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`): when a stage's session ends
-> in a provider `APIError`, `pipeline-run` resumes that session once on the fallback.
+> in a provider `APIError`, or the failure-marker watchdog sees Zen's quota text, `pipeline-run`
+> resumes that session once on the fallback. The job's own `fallback_model` is unused for
+> `kind: pipeline`: tick does not relaunch a `quota_exhausted` run.
 
 Stage rules copied from spec §3: tests before code (stage 3 done = every
 acceptance test exists and passes), comment-addressal capped at 2 iterations +

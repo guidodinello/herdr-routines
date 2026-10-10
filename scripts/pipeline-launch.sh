@@ -45,8 +45,8 @@ Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-n
   --failure-marker   text `pipeline-run` watches each stage's screen for (repeatable;
                       default: "Free usage exceeded" — same as runner.py's
                       DEFAULT_FAILURE_MARKERS). Two consecutive sightings of the same
-                      marker end the run early with an outcome of "failed
-                      (quota_exhausted)" instead of waiting out the full deadline.
+                      marker resume that stage on its fallback model instead of waiting
+                      out the stage's timeout.
 
   Accepted and ignored, kept only because tick still passes them (phase B):
   --agent-name, --agent-kind, --model, --prompt-file, --wait-timeout-ms
