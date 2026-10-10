@@ -318,13 +318,24 @@ def build_branch_name(job_name: str, run_id: str) -> str:
 
 
 def substitute_prompt(
-    prompt_template: str, *, report_path: Path, job_name: str, run_id: str
+    prompt_template: str,
+    *,
+    report_path: Path,
+    job_name: str,
+    run_id: str,
+    findings_path: Path | None = None,
 ) -> str:
-    return (
+    resolved = (
         prompt_template.replace("$ROUTINE_REPORT", str(report_path))
         .replace("$ROUTINE_JOB", job_name)
         .replace("$ROUTINE_RUN_ID", run_id)
     )
+    # $ROUTINE_FINDINGS only resolves for audit jobs (issue 057); the placeholder is left
+    # verbatim elsewhere rather than replaced with an empty/None string, so a non-audit
+    # prompt that happens to contain it fails loudly instead of silently pointing nowhere.
+    if findings_path is not None:
+        resolved = resolved.replace("$ROUTINE_FINDINGS", str(findings_path))
+    return resolved
 
 
 def _best_effort_tmp_diagnosis(
