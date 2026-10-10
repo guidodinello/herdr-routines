@@ -836,7 +836,7 @@ def test_pipeline_run_keeps_its_never_raises_contract_when_the_session_is_unread
     own settle decides, and the report is still written."""
     client = SessionReadFailsHerdr(SESSION_IDS, settles={1: ["blocked"]})
 
-    outcome, client, _gh = _run(
+    outcome, _client, _gh = _run(
         prepared,
         client=client,
         session_export=lambda _id: _export(error=ZEN_BAD_REQUEST),
