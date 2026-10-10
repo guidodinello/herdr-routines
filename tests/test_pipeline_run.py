@@ -34,6 +34,7 @@ import pytest
 
 from herdr_routines import tick
 from herdr_routines.auto_fix import GhClient
+from herdr_routines.gates import gate3_test_names
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.pipeline_run import (
     FALLBACK_CONTINUE_PROMPT,
@@ -71,10 +72,8 @@ Build it in `pipeline_run.py`.
 
 ## Acceptance criteria
 
-1. The thing works. blocking. confidence: high
-   Test: test_the_thing_works
-2. A second thing works. non-blocking. confidence: medium
-   Test: test_the_second_thing_works
+1. [blocking] The thing works — confidence: high — Test: test_the_thing_works
+2. [non-blocking] A second thing works — confidence: medium — Test: test_the_second_thing_works
 
 ## files touched
 
@@ -88,6 +87,9 @@ Build it in `pipeline_run.py`.
 
 v1 had no acceptance criteria; v2 adds two, each ending `Test: <name>`.
 """
+
+# The criteria are one line each, `Test:` last: the shape run 20261010T174659Z's stage 2
+# really wrote, which a fixture with `Test:` on its own line hid from gate 3's parser.
 
 # The gate-3 mechanical check only asks "does this test name exist under tests/".
 # A fixture that satisfies it needs a real tests/ dir with a real file naming it.
@@ -1176,3 +1178,43 @@ def test_pipeline_pushes_signed_commits_when_the_clone_signs(
     # Signed before the first push (stage 4), not repaired by force-push at the end:
     # the end-of-run check found nothing left to do.
     assert "re-signed" not in prepared.report.read_text()
+
+
+# ---------------------------------------------------------------------------
+# stage 1 is told which feature to build; gate 3 reads the spec it gets
+# ---------------------------------------------------------------------------
+
+
+def test_stage_1_prompt_names_the_picked_issue(prepared: PipelineFixture) -> None:
+    """Run 20261010T174659Z picked issue 055, but stage 1's prompt named only
+    `docs/plan-v1.md`, so the spec it wrote was for the project's original plan. The
+    picked issue reaches stage 1 only through its prompt."""
+    _outcome, client, _gh = _run(prepared)
+
+    stage1_prompt = next(t for n, t in client.prompts if n == f"pl-1-{RUN_ID}".lower())
+    assert f"{prepared.worktree}/{prepared.issue_rel}" in stage1_prompt
+
+
+@pytest.mark.parametrize(
+    ("spec_text", "expected"),
+    [
+        # Verbatim shape from run 20261010T174659Z's spec v2.
+        (
+            (
+                "1. [blocking] Packaged CLI — confidence: high — Test: test_cli_exposes\n"
+                "2. [non-blocking] Timer shape — confidence: medium — Test: test_timer\n"
+            ),
+            ["test_cli_exposes", "test_timer"],
+        ),
+        ("1. The thing works.\n   Test: test_own_line\n", ["test_own_line"]),
+        ("1. The thing works — Test: `test_backticked`\n", ["test_backticked"]),
+        # Prose describing the format names no test.
+        ("each item ends `Test: <name>` (exact test name).\n", []),
+        ("Test: test_mid_line is not the end of this line\n", []),
+    ],
+    ids=["inline-end", "own-line", "backticked", "format-prose", "mid-line"],
+)
+def test_gate3_test_names_reads_a_test_name_ending_a_line(
+    spec_text: str, expected: list[str]
+) -> None:
+    assert gate3_test_names(spec_text) == expected
