@@ -1,0 +1,48 @@
+# kind: audit (issue 057) — a report-diff gate job.
+#
+# An audit job schedules an audit skill/command, parses the findings manifest it writes
+# to $ROUTINE_FINDINGS, and diffs it against the per-job ledger at
+# <state>/findings/audit-type-health.json. It dispatches a fix worker only for findings
+# that are *new* or *regressed* since last cycle — so a stable, pre-existing backlog does
+# not re-open a PR every week.
+#
+# Ship off: this is the reference example, not a job that should start running the night
+# it is deployed. Phase A (issue 057) does not run the audit yet — it only diffs a manifest
+# that already exists — so enabling it before phase B/058 makes every fire fail with
+# `findings_manifest_invalid`. Flip enabled: true once phase B runs the audit.
+enabled: false
+cron: "0 4 * * 1" # Mondays 04:00
+repo: /home/guido/.local/state/herdr-routines/repos/fitted
+workspace: worktree # required for kind: audit (the fix worker edits source)
+base: development
+kind: audit
+
+# Exactly one of skill/command. `skill` names the audit skill an agent runs; `command` is
+# a cheap synchronous command that writes the manifest itself (its exit code is not the
+# gate). Either way the manifest lands at $ROUTINE_FINDINGS
+# (<reports_dir>/<run_id>-findings.json).
+audit:
+  skill: type-health
+  timeout_ms: 1800000 # the audit's own budget (30 min)
+
+# The fix worker (Phase B/058) inherits the job's agent fields.
+agent_kind: opencode
+model: null
+
+# Dispatch budget: at most this many findings per cycle, most severe first. The rest stay
+# queued in the ledger for the next cycle.
+max_findings_per_dispatch: 10
+# Per-finding retry budget, across cycles; a finding at this many attempts is suppressed
+# (reported, never re-dispatched). Attempts survive a resolve-then-reappear.
+max_attempts_per_target: 3
+# Resolved-ledger entries older than this are pruned. Open entries are never pruned.
+ledger_retention_days: 90
+# On a cold start, adopt the current report as the baseline and dispatch nothing — so the
+# first night establishes the backlog instead of opening a PR for all of it.
+adopt_baseline: true
+
+catch_up_minutes: 720 # weekly cron: a long catch-up window is the point
+on_missed: log
+# Clean night = done/passed, no notification under on-finding; a gate that found something
+# still notifies.
+notify_policy: on-finding

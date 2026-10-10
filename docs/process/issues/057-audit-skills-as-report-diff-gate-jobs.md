@@ -1,7 +1,7 @@
 ---
 id: "057"
 title: "Audit skills as report→diff gate jobs: schedule an audit, fix only new/regressed findings"
-status: open
+status: done
 priority: medium
 area: pipeline
 gate: phase A (criteria 1-16) is the buildable ticket and closes this issue; phase B (17-22) is listed here for 058 to be filed from, exactly as 054/056 split the orchestrator work

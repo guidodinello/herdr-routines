@@ -81,9 +81,12 @@ VALID_NOTIFY_POLICIES = frozenset({"always", "terminal", "on-finding", "on-failu
 
 # Single dispatch key (issue 049). "routine" (default) = plain unconditional execute_run;
 # "gated" = gate checks + fix dispatch (_process_gated_job); "pipeline" = detached
-# systemd-run launch (_process_pipeline_job). Gate mode is no longer an orthogonal axis
+# systemd-run launch (_process_pipeline_job); "audit" = report-diff gate job (issue 057):
+# schedule an audit skill, parse its findings manifest, diff against the ledger, and
+# dispatch fixes only for new/regressed findings. Gate mode is no longer an orthogonal
+# axis:
 # (the old `checks is not None` discriminator); kind is the exhaustive SSOT.
-VALID_JOB_KINDS = frozenset({"routine", "gated", "pipeline"})
+VALID_JOB_KINDS = frozenset({"routine", "gated", "pipeline", "audit"})
 
 # Closed set of known terminal RunOutcome.reason values eligible for retry.
 # Derived from runner.py + tick.py failure sites. Unknown strings in retry_on
@@ -170,6 +173,13 @@ _JOB_ALLOWED_KEYS = (
             "tmp_hygiene",
             "retry_attempts",
             "retry_on",
+            # kind: audit (issue 057). Deliberately NOT in _DEFAULTS_ALLOWED_KEYS:
+            # an audit's identity (which skill/command) and its budget are per-job.
+            "audit",
+            "max_findings_per_dispatch",
+            "ledger_retention_days",
+            "adopt_baseline",
+            "fix_prompt",
         }
     )
 )
@@ -204,6 +214,12 @@ _JOB_DEFAULTS = {
     "tmp_hygiene": None,
     "retry_attempts": 0,
     "retry_on": None,
+    # kind: audit (issue 057). None for every other kind.
+    "audit": None,
+    "max_findings_per_dispatch": 10,
+    "ledger_retention_days": 90,
+    "adopt_baseline": True,
+    "fix_prompt": "",
 }
 
 
@@ -261,6 +277,23 @@ class GateCheck:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditSpec:
+    """The audit half of a kind: audit job (issue 057 Phase A).
+
+    Exactly one of ``skill``/``command`` is set (validated at load):
+    - ``skill`` names a Claude/agent skill the run should execute (e.g. ``type-health``).
+    - ``command`` is a shell command whose stdout is the audit.
+
+    Both write the report to ``$ROUTINE_REPORT`` and the findings manifest to
+    ``$ROUTINE_FINDINGS``. ``timeout_ms`` bounds the audit run itself, distinct from
+    the fix worker's ``Job.timeout_ms``."""
+
+    skill: str | None = None
+    command: str | None = None
+    timeout_ms: int = 1_800_000
+
+
+@dataclass(frozen=True, slots=True)
 class Job:
     name: str
     enabled: bool
@@ -298,11 +331,11 @@ class Job:
     # Retry budget keyed per target (per gate branch for base, per PR number for pr).
     max_attempts_per_target: int = 3
     # Scheduling-only mode discriminator (issue 026, unified in 049):
-    # "routine" | "gated" | "pipeline". kind is the exhaustive single source of truth
-    # for how a job is dispatched; it never serializes into history.jsonl (records store
-    # job name / state / run_id / outcome extras; status/scheduled join live config +
-    # history by job name only — see cli.py:432-434 / cli.py:481).
-    kind: Literal["routine", "gated", "pipeline"] = "routine"
+    # "routine" | "gated" | "pipeline" | "audit". kind is the exhaustive single source
+    # of truth for how a job is dispatched; it never serializes into history.jsonl
+    # (records store job name / state / run_id / outcome extras; status/scheduled join
+    # live config + history by job name only — see cli.py:432-434 / cli.py:481).
+    kind: Literal["routine", "gated", "pipeline", "audit"] = "routine"
     # Prompt source file, read by the pipeline launcher script (not by `load_config`).
     # Required for kind: pipeline; a plain routine may also use it as an I/O convenience.
     prompt_file: str | None = None
@@ -318,6 +351,21 @@ class Job:
     # Whitelist of RunOutcome.reason values eligible for retry. None = no eligible
     # reasons (so retry_attempts is inert). NOT inheritable via defaults.yaml.
     retry_on: tuple[str, ...] | None = None
+    # -- kind: audit (issue 057) ---------------------------------------------------
+    # The audit command/skill and its own timeout. Required for kind: audit, None
+    # otherwise. NOT inheritable via defaults.yaml (per-job identity).
+    audit: AuditSpec | None = None
+    # Max findings dispatched for a fix in a single cycle (the rest wait, most severe
+    # first). Bounds the PR blast radius of one audit night.
+    max_findings_per_dispatch: int = 10
+    # Resolved-ledger entries older than this are pruned. Open entries are never pruned.
+    ledger_retention_days: int = 90
+    # On a cold start (no ledger): adopt the current findings as the baseline and
+    # dispatch nothing. False = treat the first report as the first dispatch set.
+    adopt_baseline: bool = True
+    # The fix worker's prompt template, seeded with $ROUTINE_FINDINGS. Empty = the
+    # built-in default. NOT inheritable via defaults.yaml.
+    fix_prompt: str = ""
 
     @property
     def agent_name(self) -> str:
@@ -861,6 +909,80 @@ def _build_job(
             "(a job with checks is a gated workflow; add kind: gated)"
         )
 
+    # -- kind: audit (issue 057 Phase A) ------------------------------------------------
+    #
+    # An audit is a report-diff gate: it schedules an audit skill/command, parses the
+    # resulting findings manifest, and diffs against a ledger. Unlike a gated job its
+    # "gate" is the diff, not a checks list, and it always targets base.
+    audit: AuditSpec | None = None
+    fix_prompt = merged.get("fix_prompt", "")
+    if not isinstance(fix_prompt, str):
+        raise ConfigError(f"{label}: 'fix_prompt' must be a string")
+
+    if kind == "audit":
+        if merged["workspace"] != "worktree":
+            raise ConfigError(
+                f"{label}: 'workspace' must be 'worktree' for kind: audit "
+                "(the fix worker edits source; an audit never runs in a live checkout)"
+            )
+        target_raw_for_audit = merged.get("target")
+        if target_raw_for_audit is not None and target_raw_for_audit != "base":
+            raise ConfigError(f"{label}: 'target' must be 'base' for kind: audit")
+        if "max_workers_per_tick" in raw_job:
+            raise ConfigError(
+                f"{label}: 'max_workers_per_tick' is not applicable to kind: audit "
+                "(use 'max_findings_per_dispatch')"
+            )
+
+        audit_raw = merged["audit"]
+        if audit_raw is None:
+            raise ConfigError(f"{label}: kind: audit requires an 'audit' mapping")
+        if not isinstance(audit_raw, dict):
+            raise ConfigError(f"{label}: 'audit' must be a mapping")
+        unknown_audit = set(audit_raw) - {"skill", "command", "timeout_ms"}
+        if unknown_audit:
+            raise ConfigError(
+                f"{label}: 'audit' has unknown key(s): {sorted(unknown_audit)}"
+            )
+        audit_skill = audit_raw.get("skill")
+        audit_command = audit_raw.get("command")
+        if (audit_skill is None) == (audit_command is None):
+            raise ConfigError(
+                f"{label}: 'audit' requires exactly one of 'skill'/'command'"
+            )
+        if audit_skill is not None and (
+            not isinstance(audit_skill, str) or not audit_skill
+        ):
+            raise ConfigError(f"{label}: 'audit.skill' must be a non-empty string")
+        if audit_command is not None and (
+            not isinstance(audit_command, str) or not audit_command
+        ):
+            raise ConfigError(f"{label}: 'audit.command' must be a non-empty string")
+        audit_timeout = audit_raw.get("timeout_ms", 1_800_000)
+        if (
+            not isinstance(audit_timeout, int)
+            or isinstance(audit_timeout, bool)
+            or audit_timeout <= 0
+        ):
+            raise ConfigError(f"{label}: 'audit.timeout_ms' must be a positive integer")
+        audit = AuditSpec(
+            skill=audit_skill, command=audit_command, timeout_ms=audit_timeout
+        )
+
+        for int_key in (
+            "max_findings_per_dispatch",
+            "max_attempts_per_target",
+            "ledger_retention_days",
+        ):
+            value = merged[int_key]
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ConfigError(f"{label}: '{int_key}' must be a positive integer")
+
+        if not isinstance(merged["adopt_baseline"], bool):
+            raise ConfigError(f"{label}: 'adopt_baseline' must be a boolean")
+    elif "audit" in raw_job:
+        raise ConfigError(f"{label}: 'audit' requires kind: audit")
+
     if kind == "pipeline":
         if checks is not None:
             raise ConfigError(
@@ -931,6 +1053,11 @@ def _build_job(
 
     if kind == "gated" and target is None:
         target = inferred_target
+
+    # An audit always targets base: the fixes it dispatches are ordinary base-target
+    # gated work, and the audit itself has no PR to gate on.
+    if kind == "audit":
+        target = "base"
 
     if target == "base" and kind == "gated" and (not isinstance(base, str) or not base):
         raise ConfigError(
@@ -1049,4 +1176,9 @@ def _build_job(
         tmp_hygiene=tmp_hygiene,
         retry_attempts=retry_attempts,
         retry_on=retry_on,
+        audit=audit,
+        max_findings_per_dispatch=merged["max_findings_per_dispatch"],
+        ledger_retention_days=merged["ledger_retention_days"],
+        adopt_baseline=merged["adopt_baseline"],
+        fix_prompt=fix_prompt,
     )

@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from collections.abc import Generator
@@ -38,6 +39,17 @@ from herdr_routines.auto_fix import (
     run_checks,
 )
 from herdr_routines.config import Job, RoutinesConfig
+from herdr_routines.findings import (
+    Ledger,
+    apply_diff,
+    diff_findings,
+    dispatch_pool,
+    ledger_path,
+    load_findings_manifest_full,
+    load_ledger,
+    prune_ledger,
+    save_ledger,
+)
 from herdr_routines.herdr import LIVE_AGENT_STATUSES, HerdrClient, HerdrCliError
 from herdr_routines.history import (
     TERMINAL_STATES,
@@ -167,6 +179,389 @@ def run_tick(
         log.warning("history rotation failed (continuing): %s", e)
 
     return TickOutcome(summaries=tuple(summaries), any_job_failed=any_job_failed)
+
+
+def _process_audit_job(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+) -> tuple[str, bool]:
+    """Process a kind: audit job (issue 057 Phase A).
+
+    The schedule guards are identical to a gated job's; when the cron fires, the
+    record-only core (`_audit_phase_a`) runs an audit, diffs its findings against the
+    ledger, and records the full dispatch set — but dispatches nothing. Phase B/058
+    layers the fix dispatch on top of the same seam."""
+    assert job.audit is not None
+
+    if not has_ever_been_seen(history_path, job.name):
+        append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
+        return f"{job.name}: registered", False
+
+    stale = find_stale_running(
+        history_path, job.name, timeout_ms=job.timeout_ms, now=now
+    )
+    if stale is not None:
+        stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
+        reaped = _reap_agents_of_rebooted_run(
+            client, job, stale, boot_epoch=system_boot_epoch()
+        )
+        if reaped:
+            stale_extra["reaped_agents"] = reaped
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="interrupted_unknown",
+                run_id=stale.run_id,
+                extra=stale_extra,
+            ),
+        )
+
+    if is_currently_running(history_path, job.name, timeout_ms=job.timeout_ms, now=now):
+        return f"{job.name}: skipped (already running)", False
+
+    if _live_agent_exists(client, job):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                extra={"reason": "agent_name_live"},
+            ),
+        )
+        return f"{job.name}: skipped (agent already live)", False
+
+    last = last_terminal_run(history_path, job.name)
+    registered_at = first_seen_at(history_path, job.name) or now
+    result = decide(
+        cron=job.cron,
+        timezone=job.timezone,
+        catch_up_minutes=job.catch_up_minutes,
+        now=now,
+        last_terminal=last,
+        job_registered_at=registered_at,
+    )
+
+    if result.decision == Decision.NOT_DUE:
+        return f"{job.name}: not due", False
+
+    if result.decision == Decision.MISSED:
+        assert result.occurrence is not None
+        extra: dict[str, Any] = {
+            "reason": "outside_catch_up_window",
+            "occurrence": result.occurrence.isoformat(),
+        }
+        if result.skipped_occurrences:
+            extra["skipped_occurrences"] = result.skipped_occurrences
+        append(
+            history_path,
+            HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
+        )
+        if job.on_missed == "notify":
+            _notify(
+                client,
+                f"herdr-routines: {job.name} missed",
+                body="outside catch-up window",
+                sound="request",
+            )
+        return f"{job.name}: missed", False
+
+    assert result.occurrence is not None
+    run_id = make_run_id(job.name, result.occurrence)
+
+    if result.skipped_occurrences:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="missed",
+                extra={
+                    "reason": "collapsed_earlier_occurrences",
+                    "skipped_occurrences": result.skipped_occurrences,
+                    "skipped_first": result.skipped_first.isoformat()
+                    if result.skipped_first
+                    else None,
+                    "skipped_last": result.skipped_last.isoformat()
+                    if result.skipped_last
+                    else None,
+                },
+            ),
+        )
+
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="running",
+            run_id=run_id,
+            extra={
+                "scheduled_for": result.occurrence.isoformat(),
+                "late_seconds": result.late_seconds,
+            },
+        ),
+    )
+
+    return _audit_phase_a(job, history_path, client=client, now=now, run_id=run_id)
+
+
+# Per-run cap on how many suppressed IDs the history record carries. Suppression is
+# terminal (never re-dispatched) so the count matters more than the list, but a bounded
+# sample keeps one bad night from bloating every history line.
+_AUDIT_SUPPRESSED_ID_CAP = 20
+
+# gate -> notification kind (see _notify_gate's four-tier policy). Phase A records
+# `fix_pending` (the set a worker would get); phase B/058 adds `fix_dispatched`.
+_AUDIT_GATE_NOTIFY_KIND = {
+    "baseline": "finding",
+    "fix_pending": "finding",
+    "suppressed": "finding",
+    "passed": "success",
+    "failed": "failure",
+}
+
+
+def _render_audit_report(
+    *,
+    job_name: str,
+    run_id: str,
+    check: str,
+    gate: str,
+    manifest: Any,
+    diff: Any,
+    dispatched_ids: list[str],
+    suppressed_ids: list[str],
+) -> str:
+    dispatched = set(dispatched_ids)
+    suppressed = set(suppressed_ids)
+    new_ids = {f.id for f in diff.new}
+    regressed_ids = {f.id for f in diff.regressed}
+    unchanged_ids = {f.id for f in diff.unchanged}
+
+    lines = [
+        f"# Audit report: {job_name}",
+        "",
+        f"- run: {run_id}",
+        f"- check: {check}",
+        f"- gate: {gate}",
+        (
+            f"- findings: {len(manifest.findings)} total — "
+            f"{len(diff.new)} new, {len(diff.regressed)} regressed, "
+            f"{len(diff.unchanged)} unchanged, {len(diff.resolved)} resolved"
+        ),
+        f"- dispatched: {len(dispatched_ids)}",
+        f"- suppressed: {len(suppressed_ids)}",
+    ]
+    if manifest.duplicate_ids:
+        lines.append(f"- duplicate_ids: {', '.join(manifest.duplicate_ids)}")
+    lines += ["", "## Findings", ""]
+    if not manifest.findings:
+        lines.append("_No findings._")
+    for finding in manifest.findings:
+        if finding.id in new_ids:
+            disposition = "new"
+        elif finding.id in regressed_ids:
+            disposition = "regressed"
+        elif finding.id in unchanged_ids:
+            disposition = "unchanged"
+        else:
+            disposition = "unknown"
+        flags = []
+        if finding.id in dispatched:
+            flags.append("would dispatch")
+        if finding.id in suppressed:
+            flags.append("suppressed")
+        flag_text = f" ({', '.join(flags)})" if flags else ""
+        lines.append(
+            f"- [{disposition}{flag_text}] id=`{finding.id}` "
+            f"severity={finding.severity} kind={finding.kind} "
+            f"location={finding.location} — {finding.summary}"
+        )
+    if diff.resolved:
+        lines += ["", "## Resolved", ""]
+        for fid in diff.resolved:
+            lines.append(f"- id=`{fid}`")
+    return "\n".join(lines) + "\n"
+
+
+def _audit_phase_a(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    run_id: str,
+) -> tuple[str, bool]:
+    """The record-only core of a kind: audit job (issue 057 Phase A).
+
+    Parses the findings manifest, diffs against the ledger, records the full dispatch
+    set in the report + history `extra`, and writes the ledger — but dispatches no
+    agent, pane, or worktree. Fail-closed on an unverifiable manifest or a corrupt
+    ledger: record `failed`, notify, act on nothing."""
+    assert job.audit is not None
+    reports_dir = default_reports_dir()
+    manifest_path = reports_dir / f"{run_id}-findings.json"
+    report_path = reports_dir / f"{run_id}.md"
+    ledger_p = ledger_path(job.name)
+
+    def _notify_gate_outcome(gate: str, body: str) -> None:
+        if _notify_gate(job, _AUDIT_GATE_NOTIFY_KIND[gate]):
+            _notify(client, f"herdr-routines: {job.name} {gate}", body=body)
+
+    def _record_failure(gate: str, reason: str, body: str) -> tuple[str, bool]:
+        _notify_gate_outcome(gate, body)
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": gate,
+                    "target": job.target or "base",
+                    "reason": reason,
+                    "manifest_path": str(manifest_path),
+                    "ledger_path": str(ledger_p),
+                    "report_path": str(report_path),
+                    "report_written": False,
+                },
+            ),
+        )
+        return f"{job.name}: failed ({reason})", True
+
+    manifest = load_findings_manifest_full(manifest_path)
+    if manifest is None:
+        return _record_failure(
+            "failed", "findings_manifest_invalid", "findings manifest invalid"
+        )
+
+    ledger: Ledger | None
+    if ledger_p.exists():
+        ledger = load_ledger(ledger_p)
+        if ledger is None:
+            # Never silently re-baseline: preserve the corrupt file for inspection so the
+            # regression signal is not thrown away, then fail closed.
+            backup = ledger_p.parent / (
+                f"{ledger_p.name}.corrupt-{now.strftime('%Y%m%dT%H%M%SZ')}"
+            )
+            try:
+                shutil.copyfile(ledger_p, backup)
+            except OSError as e:
+                log.warning("could not back up corrupt ledger %s: %s", ledger_p, e)
+            return _record_failure("failed", "ledger_corrupt", "ledger corrupt")
+    else:
+        ledger = None
+
+    check = manifest.check
+    diff = diff_findings(manifest.findings, ledger, check=check)
+    old_entries = ledger.entries if ledger is not None else {}
+
+    cold = ledger is None
+    dispatched_ids: list[str] = []
+    suppressed_ids: list[str] = []
+    adopted = 0
+
+    if cold and job.adopt_baseline:
+        # Adopt the current report as the baseline and dispatch nothing. An empty report
+        # is a clean pass, not a baseline (nothing to adopt).
+        adopted = len(manifest.findings)
+        gate = "baseline" if manifest.findings else "passed"
+    else:
+        # Suppression is checked against *every* current finding, not just the actionable
+        # ones: an unchanged finding already at its budget stays suppressed (and reported)
+        # rather than quietly re-entering the dispatch pool.
+        suppressed_ids = [
+            f.id
+            for f in manifest.findings
+            if (entry := old_entries.get(f.id)) is not None
+            and entry.state == "open"
+            and entry.attempts >= job.max_attempts_per_target
+        ]
+        suppressed_set = set(suppressed_ids)
+        candidates = [
+            f.id for f in dispatch_pool(diff, ledger) if f.id not in suppressed_set
+        ]
+        dispatched_ids = candidates[: job.max_findings_per_dispatch]
+        if dispatched_ids:
+            gate = "fix_pending"
+        elif suppressed_ids:
+            gate = "suppressed"
+        else:
+            gate = "passed"
+
+    base_ledger = ledger if ledger is not None else Ledger(job=job.name, entries={})
+    # Phase A dispatches nothing, so it consumes no budget: the dispatch set is recorded
+    # in the report and `extra` only. A baseline adoption queues nothing either.
+    queued_ids = (
+        [] if gate == "baseline" else [f.id for f in (*diff.new, *diff.regressed)]
+    )
+    updated = apply_diff(
+        base_ledger,
+        diff,
+        now=now,
+        run_id=run_id,
+        queued_ids=queued_ids,
+        dispatched_ids=[],
+    )
+    updated = prune_ledger(updated, now=now, retention_days=job.ledger_retention_days)
+    save_ledger(ledger_p, updated)
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_text = _render_audit_report(
+        job_name=job.name,
+        run_id=run_id,
+        check=check,
+        gate=gate,
+        manifest=manifest,
+        diff=diff,
+        dispatched_ids=dispatched_ids,
+        suppressed_ids=suppressed_ids,
+    )
+    report_path.write_text(report_text)
+
+    if gate == "baseline":
+        body = f"baseline adopted ({adopted} findings)"
+    elif gate == "fix_pending":
+        body = f"{len(dispatched_ids)} to fix, {len(suppressed_ids)} suppressed"
+    elif gate == "suppressed":
+        body = f"{len(suppressed_ids)} suppressed at budget"
+    else:
+        body = "clean"
+    _notify_gate_outcome(gate, body)
+
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="done",
+            run_id=run_id,
+            extra={
+                "gate": gate,
+                "target": job.target or "base",
+                "check": check,
+                "manifest_path": str(manifest_path),
+                "ledger_path": str(ledger_p),
+                "report_path": str(report_path),
+                "report_written": True,
+                "duplicate_ids": list(manifest.duplicate_ids),
+                "findings_total": len(manifest.findings),
+                "new": len(diff.new),
+                "regressed": len(diff.regressed),
+                "unchanged": len(diff.unchanged),
+                "resolved": len(diff.resolved),
+                "dispatched": len(dispatched_ids),
+                "suppressed": len(suppressed_ids),
+                "adopted": adopted,
+                "dispatched_ids": list(dispatched_ids),
+                "suppressed_ids": list(suppressed_ids[:_AUDIT_SUPPRESSED_ID_CAP]),
+            },
+        ),
+    )
+    return f"{job.name}: done ({gate})", False
 
 
 def _process_gated_job(
@@ -1299,6 +1694,12 @@ def _process_job(
     # dispatch paths); the order here is belt-and-braces, not load-bearing.
     if job.kind == "pipeline":
         return _process_pipeline_job(job, history_path, client=client, now=now)
+
+    # Audit jobs (issue 057) run an audit skill/command, diff its findings against the
+    # ledger, and dispatch fixes only for new/regressed findings. Schedule guards match
+    # the gated path; the "gate" is the report diff, not a checks list.
+    if job.kind == "audit":
+        return _process_audit_job(job, history_path, client=client, now=now)
 
     # Gated jobs follow the same schedule guards but run gate checks + dispatch
     # instead of execute_run when their cron fires (issue 049: kind is the SSOT).
