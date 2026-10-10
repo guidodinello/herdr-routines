@@ -1841,38 +1841,12 @@ def _process_pipeline_job(
             if state == "skipped":
                 return f"{job.name}: skipped", False
 
-            # Retry once with fallback_model, same bound as the routine-job path
-            # (tick._process_job): a run that is itself already a fallback attempt
-            # (extra.reason == "fallback_retry") never chains a second one, so two
-            # exhausted providers in one night still terminates rather than looping.
-            already_fallback = (open_run.extra or {}).get("reason") == "fallback_retry"
-            if (
-                reason == "quota_exhausted"
-                and job.fallback_model
-                and job.fallback_model != job.model
-                and not already_fallback
-            ):
-                log.info(
-                    "%s: orchestrator quota_exhausted, retrying once with "
-                    "fallback_model=%r",
-                    job.name,
-                    job.fallback_model,
-                )
-                fallback_run_id = make_run_id(job.name, now)
-                fallback_bare_run_id = _bare_pipeline_run_id(job.name, fallback_run_id)
-                return _launch_pipeline_run(
-                    replace(job, model=job.fallback_model),
-                    history_path,
-                    client=client,
-                    now=now,
-                    run_id=fallback_run_id,
-                    bare_run_id=fallback_bare_run_id,
-                    running_extra={
-                        "reason": "fallback_retry",
-                        "primary_run_id": open_run.run_id,
-                    },
-                )
-
+            # No run-level fallback_model relaunch, unlike the routine-job path: a quota
+            # wedge already resumed the stage on `StageSpec.fallback_model` inside
+            # `pipeline_run`, so a `quota_exhausted` report means that resume was not
+            # possible (the session id could not be read). A relaunch could not change the stage models (they are pinned in
+            # `pipeline_stages.py`, and the launcher ignores `--model`), so it only redid
+            # the night from scratch on the same exhausted Zen models.
             if _notify_gate(job, "failure"):
                 _notify(
                     client,
@@ -2019,10 +1993,8 @@ def _launch_pipeline_run(
     running_extra: dict[str, Any],
 ) -> tuple[str, bool]:
     """Sync the repo, launch the detached orchestrator unit, and record the outcome.
-    Shared by the scheduled Decision.RUN dispatch and the same-tick quota_exhausted
-    fallback_model retry (`_process_pipeline_job`) — the two differ only in which run_id
-    they launch under and what goes in the `running` record's `extra` (scheduled_for/
-    late_seconds for the former, reason=fallback_retry/primary_run_id for the latter)."""
+    `running_extra` goes into the `running` record's `extra` (scheduled_for/
+    late_seconds)."""
     report_path = pipeline_report_path(bare_run_id)
     unit_name = f"herdr-pipeline-{bare_run_id}"
     # Recorded in the `running` record below: the watchdog reads it from history.
