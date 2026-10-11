@@ -27,6 +27,7 @@ from herdr_routines.auto_fix import (
     RealGhClient,
     attempt_count_for_gate_branch,
     attempt_count_for_pr,
+    attempt_count_for_target,
     build_audit_agent_name,
     build_audit_fix_prompt,
     build_audit_prompt,
@@ -34,12 +35,17 @@ from herdr_routines.auto_fix import (
     build_fix_prompt,
     build_gate_worker_agent_name,
     build_pr_agent_name,
+    build_review_agent_name,
+    build_review_agent_prefix,
+    build_review_prompt,
     build_worker_agent_name,
     fetch_failing_checks,
     fetch_thread_bodies,
     is_eligible,
     list_open_prs,
     repo_owner_and_name,
+    review_marker,
+    review_target_hash,
     run_checks,
 )
 from herdr_routines.config import Job, RoutinesConfig
@@ -80,7 +86,15 @@ from herdr_routines.pipeline_watchdog import (
     system_boot_epoch,
     validate_stage_sessions,
 )
-from herdr_routines.repos import ensure_repo
+from herdr_routines.repos import _ensure_checkout, ensure_repo
+from herdr_routines.review_scan import (
+    Candidate,
+    apply_attempt_budget,
+    apply_marker_guard,
+    cap_candidates,
+    render_review_report,
+    scan_review_targets,
+)
 from herdr_routines.runner import (
     RunOutcome,
     build_branch_name,
@@ -2174,6 +2188,12 @@ def _process_job(
     if job.kind == "gated":
         return _process_gated_job(job, history_path, client=client, now=now)
 
+    # Review jobs (issue 055) search across repos, dispatch one read-only review worker
+    # per eligible open PR, and verify each posted review with a content marker. Same
+    # schedule guards as the gated path.
+    if job.kind == "review":
+        return _process_review_job(job, history_path, client=client, now=now)
+
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
         return f"{job.name}: registered", False
@@ -3158,3 +3178,694 @@ def _pr_worker_is_live(client: HerdrClient, job_name: str, pr_number: int) -> bo
         for name, status in statuses.items()
         if name.startswith(prefix)
     )
+
+
+# -- kind: review dispatch (issue 055 Phase B) --------------------------------------
+#
+# A review job is a cross-repo analogue of the gated pr-target path: one batched search
+# (review_scan), two re-review guards (content marker + per-target attempt budget), then
+# a per-repo checkout, a read-only worktree, one review agent per PR, and a post-condition
+# that re-reads the PR for the marker. The after-condition, not the worker's own settle
+# status, is what decides `done` — an unverifiable review is never green.
+
+# Target dispositions that count as this tick having failed. Skips (over cap, marker,
+# budget, head-branch collision, live agent) are not failures.
+_REVIEW_FAILURE_DISPOSITIONS = frozenset(
+    {
+        "review_not_posted",
+        "review_verification_failed",
+        "agent_start_failed",
+        "agent_prompt_failed",
+        "worktree_failed",
+        "repo_info_failed",
+        "clone_failed",
+    }
+)
+
+
+def _process_review_job(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+) -> tuple[str, bool]:
+    """Schedule guards for a kind: review job (same shape as _process_gated_job), then
+    run one review cycle. A tick dispatches up to `max_workers_per_tick` workers
+    sequentially, so the running-record staleness window is scaled by that cap."""
+    run_timeout_ms = job.timeout_ms * max(1, job.max_workers_per_tick)
+
+    if not has_ever_been_seen(history_path, job.name):
+        append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
+        return f"{job.name}: registered", False
+
+    stale = find_stale_running(
+        history_path, job.name, timeout_ms=run_timeout_ms, now=now
+    )
+    if stale is not None:
+        stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
+        reaped = _reap_agents_of_rebooted_run(
+            client, job, stale, boot_epoch=system_boot_epoch()
+        )
+        if reaped:
+            stale_extra["reaped_agents"] = reaped
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="interrupted_unknown",
+                run_id=stale.run_id,
+                extra=stale_extra,
+            ),
+        )
+
+    if is_currently_running(history_path, job.name, timeout_ms=run_timeout_ms, now=now):
+        return f"{job.name}: skipped (already running)", False
+
+    if _live_agent_exists(client, job):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                extra={"reason": "agent_name_live"},
+            ),
+        )
+        return f"{job.name}: skipped (agent already live)", False
+
+    last = last_terminal_run(history_path, job.name)
+    registered_at = first_seen_at(history_path, job.name) or now
+    result = decide(
+        cron=job.cron,
+        timezone=job.timezone,
+        catch_up_minutes=job.catch_up_minutes,
+        now=now,
+        last_terminal=last,
+        job_registered_at=registered_at,
+    )
+
+    if result.decision == Decision.NOT_DUE:
+        return f"{job.name}: not due", False
+
+    if result.decision == Decision.MISSED:
+        assert result.occurrence is not None
+        extra: dict[str, Any] = {
+            "reason": "outside_catch_up_window",
+            "occurrence": result.occurrence.isoformat(),
+        }
+        if result.skipped_occurrences:
+            extra["skipped_occurrences"] = result.skipped_occurrences
+        append(
+            history_path,
+            HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
+        )
+        if job.on_missed == "notify":
+            _notify(
+                client,
+                f"herdr-routines: {job.name} missed",
+                body="outside catch-up window",
+                sound="request",
+            )
+        return f"{job.name}: missed", False
+
+    # Decision.RUN
+    assert result.occurrence is not None
+    run_id = make_run_id(job.name, result.occurrence)
+
+    if result.skipped_occurrences:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="missed",
+                extra={
+                    "reason": "collapsed_earlier_occurrences",
+                    "skipped_occurrences": result.skipped_occurrences,
+                    "skipped_first": result.skipped_first.isoformat()
+                    if result.skipped_first
+                    else None,
+                    "skipped_last": result.skipped_last.isoformat()
+                    if result.skipped_last
+                    else None,
+                },
+            ),
+        )
+
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="running",
+            run_id=run_id,
+            extra={
+                "scheduled_for": result.occurrence.isoformat(),
+                "late_seconds": result.late_seconds,
+            },
+        ),
+    )
+
+    return _review_cycle(job, history_path, client=client, now=now, run_id=run_id)
+
+
+def _review_terminal_failure(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    run_id: str,
+    reason: str,
+    error: str | None = None,
+) -> tuple[str, bool]:
+    """Record a whole-cycle failure (auth/search) as this tick's terminal outcome."""
+    extra: dict[str, Any] = {
+        "gate": "failed",
+        "target": "pr",
+        "reason": reason,
+        "enumerated": 0,
+        "candidates": 0,
+        "dispatched": 0,
+        "skipped": 0,
+        "repos_failed": 0,
+    }
+    if error is not None:
+        extra["error"] = error
+    append(
+        history_path,
+        HistoryRecord(ts=now, job=job.name, state="failed", run_id=run_id, extra=extra),
+    )
+    if _notify_gate(job, "failure"):
+        _notify(
+            client,
+            f"herdr-routines: {job.name} failed",
+            body=reason,
+            sound="request",
+        )
+    return f"{job.name}: failed ({reason})", True
+
+
+def _review_cycle(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime, run_id: str
+) -> tuple[str, bool]:
+    """Search, apply both re-review guards, cap, dispatch per repo, verify each review,
+    and write the aggregate report + terminal history record."""
+    gh = RealGhClient()
+
+    try:
+        login = gh.api_user()
+    except Exception as e:  # noqa: BLE001
+        return _review_terminal_failure(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            run_id=run_id,
+            reason="gh_auth_missing",
+            error=str(e),
+        )
+
+    outcome = scan_review_targets(gh, job, login=login)
+    if outcome is None:
+        # Fail closed: an unknown search answer must never read as "nothing to review".
+        return _review_terminal_failure(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            run_id=run_id,
+            reason="search_failed",
+        )
+
+    rows: list[tuple[Candidate, str]] = [
+        (cand, cand.skip_reason or "skipped") for cand in outcome.skipped
+    ]
+
+    dispatchable, marker_skipped = apply_marker_guard(gh, job.name, outcome.candidates)
+    rows.extend(
+        (cand, cand.skip_reason or "review_already_posted") for cand in marker_skipped
+    )
+
+    dispatchable, budget_skipped = apply_attempt_budget(
+        history_path, job.name, dispatchable, max_attempts=job.max_attempts_per_target
+    )
+    rows.extend(
+        (cand, cand.skip_reason or "max_attempts_exceeded") for cand in budget_skipped
+    )
+
+    to_dispatch, over_cap = cap_candidates(dispatchable, job.max_workers_per_tick)
+    rows.extend((cand, cand.skip_reason or "over_cap") for cand in over_cap)
+
+    by_repo: dict[str, list[Candidate]] = {}
+    for cand in to_dispatch:
+        by_repo.setdefault(cand.repo, []).append(cand)
+
+    repo_info_cache: dict[str, dict[str, object] | None] = {}
+    repos_failed = 0
+    dispatched_count = 0
+    any_failed = False
+    for repo, cands in sorted(by_repo.items()):
+        owner, _, repo_name = repo.partition("/")
+        if repo not in repo_info_cache:
+            repo_info_cache[repo] = gh.repo_info(owner=owner, repo=repo_name)
+        info = repo_info_cache[repo]
+        if info is None:
+            repos_failed += 1
+            any_failed = True
+            for cand in cands:
+                rows.append((cand, "repo_info_failed"))
+            continue
+
+        clone_url = info.get("clone_url")
+        default_branch = info.get("default_branch")
+        checkout = Path(job.repo) / owner / repo_name
+        try:
+            _ensure_checkout(
+                clone_url if isinstance(clone_url, str) else None,
+                checkout,
+                base=default_branch if isinstance(default_branch, str) else "main",
+            )
+        except (RuntimeError, OSError) as e:
+            # Isolate: only this repo's targets fail; other repos still dispatch.
+            repos_failed += 1
+            any_failed = True
+            log.warning("%s: review checkout failed for %s: %s", job.name, repo, e)
+            for cand in cands:
+                rows.append((cand, "clone_failed"))
+            continue
+
+        for cand in cands:
+            disposition = _dispatch_review_target(
+                job,
+                cand,
+                checkout,
+                gh=gh,
+                client=client,
+                history_path=history_path,
+                now=now,
+                run_id=run_id,
+            )
+            rows.append((cand, disposition))
+            if disposition == "dispatched":
+                dispatched_count += 1
+            elif disposition in _REVIEW_FAILURE_DISPOSITIONS:
+                any_failed = True
+
+    skipped_count = len(rows) - dispatched_count
+
+    try:
+        reports_dir = default_reports_dir()
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = reports_dir / f"review-{run_id}.md"
+        report_path.write_text(
+            render_review_report(
+                job_name=job.name,
+                run_id=run_id,
+                now=now,
+                enumerated=outcome.enumerated,
+                candidate_count=len(outcome.candidates),
+                repos_failed=repos_failed,
+                rows=rows,
+                truncated_modes=outcome.truncated_modes,
+            )
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("%s: could not write review report: %s", job.name, e)
+
+    summary = (
+        f"{job.name}: done (enumerated={outcome.enumerated}, "
+        f"candidates={len(outcome.candidates)}, dispatched={dispatched_count}, "
+        f"skipped={skipped_count}, repos_failed={repos_failed})"
+    )
+
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="failed" if any_failed else "done",
+            run_id=run_id,
+            extra={
+                "gate": "failed" if any_failed else "passed",
+                "target": "pr",
+                "enumerated": outcome.enumerated,
+                "candidates": len(outcome.candidates),
+                "dispatched": dispatched_count,
+                "skipped": skipped_count,
+                "repos_failed": repos_failed,
+            },
+        ),
+    )
+
+    if any_failed:
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=f"{dispatched_count} dispatched, {skipped_count} skipped",
+                sound="request",
+            )
+        return summary, True
+
+    if _notify_gate(job, "finding" if dispatched_count > 0 else "success"):
+        _notify(client, f"herdr-routines: {job.name} done", sound="done")
+    return summary, False
+
+
+def _live_review_agent_exists(
+    client: HerdrClient, job_name: str, target_key: str
+) -> bool:
+    """Double-dispatch guard for one review target, matching by the shared
+    ``build_review_agent_prefix`` (`rt-<job>-rv<h6>`) so two ticks five minutes apart
+    can never dispatch the same PR twice (issue 036c's lesson). Fails open on a
+    HerdrCliError, same as `_live_agent_exists`."""
+    prefix = build_review_agent_prefix(job_name, target_key).lower()
+    try:
+        statuses = client.agent_statuses()
+    except HerdrCliError as e:
+        log.warning(
+            "%s: could not query live agents for %s: %s", job_name, target_key, e
+        )
+        return False
+    return any(
+        status in LIVE_AGENT_STATUSES
+        for name, status in statuses.items()
+        if name.lower().startswith(prefix)
+    )
+
+
+def _review_target_record(
+    *,
+    job: Job,
+    cand: Candidate,
+    run_id: str,
+    now: datetime,
+    state: str,
+    attempt: int,
+    agent_name: str | None,
+    pane_id: str | None,
+    report_path: Path | None,
+    verified: bool | None,
+    reason: str | None = None,
+    error: str | None = None,
+) -> HistoryRecord:
+    """One per-target history record, shaped per issue 055's "History and report"."""
+    extra: dict[str, Any] = {
+        "target_key": cand.target_key,
+        "repo": cand.repo,
+        "pr_number": cand.number,
+        "headRefName": cand.head_ref,
+        "select_mode": cand.select_mode,
+        "attempt": attempt,
+        "agent": agent_name,
+        "pane_id": pane_id,
+        "report_path": str(report_path) if report_path is not None else None,
+        "verified": verified,
+        "target": "pr",
+    }
+    if reason is not None:
+        extra["reason"] = reason
+    if error is not None:
+        extra["error"] = error
+    return HistoryRecord(ts=now, job=job.name, state=state, run_id=run_id, extra=extra)
+
+
+def _dispatch_review_target(
+    job: Job,
+    cand: Candidate,
+    checkout: Path,
+    *,
+    gh: RealGhClient,
+    client: HerdrClient,
+    history_path: Path,
+    now: datetime,
+    run_id: str,
+) -> str:
+    """Fetch the PR head ref, create/reuse a read-only worktree, run one review agent,
+    then verify the marker was posted. Always removes the worktree after settle.
+
+    Returns the disposition string recorded in the aggregate report."""
+    from herdr_routines.runner import (
+        _capture_visible_tail,
+        _close_run_pane,
+        _prompt_with_watchdog,
+        _wait_for_agent_ready,
+        substitute_prompt,
+    )
+
+    attempt = attempt_count_for_target(history_path, job.name, cand.target_key)
+    h6 = review_target_hash(job.name, cand.target_key)
+    report_path = default_reports_dir() / f"auto-review-{run_id}-{h6}.md"
+    agent_name = build_review_agent_name(job.name, cand.target_key, run_id)
+
+    if _live_review_agent_exists(client, job.name, cand.target_key):
+        append(
+            history_path,
+            _review_target_record(
+                job=job,
+                cand=cand,
+                run_id=run_id,
+                now=now,
+                state="skipped",
+                attempt=attempt,
+                agent_name=agent_name,
+                pane_id=None,
+                report_path=None,
+                verified=None,
+                reason="agent_live",
+            ),
+        )
+        return "agent_live"
+
+    wt_path = checkout / ".worktrees" / f"review-pr{cand.number}"
+
+    # Never steal another owner's worktree holding the head branch (issue 036 redux).
+    existing = _find_existing_worktree(checkout, cand.head_ref)
+    if existing is not None and existing != wt_path:
+        append(
+            history_path,
+            _review_target_record(
+                job=job,
+                cand=cand,
+                run_id=run_id,
+                now=now,
+                state="skipped",
+                attempt=attempt,
+                agent_name=None,
+                pane_id=None,
+                report_path=None,
+                verified=None,
+                reason="head_branch_checked_out",
+            ),
+        )
+        return "head_branch_checked_out"
+
+    # Reuse our own clean worktree; force-remove a stale one before re-adding.
+    if wt_path.exists():
+        reusable, why = _worktree_reuse_check(wt_path)
+        if not reusable:
+            log.info(
+                "%s: re-adding stale review worktree %s (%s)", job.name, wt_path, why
+            )
+            _cleanup_worktree(checkout, wt_path)
+
+    try:
+        fetch = subprocess.run(
+            ["git", "-C", str(checkout), "fetch", "origin", cand.head_ref],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if fetch.returncode != 0:
+            raise RuntimeError(f"git fetch failed: {fetch.stderr.strip()}")
+        if not wt_path.exists():
+            proc = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "worktree",
+                    "add",
+                    "-B",
+                    cand.head_ref,
+                    str(wt_path),
+                    f"origin/{cand.head_ref}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
+    except Exception as e:  # noqa: BLE001
+        _cleanup_worktree(checkout, wt_path)
+        append(
+            history_path,
+            _review_target_record(
+                job=job,
+                cand=cand,
+                run_id=run_id,
+                now=now,
+                state="failed",
+                attempt=attempt,
+                agent_name=None,
+                pane_id=None,
+                report_path=None,
+                verified=False,
+                reason="worktree_failed",
+                error=str(e),
+            ),
+        )
+        return "worktree_failed"
+
+    prompt_text = job.prompt or build_review_prompt(
+        job_name=job.name,
+        target_key=cand.target_key,
+        url=cand.url,
+        report_path=str(report_path),
+    )
+    prompt_text = substitute_prompt(
+        prompt_text, report_path=report_path, job_name=job.name, run_id=run_id
+    )
+
+    pane_id: str | None = None
+    try:
+        pane_id = client.tab_create(cwd=str(wt_path), label=agent_name)
+        client.agent_start(
+            name=agent_name,
+            kind=job.agent_kind,
+            pane_id=pane_id,
+            start_timeout_ms=job.start_timeout_ms,
+            model=job.model,
+        )
+    except (HerdrCliError, OSError) as e:
+        if pane_id is not None:
+            try:
+                client.pane_close(pane_id)
+            except Exception:  # noqa: BLE001, S110
+                pass
+        _cleanup_worktree(checkout, wt_path)
+        append(
+            history_path,
+            _review_target_record(
+                job=job,
+                cand=cand,
+                run_id=run_id,
+                now=now,
+                state="failed",
+                attempt=attempt,
+                agent_name=agent_name,
+                pane_id=pane_id,
+                report_path=None,
+                verified=False,
+                reason="agent_start_failed",
+                error=str(e),
+            ),
+        )
+        return "agent_start_failed"
+
+    ready, last_error = _wait_for_agent_ready(
+        client, agent_name, timeout_s=job.start_timeout_ms / 1000
+    )
+    if not ready:
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
+        _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+        _cleanup_worktree(checkout, wt_path)
+        append(
+            history_path,
+            _review_target_record(
+                job=job,
+                cand=cand,
+                run_id=run_id,
+                now=now,
+                state="failed",
+                attempt=attempt,
+                agent_name=agent_name,
+                pane_id=pane_id,
+                report_path=None,
+                verified=False,
+                reason="agent_start_failed",
+                error=last_error,
+            ),
+        )
+        return "agent_start_failed"
+
+    try:
+        _prompt_with_watchdog(
+            client,
+            job_name=agent_name,
+            target=agent_name,
+            text=prompt_text,
+            timeout_ms=job.timeout_ms,
+            markers=job.failure_markers
+            if job.failure_markers is not None
+            else ("Free usage exceeded",),
+            prompt_text=prompt_text,
+        )
+    except Exception as e:  # noqa: BLE001
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
+        _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+        _cleanup_worktree(checkout, wt_path)
+        append(
+            history_path,
+            _review_target_record(
+                job=job,
+                cand=cand,
+                run_id=run_id,
+                now=now,
+                state="failed",
+                attempt=attempt,
+                agent_name=agent_name,
+                pane_id=pane_id,
+                report_path=None,
+                verified=False,
+                reason="agent_prompt_failed",
+                error=str(e),
+            ),
+        )
+        return "agent_prompt_failed"
+
+    _capture_visible_tail(
+        client, agent_name, reports_dir=report_path.parent, run_id=run_id
+    )
+    _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+    # A review retains no branch: remove the worktree on both success and failure.
+    _cleanup_worktree(checkout, wt_path)
+
+    # Post-condition (the gate analogue): re-read the PR and require the marker.
+    bodies = gh.pr_review_bodies(
+        owner=cand.owner, repo=cand.repo_name, number=cand.number
+    )
+    if bodies is None:
+        disposition, verified, reason = (
+            "review_verification_failed",
+            False,
+            "review_verification_failed",
+        )
+    elif review_marker(job.name, cand.target_key) in "\n".join(bodies):
+        disposition, verified, reason = "dispatched", True, None
+    else:
+        disposition, verified, reason = "review_not_posted", False, "review_not_posted"
+
+    append(
+        history_path,
+        _review_target_record(
+            job=job,
+            cand=cand,
+            run_id=run_id,
+            now=now,
+            state="done" if verified else "failed",
+            attempt=attempt,
+            agent_name=agent_name,
+            pane_id=pane_id,
+            report_path=report_path,
+            verified=verified,
+            reason=reason,
+        ),
+    )
+    return disposition

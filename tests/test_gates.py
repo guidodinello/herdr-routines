@@ -7,7 +7,9 @@ deploy (spec 20260929T050000Z finding F5).
 
 from __future__ import annotations
 
-from herdr_routines.auto_fix import GhClient, RealGhClient
+from collections.abc import Sequence
+
+from herdr_routines.auto_fix import GhClient, RealGhClient, ReviewSearch
 from herdr_routines.gates import (
     BLOCKING_TAG,
     GATE3_LINT_TEST_CHECKS,
@@ -86,6 +88,19 @@ class FakeGhClient:
         self, *, owner: str, repo: str, number: int
     ) -> list[dict[str, object]]:
         return list(self._inline_comments)
+
+    # issue 055 widened the GhClient protocol with the review-search trio; these stubs
+    # keep the static (mypy) and runtime protocol-conformance checks green.
+    def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
+        return None
+
+    def pr_review_bodies(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[str] | None:
+        return None
+
+    def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
+        return None
 
 
 def _fake_runner(exit_codes: dict[str, int]):

@@ -56,14 +56,32 @@ def ensure_repo(job: Job) -> Path:
 
     Returns the checkout path on success.  Raises ``RuntimeError`` on
     clone/sync failure so callers can map it to a terminal ``RunOutcome``.
-    """
-    checkout = job.repo
-    if job.repository is not None and not (checkout / ".git").exists():
-        _clone(job.repository, checkout)
-    else:
-        _fetch_and_fast_forward(checkout, base=job.base)
 
-    return checkout
+    This is the ``job``-shaped wrapper around :func:`_ensure_checkout`; a
+    clone URL of ``None`` (a plain ``repo:`` path) can never trigger a clone.
+    """
+    return _ensure_checkout(job.repository, job.repo, base=job.base)
+
+
+def _ensure_checkout(clone_url: str | None, dest: Path, *, base: str) -> Path:
+    """Ensure *dest* exists and is up-to-date, cloning from *clone_url* when it
+    is missing and the URL is known.
+
+    The per-repo checkout path for ``kind: review`` jobs calls this directly:
+    its clone URL and default branch are discovered per-repo at tick time, so
+    there is no ``Job`` to hand it.  ``ensure_repo`` is the ``Job``-shaped
+    caller and preserves the pre-refactor behavior exactly — a plain ``repo:``
+    job (``clone_url is None``) is still never cloned, only synced.
+
+    Returns *dest*.  Raises ``RuntimeError`` on clone/sync failure so callers
+    can map it to a terminal outcome.
+    """
+    if clone_url is not None and not (dest / ".git").exists():
+        _clone(clone_url, dest)
+    else:
+        _fetch_and_fast_forward(dest, base=base)
+
+    return dest
 
 
 def _clone(url: str, dest: Path) -> None:

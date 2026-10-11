@@ -83,6 +83,25 @@ class GhClient(Protocol):
         gate-4 failure hours later, so it must never be a silent no-op."""
         ...
 
+    def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
+        """One batched ``gh api graphql`` search, one alias per selected mode. Returns
+        ``None`` on any failure (fail closed — an unknown answer must never mean
+        "nothing to review")."""
+        ...
+
+    def pr_review_bodies(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[str] | None:
+        """The PR's posted review bodies **and** issue comments, concatenated (one
+        ``gh pr view --json comments,reviews`` call). Returns ``None`` on any failure;
+        every caller treats ``None`` as *unverified*, never as "empty"."""
+        ...
+
+    def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
+        """``gh api repos/{owner}/{repo}`` → a mapping carrying at least ``clone_url``
+        and ``default_branch``. ``None`` on any failure."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class PRInfo:
@@ -92,6 +111,33 @@ class PRInfo:
     head_ref: str
     author: str
     url: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewPR:
+    """One open PR returned by a review search, before skip/guard filtering."""
+
+    number: int
+    title: str
+    url: str
+    created_at: str
+    updated_at: str
+    head_ref: str
+    author: str
+    repo: str  # base repo "owner/name" (repository.nameWithOwner)
+    head_repo: str  # head repo "owner/name", or "" when unknown
+    mode: (
+        str  # the selected mode alias that returned it ("author" | "review_requested")
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewSearch:
+    """The batched search result: nodes plus the modes that hit GitHub's 100-node
+    ceiling (recorded as ``search_truncated`` — phase A does not paginate)."""
+
+    prs: tuple[ReviewPR, ...]
+    truncated_modes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +287,90 @@ class RealGhClient:
         if match is None:
             raise RuntimeError(f"gh pr create printed no PR url: {stdout.strip()!r}")
         return int(match.group(1))
+
+    def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
+        aliases = [m for m in modes if m in REVIEW_SEARCH_QUALIFIERS]
+        if not aliases:
+            return ReviewSearch(prs=())
+        var_decls = ", ".join(f"${m}: String!" for m in aliases)
+        selections = "\n".join(
+            f"{m}: search(query: ${m}, type: ISSUE, first: {limit}) "
+            "{ nodes { ... on PullRequest { " + _REVIEW_NODE_FIELDS + " } } }"
+            for m in aliases
+        )
+        query = f"query({var_decls}) {{ {selections} }}"
+        try:
+            data = self.graphql(
+                query, **{m: REVIEW_SEARCH_QUALIFIERS[m] for m in aliases}
+            )
+        except Exception as e:  # noqa: BLE001 — fail closed, never "nothing to do"
+            log.warning("review search failed: %s", e)
+            return None
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            return None
+        prs: list[ReviewPR] = []
+        truncated: list[str] = []
+        for mode in aliases:
+            bucket = payload.get(mode)
+            if not isinstance(bucket, dict):
+                return None
+            nodes = bucket.get("nodes")
+            if not isinstance(nodes, list):
+                return None
+            if len(nodes) >= limit:
+                truncated.append(mode)
+            for node in nodes:
+                pr = _parse_review_node(node, mode)
+                if pr is not None:
+                    prs.append(pr)
+        return ReviewSearch(prs=tuple(prs), truncated_modes=tuple(truncated))
+
+    def pr_review_bodies(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[str] | None:
+        exit_code, stdout, _stderr = self._run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                f"{owner}/{repo}",
+                "--json",
+                "comments,reviews",
+            ]
+        )
+        if exit_code != 0:
+            return None
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        bodies: list[str] = []
+        for surface in ("reviews", "comments"):
+            items = payload.get(surface, [])
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                body = item.get("body", "")
+                if isinstance(body, str) and body:
+                    bodies.append(body)
+        return bodies
+
+    def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
+        exit_code, stdout, _stderr = self._run(["gh", "api", f"repos/{owner}/{repo}"])
+        if exit_code != 0:
+            return None
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def graphql(self, query: str, **variables: str) -> dict[str, object]:
         argv = ["gh", "api", "graphql"]
@@ -600,6 +730,149 @@ def build_worker_agent_name(job_name: str, pr_number: int, run_id: str) -> str:
     if len(tail) > budget:
         tail = hashlib.sha1(run_id.encode()).hexdigest()[:budget]
     return f"{prefix}-{tail}"
+
+
+# ---------------------------------------------------------------------------
+# kind: review helpers (issue 055)
+# ---------------------------------------------------------------------------
+
+# The stable HTML marker a review agent ends its posted review with, and the engine
+# looks for before dispatching and again as its post-condition. Names *both* the job and
+# the target key so two review jobs over one account never treat each other's reviews as
+# their own (the same "own work only" shape as the attempt budget).
+REVIEW_MARKER_PREFIX = "herdr-routines:review"
+
+# The per-mode GitHub search qualifier. `first: 100` (GitHub's own ceiling) is added at
+# query-build time; phase A does not paginate.
+REVIEW_SEARCH_QUALIFIERS: dict[str, str] = {
+    "author": "is:pr is:open archived:false draft:false author:@me",
+    "review_requested": "is:pr is:open archived:false draft:false review-requested:@me",
+}
+
+_REVIEW_NODE_FIELDS = (
+    "number title url createdAt updatedAt headRefName "
+    "author { login } repository { nameWithOwner } headRepository { nameWithOwner }"
+)
+
+
+def _parse_review_node(node: object, mode: str) -> ReviewPR | None:
+    """Best-effort parse of one search node; a malformed node is skipped, not fatal."""
+    if not isinstance(node, dict):
+        return None
+    number = node.get("number")
+    if not isinstance(number, int):
+        return None
+    author_block = node.get("author")
+    login = author_block.get("login", "") if isinstance(author_block, dict) else ""
+    repo_block = node.get("repository")
+    repo = repo_block.get("nameWithOwner", "") if isinstance(repo_block, dict) else ""
+    head_block = node.get("headRepository")
+    head_repo = (
+        head_block.get("nameWithOwner", "") if isinstance(head_block, dict) else ""
+    )
+    return ReviewPR(
+        number=number,
+        title=str(node.get("title", "")),
+        url=str(node.get("url", "")),
+        created_at=str(node.get("createdAt", "")),
+        updated_at=str(node.get("updatedAt", "")),
+        head_ref=str(node.get("headRefName", "")),
+        author=str(login),
+        repo=str(repo),
+        head_repo=str(head_repo or ""),
+        mode=mode,
+    )
+
+
+def review_marker(job_name: str, target_key: str) -> str:
+    """The exact marker this job writes for this target — one function so the prompt,
+    the pre-dispatch guard and the post-condition can never drift apart."""
+    return f"<!-- {REVIEW_MARKER_PREFIX} job={job_name} key={target_key} -->"
+
+
+def review_target_hash(job_name: str, target_key: str) -> str:
+    """``h6 = sha1("job|target_key")[:6]`` — the per-(job, target) discriminator. A bare
+    PR number is ambiguous across repos, so the hash keys the agent name *and* the per-PR
+    report filename on the full target key."""
+    return hashlib.sha1(f"{job_name}|{target_key}".encode()).hexdigest()[:6]
+
+
+def build_review_agent_prefix(job_name: str, target_key: str) -> str:
+    """The stable per-(job, target) agent-name prefix: ``rt-<job>-rv<h6>`` where
+    ``h6 = sha1("job|target_key")[:6]``. The job-name portion is capped at 13 chars so
+    the prefix is at most ``13 + 12 = 25`` chars, leaving the run tail ≥ 6 (issue 051:
+    a full 24-char job name would otherwise leave no room for the tail, and two ticks
+    five minutes apart would collide on `agent_name_taken`). The single function is both
+    the builder's and the liveness guard's source of truth (issue 036c)."""
+    return f"rt-{job_name[:13]}-rv{review_target_hash(job_name, target_key)}"
+
+
+def build_review_agent_name(job_name: str, target_key: str, run_id: str) -> str:
+    """The full worker agent name: the shared prefix plus a run tail, truncated to the
+    32-char NAME_RE cap. The ``rv<h6>`` discriminator is never truncated; only the tail
+    is hashed when it doesn't fit, exactly like ``build_worker_agent_name``."""
+    prefix = build_review_agent_prefix(job_name, target_key)
+    tail = run_id.removeprefix(f"{job_name}-")
+    budget = 32 - len(prefix) - 1
+    if budget <= 0:
+        return prefix[:32]
+    if len(tail) > budget:
+        tail = hashlib.sha1(run_id.encode()).hexdigest()[:budget]
+    return f"{prefix}-{tail}"
+
+
+def build_review_prompt(
+    *,
+    job_name: str,
+    target_key: str,
+    url: str,
+    report_path: str,
+) -> str:
+    """The engine-injected prompt for a review worker (the sibling of
+    ``build_fix_prompt``; a job-level ``prompt`` overrides it). Read-only by
+    construction: the agent reviews the PR and disappears with its worktree."""
+    marker = review_marker(job_name, target_key)
+    return textwrap.dedent(f"""\
+        You are reviewing an open pull request. This is a read-only review: do not
+        edit files, commit, push, create a branch, resolve threads, or otherwise change
+        the PR. The worktree is removed when you finish.
+
+        PR: {url}
+        Target: {target_key}
+        Report: {report_path}
+
+        Steps:
+        1. First re-read the PR's existing comments and reviews. If it already contains
+           this exact marker, POST NOTHING and stop:
+               {marker}
+        2. Otherwise run the `code-review` skill against {url} in single-session mode.
+        3. Post exactly one review. Tag every finding `blocking` or `non-blocking`.
+        4. End the posted review body with this exact marker line:
+               {marker}
+
+        Write a summary to $ROUTINE_REPORT whose first line is
+        `## Outcome: ok` (or `## Outcome: skipped` / `## Outcome: failed`) followed by
+        the PR URL and what you did.
+
+        Bounded work: post the single review, write the report, then stop.
+    """)
+
+
+def attempt_count_for_target(history_path: Path, job_name: str, target_key: str) -> int:
+    """Count prior review-attempt records for this job+target_key that were real
+    attempts (done or failed — not skipped). Sibling of ``attempt_count_for_pr``, keyed
+    on the full ``owner/repo#N`` so ``#7`` in one repo is independent of ``#7`` in
+    another. Skipped/max_attempts_exceeded records must not consume budget."""
+    records = read_job(history_path, job_name)
+    count = 0
+    for r in records:
+        if (
+            r.state in _COUNTABLE_STATES
+            and r.extra
+            and r.extra.get("target_key") == target_key
+        ):
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
