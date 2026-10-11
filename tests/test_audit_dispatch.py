@@ -506,3 +506,28 @@ def test_failed_fix_dispatch_still_consumes_budget(repo: Path, tmp_path: Path) -
     assert ledger.entries[fid].last_dispatched_run == RUN_ID
     assert ledger.entries[fid].queued
     assert not (repo / ".worktrees" / f"audit-fix-{RUN_ID}").exists()
+
+
+def test_inline_audit_prompt_keeps_the_engine_contract(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A job `prompt` describes the audit inline (for a repo without the skill); the
+    engine still owns the output contract, and the fix worker re-runs the audit from
+    the saved instructions rather than from a skill that does not exist."""
+    history = tmp_path / "history.jsonl"
+    job = _job(repo, prompt="Scan src/ for bare `Any` (job $ROUTINE_JOB).")
+    client = _FakeHerdr(_auditor([_finding(1)]))
+    summary, failed = _cycle(job, client, history)
+    assert failed is False, summary
+
+    audit, fix = client.agents
+    assert audit.prompt is not None and fix.prompt is not None
+    assert "Run the `type-health` audit described below" in audit.prompt
+    assert "Scan src/ for bare `Any` (job audit-type-health)." in audit.prompt
+    assert str(_manifest_path()) in audit.prompt
+    assert "Do NOT edit source files, commit, push" in audit.prompt
+
+    saved = tick.default_reports_dir() / f"{RUN_ID}-audit-prompt.md"
+    assert saved.read_text() == audit.prompt
+    assert str(saved) in fix.prompt
+    assert "skill and read its findings" not in fix.prompt

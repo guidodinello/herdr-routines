@@ -400,6 +400,7 @@ class _AuditPaths:
     manifest: Path
     report: Path
     audit_report: Path
+    audit_prompt: Path
     fix_report: Path
     ledger: Path
 
@@ -410,6 +411,7 @@ class _AuditPaths:
             manifest=reports / f"{run_id}-findings.json",
             report=reports / f"{run_id}.md",
             audit_report=reports / f"{run_id}-audit.md",
+            audit_prompt=reports / f"{run_id}-audit-prompt.md",
             fix_report=reports / f"{run_id}-fix.md",
             ledger=ledger_path(job_name),
         )
@@ -685,11 +687,14 @@ def _run_audit(
 
         assert job.audit.skill is not None
         agent_name = build_audit_agent_name(job.name, run_id)
-        prompt_text = job.prompt or build_audit_prompt(
+        # A non-empty `prompt` is the audit itself, inline (for a repo without the skill);
+        # the output contract around it is always the engine's.
+        prompt_text = build_audit_prompt(
             skill=job.audit.skill,
             base=job.base,
             report_path=str(paths.audit_report),
             findings_path=str(paths.manifest),
+            instructions=job.prompt,
         )
         prompt_text = substitute_prompt(
             prompt_text,
@@ -698,6 +703,11 @@ def _run_audit(
             run_id=run_id,
             findings_path=paths.manifest,
         )
+        # Kept for the fix worker, which re-runs the audit from these instructions.
+        try:
+            paths.audit_prompt.write_text(prompt_text)
+        except OSError as e:
+            log.warning("%s: could not save the audit prompt: %s", job.name, e)
         run = _run_agent_in_worktree(
             job,
             client,
@@ -746,7 +756,11 @@ def _dispatch_audit_fix(
         recheck = (
             f"`{job.audit.command}` (it writes the findings manifest)"
             if job.audit.command is not None
-            else f"run the `{job.audit.skill}` skill and read its findings"
+            else (
+                f"follow the `{job.audit.skill}` audit instructions in "
+                f"{paths.audit_prompt} to re-scan. Do not overwrite the report or "
+                f"manifest they name"
+            )
         )
         prompt_text = job.fix_prompt or build_audit_fix_prompt(
             job_name=job.name,

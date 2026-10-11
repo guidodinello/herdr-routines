@@ -804,12 +804,25 @@ _MANIFEST_EXAMPLE = """\
 
 
 def build_audit_prompt(
-    *, skill: str, base: str, report_path: str, findings_path: str
+    *,
+    skill: str,
+    base: str,
+    report_path: str,
+    findings_path: str,
+    instructions: str = "",
 ) -> str:
-    """The engine-injected prompt for an audit agent (`audit.skill`)."""
-    return textwrap.dedent("""\
-        Run the `{skill}` skill against this repository. You are in a fresh worktree
-        checked out at `{base}`.
+    """The prompt for an audit agent (`audit.skill`). With `instructions` (the job's
+    `prompt`), the audit is described inline instead of loaded as a skill, for a repo
+    that has no such skill. Either way the output contract below stays the engine's."""
+    if instructions.strip():
+        what = (
+            f"Run the `{skill}` audit described below against this repository.\n\n"
+            f"{instructions.strip()}\n\n---\n\n"
+        )
+    else:
+        what = f"Run the `{skill}` skill against this repository. "
+    return what + textwrap.dedent("""\
+        You are in a fresh worktree checked out at `{base}`.
 
         This is a read-only audit. Do NOT edit source files, commit, push, create a
         branch, or open a PR. A separate worker fixes findings later.
@@ -824,12 +837,13 @@ def build_audit_prompt(
 
            - `severity` must be one of low, medium, high.
            - `kind`, `location` and `summary` are required, non-empty strings.
-           - Include every finding. An empty `findings` list means the audit is clean.
+           - List every finding that should be fixed (a fix worker acts on each entry;
+             if the audit's own instructions narrow which findings qualify, follow
+             them). An empty `findings` list means there is nothing to fix.
            - Write the manifest even when there are no findings.
 
         Bounded work: finish the audit, write both files, then stop.
     """).format(
-        skill=skill,
         base=base,
         report_path=report_path,
         findings_path=findings_path,

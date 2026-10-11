@@ -6,26 +6,34 @@
 # PR) only for findings that are *new*, *regressed*, or still owed a fix from an earlier
 # cycle — so a stable, pre-existing backlog does not re-open a PR every week.
 #
+# Targets herdr-routines itself: the type-health skill lives in fitted, so `prompt` below
+# carries an adaptation of it inline. Fix PRs land on `auto/` branches here, where
+# babysit-prs already picks them up.
+#
 # Ships off: it opens PRs on the operator's behalf. The first enabled run only adopts a
 # baseline (see adopt_baseline); PRs start from the second.
 enabled: false
-cron: "0 4 * * 1" # Mondays 04:00
-repo: /home/guido/.local/state/herdr-routines/repos/fitted
+cron: "0 4 * * 1" # Mondays 04:00 — clear of the 02:00 feature-pipeline
+# The plain clone feature-pipeline and issue-refinement also use. Audit worktrees are
+# .worktrees/audit-<run_id> and audit-fix-<run_id>, so they never collide with theirs.
+repo: /home/guido/.local/state/herdr-routines/repos/herdr-routines
 workspace: worktree # required for kind: audit (the fix worker edits source)
-base: development
+base: main
 kind: audit
 
-# Exactly one of skill/command. `skill` names the audit skill an agent runs; the engine's
-# prompt tells it the manifest format, so the skill needs no changes. `command` is a cheap
-# synchronous command that writes the manifest itself — $ROUTINE_FINDINGS is substituted
-# into it and exported — and its exit code is not the gate (only 127, "not found", fails).
-# Either way the manifest lands at <reports_dir>/<run_id>-findings.json.
+# Exactly one of skill/command. `skill` names the audit. With an empty `prompt` the agent
+# loads that skill from the target repo; with a `prompt` (as here) the prompt *is* the
+# audit, inline. Either way the engine appends the output contract: write the Markdown
+# report to $ROUTINE_REPORT and the findings manifest to $ROUTINE_FINDINGS, never commit.
+# `command` instead runs a cheap synchronous command that writes the manifest itself —
+# $ROUTINE_FINDINGS is substituted into it and exported — and its exit code is not the
+# gate (only 127, "not found", fails).
 audit:
   skill: type-health
   timeout_ms: 1800000 # the audit's own budget (30 min)
 
-# The audit agent and the fix worker both use the job's agent fields. `prompt` overrides
-# the audit prompt and `fix_prompt` the fix prompt; empty means engine-injected.
+# The audit agent and the fix worker both use the job's agent fields. `fix_prompt`
+# overrides the fix worker's prompt; empty means engine-injected.
 agent_kind: opencode
 model: null
 timeout_ms: 2700000 # the fix worker's budget (45 min)
@@ -47,3 +55,146 @@ on_missed: log
 # Clean night = done/passed, no notification under on-finding; a gate that found something
 # still notifies.
 notify_policy: on-finding
+
+# Adapted from fitted's `.claude/skills/type-health` (SKILL.md + references/) for this
+# repo: Python only, mypy instead of pyright, frozen dataclasses instead of Pydantic.
+prompt: |
+  # Type-health audit — herdr-routines
+
+  Audit type coverage in this repository and classify every finding. Tighten types
+  where it prevents real bugs, not to maximize annotation count. A well-typed
+  codebase should produce few findings.
+
+  The repo's conventions anchor every finding:
+
+  - **Parse at the boundary into a typed value.** Data entering the process —
+    `history.jsonl` lines, the findings ledger and manifest, `herdr` and `gh` CLI
+    JSON, YAML job config — is parsed once into a frozen dataclass (or a validated
+    primitive), and the core works on that type. Raw `dict[str, Any]` past the
+    parse point is the smell.
+  - **Frozen, slotted dataclasses** (`@dataclass(frozen=True, slots=True)`) for
+    data; `Literal[...]` for closed string sets (see `Job.kind`); `X | None`
+    for absence, never `""` or `-1`.
+  - **Fail closed.** A parser that cannot verify its input returns `None` (or
+    raises `ConfigError`), never an empty "clean" value.
+
+  ## Scope
+
+  `src/herdr_routines/` only. Tests (`tests/`) are out of scope: loose types in a
+  test are usually deliberate fakes. Say so in the report. Never touch
+  `docs/pipeline/runs/`, `.venv/` or anything generated.
+
+  ## Step 1 — Mechanical scan
+
+  Run these from the repo root and collect every hit:
+
+  ```bash
+  # Bare Any and dict[str, Any] (H3, H7d)
+  grep -rn ": Any\|-> Any\|\[Any\]\|dict\[str, Any\]" src --include="*.py" | sort
+  # Bare container annotations (H3)
+  grep -rnE "^\s*[a-z_]+: (list|dict|set|tuple)( *[=)]| *$)" src --include="*.py" | sort
+  # Public functions missing return annotations (H3)
+  grep -rnE "^(async )?def [a-z_]+\(.*\):$" src --include="*.py" | grep -v "def _" | sort
+  # String-literal comparisons that suggest a missing Literal/enum (H3; not an H4 scan)
+  grep -rnE "== ['\"][a-z_]+['\"]|in \(['\"]" src --include="*.py" | sort
+  # "" / -1 as an absent sentinel instead of None (H7e)
+  grep -rnE ': str = ""|str = ""\)|else ""' src --include="*.py" | sort
+  # Escape hatches (H8)
+  grep -rn "cast(" src --include="*.py" | sort
+  grep -rnE "# type: ignore" src --include="*.py" | sort
+  grep -rnE "assert .* is not None" src --include="*.py" | sort
+  # Mutable defaults and in-place mutation of caller data (H9)
+  grep -rnE "def .*=\s*(\[\]|\{\}|set\(\))" src --include="*.py" | sort
+  grep -rnE "^\s*[a-z_]+\.(sort|update|clear|reverse)\(" src --include="*.py" | sort
+  # Unvalidated JSON parsing — where boundaries are (H2, H7d)
+  grep -rnE "json\.loads?\(|\.get\(\"" src --include="*.py" | sort
+  ```
+
+  For a `cast(` hit, check what it compensates for before classifying.
+
+  ## Step 2 — Checker configuration (measure, never assume)
+
+  CI gates on plain `uv run mypy .` (see `[tool.mypy]` in `pyproject.toml`). A
+  missing strictness flag exempts the whole codebase from a bug class. Measure
+  each candidate with a CLI flag — never edit `pyproject.toml`:
+
+  ```bash
+  uv run mypy src --strict 2>&1 | tail -1
+  for f in --disallow-any-generics --warn-return-any --disallow-untyped-defs \
+           --warn-unused-ignores --strict-equality --disallow-any-explicit; do
+    echo "$f: $(uv run mypy src $f 2>&1 | grep -c ': error:')"
+  done
+  ```
+
+  Report each flag with its measured error count. Every checker-config finding is
+  INVESTIGATE: turning a flag on changes the CI contract, which is a human's call.
+
+  ## Step 3 — Classify
+
+  For EVERY hit, read ~20 lines of context in the actual file first; never
+  classify from the grep line. Be conservative: when in doubt, INVESTIGATE.
+
+  **FIX** — tightenable without changing behavior, confined to one file:
+  - `dict[str, Any]` whose shape the code clearly knows → a frozen dataclass or
+    `TypedDict`, parsed at the boundary (H7d)
+  - `Any` that can be a specific type, `TypedDict` or `Literal` union (H3)
+  - bare `list`/`dict` annotations; missing annotations on public functions (H3)
+  - a closed string set compared in several places → `Literal` (H2, H4)
+  - `""` / `-1` meaning "absent" → `X | None` at both producer and consumer (H7e)
+  - `cast()` right after a check mypy can follow → delete it; bare
+    `# type: ignore` with a known code → `# type: ignore[code]`; a dead ignore
+    that `--warn-unused-ignores` reports → delete it (H8)
+  - `assert x is not None` guarding production logic (not a type-narrowing
+    assert on a value config validation guarantees) → explicit check and raise
+    (H8)
+  - a mutable default argument → `None` + local construction; a `list[T]`
+    parameter never mutated → `Sequence[T]` (H9)
+  - a bare positional tuple with meaning → `NamedTuple` (H3)
+
+  **LEGITIMATE** — the loose type is correct:
+  - `Any` in genuinely dynamic code (`**kwargs` passthrough, an injectable
+    test seam typed `Any` on purpose)
+  - JSON handled as `dict[str, Any]` only until the function that validates it
+    (that function *is* the boundary)
+  - `cast()` / a scoped ignore compensating for a missing stub — only if a comment
+    says so; an uncommented escape hatch is at least "add the justification"
+  - mutation of a locally built collection that never escapes
+
+  **INVESTIGATE** — a design decision or a multi-file change:
+  - anything changing a shared signature or a type used across modules
+  - every checker-configuration finding from Step 2
+  - anything that changes what a parser accepts (a value that was accepted would
+    now be rejected) — trace its provenance first
+  - a product invariant brushed by a scan (budgets, idempotency): note it as a
+    property-test candidate, not a type finding
+
+  Heuristics, for classification and the report:
+  H1 illegal states unrepresentable · H2 parse, don't validate · H3 precision
+  (`Any` < `object` < concrete) · H4 exhaustive `match` with `assert_never` ·
+  H5 boundary vs core · H6 nominal types for IDs crossing boundaries ·
+  H7a boolean blindness · H7b double optional · H7d `dict[str, Any]` for known
+  shapes · H7e sentinels instead of `None` · H8 escape hatches · H9 immutability
+  by default · H10 ranges/shapes in the type · H11 constructor discipline.
+  High priority: H1, H2, H3, H4, H7a, H7d, H7e, H8, H10. Medium: the rest.
+
+  ## Output
+
+  **The manifest lists FIX findings only.** LEGITIMATE needs nothing, and
+  INVESTIGATE needs a human — a fix worker acts on every manifest entry, so
+  neither belongs there. For each FIX finding:
+  - `id`: `"<heuristic>:<path>:<symbol>"`, e.g. `"H7d:src/herdr_routines/tick.py:_outcome_extra"`
+    — a structural anchor, so the ID survives line shifts.
+  - `kind`: the pattern, kebab-case (`dict-any-known-shape`, `bare-type-ignore`, …).
+  - `severity`: `high` for High-priority heuristics, `medium` for Medium, `low`
+    for cosmetic.
+  - `location`: `path:line`. `summary`: one line with the proposed change.
+
+  **The Markdown report** has a summary table (file, line, pattern, heuristic,
+  category) and four sections: Fix candidates, Checker configuration (measured
+  counts), Legitimate (and why), Investigate (with scope notes).
+
+  ## For the fix worker (when this audit is re-run to verify a fix)
+
+  Confirm with the repo's own gates before pushing:
+  `uv run ruff format --check . && uv run ruff check . && uv run mypy . && uv run pytest -q`.
+  If a fix would ripple into another file, leave it and say so in the fix report.

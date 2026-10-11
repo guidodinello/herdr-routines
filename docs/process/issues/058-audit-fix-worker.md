@@ -30,6 +30,15 @@ here. What follows is only what phase B decides that 057 left open.
   manifest today. The injected audit prompt names the skill and spells out the
   JSON shape, so a skill runs unmodified; a skill-supplied `id` stays the
   recommended follow-up (057, "Follow-up").
+- **A job `prompt` is the audit, inline.** For a repo that lacks the skill, the
+  job's `prompt` describes the audit and the engine appends the same output
+  contract (report, manifest schema, no commits) — the contract stays in code
+  either way. The resolved audit prompt is saved as
+  `reports/<run_id>-audit-prompt.md`, and the fix worker is pointed at it to
+  re-scan, since "re-run the skill" means nothing when there is no skill. The
+  shipped `audit-type-health` job uses this: it targets herdr-routines with an
+  adaptation of fitted's `type-health` skill, and its manifest carries FIX
+  findings only.
 - **`audit.command` gets the paths twice.** `$ROUTINE_FINDINGS` / `$ROUTINE_REPORT`
   are substituted into the command string and also exported as environment
   variables of the same name, so a script can read either.
@@ -68,7 +77,10 @@ here. What follows is only what phase B decides that 057 left open.
 6. `kind: audit` changes nothing for existing jobs: `tests/test_kind_gated.py`,
    `tests/test_auto_fix.py` and `tests/test_tick.py` pass unmodified. Test:
    `test_audit_does_not_change_existing_job_dispatch` (plus the three suites)
-7. A fix dispatch that fails after the ledger write (agent start raises) leaves
+7. A job `prompt` on a skill audit is wrapped by the engine's output contract,
+   saved for the fix worker, and the fix prompt points there. Test:
+   `test_inline_audit_prompt_keeps_the_engine_contract`
+8. A fix dispatch that fails after the ledger write (agent start raises) leaves
    the incremented attempt and `last_dispatched_run` on disk. Test:
    `test_failed_fix_dispatch_still_consumes_budget`
 
