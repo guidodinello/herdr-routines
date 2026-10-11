@@ -28,6 +28,7 @@ from herdr_routines.config import (
     DEFAULT_REPORTS_MAX_AGE_DAYS,
     TINY_HISTORY_MAX_BYTES,
     ConfigError,
+    Job,
     RoutinesConfig,
     default_config_path,
     load_config,
@@ -87,6 +88,7 @@ from herdr_routines.tick import (
     launch_pipeline,
     pipeline_deadline_epoch,
     pipeline_report_path,
+    run_audit_now,
     run_tick,
     tick_lock,
 )
@@ -834,7 +836,11 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                     f"{job.name}: prompt_file does not exist: {job.repo / job.prompt_file}"
                 )
         elif (
-            job.enabled and job.kind != "gated" and "$ROUTINE_REPORT" not in job.prompt
+            job.enabled
+            # gated and audit jobs inject their own prompts when `prompt` is empty, and
+            # an audit's verdict is its manifest, not $ROUTINE_REPORT.
+            and job.kind not in ("gated", "audit")
+            and "$ROUTINE_REPORT" not in job.prompt
         ):
             # A run only settles as "done" when the report file exists and is non-empty (see
             # runner.execute_run's no_report check); the agent only writes it if the prompt
@@ -928,6 +934,19 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
         # would otherwise silently inflate the required TimeoutStartSec by ~30 min.
         if job.kind == "pipeline":
             continue
+        # kind: audit (issue 058) runs the audit, then at most one fix worker, in
+        # sequence: slop + audit.timeout_ms + timeout_ms. A skill audit is an agent, so it
+        # waits on start_timeout_ms too — one start per agent.
+        if job.kind == "audit":
+            assert job.audit is not None  # guaranteed by config validation
+            agent_starts = 1 if job.audit.command is not None else 2
+            total_job_seconds += (
+                agent_starts * job.start_timeout_ms / 1000
+                + GATE_SLOP_S
+                + job.audit.timeout_ms / 1000
+                + job.timeout_ms / 1000
+            )
+            continue
         if job.kind == "gated" and job.target is not None:
             assert job.checks is not None  # guaranteed by config validation
             gate_time_s = sum(c.timeout_ms for c in job.checks) / 1000
@@ -978,6 +997,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     run_id = args.run_id or make_run_id(job.name, now)
 
+    if job.kind == "audit" and not args.dry_run:
+        return _cmd_run_audit(job, run_id=run_id, now=now)
+
     if args.dry_run:
         for command in build_dry_run_argv(job, run_id=run_id):
             print(" ".join(command))
@@ -991,6 +1013,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.error("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
     return 0 if outcome.state == "done" else 1
+
+
+def _cmd_run_audit(job: Job, *, run_id: str, now: datetime) -> int:
+    """kind: audit is not an execute_run job: it runs the audit, diff and fix phases.
+    Takes the tick lock so a manual run can never overlap the scheduled tick."""
+    with tick_lock(default_lock_path()) as acquired:
+        if not acquired:
+            log.error("%s: a tick is running; try again when it finishes", job.name)
+            return 1
+        summary, failed = run_audit_now(
+            job, default_history_path(), client=HerdrClient(), now=now, run_id=run_id
+        )
+    (log.error if failed else log.info)(summary)
+    return 1 if failed else 0
 
 
 def _cmd_run_pipeline(job, args: argparse.Namespace, *, now: datetime) -> int:

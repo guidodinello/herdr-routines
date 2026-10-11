@@ -241,17 +241,11 @@ def test_ledger_write_ahead_consumes_budget_on_failed_dispatch(
     assert written.entries["f2"].attempts == 0
     assert written.entries["f2"].last_dispatched_run is None
 
-    # Write-ahead: the increment is on disk before the dispatch is attempted, so a
-    # dispatch that raises still consumes the budget.
+    # The increment survives a save/load round trip. That the tick saves it *before*
+    # dispatching is pinned through the real tick by
+    # test_audit_dispatch.py::test_failed_fix_dispatch_still_consumes_budget (issue 058).
     path = tmp_path / "ledger.json"
     save_ledger(path, written)
-
-    def _dispatch() -> None:
-        raise RuntimeError("boom")
-
-    with pytest.raises(RuntimeError):
-        _dispatch()
-
     reloaded = load_ledger(path)
     assert reloaded is not None
     assert reloaded.entries["f1"].attempts == 1

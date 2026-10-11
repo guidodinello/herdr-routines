@@ -22,10 +22,14 @@ from logger import get_logger
 
 from herdr_routines.auto_fix import (
     EligiblePR,
+    GateCheck,
     PRInfo,
     RealGhClient,
     attempt_count_for_gate_branch,
     attempt_count_for_pr,
+    build_audit_agent_name,
+    build_audit_fix_prompt,
+    build_audit_prompt,
     build_base_fix_prompt,
     build_fix_prompt,
     build_gate_worker_agent_name,
@@ -40,6 +44,7 @@ from herdr_routines.auto_fix import (
 )
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.findings import (
+    Finding,
     Ledger,
     apply_diff,
     diff_findings,
@@ -47,6 +52,7 @@ from herdr_routines.findings import (
     ledger_path,
     load_findings_manifest_full,
     load_ledger,
+    mark_handed_off,
     prune_ledger,
     save_ledger,
 )
@@ -77,10 +83,12 @@ from herdr_routines.pipeline_watchdog import (
 from herdr_routines.repos import ensure_repo
 from herdr_routines.runner import (
     RunOutcome,
+    build_branch_name,
     default_reports_dir,
     execute_run,
     extract_prompt_excerpt,
     make_run_id,
+    substitute_prompt,
 )
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.tmp_hygiene import reap_tmp
@@ -184,20 +192,20 @@ def run_tick(
 def _process_audit_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
-    """Process a kind: audit job (issue 057 Phase A).
+    """Process a kind: audit job (issues 057, 058).
 
-    The schedule guards are identical to a gated job's; when the cron fires, the
-    record-only core (`_audit_phase_a`) runs an audit, diffs its findings against the
-    ledger, and records the full dispatch set — but dispatches nothing. Phase B/058
-    layers the fix dispatch on top of the same seam."""
+    The schedule guards are a gated job's; when the cron fires, `_audit_cycle` runs the
+    audit, diffs its findings against the ledger, and dispatches at most one fix worker.
+    One run spans the audit and the fix worker, so staleness is judged against both."""
     assert job.audit is not None
+    run_timeout_ms = job.audit.timeout_ms + job.timeout_ms
 
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
         return f"{job.name}: registered", False
 
     stale = find_stale_running(
-        history_path, job.name, timeout_ms=job.timeout_ms, now=now
+        history_path, job.name, timeout_ms=run_timeout_ms, now=now
     )
     if stale is not None:
         stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
@@ -217,10 +225,10 @@ def _process_audit_job(
             ),
         )
 
-    if is_currently_running(history_path, job.name, timeout_ms=job.timeout_ms, now=now):
+    if is_currently_running(history_path, job.name, timeout_ms=run_timeout_ms, now=now):
         return f"{job.name}: skipped (already running)", False
 
-    if _live_agent_exists(client, job):
+    if _live_audit_agent_exists(client, job):
         append(
             history_path,
             HistoryRecord(
@@ -304,7 +312,7 @@ def _process_audit_job(
         ),
     )
 
-    return _audit_phase_a(job, history_path, client=client, now=now, run_id=run_id)
+    return _audit_cycle(job, history_path, client=client, now=now, run_id=run_id)
 
 
 # Per-run cap on how many suppressed IDs the history record carries. Suppression is
@@ -312,11 +320,10 @@ def _process_audit_job(
 # sample keeps one bad night from bloating every history line.
 _AUDIT_SUPPRESSED_ID_CAP = 20
 
-# gate -> notification kind (see _notify_gate's four-tier policy). Phase A records
-# `fix_pending` (the set a worker would get); phase B/058 adds `fix_dispatched`.
+# gate -> notification kind (see _notify_gate's four-tier policy).
 _AUDIT_GATE_NOTIFY_KIND = {
     "baseline": "finding",
-    "fix_pending": "finding",
+    "fix_dispatched": "finding",
     "suppressed": "finding",
     "passed": "success",
     "failed": "failure",
@@ -370,7 +377,7 @@ def _render_audit_report(
             disposition = "unknown"
         flags = []
         if finding.id in dispatched:
-            flags.append("would dispatch")
+            flags.append("dispatched")
         if finding.id in suppressed:
             flags.append("suppressed")
         flag_text = f" ({', '.join(flags)})" if flags else ""
@@ -386,72 +393,463 @@ def _render_audit_report(
     return "\n".join(lines) + "\n"
 
 
-def _audit_phase_a(
+@dataclass(frozen=True, slots=True)
+class _AuditPaths:
+    """Where one audit cycle's files live. The audit and the fix worker each get their own
+    Markdown report; `report` is the engine's aggregate (issue 058, "Three report paths")."""
+
+    manifest: Path
+    report: Path
+    audit_report: Path
+    audit_instructions: Path
+    fix_report: Path
+    ledger: Path
+
+    @classmethod
+    def for_run(cls, job_name: str, run_id: str) -> _AuditPaths:
+        reports = default_reports_dir()
+        return cls(
+            manifest=reports / f"{run_id}-findings.json",
+            report=reports / f"{run_id}.md",
+            audit_report=reports / f"{run_id}-audit.md",
+            audit_instructions=reports / f"{run_id}-audit-instructions.md",
+            fix_report=reports / f"{run_id}-fix.md",
+            ledger=ledger_path(job_name),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentRun:
+    """How one agent dispatched into a worktree ended. `reason` is set iff it failed."""
+
+    reason: str | None = None
+    error: str | None = None
+    pane_id: str | None = None
+    final_agent_status: str | None = None
+    session_id: str | None = None
+
+
+def _record_audit_failure(
     job: Job,
     history_path: Path,
     *,
     client: HerdrClient,
     now: datetime,
     run_id: str,
+    paths: _AuditPaths,
+    reason: str,
+    extra: dict[str, Any] | None = None,
 ) -> tuple[str, bool]:
-    """The record-only core of a kind: audit job (issue 057 Phase A).
+    if _notify_gate(job, _AUDIT_GATE_NOTIFY_KIND["failed"]):
+        _notify(client, f"herdr-routines: {job.name} failed", body=reason)
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="failed",
+            run_id=run_id,
+            extra={
+                "gate": "failed",
+                "target": job.target or "base",
+                "reason": reason,
+                "manifest_path": str(paths.manifest),
+                "ledger_path": str(paths.ledger),
+                "report_path": str(paths.report),
+                "report_written": False,
+                **(extra or {}),
+            },
+        ),
+    )
+    return f"{job.name}: failed ({reason})", True
 
-    Parses the findings manifest, diffs against the ledger, records the full dispatch
-    set in the report + history `extra`, and writes the ledger — but dispatches no
-    agent, pane, or worktree. Fail-closed on an unverifiable manifest or a corrupt
-    ledger: record `failed`, notify, act on nothing."""
-    assert job.audit is not None
+
+def _add_worktree(repo: Path, wt_path: Path, base: str) -> None:
+    """Force-remove then add a detached worktree at `base` — the sequence
+    `_process_base_target` runs. Raises RuntimeError when `git worktree add` fails."""
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "remove", "--force", str(wt_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", str(wt_path), base],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
+
+
+def _run_agent_in_worktree(
+    job: Job,
+    client: HerdrClient,
+    *,
+    agent_name: str,
+    wt_path: Path,
+    prompt_text: str,
+    timeout_ms: int,
+    tail_id: str,
+) -> _AgentRun:
+    """Start `agent_name` in a pane at `wt_path`, prompt it and wait for it to settle,
+    then close the pane. The same start / ready / watchdog / tail / close path
+    `_process_base_target` uses. Never raises; the caller owns the worktree."""
+    from herdr_routines.runner import (
+        _capture_visible_tail,
+        _close_run_pane,
+        _prompt_with_watchdog,
+        _wait_for_agent_ready,
+    )
+
     reports_dir = default_reports_dir()
-    manifest_path = reports_dir / f"{run_id}-findings.json"
-    report_path = reports_dir / f"{run_id}.md"
-    ledger_p = ledger_path(job.name)
+    pane_id: str | None = None
+    try:
+        pane_id = client.tab_create(cwd=str(wt_path), label=agent_name)
+        client.agent_start(
+            name=agent_name,
+            kind=job.agent_kind,
+            pane_id=pane_id,
+            start_timeout_ms=job.start_timeout_ms,
+            model=job.model,
+        )
+    except (HerdrCliError, OSError) as e:
+        if pane_id is not None:
+            _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+        return _AgentRun(reason="agent_start_failed", error=str(e), pane_id=pane_id)
 
-    def _notify_gate_outcome(gate: str, body: str) -> None:
-        if _notify_gate(job, _AUDIT_GATE_NOTIFY_KIND[gate]):
-            _notify(client, f"herdr-routines: {job.name} {gate}", body=body)
+    ready, last_error = _wait_for_agent_ready(
+        client, agent_name, timeout_s=job.start_timeout_ms / 1000
+    )
+    if not ready:
+        _capture_visible_tail(
+            client, agent_name, reports_dir=reports_dir, run_id=tail_id
+        )
+        _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+        return _AgentRun(
+            reason="agent_not_interactive", error=last_error, pane_id=pane_id
+        )
 
-    def _record_failure(gate: str, reason: str, body: str) -> tuple[str, bool]:
-        _notify_gate_outcome(gate, body)
-        append(
+    try:
+        settled_status = _prompt_with_watchdog(
+            client,
+            job_name=agent_name,
+            target=agent_name,
+            text=prompt_text,
+            timeout_ms=timeout_ms,
+            markers=job.failure_markers
+            if job.failure_markers is not None
+            else ("Free usage exceeded",),
+            prompt_text=prompt_text,
+        )
+    except Exception as e:  # noqa: BLE001
+        _capture_visible_tail(
+            client, agent_name, reports_dir=reports_dir, run_id=tail_id
+        )
+        _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+        return _AgentRun(reason="agent_prompt_failed", error=str(e), pane_id=pane_id)
+
+    _capture_visible_tail(client, agent_name, reports_dir=reports_dir, run_id=tail_id)
+    session_id: str | None = None
+    try:
+        session_id = client.agent_session_id(agent_name)
+    except Exception as e:  # noqa: BLE001 — session id is best-effort reporting data
+        log.debug("could not read session id for %s: %s", agent_name, e)
+    _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+
+    return _AgentRun(
+        reason=None if settled_status in ("idle", "done") else "agent_prompt_failed",
+        pane_id=pane_id,
+        final_agent_status=settled_status,
+        session_id=session_id,
+    )
+
+
+def _audit_cycle(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime, run_id: str
+) -> tuple[str, bool]:
+    """One cron fire of a kind: audit job: run the audit (phase 1), diff its manifest
+    against the ledger (phase 2), then dispatch at most one fix worker (phase 3)."""
+    paths = _AuditPaths.for_run(job.name, run_id)
+    failure = _run_audit(
+        job, history_path, client=client, now=now, run_id=run_id, paths=paths
+    )
+    if failure is not None:
+        return failure
+    return _diff_and_fix(
+        job, history_path, client=client, now=now, run_id=run_id, paths=paths
+    )
+
+
+def run_audit_now(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime, run_id: str
+) -> tuple[str, bool]:
+    """`herdr-routines run <audit job>`: one audit cycle outside the schedule, recorded
+    like a cron fire. The caller holds the tick lock."""
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="running",
+            run_id=run_id,
+            extra={"trigger": "manual"},
+        ),
+    )
+    return _audit_cycle(job, history_path, client=client, now=now, run_id=run_id)
+
+
+def _run_audit(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    run_id: str,
+    paths: _AuditPaths,
+) -> tuple[str, bool] | None:
+    """Phase 1: run the audit in its own `audit-<run_id>` worktree at `base`, which is
+    removed before this returns. Returns a failure result, or None when the audit ran —
+    whether it produced a valid manifest is phase 2's question.
+
+    `audit.command`'s exit code is not the gate: non-zero is the healthy case for an
+    audit, so only 127 (the binary is missing) is a failure."""
+    assert job.audit is not None
+
+    def _fail(reason: str, extra: dict[str, Any]) -> tuple[str, bool]:
+        return _record_audit_failure(
+            job,
             history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="failed",
-                run_id=run_id,
-                extra={
-                    "gate": gate,
-                    "target": job.target or "base",
-                    "reason": reason,
-                    "manifest_path": str(manifest_path),
-                    "ledger_path": str(ledger_p),
-                    "report_path": str(report_path),
-                    "report_written": False,
-                },
-            ),
+            client=client,
+            now=now,
+            run_id=run_id,
+            paths=paths,
+            reason=reason,
+            extra=extra,
         )
-        return f"{job.name}: failed ({reason})", True
 
-    manifest = load_findings_manifest_full(manifest_path)
-    if manifest is None:
-        return _record_failure(
-            "failed", "findings_manifest_invalid", "findings manifest invalid"
+    try:
+        ensure_repo(job)
+    except (RuntimeError, OSError) as e:
+        reason = (
+            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
         )
+        return _fail(reason, {"error": str(e)})
+
+    try:
+        paths.report.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return _fail("report_dir_creation_failed", {"error": str(e)})
+
+    wt_path = Path(job.repo) / ".worktrees" / f"audit-{run_id}"
+    try:
+        _add_worktree(job.repo, wt_path, job.base)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        return _fail("worktree_creation_failed", {"error": str(e)})
+
+    try:
+        if job.audit.command is not None:
+            command = substitute_prompt(
+                job.audit.command,
+                report_path=paths.audit_report,
+                job_name=job.name,
+                run_id=run_id,
+                findings_path=paths.manifest,
+            )
+            env = {
+                **os.environ,
+                "ROUTINE_FINDINGS": str(paths.manifest),
+                "ROUTINE_REPORT": str(paths.audit_report),
+            }
+            outcome = run_checks(
+                (
+                    GateCheck(
+                        kind="command", command=command, timeout_ms=job.audit.timeout_ms
+                    ),
+                ),
+                cwd=str(wt_path),
+                env=env,
+            )
+            output_path = paths.report.parent / f"{run_id}-audit-output.txt"
+            try:
+                output_path.write_text(outcome.combined_output)
+            except OSError as e:
+                log.warning("%s: could not write audit output: %s", job.name, e)
+            exit_code = outcome.results[0].exit_code
+            if exit_code == 127:
+                return _fail(
+                    "audit_command_failed",
+                    {"exit_code": exit_code, "audit_output_path": str(output_path)},
+                )
+            return None
+
+        assert job.audit.skill is not None
+        agent_name = build_audit_agent_name(job.name, run_id)
+        # A non-empty `prompt` is the audit itself, inline (for a repo without the skill);
+        # the output contract around it is always the engine's.
+        prompt_text = build_audit_prompt(
+            skill=job.audit.skill,
+            base=job.base,
+            report_path=str(paths.audit_report),
+            findings_path=str(paths.manifest),
+            instructions=job.prompt,
+        )
+        prompt_text = substitute_prompt(
+            prompt_text,
+            report_path=paths.audit_report,
+            job_name=job.name,
+            run_id=run_id,
+            findings_path=paths.manifest,
+        )
+        # Inline instructions are kept for the fix worker, which re-scans from them. Only
+        # the instructions: the engine's wrapper tells the audit agent not to commit,
+        # which a fix worker must not read as addressed to it.
+        if job.prompt.strip():
+            try:
+                paths.audit_instructions.write_text(
+                    substitute_prompt(
+                        job.prompt,
+                        report_path=paths.audit_report,
+                        job_name=job.name,
+                        run_id=run_id,
+                        findings_path=paths.manifest,
+                    )
+                )
+            except OSError as e:
+                log.warning("%s: could not save audit instructions: %s", job.name, e)
+        run = _run_agent_in_worktree(
+            job,
+            client,
+            agent_name=agent_name,
+            wt_path=wt_path,
+            prompt_text=prompt_text,
+            timeout_ms=job.audit.timeout_ms,
+            tail_id=f"{run_id}-audit",
+        )
+        if run.reason is not None:
+            return _fail(
+                run.reason,
+                {
+                    "phase": "audit",
+                    "agent_name": agent_name,
+                    "error": run.error,
+                    "pane_id": run.pane_id,
+                    "final_agent_status": run.final_agent_status,
+                },
+            )
+        return None
+    finally:
+        _cleanup_worktree(job.repo, wt_path)
+
+
+def _dispatch_audit_fix(
+    job: Job,
+    *,
+    client: HerdrClient,
+    run_id: str,
+    check: str,
+    findings: list[Finding],
+    paths: _AuditPaths,
+) -> _AgentRun:
+    """Phase 3: exactly one fix worker, in its own `audit-fix-<run_id>` worktree at
+    `base`, told to push `auto/<job>-<run_id>` and open a PR. The worktree is removed
+    after the worker settles; the branch it pushed survives."""
+    assert job.audit is not None
+    wt_path = Path(job.repo) / ".worktrees" / f"audit-fix-{run_id}"
+    try:
+        _add_worktree(job.repo, wt_path, job.base)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        return _AgentRun(reason="worktree_creation_failed", error=str(e))
+
+    try:
+        if job.audit.command is not None:
+            recheck = f"`{job.audit.command}` (it writes the findings manifest)"
+        elif job.prompt.strip():
+            recheck = (
+                f"follow the `{job.audit.skill}` audit instructions in "
+                f"{paths.audit_instructions} to re-scan. Do not overwrite the "
+                f"audit's report or manifest"
+            )
+        else:
+            recheck = f"run the `{job.audit.skill}` skill and read its findings"
+        prompt_text = job.fix_prompt or build_audit_fix_prompt(
+            job_name=job.name,
+            check=check,
+            base=job.base,
+            branch=build_branch_name(job.name, run_id),
+            report_path=str(paths.fix_report),
+            findings=findings,
+            recheck=recheck,
+        )
+        prompt_text = substitute_prompt(
+            prompt_text,
+            report_path=paths.fix_report,
+            job_name=job.name,
+            run_id=run_id,
+            findings_path=paths.manifest,
+        )
+        return _run_agent_in_worktree(
+            job,
+            client,
+            agent_name=build_gate_worker_agent_name(job.name, run_id),
+            wt_path=wt_path,
+            prompt_text=prompt_text,
+            timeout_ms=job.timeout_ms,
+            tail_id=f"{run_id}-fix",
+        )
+    finally:
+        _cleanup_worktree(job.repo, wt_path)
+
+
+def _diff_and_fix(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    run_id: str,
+    paths: _AuditPaths,
+) -> tuple[str, bool]:
+    """Phases 2 and 3: parse the manifest, diff it against the ledger, write the ledger
+    and the aggregate report, then dispatch one fix worker for the capped set.
+
+    Fail-closed on an unverifiable manifest or a corrupt ledger: record `failed`,
+    notify, act on nothing. The ledger is written *before* the dispatch (write-ahead),
+    so a dispatch that fails has still consumed its attempt."""
+    assert job.audit is not None
+
+    def _fail(reason: str) -> tuple[str, bool]:
+        return _record_audit_failure(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            run_id=run_id,
+            paths=paths,
+            reason=reason,
+        )
+
+    manifest = load_findings_manifest_full(paths.manifest)
+    if manifest is None:
+        return _fail("findings_manifest_invalid")
 
     ledger: Ledger | None
-    if ledger_p.exists():
-        ledger = load_ledger(ledger_p)
+    if paths.ledger.exists():
+        ledger = load_ledger(paths.ledger)
         if ledger is None:
             # Never silently re-baseline: preserve the corrupt file for inspection so the
             # regression signal is not thrown away, then fail closed.
-            backup = ledger_p.parent / (
-                f"{ledger_p.name}.corrupt-{now.strftime('%Y%m%dT%H%M%SZ')}"
+            backup = paths.ledger.parent / (
+                f"{paths.ledger.name}.corrupt-{now.strftime('%Y%m%dT%H%M%SZ')}"
             )
             try:
-                shutil.copyfile(ledger_p, backup)
+                shutil.copyfile(paths.ledger, backup)
             except OSError as e:
-                log.warning("could not back up corrupt ledger %s: %s", ledger_p, e)
-            return _record_failure("failed", "ledger_corrupt", "ledger corrupt")
+                log.warning("could not back up corrupt ledger %s: %s", paths.ledger, e)
+            return _fail("ledger_corrupt")
     else:
         ledger = None
 
@@ -486,15 +884,14 @@ def _audit_phase_a(
         ]
         dispatched_ids = candidates[: job.max_findings_per_dispatch]
         if dispatched_ids:
-            gate = "fix_pending"
+            gate = "fix_dispatched"
         elif suppressed_ids:
             gate = "suppressed"
         else:
             gate = "passed"
 
     base_ledger = ledger if ledger is not None else Ledger(job=job.name, entries={})
-    # Phase A dispatches nothing, so it consumes no budget: the dispatch set is recorded
-    # in the report and `extra` only. A baseline adoption queues nothing either.
+    # A baseline adoption records debt without queueing it.
     queued_ids = (
         [] if gate == "baseline" else [f.id for f in (*diff.new, *diff.regressed)]
     )
@@ -504,64 +901,135 @@ def _audit_phase_a(
         now=now,
         run_id=run_id,
         queued_ids=queued_ids,
-        dispatched_ids=[],
+        dispatched_ids=dispatched_ids,
     )
     updated = prune_ledger(updated, now=now, retention_days=job.ledger_retention_days)
-    save_ledger(ledger_p, updated)
+    save_ledger(paths.ledger, updated)
 
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_text = _render_audit_report(
-        job_name=job.name,
+    paths.report.parent.mkdir(parents=True, exist_ok=True)
+    paths.report.write_text(
+        _render_audit_report(
+            job_name=job.name,
+            run_id=run_id,
+            check=check,
+            gate=gate,
+            manifest=manifest,
+            diff=diff,
+            dispatched_ids=dispatched_ids,
+            suppressed_ids=suppressed_ids,
+        )
+    )
+
+    extra: dict[str, Any] = {
+        "gate": gate,
+        "target": job.target or "base",
+        "check": check,
+        "manifest_path": str(paths.manifest),
+        "ledger_path": str(paths.ledger),
+        "report_path": str(paths.report),
+        "report_written": True,
+        "duplicate_ids": list(manifest.duplicate_ids),
+        "findings_total": len(manifest.findings),
+        "new": len(diff.new),
+        "regressed": len(diff.regressed),
+        "unchanged": len(diff.unchanged),
+        "resolved": len(diff.resolved),
+        "dispatched": len(dispatched_ids),
+        "suppressed": len(suppressed_ids),
+        "adopted": adopted,
+        "dispatched_ids": list(dispatched_ids),
+        "suppressed_ids": list(suppressed_ids[:_AUDIT_SUPPRESSED_ID_CAP]),
+    }
+
+    if not dispatched_ids:
+        if gate == "baseline":
+            body = f"baseline adopted ({adopted} findings)"
+        elif gate == "suppressed":
+            body = f"{len(suppressed_ids)} suppressed at budget"
+        else:
+            body = "clean"
+        if _notify_gate(job, _AUDIT_GATE_NOTIFY_KIND[gate]):
+            _notify(client, f"herdr-routines: {job.name} {gate}", body=body)
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now, job=job.name, state="done", run_id=run_id, extra=extra
+            ),
+        )
+        return f"{job.name}: done ({gate})", False
+
+    by_id = {f.id: f for f in manifest.findings}
+    run = _dispatch_audit_fix(
+        job,
+        client=client,
         run_id=run_id,
         check=check,
-        gate=gate,
-        manifest=manifest,
-        diff=diff,
-        dispatched_ids=dispatched_ids,
-        suppressed_ids=suppressed_ids,
+        findings=[by_id[fid] for fid in dispatched_ids],
+        paths=paths,
     )
-    report_path.write_text(report_text)
+    fix_report_written = paths.fix_report.exists()
+    gate_branch = build_branch_name(job.name, run_id)
+    extra.update(
+        {
+            "gate_branch": gate_branch,
+            "branch": gate_branch,
+            "agent_name": build_gate_worker_agent_name(job.name, run_id),
+            "pane_id": run.pane_id,
+            "final_agent_status": run.final_agent_status,
+            "session_id": run.session_id,
+            "fix_report_path": str(paths.fix_report) if fix_report_written else None,
+            "fix_report_written": fix_report_written,
+        }
+    )
 
-    if gate == "baseline":
-        body = f"baseline adopted ({adopted} findings)"
-    elif gate == "fix_pending":
-        body = f"{len(dispatched_ids)} to fix, {len(suppressed_ids)} suppressed"
-    elif gate == "suppressed":
-        body = f"{len(suppressed_ids)} suppressed at budget"
-    else:
-        body = "clean"
-    _notify_gate_outcome(gate, body)
+    if run.reason is not None:
+        extra.update({"reason": run.reason, "error": run.error})
+        if _notify_gate(job, _AUDIT_GATE_NOTIFY_KIND["failed"]):
+            _notify(client, f"herdr-routines: {job.name} failed", body=run.reason)
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now, job=job.name, state="failed", run_id=run_id, extra=extra
+            ),
+        )
+        return f"{job.name}: failed ({run.reason})", True
 
+    # The worker settled: its findings are handed off, so an unmerged fix PR is not
+    # dispatched again next cycle. A failed dispatch (above) keeps them queued for a retry.
+    save_ledger(paths.ledger, mark_handed_off(updated, dispatched_ids))
+    if _notify_gate(job, _AUDIT_GATE_NOTIFY_KIND[gate]):
+        _notify(
+            client,
+            f"herdr-routines: {job.name} {gate}",
+            body=f"fix worker ran for {len(dispatched_ids)} findings",
+        )
     append(
         history_path,
-        HistoryRecord(
-            ts=now,
-            job=job.name,
-            state="done",
-            run_id=run_id,
-            extra={
-                "gate": gate,
-                "target": job.target or "base",
-                "check": check,
-                "manifest_path": str(manifest_path),
-                "ledger_path": str(ledger_p),
-                "report_path": str(report_path),
-                "report_written": True,
-                "duplicate_ids": list(manifest.duplicate_ids),
-                "findings_total": len(manifest.findings),
-                "new": len(diff.new),
-                "regressed": len(diff.regressed),
-                "unchanged": len(diff.unchanged),
-                "resolved": len(diff.resolved),
-                "dispatched": len(dispatched_ids),
-                "suppressed": len(suppressed_ids),
-                "adopted": adopted,
-                "dispatched_ids": list(dispatched_ids),
-                "suppressed_ids": list(suppressed_ids[:_AUDIT_SUPPRESSED_ID_CAP]),
-            },
-        ),
+        HistoryRecord(ts=now, job=job.name, state="done", run_id=run_id, extra=extra),
     )
     return f"{job.name}: done ({gate})", False
+
+
+def _live_audit_agent_exists(client: HerdrClient, job: Job) -> bool:
+    """An audit job's cross-tick double-dispatch guard: a live audit agent
+    (`rt-<job>-au<h>`) or fix worker (`rt-<job>-gate-<h>`). Matched by prefix, because the
+    32-char cap truncates a 24-char job's fix-worker name to `rt-<job>-gate` with no hash
+    at all. A prefix can also match another job named `<job>-au…`; for a guard that only
+    costs a skipped tick, which is why this is not used for reaping. Fails open on a
+    HerdrCliError, like `_live_agent_exists`."""
+    prefixes = (
+        f"rt-{job.name}-au"[:32].lower(),
+        f"rt-{job.name}-gate"[:32].lower(),
+    )
+    try:
+        statuses = client.agent_statuses()
+    except HerdrCliError as e:
+        log.warning("%s: could not query live agents, proceeding: %s", job.name, e)
+        return False
+    return any(
+        name.lower().startswith(prefixes) and status in LIVE_AGENT_STATUSES
+        for name, status in statuses.items()
+    )
 
 
 def _process_gated_job(
@@ -2564,9 +3032,17 @@ def _reap_agents_of_rebooted_run(
     except HerdrCliError as e:
         log.warning("%s: could not list agents to reap: %s", job.name, e)
         return []
+    # An audit run's agents carry its run id in their names, which `_is_job_agent`'s
+    # suffix shapes do not cover; the stale record names the run, so match them exactly.
+    audit_names: set[str] = set()
+    if job.kind == "audit" and stale.run_id is not None:
+        audit_names = {
+            build_audit_agent_name(job.name, stale.run_id).lower(),
+            build_gate_worker_agent_name(job.name, stale.run_id).lower(),
+        }
     reaped: list[str] = []
     for name, (_status, pane_id) in sorted(agents.items()):
-        if not _is_job_agent(name, job):
+        if not (_is_job_agent(name, job) or name.lower() in audit_names):
             continue
         try:
             client.pane_close(pane_id)
