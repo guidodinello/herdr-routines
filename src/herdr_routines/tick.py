@@ -52,6 +52,7 @@ from herdr_routines.findings import (
     ledger_path,
     load_findings_manifest_full,
     load_ledger,
+    mark_handed_off,
     prune_ledger,
     save_ledger,
 )
@@ -400,7 +401,7 @@ class _AuditPaths:
     manifest: Path
     report: Path
     audit_report: Path
-    audit_prompt: Path
+    audit_instructions: Path
     fix_report: Path
     ledger: Path
 
@@ -411,7 +412,7 @@ class _AuditPaths:
             manifest=reports / f"{run_id}-findings.json",
             report=reports / f"{run_id}.md",
             audit_report=reports / f"{run_id}-audit.md",
-            audit_prompt=reports / f"{run_id}-audit-prompt.md",
+            audit_instructions=reports / f"{run_id}-audit-instructions.md",
             fix_report=reports / f"{run_id}-fix.md",
             ledger=ledger_path(job_name),
         )
@@ -703,11 +704,22 @@ def _run_audit(
             run_id=run_id,
             findings_path=paths.manifest,
         )
-        # Kept for the fix worker, which re-runs the audit from these instructions.
-        try:
-            paths.audit_prompt.write_text(prompt_text)
-        except OSError as e:
-            log.warning("%s: could not save the audit prompt: %s", job.name, e)
+        # Inline instructions are kept for the fix worker, which re-scans from them. Only
+        # the instructions: the engine's wrapper tells the audit agent not to commit,
+        # which a fix worker must not read as addressed to it.
+        if job.prompt.strip():
+            try:
+                paths.audit_instructions.write_text(
+                    substitute_prompt(
+                        job.prompt,
+                        report_path=paths.audit_report,
+                        job_name=job.name,
+                        run_id=run_id,
+                        findings_path=paths.manifest,
+                    )
+                )
+            except OSError as e:
+                log.warning("%s: could not save audit instructions: %s", job.name, e)
         run = _run_agent_in_worktree(
             job,
             client,
@@ -753,15 +765,16 @@ def _dispatch_audit_fix(
         return _AgentRun(reason="worktree_creation_failed", error=str(e))
 
     try:
-        recheck = (
-            f"`{job.audit.command}` (it writes the findings manifest)"
-            if job.audit.command is not None
-            else (
+        if job.audit.command is not None:
+            recheck = f"`{job.audit.command}` (it writes the findings manifest)"
+        elif job.prompt.strip():
+            recheck = (
                 f"follow the `{job.audit.skill}` audit instructions in "
-                f"{paths.audit_prompt} to re-scan. Do not overwrite the report or "
-                f"manifest they name"
+                f"{paths.audit_instructions} to re-scan. Do not overwrite the "
+                f"audit's report or manifest"
             )
-        )
+        else:
+            recheck = f"run the `{job.audit.skill}` skill and read its findings"
         prompt_text = job.fix_prompt or build_audit_fix_prompt(
             job_name=job.name,
             check=check,
@@ -981,6 +994,9 @@ def _diff_and_fix(
         )
         return f"{job.name}: failed ({run.reason})", True
 
+    # The worker settled: its findings are handed off, so an unmerged fix PR is not
+    # dispatched again next cycle. A failed dispatch (above) keeps them queued for a retry.
+    save_ledger(paths.ledger, mark_handed_off(updated, dispatched_ids))
     if _notify_gate(job, _AUDIT_GATE_NOTIFY_KIND[gate]):
         _notify(
             client,
@@ -3016,9 +3032,17 @@ def _reap_agents_of_rebooted_run(
     except HerdrCliError as e:
         log.warning("%s: could not list agents to reap: %s", job.name, e)
         return []
+    # An audit run's agents carry its run id in their names, which `_is_job_agent`'s
+    # suffix shapes do not cover; the stale record names the run, so match them exactly.
+    audit_names: set[str] = set()
+    if job.kind == "audit" and stale.run_id is not None:
+        audit_names = {
+            build_audit_agent_name(job.name, stale.run_id).lower(),
+            build_gate_worker_agent_name(job.name, stale.run_id).lower(),
+        }
     reaped: list[str] = []
     for name, (_status, pane_id) in sorted(agents.items()):
-        if not _is_job_agent(name, job):
+        if not (_is_job_agent(name, job) or name.lower() in audit_names):
             continue
         try:
             client.pane_close(pane_id)

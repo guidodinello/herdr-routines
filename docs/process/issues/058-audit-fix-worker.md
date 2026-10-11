@@ -34,7 +34,7 @@ here. What follows is only what phase B decides that 057 left open.
   job's `prompt` describes the audit and the engine appends the same output
   contract (report, manifest schema, no commits) — the contract stays in code
   either way. The resolved audit prompt is saved as
-  `reports/<run_id>-audit-prompt.md`, and the fix worker is pointed at it to
+  `reports/<run_id>-audit-instructions.md` (the instructions only, not the audit agent's no-commit rules), and the fix worker is pointed at it to
   re-scan, since "re-run the skill" means nothing when there is no skill. The
   shipped `audit-type-health` job uses this: it targets herdr-routines with an
   adaptation of fitted's `type-health` skill, and its manifest carries FIX

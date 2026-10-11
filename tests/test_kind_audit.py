@@ -624,12 +624,13 @@ def test_report_and_extra_record_the_full_dispatch_set(
     assert new_id in report
     assert suppressed_id in report
 
-    # The dispatched finding consumed one attempt and stays owed a fix until it resolves.
+    # The dispatched finding consumed one attempt, and the worker settled, so it is
+    # handed off: no longer queued for another dispatch.
     ledger = load_ledger(ledger_path(job.name))
     assert ledger is not None
     assert ledger.entries[new_id].attempts == 1
     assert ledger.entries[new_id].last_dispatched_run == RUN_ID
-    assert ledger.entries[new_id].queued
+    assert not ledger.entries[new_id].queued
 
     # _process_job routes kind: audit to _process_audit_job.
     called: dict[str, bool] = {}

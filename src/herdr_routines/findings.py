@@ -86,9 +86,12 @@ class LedgerEntry:
     resolved_at: str | None = None
     attempts: int = 0
     last_dispatched_run: str | None = None
-    # Owed a fix: set when the finding first appears as new/regressed outside a baseline
-    # adoption, cleared on resolve. Without it a finding that was capped out or whose fix
-    # did not land reads as "unchanged" next cycle and silently joins the backlog.
+    # Owed a fix that no worker has taken yet: set when the finding first appears as
+    # new/regressed outside a baseline adoption, cleared once a fix worker settles with it
+    # (`mark_handed_off`) or the finding resolves. Without it a finding that was capped out
+    # or whose dispatch failed reads as "unchanged" next cycle and silently joins the
+    # backlog; clearing it on hand-off is what keeps an unmerged fix PR from being
+    # re-dispatched every cycle.
     queued: bool = False
 
 
@@ -325,6 +328,17 @@ def apply_diff(
         updated=stamp,
         runs=ledger.runs + 1,
     )
+
+
+def mark_handed_off(ledger: Ledger, finding_ids: Iterable[str]) -> Ledger:
+    """A fix worker settled with these findings: they are no longer owed a dispatch. If
+    the fix never lands they stay open and unchanged — reported, not re-dispatched — and
+    come back only by regressing or by resolving and reappearing."""
+    entries = dict(ledger.entries)
+    for fid in finding_ids:
+        if fid in entries:
+            entries[fid] = replace(entries[fid], queued=False)
+    return replace(ledger, entries=entries)
 
 
 def prune_ledger(ledger: Ledger, *, now: datetime, retention_days: int) -> Ledger:

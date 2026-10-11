@@ -527,7 +527,83 @@ def test_inline_audit_prompt_keeps_the_engine_contract(
     assert str(_manifest_path()) in audit.prompt
     assert "Do NOT edit source files, commit, push" in audit.prompt
 
-    saved = tick.default_reports_dir() / f"{RUN_ID}-audit-prompt.md"
-    assert saved.read_text() == audit.prompt
+    # Only the instructions are saved for the fix worker — never the audit agent's
+    # read-only rules, which a worker would read as "do not commit".
+    saved = tick.default_reports_dir() / f"{RUN_ID}-audit-instructions.md"
+    assert saved.read_text() == "Scan src/ for bare `Any` (job audit-type-health)."
+    assert "Do NOT" not in saved.read_text()
     assert str(saved) in fix.prompt
     assert "skill and read its findings" not in fix.prompt
+
+
+def test_open_fix_pr_is_not_redispatched_next_cycle(repo: Path, tmp_path: Path) -> None:
+    """A finding handed to a worker that settled is not dispatched again while its fix PR
+    is still unmerged (the finding is still on `base`). Only a capped-out or failed
+    dispatch stays queued for a retry."""
+    history = tmp_path / "history.jsonl"
+    job = _job(repo, max_findings_per_dispatch=1)
+    findings = [_finding(1), _finding(2, "low")]
+
+    client = _FakeHerdr(_auditor(findings))
+    _cycle(job, client, history)
+    assert [a.name for a in client.agents if not _is_audit_agent(a.name)] != []
+    _rec, first = _last(history)
+    assert first["dispatched"] == 1
+
+    # Next Monday: the fix PR is not merged yet, so both findings are still on base.
+    _manifest_path().unlink()
+    client = _FakeHerdr(_auditor(findings))
+    tick._audit_cycle(
+        job,
+        history,
+        client=client,  # type: ignore[arg-type]
+        now=NOW,
+        run_id=RUN_ID,
+    )
+    _rec, second = _last(history)
+    # Only the capped-out finding is dispatched; the handed-off one is not repeated.
+    assert second["dispatched_ids"] != first["dispatched_ids"]
+    assert second["dispatched"] == 1
+
+
+def test_rebooted_audit_run_agents_are_reaped(repo: Path) -> None:
+    """After a reboot herdr restores a stale audit run's agents as `blocked`; the reap
+    closes exactly that run's audit agent and fix worker, by exact name."""
+    from datetime import timedelta
+
+    long_name = "a" * 24
+    job = _job(repo, name=long_name)
+    stale_run = f"{long_name}-20261005T040000Z"
+    audit_name = build_audit_agent_name(long_name, stale_run)
+    fix_name = build_gate_worker_agent_name(long_name, stale_run)
+    other_run_audit = build_audit_agent_name(long_name, f"{long_name}-20260928T040000Z")
+
+    class _Reap:
+        def __init__(self) -> None:
+            self.closed: list[str] = []
+
+        def agent_panes_by_status(self) -> dict[str, tuple[str, str]]:
+            return {
+                audit_name: ("blocked", "p-audit"),
+                fix_name: ("blocked", "p-fix"),
+                "rt-other-job-gate-12345678": ("blocked", "p-other"),
+                other_run_audit: ("blocked", "p-old"),
+            }
+
+        def pane_close(self, pane_id: str) -> None:
+            self.closed.append(pane_id)
+
+    client = _Reap()
+    reaped = tick._reap_agents_of_rebooted_run(
+        client,  # type: ignore[arg-type]
+        job,
+        HistoryRecord(
+            ts=NOW - timedelta(hours=1),
+            job=long_name,
+            state="running",
+            run_id=stale_run,
+        ),
+        boot_epoch=NOW.timestamp(),
+    )
+    assert sorted(reaped) == sorted([audit_name, fix_name])
+    assert sorted(client.closed) == ["p-audit", "p-fix"]
