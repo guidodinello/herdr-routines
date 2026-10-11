@@ -1,4 +1,4 @@
-# Spec v1 — Issue 055: Review `@me` PRs across repos (`kind: review`)
+# Spec v2 — Issue 055: Review `@me` PRs across repos (`kind: review`)
 
 Source: `docs/process/issues/055-review-me-prs-across-repos.md` (only scope for this run).
 Background only: `docs/plan-v1.md` (project context, not the feature).
@@ -77,7 +77,7 @@ Phase B (dispatch + verify). Per the issue design:
   `gate: passed|failed` + counts (`enumerated`, `candidates`, `dispatched`,
   `skipped`, `repos_failed`). Aggregate `reports/review-<run_id>.md` lists every
   candidate + disposition; per-PR `reports/auto-review-<run_id>-<h6>.md`.
-- **Tests (18 criteria → named tests):** Phase A: `test_review_job_config_validation`,
+- **Tests (19 criteria → named tests):** Phase A: `test_review_job_config_validation`,
   `test_review_scan_selects_open_non_draft_prs`,
   `test_review_scan_skips_auto_branches_unless_opted_in`,
   `test_review_scan_skips_fork_prs`,
@@ -135,3 +135,34 @@ Phase B (dispatch + verify). Per the issue design:
 8. **Per-run path note:** this spec lives at
    `docs/pipeline/runs/20261011T050000Z/spec.md`, not root `spec.md` (G-15: shared
    root path caused PR #29/#28 merge conflict).
+
+## Acceptance criteria
+
+Each item states its tier (`blocking` or `non-blocking`) and a `confidence:` tier
+(`high` / `medium` / `low`), and ends with its exact verification test name.
+
+1. [blocking, confidence: high] `kind: review` validates: rejects `repo`/`repository`/`workspace`/`checks`, requires non-empty duplicate-free `select` of `author`/`review_requested`, `target` absent-or-`pr`, `include_auto_branches` defaults `false`, `max_attempts_per_target` defaults `1`. Test: test_review_job_config_validation
+2. [blocking, confidence: high] Scan selects only open non-draft non-archived PRs via one batched GraphQL call with `author:@me` / `review-requested:@me` qualifiers per selected mode. Test: test_review_scan_selects_open_non_draft_prs
+3. [blocking, confidence: high] Scan skips `auto/`-prefixed branches as `routine_owned_branch` unless `include_auto_branches` is opted in, avoiding double-review of pipeline PRs. Test: test_review_scan_skips_auto_branches_unless_opted_in
+4. [non-blocking, confidence: medium] Scan skips fork PRs with `fork_pr` skip reason and names the deferred follow-up. Test: test_review_scan_skips_fork_prs
+5. [blocking, confidence: medium] Scan orders candidates oldest-first by `createdAt`, then `updatedAt`, then `owner/repo#N`, and `max_workers_per_tick` cap cuts newest first. Test: test_review_scan_orders_oldest_first_and_caps_newest
+6. [blocking, confidence: high] Pre-dispatch marker guard skips `review_already_posted` on exact job+key marker match only, and any `gh` search failure fails closed as `failed (search_failed)`. Test: test_review_scan_marker_guard_and_search_fail_closed
+7. [blocking, confidence: high] Attempt budget counts only countable states per `owner/repo#N` target key and skips `max_attempts_exceeded` at budget without dispatch. Test: test_review_attempts_are_counted_per_target_key
+8. [non-blocking, confidence: medium] Aggregate `reports/review-<run_id>.md` lists every candidate with disposition plus skip reasons and counts (`enumerated`, `candidates`, `dispatched`, `skipped`, `repos_failed`). Test: test_review_report_lists_candidates_and_skips
+9. [non-blocking, confidence: medium] Shipped example `deploy/jobs.d/review-my-prs.yaml` is disabled by default and passes `kind: review` validation. Test: test_shipped_review_job_config_validates
+10. [blocking, confidence: high] Dispatch creates per-repo checkout at `<base>/<owner>/<repo>` on the repo's default branch via extracted `_ensure_checkout` with per-repo GraphQL default-branch lookup cached per tick. Test: test_review_dispatch_creates_per_repo_checkout
+11. [blocking, confidence: medium] Dispatch skips `head_branch_checked_out` when another owner's worktree holds the PR head branch instead of fighting it. Test: test_review_dispatch_skips_other_worktrees_head_branch
+12. [non-blocking, confidence: medium] Dispatch reuses the job's own clean review worktree at `<checkout>/.worktrees/review-pr<N>` and force-removes plus re-adds a stale one. Test: test_review_dispatch_reuses_own_review_worktree
+13. [blocking, confidence: medium] Dispatch removes the per-PR worktree with `--force` after settle on both success and failure paths. Test: test_review_dispatch_removes_worktree_after_settle
+14. [blocking, confidence: high] Post-condition re-queries review bodies: marker present yields `done` + `verified: True` + `gate: passed`; absent yields `failed (review_not_posted)`; read failure yields `failed (review_verification_failed)`, never `done`. Test: test_review_verification_is_fail_closed
+15. [blocking, confidence: medium] Per-repo clone/sync failure fails only that repo's targets and the tick continues for remaining repos. Test: test_review_dispatch_isolates_per_repo_failures
+16. [blocking, confidence: medium] Live agent name uses shared `build_review_agent_prefix` `rt-<job>-rv<h6>` with 13-char job-name cap keeping total length ≤ 32 with ≥ 6-char tail so the liveness guard matches. Test: test_review_live_agent_prefix_guard_and_name_cap
+17. [blocking, confidence: high] Default review prompt runs the `code-review` skill single-session, posts exactly one blocking/non-blocking-tiered review, re-checks the marker first, never edits/commits/pushes/resolves, and writes `$ROUTINE_REPORT` with a `## Outcome:` line. Test: test_review_prompt_is_read_only_and_idempotent
+18. [blocking, confidence: high] A reviewed target is not re-dispatched on later ticks via the marker guard plus attempt budget across restarts. Test: test_review_is_not_repeated_across_ticks
+19. [blocking, confidence: high] `repos._ensure_checkout` extraction preserves existing `babysit-prs` `ensure_repo` behavior with existing `test_auto_fix.py`/`test_tick.py` suites green. Test: test_ensure_checkout_refactor_preserves_babysit
+
+## Changelog v1→v2
+
+- v1 title `Spec v1` → v2 title `Spec v2`; corrected test count `18 criteria` → `19 criteria` to match the 19 named tests actually listed.
+- Added `## Acceptance criteria` (19 numbered items): each item carries a `blocking`/`non-blocking` tier plus a `confidence:` tier (`high`/`medium`/`low`) and ends with `Test: <exact test name>`.
+- No change to Problem/Approach/Files/Risks scope; risks criterion cross-references unchanged.
