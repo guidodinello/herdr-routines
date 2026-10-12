@@ -39,6 +39,7 @@ from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.pipeline_run import (
     FALLBACK_CONTINUE_PROMPT,
     RunOutcome,
+    _pr_body,
     _session_api_error,
     run_pipeline,
 )
@@ -597,6 +598,35 @@ def test_pipeline_run_aborts_on_gate_failure(prepared: PipelineFixture) -> None:
     assert client.notifications  # the human is told, not just the report
 
 
+def test_pipeline_does_not_push_or_open_a_pr_when_the_issue_is_not_done(
+    tmp_path: Path,
+) -> None:
+    """PR #159: stage 3 never flipped the issue, stage 4 opened the PR anyway, and only
+    gate 4 — after the PR existed — noticed its "Closes" line was false."""
+    prepared = PipelineFixture(tmp_path, issue_status="open")
+
+    outcome, client, gh = _run(prepared)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "issue_not_done"
+    assert gh.created == []
+    assert not _git(
+        prepared.worktree, "ls-remote", "--heads", "origin", BRANCH
+    ).stdout.strip()
+    assert "status: done" in prepared.report.read_text()
+    started = [call["name"] for call in client.started]
+    assert started == [f"pl-{n}-{RUN_ID}".lower() for n in (1, 2, 3)]
+
+
+def test_pr_body_reads_a_capitalised_problem_heading() -> None:
+    """Stage 1 wrote `## Problem` for PR #159 and the body's problem section was empty."""
+    spec = SPEC_BODY.replace("## problem", "## Problem")
+
+    body = _pr_body(spec, issue_source=None, run_id=RUN_ID)
+
+    assert "## problem\n\nThe thing is not done." in body
+
+
 def test_pipeline_run_turns_a_gh_error_in_a_gate_into_a_failed_report(
     prepared: PipelineFixture,
 ) -> None:
@@ -946,10 +976,13 @@ def test_pipeline_stage4_opens_pr_without_agent(prepared: PipelineFixture) -> No
     created = gh.created[0]
     assert created["branch"] == BRANCH
     assert created["title"] == "spec v2 — do the thing"
-    assert "## problem" in created["body"]
+    # The heading alone is always written; the spec's problem text must follow it.
+    assert "## problem\n\nThe thing is not done." in created["body"]
     for name in TEST_NAMES:
         assert name in created["body"]
-    assert "Closes #056" in created["body"]
+    assert f"Closes issue 056 (`{prepared.issue_rel}`)" in created["body"]
+    # Issue ids are file numbers; `#056` would link an unrelated GitHub issue or PR.
+    assert "#056" not in created["body"]
     # pr_number is written to state.json *before* gate 4 runs, so the gate can read it.
     assert prepared.state()["pr_number"] == gh.pr_number
     # Gate 4's two conditions both held: the right head branch, and the issue file
@@ -1061,6 +1094,10 @@ def test_prompt_substitution_uses_only_state_json_values(
     stage3 = texts[f"pl-3-{RUN_ID}".lower()]
     assert prepared.issue_rel in stage3
     assert "status: done" in stage3
+    # The flip commit names the real issue id, not the template's old literal `NN`.
+    assert "chore: mark issue 056 done" in stage3
+    # Stage 3's local gate is CI's gate: PR #159 opened with mypy errors without it.
+    assert "uv run mypy" in stage3
     # Stage 6 is prompted with the PR number, and resumes stage 3's session.
     stage6 = texts[f"pl-6-{RUN_ID}".lower()]
     assert "$PR_NUMBER" not in stage6

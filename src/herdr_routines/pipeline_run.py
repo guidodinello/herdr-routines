@@ -289,22 +289,27 @@ def _spec_section(spec_text: str, heading: str) -> str:
     """The body of `## <heading>` up to the next `## `, or "" when the heading is absent.
 
     Anchored on `^## <heading>$` with `re.MULTILINE` rather than a substring search,
-    because `## problem` must not match `## problems we hit`."""
+    because `## problem` must not match `## problems we hit`. Case-insensitive: stage 1
+    writes `## Problem` as often as `## problem`, and a case-sensitive match shipped
+    PR #159 with an empty problem section."""
     pattern = re.compile(
-        rf"^##\s+{re.escape(heading)}\s*$(.*?)(?=^##\s|\Z)", re.MULTILINE | re.DOTALL
+        rf"^##\s+{re.escape(heading)}\s*$(.*?)(?=^##\s|\Z)",
+        re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
     match = pattern.search(spec_text)
     return match.group(1).strip() if match else ""
 
 
-def _pr_body(spec_text: str, *, issue_id: str | None, run_id: str) -> str:
+def _pr_body(spec_text: str, *, issue_source: str | None, run_id: str) -> str:
     """The PR body: the spec's problem statement, the acceptance tests, and the close.
 
-    `Closes #<id>` is what makes "merging this PR closes it" real, and it is only real
-    if the issue closes on merge — which is why the `status: done` flip rides this
-    branch rather than landing separately. When no issue id is recorded the body says so
-    instead of omitting the line, because a reviewer cannot tell an omitted reference
-    from an oversight."""
+    The issue is closed by the `status: done` flip riding this branch, not by GitHub, so
+    the reference names the issue *file*. It is never `Closes #<id>`: issue ids are
+    `docs/process/issues/` numbers, and `#055` linked PR #159 to the unrelated GitHub
+    PR #55. `Closes issue <id>` is also the prose `pick_feature`'s fallback pattern
+    (`issues? NNN`) reads. When no issue id is recorded the body says so instead of
+    omitting the line, because a reviewer cannot tell an omitted reference from an
+    oversight."""
     names = gate3_test_names(spec_text)
     lines = [
         "## problem",
@@ -316,10 +321,11 @@ def _pr_body(spec_text: str, *, issue_id: str | None, run_id: str) -> str:
         *(f"- `{name}`" for name in names),
         "",
     ]
+    issue_id = _issue_id(issue_source)
     if issue_id:
         lines.append(
-            f"Closes #{issue_id} — the `status: done` flip rides this PR and lands on main "
-            f"on merge."
+            f"Closes issue {issue_id} (`{issue_source}`) — the `status: done` flip rides "
+            f"this PR and lands on main on merge."
         )
     else:
         lines.append(
@@ -354,6 +360,7 @@ def _prompt_values(
         "STAGE": str(stage),
         "FEATURE_SOURCE": state.issue_source or "",
         "ISSUE_FILE": state.issue_source or "",
+        "ISSUE_ID": _issue_id(state.issue_source) or "",
         "SHARED_WORKSPACE": state.shared_workspace or "",
         "DEADLINE_EPOCH": (
             "" if state.deadline_epoch is None else str(state.deadline_epoch)
@@ -553,7 +560,14 @@ def _open_pr(
     Re-signs the stage agents' commits first: no clone config can stop an agent running
     `git -c commit.gpgsign=false commit` (PR #140), and the ruleset blocks an unsigned PR
     at merge. Nothing is on origin yet, so this needs no force-push. Best-effort — an
-    unsigned push still leaves a PR for stage 5 to review."""
+    unsigned push still leaves a PR for stage 5 to review.
+
+    Refuses to push when the picked issue is not committed as `status: done`. Gate 4
+    checks the same thing, but only after the PR exists: PR #159 was opened by a run
+    that then failed that check, leaving a PR whose "Closes" line was false."""
+    ok, why = _issue_committed_done(state, runner)
+    if not ok:
+        raise _Abort("issue_not_done", detail=why)
     try:
         resign_local_commits(state.worktree, base=PIPELINE_BASE)
     except (ResignError, OSError, subprocess.TimeoutExpired) as e:
@@ -572,7 +586,7 @@ def _open_pr(
             branch=state.branch,
             title=_spec_title(spec_text),
             body=_pr_body(
-                spec_text, issue_id=_issue_id(state.issue_source), run_id=state.run_id
+                spec_text, issue_source=state.issue_source, run_id=state.run_id
             ),
         )
     except RuntimeError as e:
