@@ -1,7 +1,7 @@
 ---
 id: "059"
 title: "Pipeline: move stage-3 bookkeeping into code, gate on CI with a fix loop, split test authoring from implementation"
-status: open
+status: done
 priority: high
 area: pipeline
 gate: PR #160 merged (issue-done check before push, PR body fixes, stage-3 prompt runs mypy)
