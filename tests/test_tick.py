@@ -1795,7 +1795,7 @@ def _write_state_json(
         json.dumps(
             {
                 "run_id": bare_run_id,
-                "current_stage": 6,
+                "current_stage": 7,
                 "stage_sessions": stage_sessions,
             }
         )

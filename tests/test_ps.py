@@ -134,7 +134,7 @@ def test_status_running_table_shows_pipeline_stage(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A working pl-<N>-<run_id> agent must be enriched to 'pipeline run … stage N/6'
+    """A working pl-<N>-<run_id> agent must be enriched to 'pipeline run … stage N/7'
     using the matching in-progress state.json under the reports dir — and settled agents
     (idle/done) must not be listed as running at all."""
     state_dir = setup_state_dir(tmp_path, monkeypatch)
@@ -147,7 +147,7 @@ def test_status_running_table_shows_pipeline_stage(
     assert cli.main(["ps"]) == 0
 
     out = capsys.readouterr().out
-    assert "stage 4/6" in out
+    assert "stage 4/7" in out
     assert f"pipeline run {RUN_ID[:10]}" in out
     # idle agents stay registered until their pane closes but are not "running".
     assert "rt-a" not in out
@@ -164,7 +164,7 @@ def test_scan_and_enrich_round_trip(tmp_path: Path) -> None:
 
     rows = build_ps_rows({f"pl-4-{RUN_ID}": "working"}, runs)
     assert len(rows) == 1
-    assert rows[0].detail == f"pipeline run {RUN_ID[:10]}… stage 4/{6}"
+    assert rows[0].detail == f"pipeline run {RUN_ID[:10]}… stage 4/{7}"
 
     # Herdr lowercases agent names; matching must survive that (observed live).
     lowered_rows = build_ps_rows({f"pl-4-{RUN_ID.lower()}": "working"}, runs)
@@ -272,5 +272,5 @@ def test_detail_column_kept_when_a_row_has_one(
 
     out = capsys.readouterr().out
     assert "DETAIL" in out
-    assert "stage 4/6" in out
+    assert "stage 4/7" in out
     assert "rt-nightly" in out

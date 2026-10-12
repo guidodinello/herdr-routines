@@ -19,7 +19,7 @@ Design notes (see the issue for the full incident writeup):
   in-flight `--wait` and about to write its own partial report at deadline,
   `orchestrator-prompt.md` "Pipeline deadline, quota, resume, cleanup"), **and** its
   heartbeat log (`/tmp/pipeline_resume_<run_id>.log`) has not been touched recently
-  either. Stage 3's own worker timeout is 90 minutes and the orchestrator is documented
+  either. The implement stage's (stage 4) own worker timeout is 90 minutes and the orchestrator is documented
   to legitimately wait out an in-flight `--wait` before it can even notice its deadline
   passed — deadline overrun alone is not evidence of a *dead* orchestrator, a stale
   heartbeat is. A missing heartbeat file counts as stale (never as healthy): `/tmp`
@@ -32,7 +32,7 @@ Design notes (see the issue for the full incident writeup):
   verified empirically 2026-09-03 against a live `herdr` server: closing a pane running
   a foreground child kills that child's process group, not just the UI — see the issue
   PR description for the transcript), write a terminal report distinguishing this from
-  a normal stage-6 report, and fire the same notification channel routine job failures
+  a normal stage-7 report, and fire the same notification channel routine job failures
   already use.
 - Never resumes or retries. Kill + report only.
 
@@ -84,7 +84,7 @@ BOOT_SLOP_SECONDS = 60
 
 # Real opencode session ids are `ses_` + 20+ alphanumerics, all distinct across stages
 # (each stage is its own fresh session — design.md G-17). Anything shorter, containing a
-# separator, matching a placeholder word, or duplicated means the 6-session independence
+# separator, matching a placeholder word, or duplicated means the per-stage session independence
 # contract was faked (observed: `ses_..._fake1`, `ses_fake_1_<run_id>` — 2026-09-06/07).
 _SESSION_ID_RE = re.compile(r"^ses_[A-Za-z0-9]{20,}$")
 _FABRICATED_MARKERS = (
@@ -119,8 +119,8 @@ def validate_stage_sessions(
     not honored; None if it looks genuine.
 
     A legitimate run records one real session id per stage that ran an agent. Two stages
-    legitimately share: stage 4 runs no agent (no session id), and stage 6 resumes stage
-    3's session on purpose — both are declared in `STAGES` rather than special-cased here,
+    legitimately share: stage 5 runs no agent (no session id), and stage 7 resumes stage
+    4's session on purpose — both are declared in `STAGES` rather than special-cased here,
     so `pipeline_run` (which writes the ids) and this gate (which audits them) read the
     same table and cannot disagree. Everything else — a reused session across independent
     stages, a placeholder id, a stage that never recorded one — is unprovable independence,
@@ -139,7 +139,7 @@ def validate_stage_sessions(
         if not _SESSION_ID_RE.match(value):
             return f"stage_sessions entry is not a real session id ({value!r})"
 
-    # Reuse is legal only where STAGES says it is: stage 6 reuses stage 3's id. Any other
+    # Reuse is legal only where STAGES says it is: stage 7 reuses stage 4's id. Any other
     # repetition means two independent stages shared one conversation.
     reuse_allowed: dict[str, str] = {
         str(spec.reuses_stage): str(spec.stage)
@@ -163,7 +163,7 @@ def validate_stage_sessions(
         reached = min(current_stage, len(expected))
         # Every independent stage that ran an agent must have recorded *its own* id,
         # keyed by its stage number. A count would let a key that maps to no stage pad
-        # over a stage that recorded nothing. Stage 4 (no model) records none, and a
+        # over a stage that recorded nothing. Stage 5 (no model) records none, and a
         # reused stage shares its owner's id, so neither is required to have a key.
         missing = [
             spec.stage

@@ -44,8 +44,8 @@ def test_design_doc_documents_session_resume_mechanism() -> None:
     assert "agent_session.value" in text
     # Empirically verified flag must be mentioned
     assert "2026-08-25" in text
-    # Must mention the concrete command shape for pl-6 resume
-    assert "herdr agent start pl-6-" in text
+    # Must mention the concrete command shape for pl-7 resume
+    assert "herdr agent start pl-7-" in text
 
 
 def test_pipeline_run_closes_each_stage_pane_after_its_gate() -> None:
@@ -58,26 +58,26 @@ def test_pipeline_run_closes_each_stage_pane_after_its_gate() -> None:
     # ...and it happens inside the per-stage function on the gate path, right after the
     # verdict rather than in a run-wide sweep at the end. Position is the assertion:
     # the close follows the gate call and is guarded on `pane_id`, so a stage with no
-    # agent (stage 4) closes nothing and a failed gate closes before reporting.
+    # agent (stage 5) closes nothing and a failed gate closes before reporting.
     gate_idx = text.index("verdict = _gate_for_stage")
     close_idx = text.index("if pane_id is not None:", gate_idx)
     assert gate_idx < close_idx
 
 
-def test_pipeline_run_stage6_resumes_the_stage3_session() -> None:
-    """Criterion 4: stage 6 resumes stage 3's real session id with
+def test_pipeline_run_stage7_resumes_the_stage4_session() -> None:
+    """Criterion 4: stage 7 resumes stage 4's real session id with
     `agent_start(..., session_id=...)` against a fresh pane, rather than prompting a pane
-    held open since stage 3."""
+    held open since stage 4."""
     text = _read(PIPELINE_RUN)
     # The resume is a real parameter on the start call, not a string in a prompt.
     assert "session_id=resume_session," in text
     # ...and that value is read out of the session the run recorded for the reused
-    # stage, so it is the stage-3 id and not a fresh one. A missing id aborts rather
+    # stage, so it is the stage-4 id and not a fresh one. A missing id aborts rather
     # than silently starting a blank session that would pass the layout check anyway.
     assert "resume_session" in text
     assert "resume_session_missing" in text
     assert "reuses_stage" in text
-    # The layout is the reason it works: stage 6 repeats stage 3's session id.
+    # The layout is the reason it works: stage 7 repeats stage 4's session id.
     assert "reuses_stage" in _read(
         REPO_ROOT / "src" / "herdr_routines" / "pipeline_stages.py"
     )

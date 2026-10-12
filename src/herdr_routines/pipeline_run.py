@@ -1,7 +1,7 @@
 """The pipeline's stage loop, in code (issue 056 phases B and C).
 
 Before this module the overnight pipeline's stage sequence lived in two places that
-could disagree: `docs/pipeline/orchestrator-prompt.md` prose describing six stages and
+could disagree: `docs/pipeline/orchestrator-prompt.md` prose describing the stages and
 their gates, and a bash marker-poll loop in `scripts/pipeline-launch.sh`. An LLM read
 the prose and executed it, so "run gate 5" meant "run something that resembles gate 5
 and report the outcome you need". On PR #81 that produced a green pipeline history line
@@ -18,6 +18,11 @@ work of one stage. Everything else is code:
 - The liveness heartbeat is written from inside the shared wait loop's poll closure, so
   it advances whether or not anything remembers to advance it.
 - The deadline comes from `state.json` and is checked between stages, never mid-stage.
+- Stage 5 does the bookkeeping the implementer prompt used to ask a model to remember
+  (issue 059): sweep leftover work into a commit, run `scripts/ci-check.sh` with a fix
+  loop that resumes the implementer's session, flip the issue to `status: done`, check
+  the PR's preconditions. A model does the work that needs judgment; code does the
+  bookkeeping and checks what a model claims.
 
 `RunOutcome.outcome` is `ok | partial | failed` — `ok`, not `done`.
 `tick._classify_pipeline_outcome` maps `## Outcome: ok…` to `done` and anything it does
@@ -27,8 +32,11 @@ successful night as interrupted.
 
 from __future__ import annotations
 
+import ast
 import json
+import os
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -53,7 +61,13 @@ from herdr_routines.herdr import (
     PromptWatchdogKilled,
 )
 from herdr_routines.pipeline_prepare import write_state_json, write_terminal_report
-from herdr_routines.pipeline_stages import STAGES, StageSpec
+from herdr_routines.pipeline_stages import (
+    IMPLEMENT_STAGE,
+    PR_STAGE,
+    STAGES,
+    TEST_AUTHOR_STAGE,
+    StageSpec,
+)
 from herdr_routines.pipeline_watchdog import (
     heartbeat_log_path,
     validate_stage_sessions,
@@ -88,6 +102,7 @@ Outcome = Literal["ok", "partial", "failed"]
 _REPORT_OUTCOME: dict[tuple[Outcome, str | None], str] = {
     ("partial", "partial_deadline"): "partial (deadline exceeded)",
     ("failed", "quota_exhausted"): "failed (quota_exhausted)",
+    ("failed", "ci_check_failed"): "failed (ci_check_failed)",
 }
 
 # How long a git/gh command may take inside a stage. Long enough for a push of a real
@@ -96,6 +111,29 @@ GIT_TIMEOUT_S = 300.0
 
 # Bounds a hung `opencode export`, which only runs once a stage has already failed.
 OPENCODE_EXPORT_TIMEOUT_S = 120.0
+
+# `scripts/ci-check.sh` is what CI runs (`.github/workflows/ci.yml` calls it per job), so a
+# green check here is a green CI. Relative to the worktree: it is the target repo's script.
+CI_CHECK_SCRIPT = Path("scripts") / "ci-check.sh"
+
+# Longer than GIT_TIMEOUT_S: the check is ruff + mypy + the whole test suite, plus a cold
+# `uv sync` on a fresh worktree.
+CI_CHECK_TIMEOUT_S = 30 * 60
+
+# How often a running check writes a heartbeat line. The watchdog reaps a run whose
+# heartbeat file is older than `HEARTBEAT_STALE_SECONDS` (20 min), and the check is
+# allowed to run longer than that, so it must keep the file fresh itself, at the cadence
+# the stage poll loop uses (30 s).
+CI_HEARTBEAT_INTERVAL_S = 30.0
+
+# Fix rounds after a red check. Two, then the run fails `ci_check_failed`: a model that
+# cannot make CI green in two tries with the failure in front of it is not going to.
+MAX_CI_FIX_ROUNDS = 2
+
+# How much of a failing check's output goes into the fix prompt: the tail, where ruff,
+# mypy and pytest print their summaries.
+CI_TAIL_LINES = 120
+CI_TAIL_CHARS = 8000
 
 # The branch every pipeline run is cut from (pipeline_prepare's default base) — needed
 # here only to know which commits are the run's own when re-signing them.
@@ -111,12 +149,20 @@ class _Abort(Exception):
     """
 
     def __init__(
-        self, reason: str, *, detail: str | None = None, lines: list[str] | None = None
+        self,
+        reason: str,
+        *,
+        detail: str | None = None,
+        lines: list[str] | None = None,
+        outcome: Outcome = "failed",
     ) -> None:
         super().__init__(reason)
         self.reason = reason
         self.detail = detail
         self.lines = lines or []
+        # `partial` for the one abort that is not a failure: the deadline arriving while
+        # a CI fix round was about to start.
+        self.outcome: Outcome = outcome
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +202,10 @@ class _State:
     current_stage: int
     pr_number: int | None
     stage_sessions: dict[str, str]
+    # The worktree HEAD recorded before stages 3 and 4 started, keyed by stage number.
+    # Write-once (see `_record_base`): the "test author touched only tests/" and "the
+    # implementer removed no named test" checks diff against these.
+    stage_bases: dict[str, str]
     # The document as it was read, kept so writing it back cannot silently drop a key
     # this loop does not know about. See `payload`.
     raw: dict[str, object] = field(default_factory=dict)
@@ -187,6 +237,7 @@ class _State:
                 "branch — all three are written by pipeline-prepare"
             )
         sessions = raw.get("stage_sessions")
+        bases = raw.get("stage_bases")
         stage = opt_int("current_stage")
         return cls(
             run_id=opt_str("run_id") or "",
@@ -201,6 +252,11 @@ class _State:
             stage_sessions=(
                 {str(k): v for k, v in sessions.items() if isinstance(v, str)}
                 if isinstance(sessions, dict)
+                else {}
+            ),
+            stage_bases=(
+                {str(k): v for k, v in bases.items() if isinstance(v, str)}
+                if isinstance(bases, dict)
                 else {}
             ),
             raw=dict(raw),
@@ -234,6 +290,7 @@ class _State:
                 "feature_source": self.issue_source,
                 "artifact_paths": artifacts,
                 "stage_sessions": dict(self.stage_sessions),
+                "stage_bases": dict(self.stage_bases),
             }
         )
         return doc
@@ -264,9 +321,9 @@ def _stage_agent_name(stage: int, run_id: str) -> str:
 def _issue_id(feature_source: str | None) -> str | None:
     """The `NNN` in `docs/process/issues/056-<slug>.md`, or None.
 
-    Read from the recorded `feature_source` rather than a new flag, so stage 4 cannot be
-    pointed at a different issue than the one prepare picked — and so gate 4's
-    `git show HEAD:<path>` flip check checks the same file stage 3 was told to edit."""
+    Read from the recorded `feature_source` rather than a new flag, so stage 5 cannot be
+    pointed at a different issue than the one prepare picked — and so its
+    `git show HEAD:<path>` flip check checks the same file the flip rewrites."""
     if not feature_source:
         return None
     match = re.match(r"^(\d+)", Path(feature_source).name)
@@ -300,8 +357,19 @@ def _spec_section(spec_text: str, heading: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def _pr_body(spec_text: str, *, issue_source: str | None, run_id: str) -> str:
-    """The PR body: the spec's problem statement, the acceptance tests, and the close.
+def _pr_body(
+    spec_text: str,
+    *,
+    issue_source: str | None,
+    run_id: str,
+    edited_tests: Sequence[str] = (),
+) -> str:
+    """The PR body: the spec's problem statement, the acceptance tests, the named tests
+    the implementer edited, and the close.
+
+    `edited_tests` are the acceptance tests whose body the implementer changed after the
+    test author committed them. Editing is allowed (a test can be wrong), but the human
+    reviewer is told exactly where the implementer touched its own grader.
 
     The issue is closed by the `status: done` flip riding this branch, not by GitHub, so
     the reference names the issue *file*. It is never `Closes #<id>`: issue ids are
@@ -319,6 +387,11 @@ def _pr_body(spec_text: str, *, issue_source: str | None, run_id: str) -> str:
         "## Acceptance tests",
         "",
         *(f"- `{name}`" for name in names),
+        "",
+        "## Tests changed by the implementer",
+        "",
+        *(f"- `{name}`" for name in edited_tests),
+        *(() if edited_tests else ("none",)),
         "",
     ]
     issue_id = _issue_id(issue_source)
@@ -365,8 +438,8 @@ def _prompt_values(
         "DEADLINE_EPOCH": (
             "" if state.deadline_epoch is None else str(state.deadline_epoch)
         ),
-        # Stages 1-4 run before a PR exists; stage 5 and 6 are prompted with the number
-        # stage 4 recorded, which is why this is "" rather than a placeholder.
+        # Stages 1-4 run before a PR exists; stages 6 and 7 are prompted with the number
+        # stage 5 recorded, which is why this is "" rather than a placeholder.
         "PR_NUMBER": "" if state.pr_number is None else str(state.pr_number),
     }
 
@@ -492,14 +565,14 @@ def _heartbeat_hook(
 
 
 # ---------------------------------------------------------------------------
-# Stage 4 — the PR, with no agent at all
+# Stage 5 — the PR, with no agent at all
 # ---------------------------------------------------------------------------
 
 
 def _issue_committed_done(
     state: _State, runner: Callable[..., tuple[int, str, str]]
 ) -> tuple[bool, str]:
-    """Gate 4's second condition: the picked issue is committed as `status: done`.
+    """Gate 5's second condition: the picked issue is committed as `status: done`.
 
     Both halves are needed and neither alone suffices. `git status --porcelain <path>`
     empty proves the flip was committed with nothing left dangling; `git show
@@ -537,6 +610,430 @@ def _issue_committed_done(
     return True, "issue committed as status: done"
 
 
+# ---------------------------------------------------------------------------
+# Bookkeeping the stage prompts used to ask a model for (issue 059)
+# ---------------------------------------------------------------------------
+
+Runner = Callable[..., tuple[int, str, str]]
+
+
+def _git_out(state: _State, runner: Runner, *args: str, what: str) -> str:
+    """stdout of `git -C <worktree> <args>`; `_Abort(what)` when git fails."""
+    code, stdout, stderr = runner(
+        ["git", "-C", str(state.worktree), *args], timeout_s=GIT_TIMEOUT_S
+    )
+    if code != 0:
+        raise _Abort(what, detail=f"git {' '.join(args)}: {stderr.strip() or code}")
+    return stdout
+
+
+def _record_base(state: _State, state_json: Path, stage: int, runner: Runner) -> _State:
+    """Record the worktree HEAD as `stage`'s base, once.
+
+    Write-once on purpose: a relaunch of a half-finished stage must keep the base from
+    before the stage first started, or the diff it is checked against would shrink to
+    whatever the first attempt had not yet committed."""
+    key = str(stage)
+    if key in state.stage_bases:
+        return state
+    head = _git_out(
+        state, runner, "rev-parse", "HEAD", what="stage_base_unreadable"
+    ).strip()
+    return state.commit(state_json, stage_bases={**state.stage_bases, key: head})
+
+
+def _base_for(state: _State, stage: int) -> str:
+    base = state.stage_bases.get(str(stage))
+    if not base:
+        raise _Abort(
+            "stage_base_missing",
+            detail=f"state.json records no base commit for stage {stage}",
+        )
+    return base
+
+
+def _sweep(state: _State, runner: Runner, message: str) -> str | None:
+    """Commit whatever the worktree holds uncommitted, as `message`; a report line, or
+    None when the tree was clean.
+
+    The work is kept, not discarded: PR #159's implementer left 2,644 lines uncommitted
+    and a model then swept them into a commit with a made-up message. Code does the same
+    sweep, and the message says what happened, so the history is honest about it.
+    `state.json` is git-ignored, so it is never swept."""
+    if not _git_out(
+        state, runner, "status", "--porcelain", what="sweep_failed"
+    ).strip():
+        return None
+    _git_out(state, runner, "add", "-A", what="sweep_failed")
+    _git_out(state, runner, "commit", "-m", message, what="sweep_failed")
+    return f"committed uncommitted work left in the worktree: {message}"
+
+
+def _sweep_message(state: _State, stage: int) -> str | None:
+    """The commit message for a stage's leftover work, or None for a stage that is not
+    swept."""
+    issue = _issue_id(state.issue_source) or "unknown"
+    if stage == TEST_AUTHOR_STAGE:
+        return f"test: issue {issue} — uncommitted test-author work"
+    if stage == IMPLEMENT_STAGE:
+        return f"feat: issue {issue} — uncommitted implementer work"
+    return None
+
+
+def _named_test_defs(
+    state: _State, runner: Runner, rev: str, names: Sequence[str]
+) -> dict[str, list[str]]:
+    """name -> sorted `ast.dump`s of every function with that name under `tests/` at `rev`.
+
+    Read from the commit (`git show`), not the working tree, and compared as syntax
+    trees: a reformat or a comment is not an edit, a changed assertion is. A file that
+    does not parse contributes nothing, so a named test inside it reads as removed."""
+    found: dict[str, list[str]] = {}
+    listing = runner(
+        [
+            "git",
+            "-C",
+            str(state.worktree),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            rev,
+            "tests",
+        ],
+        timeout_s=GIT_TIMEOUT_S,
+    )
+    if listing[0] != 0:
+        return found
+    for path in listing[1].splitlines():
+        if not path.endswith(".py"):
+            continue
+        code, source, _stderr = runner(
+            ["git", "-C", str(state.worktree), "show", f"{rev}:{path}"],
+            timeout_s=GIT_TIMEOUT_S,
+        )
+        if code != 0:
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                and node.name in names
+            ):
+                found.setdefault(node.name, []).append(ast.dump(node))
+    return {name: sorted(dumps) for name, dumps in found.items()}
+
+
+def _named_test_changes(
+    state: _State, runner: Runner, base: str, spec_text: str
+) -> tuple[list[str], list[str]]:
+    """(removed, edited): the spec's named tests the implementer deleted or renamed, and
+    those whose body it changed, between `base` and HEAD."""
+    names = gate3_test_names(spec_text)
+    before = _named_test_defs(state, runner, base, names)
+    after = _named_test_defs(state, runner, "HEAD", names)
+    removed = [n for n in names if n in before and n not in after]
+    edited = [n for n in names if n in before and n in after and before[n] != after[n]]
+    return removed, edited
+
+
+def _gate_test_author(state: _State, spec_text: str, runner: Runner) -> GateVerdict:
+    """Gate 3: the test author committed something, only under `tests/`, and every test
+    the spec names is there."""
+    base = _base_for(state, TEST_AUTHOR_STAGE)
+    changed = _git_out(
+        state, runner, "diff", "--name-only", f"{base}..HEAD", what="gate_3_diff_failed"
+    ).split()
+    if not changed:
+        return GateVerdict(passed=False, reason="the test author committed nothing")
+    outside = [path for path in changed if not path.startswith("tests/")]
+    if outside:
+        return GateVerdict(
+            passed=False,
+            reason=f"the test author touched files outside tests/: {', '.join(outside)}",
+        )
+    return gate3_test_names_present(spec_text, repo_path=state.worktree)
+
+
+def _gate_implementer(state: _State, spec_text: str, runner: Runner) -> GateVerdict:
+    """Gate 4: every named test is still there. The implementer may edit a test's body
+    (disclosed in the PR body) but not delete or rename it."""
+    removed, _edited = _named_test_changes(
+        state, runner, _base_for(state, IMPLEMENT_STAGE), spec_text
+    )
+    if removed:
+        return GateVerdict(
+            passed=False,
+            reason=f"the implementer deleted or renamed named test(s): {', '.join(removed)}",
+        )
+    return gate3_test_names_present(spec_text, repo_path=state.worktree)
+
+
+def _run_ci_check(
+    worktree: Path,
+    *,
+    timeout_s: float,
+    interval_s: float,
+    on_poll: Callable[[], None],
+) -> tuple[int, str]:
+    """Run `scripts/ci-check.sh` in `worktree`: (exit code, combined output). 124 on
+    overrun, 127 when it cannot be started.
+
+    A poll loop rather than a blocking `subprocess.run`: the watchdog reaps a run whose
+    heartbeat is older than 20 minutes, the check may legitimately run longer than that,
+    and the stage poll loop that normally keeps the heartbeat fresh is not running while
+    code does bookkeeping. So `on_poll` fires every `interval_s` for as long as the check
+    lives. The check runs in its own process group so an overrun kills `uv`'s children
+    too, not just the shell."""
+    script = worktree / CI_CHECK_SCRIPT
+    with tempfile.TemporaryFile("w+") as out:
+        try:
+            proc = subprocess.Popen(
+                ["bash", str(script)],
+                cwd=worktree,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError as e:
+            return 127, f"{script}: {e}"
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                code = proc.wait(
+                    timeout=min(interval_s, max(deadline - time.monotonic(), 0))
+                )
+                break
+            except subprocess.TimeoutExpired:
+                on_poll()
+                if time.monotonic() >= deadline:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait()
+                    code = 124
+                    break
+        out.seek(0)
+        output = out.read()
+    if code == 124:
+        output += f"\n{script}: timed out after {timeout_s:.0f}s"
+    return code, output
+
+
+def _output_tail(output: str) -> str:
+    """The last `CI_TAIL_LINES` lines of `output`, at most `CI_TAIL_CHARS` characters."""
+    tail = "\n".join(output.splitlines()[-CI_TAIL_LINES:])
+    return tail[-CI_TAIL_CHARS:]
+
+
+# Sent to the implementer's session when the CI check is red. The session already holds
+# the spec and everything done so far, so this only has to say what failed and what is
+# off limits.
+CI_FIX_PROMPT = (
+    "`scripts/ci-check.sh` — the same checks CI runs — failed on your work. The end of "
+    "its output is below. Fix what it reports, keep every acceptance test (do not delete, "
+    "rename or weaken one to get green), and commit the fix with a conventional message. "
+    "Do not push."
+)
+
+
+def _ci_fix_prompt(tail: str) -> str:
+    return f"{CI_FIX_PROMPT}\n\n```\n{tail}\n```"
+
+
+def _past_deadline(state: _State, clock: Callable[[], float]) -> bool:
+    return state.deadline_epoch is not None and clock() >= state.deadline_epoch
+
+
+def _ci_fix_loop(
+    state: _State,
+    *,
+    run_id: str,
+    failure_markers: Sequence[str],
+    client: HerdrClient,
+    heartbeat: Path,
+    session_export: Callable[[str], str | None],
+    clock: Callable[[], float],
+    runner: Runner,
+    notes: list[str],
+) -> None:
+    """Run the CI check; while it is red, resume the implementer's session with the
+    failure and re-check, for at most `MAX_CI_FIX_ROUNDS` rounds.
+
+    The fix round is the stage's own resume mechanism (`_prompt_with_fallback` on the
+    implementer's `pl-<N>-` agent and its recorded session id), not a new one, so it
+    also falls back to the stage's fallback model on a provider error. Raises `_Abort`:
+    `ci_check_failed` once the rounds are spent, `partial_deadline` (outcome `partial`)
+    when a round would start past the deadline, and nothing has been pushed either way."""
+    implementer = next(s for s in STAGES if s.stage == IMPLEMENT_STAGE)
+    session_id = state.stage_sessions.get(str(IMPLEMENT_STAGE))
+    beat = _heartbeat_hook(heartbeat, PR_STAGE, clock)
+    for round_number in range(MAX_CI_FIX_ROUNDS + 1):
+        beat()
+        code, output = _run_ci_check(
+            state.worktree,
+            timeout_s=CI_CHECK_TIMEOUT_S,
+            interval_s=CI_HEARTBEAT_INTERVAL_S,
+            on_poll=beat,
+        )
+        beat()
+        if code == 0:
+            if round_number:
+                notes.append(f"CI check went green after {round_number} fix round(s)")
+            return
+        tail = _output_tail(output)
+        if code == 127:
+            raise _Abort("ci_check_missing", detail=tail)
+        if round_number == MAX_CI_FIX_ROUNDS:
+            raise _Abort(
+                "ci_check_failed",
+                detail=f"{CI_CHECK_SCRIPT} still red (exit {code}) after "
+                f"{MAX_CI_FIX_ROUNDS} fix rounds",
+                lines=["last output:", *tail.splitlines()],
+            )
+        if _past_deadline(state, clock):
+            raise _Abort(
+                "partial_deadline",
+                detail="a CI fix round would start past the deadline",
+                outcome="partial",
+                lines=[
+                    f"deadline_epoch: {state.deadline_epoch}",
+                    f"{CI_CHECK_SCRIPT} was red (exit {code}); nothing was pushed",
+                ],
+            )
+        if not session_id:
+            raise _Abort(
+                "resume_session_missing",
+                detail=f"stage {IMPLEMENT_STAGE}'s session id is not in state.json",
+            )
+        pane_id, status, note = _prompt_with_fallback(
+            implementer,
+            state,
+            run_id=run_id,
+            client=client,
+            session_id=session_id,
+            text=_ci_fix_prompt(tail),
+            failure_markers=failure_markers,
+            heartbeat=heartbeat,
+            session_export=session_export,
+            clock=clock,
+        )
+        _close_pane(client, pane_id)
+        if note:
+            notes.append(note)
+        ok, reason = _settle_outcome(status)
+        if not ok:
+            raise _Abort(
+                reason or "interrupted_unknown",
+                detail=f"CI fix round {round_number + 1} settled {status!r}",
+            )
+        line = _sweep(
+            state, runner, _sweep_message(state, IMPLEMENT_STAGE) or "feat: fix"
+        )
+        if line:
+            notes.append(line)
+
+
+_STATUS_OPEN_RE = re.compile(r"^status:[ \t]*[\"']?open[\"']?[ \t]*$", re.MULTILINE)
+
+
+def _flip_issue(state: _State, runner: Runner) -> None:
+    """Rewrite the picked issue's frontmatter `status: open` to `status: done`, committing
+    only that file.
+
+    In code because the prompt told a model to, and PR #159's model committed the wrong
+    files under a message with the literal `NN`. Idempotent: an issue already committed
+    as done is left alone, so a relaunch after a crash between the flip and the push
+    resumes."""
+    if _issue_committed_done(state, runner)[0]:
+        return
+    if not state.issue_source:
+        raise _Abort("issue_flip_failed", detail="state.json records no feature_source")
+    path = state.worktree / state.issue_source
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise _Abort("issue_flip_failed", detail=f"{path}: {e}") from e
+    head, sep, rest = (
+        text.partition("\n---\n") if text.startswith("---\n") else ("", "", "")
+    )
+    if not sep or not _STATUS_OPEN_RE.search(head):
+        raise _Abort(
+            "issue_flip_failed",
+            detail=f"{state.issue_source} has no frontmatter `status: open` to flip",
+        )
+    path.write_text(_STATUS_OPEN_RE.sub("status: done", head, count=1) + sep + rest)
+    issue = _issue_id(state.issue_source) or "unknown"
+    _git_out(state, runner, "add", state.issue_source, what="issue_flip_failed")
+    _git_out(
+        state,
+        runner,
+        "commit",
+        "-m",
+        f"chore: mark issue {issue} done (merging this PR closes it)",
+        "--",
+        state.issue_source,
+        what="issue_flip_failed",
+    )
+
+
+def _preflight_spec(spec_text: str) -> None:
+    """The PR's content preconditions: a problem statement and at least one acceptance
+    test. A miss fails the run instead of opening a PR with a blank section (PR #159)."""
+    if not _spec_section(spec_text, "problem"):
+        raise _Abort(
+            "pr_preflight_failed", detail="the spec's `## problem` section is empty"
+        )
+    if not gate3_test_names(spec_text):
+        raise _Abort("pr_preflight_failed", detail="the spec names no acceptance tests")
+
+
+def _bookkeeping(
+    state: _State,
+    *,
+    spec_text: str,
+    run_id: str,
+    failure_markers: Sequence[str],
+    client: HerdrClient,
+    heartbeat: Path,
+    session_export: Callable[[str], str | None],
+    clock: Callable[[], float],
+    runner: Runner,
+    notes: list[str],
+) -> list[str]:
+    """Everything between the implementer and the PR, with no agent in charge: spec
+    preconditions, the CI check with its fix loop, the issue flip. Returns the named
+    tests the implementer edited, for the PR body. Raises `_Abort`.
+
+    The named-test check runs again here, on HEAD after the last fix round: a fix round
+    is exactly where a model is tempted to delete the test that will not go green."""
+    _preflight_spec(spec_text)
+    _ci_fix_loop(
+        state,
+        run_id=run_id,
+        failure_markers=failure_markers,
+        client=client,
+        heartbeat=heartbeat,
+        session_export=session_export,
+        clock=clock,
+        runner=runner,
+        notes=notes,
+    )
+    removed, edited = _named_test_changes(
+        state, runner, _base_for(state, IMPLEMENT_STAGE), spec_text
+    )
+    if removed:
+        raise _Abort(
+            "named_test_removed",
+            detail=f"deleted or renamed named test(s): {', '.join(removed)}",
+        )
+    _flip_issue(state, runner)
+    ok, why = _issue_committed_done(state, runner)
+    if not ok:
+        raise _Abort("issue_not_done", detail=why)
+    return edited
+
+
 def _open_pr(
     state: _State,
     *,
@@ -545,13 +1042,14 @@ def _open_pr(
     owner: str,
     repo: str,
     runner: Callable[..., tuple[int, str, str]],
+    edited_tests: Sequence[str] = (),
 ) -> int:
     """Push the branch, open the PR, return its number. No agent is involved.
 
     `gh pr create` has no machine-readable output mode — it prints the new PR's URL — so
     the number comes back through `GhClient.pr_create`, which parses it out of that URL.
     It is never predicted from a list of open PRs, because a number invented here would
-    be handed to gate CI and stage 5 as if it were real.
+    be handed to gate CI and stage 6 as if it were real.
 
     Push before create, always: `gh pr create` refuses a branch that is not on the remote,
     and the failure mode of doing it the other way round is a PR that silently does not
@@ -560,9 +1058,9 @@ def _open_pr(
     Re-signs the stage agents' commits first: no clone config can stop an agent running
     `git -c commit.gpgsign=false commit` (PR #140), and the ruleset blocks an unsigned PR
     at merge. Nothing is on origin yet, so this needs no force-push. Best-effort — an
-    unsigned push still leaves a PR for stage 5 to review.
+    unsigned push still leaves a PR for stage 6 to review.
 
-    Refuses to push when the picked issue is not committed as `status: done`. Gate 4
+    Refuses to push when the picked issue is not committed as `status: done`. Gate 5
     checks the same thing, but only after the PR exists: PR #159 was opened by a run
     that then failed that check, leaving a PR whose "Closes" line was false."""
     ok, why = _issue_committed_done(state, runner)
@@ -586,7 +1084,10 @@ def _open_pr(
             branch=state.branch,
             title=_spec_title(spec_text),
             body=_pr_body(
-                spec_text, issue_source=state.issue_source, run_id=state.run_id
+                spec_text,
+                issue_source=state.issue_source,
+                run_id=state.run_id,
+                edited_tests=edited_tests,
             ),
         )
     except RuntimeError as e:
@@ -598,6 +1099,89 @@ def _open_pr(
 # ---------------------------------------------------------------------------
 # One agent stage
 # ---------------------------------------------------------------------------
+
+
+def _prompt_with_fallback(
+    spec: StageSpec,
+    state: _State,
+    *,
+    run_id: str,
+    client: HerdrClient,
+    session_id: str | None,
+    text: str,
+    failure_markers: Sequence[str],
+    heartbeat: Path,
+    session_export: Callable[[str], str | None],
+    clock: Callable[[], float],
+) -> tuple[str, str, str | None]:
+    """Prompt `spec`'s agent (resuming `session_id` if given) and, when its model failed
+    mid-call, resume the same session once on `spec.fallback_model`. Returns (pane id,
+    settled status, report line when the fallback ran).
+
+    Shared by a stage's own run and by a CI fix round, so "resume the implementer's
+    session" is one mechanism, not two. The pane is left open for the caller: it has to
+    read the session id from it, and closes it once its gate has passed."""
+    assert spec.model is not None
+    agent_name = _stage_agent_name(spec.stage, run_id)
+
+    def attempt(
+        *, model: str, session_id: str | None, text: str, markers: Sequence[str]
+    ) -> tuple[str, str]:
+        return _start_and_prompt(
+            spec,
+            state,
+            client=client,
+            agent_name=agent_name,
+            model=model,
+            session_id=session_id,
+            text=text,
+            failure_markers=markers,
+            heartbeat=heartbeat,
+            clock=clock,
+        )
+
+    pane_id, status = attempt(
+        model=spec.model,
+        session_id=session_id,
+        text=text,
+        markers=failure_markers,
+    )
+    note: str | None = None
+    # Checked on every settle, not only a failed one: run 20261010T050000Z's provider
+    # error happened to settle `blocked`, but nothing guarantees it, and an `idle`
+    # settle on a half-done implement stage would sail through its gate (which only
+    # checks that the acceptance tests exist, and they are written first).
+    failed_session, provider_error = (
+        _fallback_cause(client, agent_name, status, session_export)
+        if spec.fallback_model
+        else (None, None)
+    )
+    if spec.fallback_model and failed_session and provider_error:
+        # Resume the same session rather than start a fresh one: the failed model
+        # usually left edits in the shared worktree, and a new session dropped onto
+        # half-done work it has no memory of would redo or undo it. The same id is
+        # also what stage 7 resumes, so the implementer's record stays one session.
+        _close_pane(client, pane_id)
+        note = (
+            f"stage {spec.stage}: {spec.model} failed ({provider_error}); "
+            f"resumed its session on {spec.fallback_model}"
+        )
+        log.warning("pipeline %s: %s", run_id, note)
+        try:
+            # No failure markers: they are Zen's quota text, the fallbacks are off Zen
+            # by construction, and a resumed session can re-render its own history —
+            # the primary's "Free usage exceeded" included — which two polls would read
+            # as the fallback's own wedge and kill it seconds in.
+            pane_id, status = attempt(
+                model=spec.fallback_model,
+                session_id=failed_session,
+                text=FALLBACK_CONTINUE_PROMPT,
+                markers=(),
+            )
+        except _Abort as abort:
+            abort.lines.insert(0, note)
+            raise
+    return pane_id, status, note
 
 
 def _run_agent_stage(
@@ -617,8 +1201,8 @@ def _run_agent_stage(
     """Start one stage's agent, prompt it, wait for settle, record its real session id.
 
     Returns the pane id so the caller can close it once the gate has passed (G-16:
-    close on gate-pass, not only at end of run — and never hold stage 3's pane open from
-    stage 4 through stage 6, which is what made the resume a fork instead of a resume),
+    close on gate-pass, not only at end of run — and never hold stage 4's pane open from
+    stage 5 through stage 7, which is what made the resume a fork instead of a resume),
     plus a report line when the stage only finished on its fallback model.
 
     Raises `_Abort` for every failure, having already closed the pane: a pane left open
@@ -647,64 +1231,18 @@ def _run_agent_stage(
             state, run_id=run_id, report=report, state_json=state_json, stage=spec.stage
         ),
     )
-
-    def attempt(
-        *, model: str, session_id: str | None, text: str, markers: Sequence[str]
-    ) -> tuple[str, str]:
-        return _start_and_prompt(
-            spec,
-            state,
-            client=client,
-            agent_name=agent_name,
-            model=model,
-            session_id=session_id,
-            text=text,
-            failure_markers=markers,
-            heartbeat=heartbeat,
-            clock=clock,
-        )
-
-    pane_id, status = attempt(
-        model=spec.model,
+    pane_id, status, note = _prompt_with_fallback(
+        spec,
+        state,
+        run_id=run_id,
+        client=client,
         session_id=resume_session,
         text=prompt,
-        markers=failure_markers,
+        failure_markers=failure_markers,
+        heartbeat=heartbeat,
+        session_export=session_export,
+        clock=clock,
     )
-    note: str | None = None
-    # Checked on every settle, not only a failed one: run 20261010T050000Z's provider
-    # error happened to settle `blocked`, but nothing guarantees it, and an `idle`
-    # settle on a half-done stage 3 would sail through gate 3 (it only checks that the
-    # acceptance tests exist, and the stage writes those first).
-    failed_session, provider_error = (
-        _fallback_cause(client, agent_name, status, session_export)
-        if spec.fallback_model
-        else (None, None)
-    )
-    if spec.fallback_model and failed_session and provider_error:
-        # Resume the same session rather than start a fresh one: the failed model
-        # usually left edits in the shared worktree, and a new session dropped onto
-        # half-done work it has no memory of would redo or undo it. The same id is
-        # also what stage 6 resumes, so stage 3's record stays one session.
-        _close_pane(client, pane_id)
-        note = (
-            f"stage {spec.stage}: {spec.model} failed ({provider_error}); "
-            f"resumed its session on {spec.fallback_model}"
-        )
-        log.warning("pipeline %s: %s", run_id, note)
-        try:
-            # No failure markers: they are Zen's quota text, the fallbacks are off Zen
-            # by construction, and a resumed session can re-render its own history —
-            # the primary's "Free usage exceeded" included — which two polls would read
-            # as the fallback's own wedge and kill it seconds in.
-            pane_id, status = attempt(
-                model=spec.fallback_model,
-                session_id=failed_session,
-                text=FALLBACK_CONTINUE_PROMPT,
-                markers=(),
-            )
-        except _Abort as abort:
-            abort.lines.insert(0, note)
-            raise
     ok, reason = _settle_outcome(status)
     if not ok:
         _close_pane(client, pane_id)
@@ -825,7 +1363,7 @@ def _session_api_error(export_json: str) -> str | None:
     in a provider `APIError`, else None.
 
     Read from the session record rather than the screen. herdr filed run
-    20261010T050000Z's stage 3 as `blocked` after Zen answered 400 `Bad Request`, which
+    20261010T050000Z's implement stage as `blocked` after Zen answered 400 `Bad Request`, which
     is indistinguishable from a permission prompt by status alone; the export says which
     it was (`info.error = {"name": "APIError", "data": {"statusCode": 400, ...}}`). A
     screen marker would not do: this repo's own source carries the error strings, and a
@@ -945,14 +1483,16 @@ def _gate_for_stage(
     One place that says which gate belongs to which stage, because "gate N runs after
     stage N" is the pipeline's whole contract and it has been stated in prose in three
     different files so far."""
-    if spec.stage == 3:
-        # Gate 3's lint/pytest half stays prose (issue 034: Gate CI below is
-        # authoritative for a PR). The mechanical half — every acceptance test named in
-        # the spec exists under tests/ — is a command, so it runs in code.
-        return gate3_test_names_present(spec_text, repo_path=state.worktree)
-    if spec.stage == 4:
+    if spec.stage == TEST_AUTHOR_STAGE:
+        # Gate 3 is git, run in code: the test author committed something, only under
+        # tests/, and every test the spec names is in it. Gate CI below is authoritative
+        # for lint and pytest.
+        return _gate_test_author(state, spec_text, runner)
+    if spec.stage == IMPLEMENT_STAGE:
+        return _gate_implementer(state, spec_text, runner)
+    if spec.stage == PR_STAGE:
         head = run_stage_gate(
-            "4",
+            str(PR_STAGE),
             repo_path=state.worktree,
             gh=gh,
             owner=owner,
@@ -964,7 +1504,7 @@ def _gate_for_stage(
             return head
         ok, why = _issue_committed_done(state, runner)
         return GateVerdict(passed=ok, reason=why)
-    if spec.stage == 5 or spec.stage == 6:
+    if spec.stage > PR_STAGE:
         return run_stage_gate(
             str(spec.stage),
             repo_path=state.worktree,
@@ -1099,7 +1639,7 @@ def run_pipeline(
         log.info("pipeline %s: stage %d", run_id, spec.stage)
         # Stage 1 is what writes the spec, so it can only be read from stage 2 on. Reading
         # it before stage 1 failed every run as `spec_unreadable` before any agent started
-        # (2026-10-07); only gate 3 and stage 4's PR body consume it.
+        # (2026-10-07); only gates 3 and 4 and stage 5's PR body consume it.
         if spec.stage > 1:
             try:
                 spec_text = state.spec.read_text()
@@ -1110,7 +1650,23 @@ def run_pipeline(
 
         pane_id: str | None = None
         try:
+            if spec.stage in (TEST_AUTHOR_STAGE, IMPLEMENT_STAGE):
+                # Before the stage can commit anything, so the checks that compare
+                # against it see exactly what this stage did.
+                state = _record_base(state, state_json, spec.stage, run)
             if spec.model is None:
+                edited_tests = _bookkeeping(
+                    state,
+                    spec_text=spec_text,
+                    run_id=run_id,
+                    failure_markers=failure_markers,
+                    client=client,
+                    heartbeat=heartbeat,
+                    session_export=session_export,
+                    clock=clock,
+                    runner=run,
+                    notes=notes,
+                )
                 pr_number = _open_pr(
                     state,
                     spec_text=spec_text,
@@ -1118,6 +1674,7 @@ def run_pipeline(
                     owner=owner,
                     repo=repo,
                     runner=run,
+                    edited_tests=edited_tests,
                 )
                 state = state.commit(state_json, pr_number=pr_number)
             else:
@@ -1136,6 +1693,13 @@ def run_pipeline(
                 )
                 if note:
                     notes.append(note)
+                sweep_message = _sweep_message(state, spec.stage)
+                if sweep_message:
+                    # Whatever the stage left uncommitted is committed by code before
+                    # its gate looks at the branch, with a message that says so.
+                    swept = _sweep(state, run, sweep_message)
+                    if swept:
+                        notes.append(f"stage {spec.stage}: {swept}")
                 # Re-read rather than carry a returned copy: the stage already wrote this
                 # file, and `state.json` is also what the watchdog and `tick`'s reconcile
                 # read while the run is in flight. Carrying a pre-stage copy forward would
@@ -1143,9 +1707,11 @@ def run_pipeline(
                 # with the stage's real id missing.
                 state = _State.read(state_json)
         except _Abort as abort:
+            if pane_id is not None:
+                _close_pane(client, pane_id)
             notify(f"pipeline {run_id}: {abort.reason}")
             return finish(
-                "failed",
+                abort.outcome,
                 abort.reason,
                 error=abort.detail,
                 stage=spec.stage,
@@ -1155,7 +1721,7 @@ def run_pipeline(
             return finish("failed", "state_unreadable", error=str(e), stage=spec.stage)
 
         # A gate's `gh` call raises RuntimeError on any non-zero exit (expired token, rate
-        # limit, network). Gate 4 catches its own; gates 5/6 do not, and an escape here
+        # limit, network). Gate 5 catches its own; gates 6/7 do not, and an escape here
         # would break this function's never-raises contract and skip the terminal report
         # (spec §8) — so an unreachable gate is a failed gate, with the error as reason.
         try:
@@ -1170,6 +1736,11 @@ def run_pipeline(
             )
         except RuntimeError as e:
             verdict = GateVerdict(passed=False, reason=f"gate could not run: {e}")
+        except _Abort as abort:
+            # Gates 3 and 4 read git themselves; a git failure is a failed gate.
+            verdict = GateVerdict(
+                passed=False, reason=f"{abort.reason}: {abort.detail or ''}".strip()
+            )
         if not verdict.passed:
             if pane_id is not None:
                 _close_pane(client, pane_id)
@@ -1203,9 +1774,9 @@ def run_pipeline(
 
         state = state.commit(state_json, current_stage=spec.stage)
 
-        if spec.stage == 4:
-            # Gate CI does not abort the run: a lint slip is exactly what stage 6 exists
-            # to clean up, and the prompt is explicit that a CI failure rides into stage 6
+        if spec.stage == PR_STAGE:
+            # Gate CI does not abort the run: a lint slip is exactly what stage 7 exists
+            # to clean up, and the prompt is explicit that a CI failure rides into stage 7
             # as a must-fix item rather than ending the night.
             try:
                 ci = run_stage_gate(
@@ -1223,7 +1794,7 @@ def run_pipeline(
             if not ci.passed:
                 log.warning("pipeline %s: Gate CI: %s", run_id, ci.reason)
 
-    # Stage 6's agent commits and pushes its own fixes, after stage 4's local re-sign —
+    # Stage 7's agent commits and pushes its own fixes, after stage 5's local re-sign —
     # so check origin once more, now that no stage will write to the branch again.
     lines = ["all stages green"]
     try:

@@ -318,7 +318,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "gate",
         help=(
             "run a hard pipeline gate and read the result off its exit code "
-            "(issues 034/035: the CI gate and gate 6's reply coverage used to be "
+            "(issues 034/035: the CI gate and gate 7's reply coverage used to be "
             "prose in the orchestrator prompt, now real code)"
         ),
     )
@@ -326,14 +326,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--stage",
         required=True,
         choices=list(GATE_STAGE_CHOICES),
-        help="which gate to run: 1/2 check the run's own artifacts, 4 the recorded PR, "
-        "5 its reviews, 6 reply coverage, 'ci' the PR checks",
+        help="which gate to run: 1/2 check the run's own artifacts, 5 the recorded PR, "
+        "6 its reviews, 7 reply coverage, 'ci' the PR checks",
     )
     p_gate.add_argument(
         "--pr",
         type=int,
         default=None,
-        help="PR number — required for stages 4, 5, 6 and 'ci', which all read a PR",
+        help="PR number — required for stages 5, 6, 7 and 'ci', which all read a PR",
     )
     p_gate.add_argument(
         "--spec",
@@ -344,7 +344,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_gate.add_argument(
         "--branch",
         default=None,
-        help="branch the PR under test was opened from — required for stage 4, which "
+        help="branch the PR under test was opened from — required for stage 5, which "
         "confirms the PR is the run's own and still open",
     )
     p_gate.add_argument(
@@ -1067,7 +1067,7 @@ def _cmd_gate(args: argparse.Namespace) -> int:
 
     Each gate's requirements differ, and the CLI mirrors that instead of flattening it
     into one "everything is required" surface: `--pr` and the GitHub owner/repo are
-    resolved only for the stages that read a PR (4, 5, 6, ci), so gates 1 and 2 — which
+    resolved only for the stages that read a PR (5, 6, 7, ci), so gates 1 and 2 — which
     inspect the checkout and the spec — are not made to fail by a checkout with no
     origin. A missing requirement is a usage error (2), not a gate failure (1): nothing
     was checked, so reporting "failed" would put a break in history for a typo.
