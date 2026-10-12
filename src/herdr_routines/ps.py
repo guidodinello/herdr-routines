@@ -8,7 +8,7 @@ Read-only merge of two sources (spec 20260825T070012Z):
 
 A pipeline run counts as in progress while its final report
 (`pipeline-<run_id>.md`) has not been written yet; its row then enriches a bare
-agent name like `pl-4-20260825T070012Z` to "pipeline run 20260825T… stage 4/6".
+agent name like `pl-4-20260825T070012Z` to "pipeline run 20260825T… stage 4/7".
 Every failure here is fail-open: an unreachable Herdr server or an unreadable
 state.json degrades to a warning, never a crash.
 """
@@ -22,14 +22,16 @@ from pathlib import Path
 from logger import get_logger
 
 from herdr_routines.herdr import LIVE_AGENT_STATUSES, HerdrClient, HerdrCliError
+from herdr_routines.pipeline_stages import STAGES
 from herdr_routines.runner import default_reports_dir
 from herdr_routines.table import render_table
 
 log = get_logger(__name__)
 
-# The pipeline workflow (docs/pipeline/design.md) always runs exactly six stages,
-# numbered 1..6; worker agents are named pl-<stage>-<run_id>.
-TOTAL_PIPELINE_STAGES = 6
+# The pipeline workflow (docs/pipeline/design.md) runs every stage in `STAGES`, numbered
+# 1..N; worker agents are named pl-<stage>-<run_id>. Derived, so adding a stage cannot
+# leave `ps` rendering "stage 7/6".
+TOTAL_PIPELINE_STAGES = len(STAGES)
 
 STATE_JSON_NAME = "state.json"
 

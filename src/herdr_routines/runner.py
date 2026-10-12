@@ -260,7 +260,7 @@ def _capture_session_id(client: HerdrClient, target: str) -> str | None:
     """Best-effort: the agent's underlying session id, captured before _close_run_pane closes
     its pane. A human can later resume and inspect the conversation via
     `herdr agent start <name> --kind <kind> --pane <fresh_pane> -- <model_flag> <model> -s
-    <session_id>` (same mechanism the pipeline orchestrator uses for its own pl-3->pl-6 reuse,
+    <session_id>` (same mechanism the pipeline orchestrator uses for its own pl-4->pl-7 reuse,
     docs/pipeline/design.md) — this is what makes "keep the pane open for inspection" no longer
     necessary. Never raises."""
     try:

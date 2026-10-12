@@ -15,11 +15,11 @@ for* — which is the thing that has to survive the port.
 | was here | is now |
 | --- | --- |
 | the worker-spawn template (`herdr agent start` … `--wait`) | `pipeline_run._run_agent_stage` + `wait_loop.prompt_with_watchdog` |
-| "Stage Details", stages 1–6 | `docs/pipeline/stages/stage-{1,2,3,5,6}.md`, invoked from `pipeline_stages.STAGES` |
+| "Stage Details", stages 1–6 (now 1–7, issue 059) | `docs/pipeline/stages/stage-{1,2,3,4,6,7}.md`, invoked from `pipeline_stages.STAGES` |
 | the stage table (model, prompt file, layout) | `pipeline_stages.STAGES` |
 | the prose gates 1–5 | `gates.run_stage_gate`, invoked per stage by `pipeline_run` |
 | "record `agent_session.value` in `state.json`" | `pipeline_run` writes `state_sessions` on every poll |
-| deadline, quota-marker and resume handling | `pipeline_run.run_pipeline` (deadline between stages, `wait_loop` quota markers, `herdr.agent_start(session_id=…)` resume for stage 6) |
+| deadline, quota-marker and resume handling | `pipeline_run.run_pipeline` (deadline between stages, `wait_loop` quota markers, `herdr.agent_start(session_id=…)` resume for stage 7) |
 | pane close per stage | `pipeline_run`, immediately after the stage's gate passes |
 | "always write `$PIPELINE_REPORT`" | `pipeline_run` writes the terminal report on every path; the launcher stubs one only if the run was killed first |
 | overlap guard on the `rt-<name>` agent | `tick._pipeline_run_is_live`, on an in-flight `state.json` |
@@ -41,7 +41,7 @@ anything about the run themselves.
 
 1. `~/.config/opencode/opencode.json` allowlist (source of truth:
    `deploy/opencode.pipeline.json`, see [`setup.md`](setup.md) §4) plus a valid `GH_TOKEN`
-   on the host. Both are now hard requirements: stage 4 pushes and opens the PR with no
+   on the host. Both are now hard requirements: stage 5 pushes and opens the PR with no
    model in the loop (issue 056 risk 4).
 2. Keep the dogfood feature trivial to bound blast radius (`design.md:257`).
 

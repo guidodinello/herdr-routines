@@ -1,20 +1,20 @@
-"""Gate 6 (reply coverage) and the CI gate — the two checks issues 034/035 move out of
+"""Gate 7 (reply coverage) and the CI gate — the two checks issues 034/035 move out of
 ``docs/pipeline/orchestrator-prompt.md`` prose into code.
 
 The orchestrator is an LLM that reads the prompt and executes the gate it describes.
-On PR #81 it was told to run a specific jq filter for gate 6, silently substituted a
+On PR #81 it was told to run a specific jq filter for gate 7, silently substituted a
 stricter regex, and reported the gate as passed — nothing detected the swap. A gate
 written as prose is advisory; an agent told "run this check" can run a different check
 and still report success. These two gates ship as real functions the orchestrator can
-only invoke (via ``herdr-routines gate --stage ci|6 --pr <n>``) and read an exit code
+only invoke (via ``herdr-routines gate --stage ci|7 --pr <n>``) and read an exit code
 from — it cannot rewrite them.
 
 Gate 3's lint widening (``ruff format --check .`` and ``ruff check .`` alongside
-pytest) stays prompt text: it's a command the implementer runs on their own tree
-before ever opening a PR, not a verdict the orchestrator computes about someone
-else's PR. ``GATE3_LINT_TEST_CHECKS`` below only pins that the widened check set fails
-on a lint error even with green tests (test_gate3_fails_on_lint_error) — it is reused
-from the same ``run_checks`` machinery as ``auto_fix.py``, not exposed as a CLI stage.
+pytest) is not a CLI stage and no prompt carries it any more: since issue 059 stage 5
+runs ``scripts/ci-check.sh`` (CI's own commands) in code before the PR, with a fix loop.
+``GATE3_LINT_TEST_CHECKS`` below only pins that the widened check set fails on a lint
+error even with green tests (test_gate3_fails_on_lint_error) — it is reused from the
+same ``run_checks`` machinery as ``auto_fix.py``.
 """
 
 from __future__ import annotations
@@ -222,8 +222,8 @@ def run_ci_gate(
     sleep: Callable[[float], None] = time.sleep,
 ) -> GateVerdict:
     """Poll ``gh pr view --json statusCheckRollup`` until every check is non-pending,
-    then evaluate. A FAILURE conclusion routes the PR to stage 6 as a must-fix item
-    (it is not itself a pipeline abort — a lint slip is exactly what stage 6 exists to
+    then evaluate. A FAILURE conclusion routes the PR to stage 7 as a must-fix item
+    (it is not itself a pipeline abort — a lint slip is exactly what stage 7 exists to
     clean up); this function only reports pass/fail, the caller decides what to do
     with it. Bounded to `timeout_s` so a stuck check can't eat the deadline."""
     deadline = clock() + timeout_s
@@ -248,10 +248,10 @@ def run_ci_gate(
 
 
 # ---------------------------------------------------------------------------
-# Gate 6 — reply coverage
+# Gate 7 — reply coverage
 # ---------------------------------------------------------------------------
 
-GATE6_REVIEW_THREADS_QUERY = """
+GATE7_REVIEW_THREADS_QUERY = """
 query($owner: String!, $repo: String!, $pr: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
@@ -314,7 +314,7 @@ def _parse_review_threads(data: dict[str, object]) -> list[ReviewThread]:
     return result
 
 
-def evaluate_gate6(threads: Sequence[ReviewThread]) -> GateVerdict:
+def evaluate_gate7(threads: Sequence[ReviewThread]) -> GateVerdict:
     """Reply coverage: every unresolved thread must carry at least one reply. Kept
     separate from — and in addition to — the blocking-tag check: neither the old
     prose gate nor its stricter substitute counted replies at all (issue 035)."""
@@ -335,13 +335,13 @@ def evaluate_gate6(threads: Sequence[ReviewThread]) -> GateVerdict:
     return GateVerdict(passed=False, reason="; ".join(reasons))
 
 
-def run_gate6(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
+def run_gate7(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
     """Fetch review threads via GraphQL and evaluate reply coverage. `gh api
     repos/.../threads` 404s (verified against a live PR) — GraphQL is the only
     route to per-thread resolution state."""
-    data = gh.graphql(GATE6_REVIEW_THREADS_QUERY, owner=owner, repo=repo, pr=str(pr))
+    data = gh.graphql(GATE7_REVIEW_THREADS_QUERY, owner=owner, repo=repo, pr=str(pr))
     threads = _parse_review_threads(data)
-    return evaluate_gate6(threads)
+    return evaluate_gate7(threads)
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +455,7 @@ def _frontmatter_has(text: str, field: str, value: str) -> bool:
 
 def run_gate2(spec: Path) -> GateVerdict:
     """Stage 2's spec v2 carries the structure the rest of the pipeline relies on — the
-    `## Acceptance criteria` block stage 3 and gate 3 read, the `## Changelog`
+    `## Acceptance criteria` block stage 3, stage 4 and gate 3 read, the `## Changelog`
     documenting the v1->v2 delta, and both tier words plus the confidence token.
 
     `-qw` for the tier words, not a substring: the prose this replaces used `rg -qw
@@ -486,10 +486,10 @@ def run_gate2(spec: Path) -> GateVerdict:
     return GateVerdict(passed=True)
 
 
-def run_gate4(
+def run_gate5(
     gh: GhClient, *, owner: str, repo: str, branch: str, pr: int | None = None
 ) -> GateVerdict:
-    """The PR stage 4 opened is live and pointed at this run's branch.
+    """The PR stage 5 opened is live and pointed at this run's branch.
 
     `gh pr create` exits 0 after printing a URL, and it exits 0 for a PR a re-invocation
     has already opened — so its exit code alone cannot prove a PR exists, and cannot
@@ -530,7 +530,7 @@ def _pr_bodies(view: Mapping[str, object]) -> list[str]:
 
     Conversation comments and review summaries only — NOT inline review comments, which
     `gh pr view` omits entirely (its `reviews` rows for them have empty bodies). Those
-    are fetched separately in `run_gate5`."""
+    are fetched separately in `run_gate6`."""
     bodies: list[str] = []
     for key in ("comments", "reviews"):
         entries = view.get(key)
@@ -542,7 +542,7 @@ def _pr_bodies(view: Mapping[str, object]) -> list[str]:
     return bodies
 
 
-def run_gate5(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
+def run_gate6(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
     """The review skill's `blocking`/`non-blocking` tier structure is present.
 
     Anchored on the literal bracketed ``[blocking]``, never a substring test. The prompt's
@@ -581,15 +581,17 @@ def run_gate5(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
     )
 
 
-# CLI-visible stage numbers. Gate 3 is prose by design (see this module's docstring and
-# GATE3_LINT_TEST_CHECKS), so "3" is absent on purpose: gate 3's verdict is the
-# implementer's own-tree check, and Gate CI is the authoritative one for a PR.
-GATE_STAGE_CHOICES: tuple[str, ...] = ("1", "2", "4", "5", "6", "ci")
+# CLI-visible stage numbers, one per pipeline stage (issue 059 renumbered the stages to
+# 1-7, so `gate_N_failed` and `--stage N` both name stage N). Gates 3 and 4 are absent on
+# purpose: they are git checks `pipeline_run` runs on its own worktree (the test author
+# touched only tests/, the implementer removed no named test), and Gate CI is the
+# authoritative one for a PR.
+GATE_STAGE_CHOICES: tuple[str, ...] = ("1", "2", "5", "6", "7", "ci")
 
 # The gates that read a PR, and therefore the only ones that need `--pr` and a resolved
 # GitHub owner/repo. Kept next to `GATE_STAGE_CHOICES` so the CLI's argument handling and
 # the dispatcher's own requirement checks are reading one list, not two that can drift.
-PR_GATE_STAGES: frozenset[str] = frozenset({"4", "5", "6", "ci"})
+PR_GATE_STAGES: frozenset[str] = frozenset({"5", "6", "7", "ci"})
 
 
 def run_stage_gate(
@@ -609,7 +611,7 @@ def run_stage_gate(
     reporting an unrun gate as a pass.
 
     The requirements are per-gate rather than uniform on purpose: gates 1 and 2 need only
-    a checkout and a spec, gate 4 only a branch, and 5/6/ci a PR. A single
+    a checkout and a spec, gate 5 only a branch, and 6/7/ci a PR. A single
     `pr: int` on the signature would force the caller to invent a PR number for gates that
     have no PR yet — which is how an unset value silently becomes gate 0's input.
 
@@ -627,18 +629,18 @@ def run_stage_gate(
         if spec is None:
             raise ValueError("gate 2 requires the spec path")
         return run_gate2(spec)
-    if token == "4":
-        if branch is None:
-            raise ValueError("gate 4 requires the branch the PR was opened from")
-        return run_gate4(gh, owner=owner, repo=repo, branch=branch, pr=pr)
     if token == "5":
-        if pr is None:
-            raise ValueError("gate 5 requires a PR number")
-        return run_gate5(gh, owner=owner, repo=repo, pr=pr)
+        if branch is None:
+            raise ValueError("gate 5 requires the branch the PR was opened from")
+        return run_gate5(gh, owner=owner, repo=repo, branch=branch, pr=pr)
     if token == "6":
         if pr is None:
             raise ValueError("gate 6 requires a PR number")
         return run_gate6(gh, owner=owner, repo=repo, pr=pr)
+    if token == "7":
+        if pr is None:
+            raise ValueError("gate 7 requires a PR number")
+        return run_gate7(gh, owner=owner, repo=repo, pr=pr)
     if token == "ci":
         if pr is None:
             raise ValueError("gate ci requires a PR number")
@@ -666,7 +668,7 @@ def gate3_test_names(
 ) -> list[str]:
     """Every acceptance-criterion test name the spec names, in order, de-duplicated.
 
-    The names are written by stage 2 and read by stage 3, gate 3 and `pipeline_run`
+    The names are written by stage 2 and read by stages 3 and 4, gate 3 and `pipeline_run`
     alike, so the extraction is one function rather than a `grep "Test:"` copied into
     each. Backticked names are unwrapped because both spellings are in the wild and a
     backtick left in would make the fixed-string existence check pass against a file that
@@ -693,9 +695,9 @@ def gate3_test_names_present(
     must not satisfy this. Plain Python rather than `rg`, so the verdict does not depend
     on which binaries the host happens to have on PATH (CI has no `rg`).
 
-    Deliberately *not* the lint/pytest half of gate 3 — that stays prose (see this
-    module's docstring). This function is the part that is mechanical enough to stop
-    trusting a model with it."""
+    Deliberately *not* the lint/pytest half: `pipeline_run` runs `scripts/ci-check.sh`
+    for that (see this module's docstring). This function is the part that is
+    mechanical enough to stop trusting a model with it."""
     names = gate3_test_names(spec_text)
     if not names:
         return GateVerdict(

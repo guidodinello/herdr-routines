@@ -128,7 +128,7 @@ def test_branch_with_merge_commit_is_not_rewritten(clone: Path) -> None:
     assert _origin_commits(clone) == before
 
 
-# --- resign_local_commits: the pipeline's stage 4, before its first push ---------------
+# --- resign_local_commits: the pipeline's stage 5, before its first push ---------------
 
 
 def _unpushed_branch(clone: Path, name: str) -> None:

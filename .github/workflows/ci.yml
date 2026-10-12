@@ -59,11 +59,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev
 
-      - name: ruff format check
-        run: uv run ruff format --check .
-
-      - name: ruff lint
-        run: uv run ruff check .
+      # The commands live in scripts/ci-check.sh, which the pipeline also runs before
+      # it pushes, so CI and the pipeline's own check cannot drift apart.
+      - name: ruff format + lint
+        run: scripts/ci-check.sh lint
 
   typecheck-python:
     name: Typecheck Python
@@ -82,7 +81,7 @@ jobs:
       # Paths, strictness and the `logger` override live in [tool.mypy] in
       # pyproject.toml, so this matches what `uv run mypy` does locally.
       - name: mypy
-        run: uv run mypy
+        run: scripts/ci-check.sh typecheck
 
   test-python:
     name: Tests (Python)
@@ -99,7 +98,7 @@ jobs:
         run: uv sync --dev
 
       - name: pytest
-        run: uv run pytest
+        run: scripts/ci-check.sh test
 
   # Single stable check name for the branch ruleset (see dev-standards
   # templates/ci/python-ci.yml). if: always() so it still runs (and fails) when a

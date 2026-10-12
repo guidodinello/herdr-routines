@@ -29,10 +29,11 @@ enforcement in code for v1 — define the workflow, let the orchestrator supervi
        │  spawns via herdr CLI, detached --wait, writes state.json + $PIPELINE_REPORT
        ├─→ stage 1 plan/spec  (muse-spark)
        ├─→ stage 2 spec review (muse-spark fresh session — independence via sessions, not model family)
-       ├─→ stage 3 implement+tests (ox-alpha-free)
-       ├─→ stage 4 open PR (same session as 3)
-       ├─→ stage 5 code review (separate session, big-pickle primary — fan-out hy3+x-preview is v2)
-       └─→ stage 6 address comments (ox fixes + muse GH ops, capped 2 iterations)
+       ├─→ stage 3 write the acceptance tests (tests only; a different model family from stage 4)
+       ├─→ stage 4 implement (make the named tests pass)
+       ├─→ stage 5 bookkeeping + open PR (no agent: sweep, CI check + fix loop, issue flip, PR)
+       ├─→ stage 6 code review (separate session — nemotron, a different family from stage 4)
+       └─→ stage 7 address comments (resumes stage 4's session, capped 2 iterations)
 ```
 
 Why agentic orchestrator over a Python driver (`src/herdr_routines/runner.py`
@@ -61,11 +62,28 @@ Hardcoded stages (mirrors spec §3, stages mirror
 | 5 | Code review | separate session (code-review skill) — **v1 single `opencode/big-pickle` primary** (measured 1/7, 5 high-sev uniques `pr4:106`); **v2 fan-out `hy3-free` + `x-preview-f-free` 2-tie** (`opencode-e2e:19`) | PR number | posted review | review posted (blocking allowed) |
 | 6 | Address comments | same agent as stages 3–4, prompted with review digest + `gh pr view --comments` (preserves code context; audit gap 8) | review findings | fixes + `gh api` thread-resolve + replies | gate 6: no unresolved blocking threads (or replies on every blocking finding per Gates) |
 
+> **Renumbered to 1–7 (issue 059).** The table above is the original six-stage design and
+> keeps its old numbers. Today's layout, in `STAGES`: **3** test author (writes only the
+> acceptance tests), **4** implement (old 3), **5** bookkeeping + PR (old 4, no agent),
+> **6** review (old 5), **7** address review (old 6, resumes stage 4's session). Stage
+> numbers appear in `state.json` (`current_stage`, `stage_sessions`, `stage_bases`), the
+> G-17 layout check, `pl-<N>-<run_id>` agent names, the `gate --stage` tokens and `ps`'s
+> `stage N/7`; they all moved together. Everything below that says "stage 3/4/5/6" in a
+> run log or an old gate row is the pre-059 numbering. Runs in flight across the change
+> are not resumable. Stage 5 does in code what the implementer prompt used to ask a model
+> to remember: commit leftover work, run `scripts/ci-check.sh` (the same commands CI runs)
+> with up to 2 fix rounds that resume stage 4's session, flip the issue to `status: done`
+> in a commit touching only that file, and check the PR's preconditions. Gate 3 (the
+> test author committed only under `tests/`) and gate 4 (no named test deleted or
+> renamed; edits are disclosed in the PR body) are git checks in `pipeline_run`.
+
 > **Current models live in `src/herdr_routines/pipeline_stages.py` (`STAGES`), not this
 > table** — the column above is the original design. As of 2026-10-01 (both
-> `muse-spark-1.2-contributor-free` and `x-preview-f-free` were withdrawn): stages 1–2
-> `opencode/muse-spark-1.3-contributor-free`, stages 3/6 `opencode/big-pickle`, stage 5
-> `opencode/nemotron-3-ultra-free` (a different family from the author). `pipeline-prepare`
+> `muse-spark-1.2-contributor-free` and `x-preview-f-free` were withdrawn): stages 1–3
+> `opencode/muse-spark-1.3-contributor-free` (the stage-3 test author falls back to the
+> OpenRouter nemotron model, never to stage 4's families), stages 4/7 `opencode/big-pickle`,
+> stage 6 `opencode/nemotron-3-ultra-free` (a different family from the implementer).
+> `MODEL_FAMILY` declares each model's family and a test checks the independence rules. `pipeline-prepare`
 > fails the night before claiming an issue if `opencode models` no longer lists one.
 > Each agent stage also has a `fallback_model` off Zen (authors `nvidia/moonshotai/kimi-k3`,
 > reviewer `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`): when a stage's session ends
@@ -84,20 +102,20 @@ skill is multi-agent (5 reviewers) — for v1 run as single worker session; full
 5-reviewer fan-out is v2 if needed (audit gap 13).
 
 **Issue close-on-merge (issue-lifecycle contract):** the picked issue's
-`status: done` flip is **carried inside the implementing PR** (stage 3 commits
-`open`/`in-progress` → `done` on `docs/process/issues/<file>`), so it lands on
+`status: done` flip is **carried inside the implementing PR** (stage 5, in code,
+commits `open` → `done` on `docs/process/issues/<file>`, touching only that file), so it lands on
 `main` atomically **exactly when the PR merges** — merging the PR *is* closing
 the issue. There is deliberately **no separate manual/post-merge flip step**:
 that gap is what left issue 025 `open` after PR #56 implemented it, so tonight's
 `pick-feature` would have re-picked an already-done feature. Because the flip is
 a commit in the PR, a human *closed-without-merge* leaves `main` untouched (issue
-stays `open`/`in-progress`) — correct. The implementer does the flip (stage 3),
-and the orchestrator enforces it via **Gate 4** (standalone, not buried in Gate 3:
+stays `open`/`in-progress`) — correct. Code does the flip (stage 5; since issue 059 no
+prompt mentions it), and refuses to push unless it is committed, and the run enforces it via **Gate 5** (standalone, not buried in Gate 3:
 the flip only becomes a real "close" once the PR is open, so that's where it's
 checked).
 
 **Spec leakage (G-13):** stage 1's `spec.md` commit(s) on `auto/pipeline-<run_id>`
-ride the PR opened in stage 4. Document as intentional — prefix spec commits
+ride the PR opened in stage 5. Document as intentional — prefix spec commits
 `spec:` so reviewers can trivially filter them. Stripping `spec.md` before PR is
 not needed for dogfood.
 
@@ -125,7 +143,7 @@ herdr worktree create --cwd <parent-clone> --base main --branch auto/pipeline-<r
 
 * Every worker attaches to that same path via `herdr tab create --workspace "$SHARED_WS" --cwd "$WT"` (new tab in the shared workspace, cwd pinned to the shared worktree — verified `herdr tab create` syntax `herdr tab:12`). **Do not** use `herdr worktree create --cwd <shared_worktree>` to "reuse" — that form is invalid per `herdr worktree:3` (expects `--cwd` of an existing repo to link *from* plus `--branch` for a *new* worktree; pointing it at an already-linked worktree errors or duplicates branch) — G-6. Fresh **sessions** give independence, not fresh worktrees.
 * Stage 1 must `git add docs/pipeline/runs/<run_id>/spec.md && git commit -m "spec: v1 for <feature>"` before settling — untracked files do not cross worktree boundaries (git shares object store, not untracked files). Stage 2 then sees the committed spec. **Per-run path, not repo root** — see G-15.
-* Stage 3 continues on the same branch (commits implementation + tests); stage 4 PRs that same branch. Artifacts: `docs/pipeline/runs/<run_id>/spec.md`, `state.json`, `$PIPELINE_REPORT` (all on the shared worktree; `$PIPELINE_REPORT` also mirrored to `~/.local/state/herdr-routines/reports/<run_id>.md` for the notification layer). Every worker prompt names input files explicitly — workers never rely on prior-session context, only on disk.
+* Stage 3 (the test author) commits the acceptance tests on the branch and stage 4 continues on it with the implementation; stage 5 PRs that same branch. Artifacts: `docs/pipeline/runs/<run_id>/spec.md`, `state.json`, `$PIPELINE_REPORT` (all on the shared worktree; `$PIPELINE_REPORT` also mirrored to `~/.local/state/herdr-routines/reports/<run_id>.md` for the notification layer). Every worker prompt names input files explicitly — workers never rely on prior-session context, only on disk.
 
 Same inversion as `docs/plan-v1.md:414` (`$ROUTINE_REPORT`): file is the only
 reliable extraction channel because agents render on the alternate screen and
@@ -185,7 +203,7 @@ fresh worktree does not show another worktree's untracked files.
   `$PIPELINE_REPORT` written at end regardless of outcome (stage-by-stage
   status, artifacts, where it stopped and why) — same pattern as
   `$ROUTINE_REPORT` in `docs/plan-v1.md:386`. **Resume recipe:** on relaunch
-  read `state.json` → `herdr agent list | jq -r '.result.agents[] | select(.name | startswith("pl-")) | "\(.name) \(.agent_status)"'` (not `rg "pl-"` on JSON — G-9) to reconcile live `pl-<stage>-<run_id>` agents. Derive orphan stage from agent name suffix when `state.json:current_stage` lags spawn (crash between `herdr agent prompt` and state write). Adopt still-`working` worker if stage matches, otherwise `herdr pane close <pane_id>` (pane_close, not settled-agent reap — reaping `working` requires `pane_close` per `src/herdr_routines/herdr.py:34`). Atomic write prevents corrupt resume on crash mid-write. **Pane-lifecycle v2 (G-16):** a closed-but-resumable worker ("not found live, but its session ID is in `state.json`/history — reopen by `-s <session_id>` if this stage still needs it") is now a normal, expected case (per-stage close), not only a crash-recovery edge case; resume captures `agent_session.value` for `pl-3` so stage 6 can `herdr agent start pl-6-… -s <session_id>`.
+  read `state.json` → `herdr agent list | jq -r '.result.agents[] | select(.name | startswith("pl-")) | "\(.name) \(.agent_status)"'` (not `rg "pl-"` on JSON — G-9) to reconcile live `pl-<stage>-<run_id>` agents. Derive orphan stage from agent name suffix when `state.json:current_stage` lags spawn (crash between `herdr agent prompt` and state write). Adopt still-`working` worker if stage matches, otherwise `herdr pane close <pane_id>` (pane_close, not settled-agent reap — reaping `working` requires `pane_close` per `src/herdr_routines/herdr.py:34`). Atomic write prevents corrupt resume on crash mid-write. **Pane-lifecycle v2 (G-16):** a closed-but-resumable worker ("not found live, but its session ID is in `state.json`/history — reopen by `-s <session_id>` if this stage still needs it") is now a normal, expected case (per-stage close), not only a crash-recovery edge case; resume captures `agent_session.value` for `pl-4` so stage 7 can `herdr agent start pl-7-… -s <session_id>`.
 - **Pipeline deadline (audit gap 5 + G-7):** hard wall-clock budget **launch + 7 h**
   (pinned default, written to `state.json:deadline_epoch` at orchestrator start;
   tune via open question 4). Orchestrator checks `date +%s` vs `deadline_epoch`
@@ -205,7 +223,7 @@ fresh worktree does not show another worktree's untracked files.
   `auto/pipeline-<run_id>`, **close each worker's tab/pane** (`herdr tab close` /
   `herdr pane` close) — **do not** `herdr workspace close` the shared workspace
   nor `herdr worktree remove` the shared worktree (that would destroy the branch
-  to keep). **Per-stage pane close on gate-pass (not only end-of-run) (G-16):** close a worker's pane as soon as its stage's gate has passed and the handoff (commit + `state.json` update) is confirmed on disk — close this worker's pane once its gate passes — for every worker except whichever one a later stage reuses for context. For the reused worker (`pl-3`, reused by stage 6 per G-11), close its pane too after stage 4, but when stage 6 needs it, reopen by resuming its session: `herdr agent start pl-6-<run_id> --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` — where `<session_id>` is `agent_session.value` already captured in `state.json`/history for that worker — instead of keeping the pane open idle from stage 3 through stage 6. This close-then-resume-by-session-id mechanism was empirically verified 2026-08-25 (`-s <session_id>` true resume, `agent_session.value` matched exact session; proposal open question 1 settled). At most 2 opencode processes resident at any point (orchestrator + active stage) instead of one per stage. Open questions 2 (grace window before closing) and 3 (cross-model `-s` interaction) remain open — immediate close is the default; a short grace window is still permissible if scrollback reliance is later found, and cross-model `-s` is out of scope for current `pl-3`/`pl-6` same-model reuse. Order: (1) mirror report + ensure `auto/pipeline-<run_id>` has all
+  to keep). **Per-stage pane close on gate-pass (not only end-of-run) (G-16):** close a worker's pane as soon as its stage's gate has passed and the handoff (commit + `state.json` update) is confirmed on disk — close this worker's pane once its gate passes — for every worker except whichever one a later stage reuses for context. For the reused worker (`pl-4`, reused by stage 7 per G-11), close its pane too after stage 5, but when stage 7 needs it, reopen by resuming its session: `herdr agent start pl-7-<run_id> --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` — where `<session_id>` is `agent_session.value` already captured in `state.json`/history for that worker — instead of keeping the pane open idle from stage 4 through stage 7. This close-then-resume-by-session-id mechanism was empirically verified 2026-08-25 (`-s <session_id>` true resume, `agent_session.value` matched exact session; proposal open question 1 settled). At most 2 opencode processes resident at any point (orchestrator + active stage) instead of one per stage. Open questions 2 (grace window before closing) and 3 (cross-model `-s` interaction) remain open — immediate close is the default; a short grace window is still permissible if scrollback reliance is later found, and cross-model `-s` is out of scope for current `pl-4`/`pl-7` same-model reuse. Order: (1) mirror report + ensure `auto/pipeline-<run_id>` has all
   commits, (2) close worker tabs/panes (per-stage as gates pass, plus final sweep for any still-open), (3) leave shared worktree+branch for
   manual GC per `roadmap:77-79`. Leaked live `pl-*` agents were the central
   incident of reaping §1. Future `herdr-routines gc` must exclude `auto/pipeline-*`
@@ -234,7 +252,7 @@ Mechanically solved — same `herdr` CLI calls `src/herdr_routines/herdr.py` +
 
 Each worker gets a unique agent name `pl-<stage>-<run_id>` (Herdr cap
 `[a-z][a-z0-9_-]{0,31}`, unique among live agents — `docs/plan-v1.md:71`),
-**except stage 6 which reuses the stage-3 session via close-then-resume-by-session-id (G-16)** via `herdr agent start pl-6-<run_id> --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` where `<session_id>` is `pl-3`'s `agent_session.value` (`-s <session_id>` empirically verified 2026-08-25, true resume not fork; `agent_session.value` on resumed agent matched original). This preserves code context per G-11 without keeping the `pl-3` pane open idle from stage 3 through stage 6 — close a worker's pane as soon as its stage's gate passes (G-16), and reopen the one needed later by `-s <session_id>` against a fresh pane. Alternative fresh `pl-6-<run_id>` seeded with `git diff main...HEAD` + `gh pr view --comments` remains the fallback if context burn or cross-model `-s` becomes an issue (open question 3).
+**except stage 7 which reuses the stage-4 session via close-then-resume-by-session-id (G-16)** via `herdr agent start pl-7-<run_id> --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` where `<session_id>` is `pl-4`'s `agent_session.value` (`-s <session_id>` empirically verified 2026-08-25, true resume not fork; `agent_session.value` on resumed agent matched original). This preserves code context per G-11 without keeping the `pl-4` pane open idle from stage 4 through stage 7 — close a worker's pane as soon as its stage's gate passes (G-16), and reopen the one needed later by `-s <session_id>` against a fresh pane. Alternative fresh `pl-7-<run_id>` seeded with `git diff main...HEAD` + `gh pr view --comments` remains the fallback if context burn or cross-model `-s` becomes an issue (open question 3).
 
 ## Gates in v1 (orchestrator-supervised, machine-checkable forms — audit gap 2)
 
@@ -333,7 +351,7 @@ a specific feature instead, append it to the prompt text before `cat`, e.g.
 gate this doesn't change.
 
 **Blast radius (audit gap 10):** worktree isolation shares the object store and
-can push (`roadmap:58-61`); stage 4 requires push; dogfood target is
+can push (`roadmap:58-61`); stage 5 requires push; dogfood target is
 `herdr-routines` itself — the repo containing the scheduler. This is
 consistent with the single-user threat model but must be stated: keep the first
 feature trivial (build-order step 3) to bound blast radius while the orchestrator

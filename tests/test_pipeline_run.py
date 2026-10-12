@@ -22,6 +22,7 @@ PR view). Neither can be exercised for real from a test, and both have a seam al
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -32,22 +33,33 @@ from typing import Any
 
 import pytest
 
-from herdr_routines import tick
+from herdr_routines import pipeline_run, tick
 from herdr_routines.auto_fix import GhClient
-from herdr_routines.gates import gate3_test_names
+from herdr_routines.gates import GATE_STAGE_CHOICES, PR_GATE_STAGES, gate3_test_names
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.pipeline_run import (
+    CI_FIX_PROMPT,
     FALLBACK_CONTINUE_PROMPT,
     RunOutcome,
     _pr_body,
     _session_api_error,
     run_pipeline,
 )
-from herdr_routines.pipeline_stages import AUTHOR_FALLBACK_MODEL, STAGES
+from herdr_routines.pipeline_stages import (
+    AUTHOR_FALLBACK_MODEL,
+    IMPLEMENT_STAGE,
+    PR_STAGE,
+    REVIEWER_FALLBACK_MODEL,
+    STAGES,
+    TEST_AUTHOR_STAGE,
+    model_family,
+    stage_families,
+)
 from herdr_routines.pipeline_watchdog import (
     heartbeat_log_path,
     validate_stage_sessions,
 )
+from herdr_routines.ps import TOTAL_PIPELINE_STAGES
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -56,10 +68,11 @@ BRANCH = f"auto/pipeline-{RUN_ID}"
 SESSION_IDS = {
     1: "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     2: "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    3: "ses_cccccccccccccccccccccccccccc",
-    5: "ses_dddddddddddddddddddddddddddd",
+    3: "ses_eeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    4: "ses_cccccccccccccccccccccccccccc",
+    6: "ses_dddddddddddddddddddddddddddd",
 }
-REUSED_SESSION_ID = SESSION_IDS[3]
+REUSED_SESSION_ID = SESSION_IDS[4]
 
 SPEC_BODY = """# spec v2 — do the thing
 
@@ -100,6 +113,15 @@ TEST_NAMES = ("test_the_thing_works", "test_the_second_thing_works")
 # ---------------------------------------------------------------------------
 # Fixtures / fakes
 # ---------------------------------------------------------------------------
+
+CI_STUB = """#!/usr/bin/env bash
+cd "$(dirname "$0")/.."
+if compgen -G ".ci-red-*" > /dev/null; then
+  echo "src/thing.py:1: error: ci is red ($(ls .ci-red-* | head -1))"
+  exit 1
+fi
+echo "all green"
+"""
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -147,11 +169,35 @@ def _git_runner(argv: list[str], *, timeout_s: float | None) -> tuple[int, str, 
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _test_file(names: tuple[str, ...], *, body: str = "pass") -> str:
+    return "\n".join(f"def {name}() -> None:\n    {body}\n" for name in names)
+
+
+def _write(worktree: Path, files: dict[str, str]) -> None:
+    for rel, content in files.items():
+        path = worktree / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+
+def _write_and_commit(worktree: Path, files: dict[str, str], message: str) -> None:
+    _write(worktree, files)
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-m", message)
+
+
 class FakeHerdr:
     """A HerdrClient-shaped fake for the stage loop.
 
-    `session_ids` is keyed by stage number; stage 6 reuses stage 3's, which the
-    caller expresses by mapping 6 to the same value. `screens` scripts the visible
+    `session_ids` is keyed by stage number; stage 7 reuses stage 4's, which the
+    caller expresses by mapping 7 to the same value.
+
+    A stage's agent does real work in the worktree it was started in (the `cwd` the stage
+    loop passed to `tab_create`), through `work` — by default the test author commits
+    the named tests and the implementer commits `src/thing.py` (and, on a CI fix prompt,
+    removes one `.ci-red-*` marker and commits a fix) — so the sweep, the diffs and the
+    CI check all run against real git. `hooks[stage] = fn(worktree, prompt)` replaces a
+    stage's default work. `screens` scripts the visible
     screen per stage: a list is fed to `on_poll` one entry per poll and then repeats
     its last entry, so the two-consecutive-poll stability gate is exercised for real.
     `settles` scripts the settled status per stage, one entry per prompt to that stage
@@ -180,12 +226,18 @@ class FakeHerdr:
         self._next_pane = 0
         self._resumed: dict[str, str] = {}
         self._prompted: set[str] = set()
+        self._pane_cwd: dict[str, str] = {}
+        self._agent_cwd: dict[str, str] = {}
+        self.hooks: dict[int, Callable[[Path, str], None]] = {}
+        self.fix_rounds = 0
 
     # -- panes -----------------------------------------------------------------
 
     def tab_create(self, *, cwd: str, label: str | None = None) -> str:
         self._next_pane += 1
-        return f"w1:p{self._next_pane}"
+        pane = f"w1:p{self._next_pane}"
+        self._pane_cwd[pane] = cwd
+        return pane
 
     # -- agents ----------------------------------------------------------------
 
@@ -208,6 +260,7 @@ class FakeHerdr:
                 "session_id": session_id,
             }
         )
+        self._agent_cwd[name] = self._pane_cwd[pane_id]
         if session_id is not None:
             # A resumed agent reports the session it resumed: verified against live herdr
             # 2026-08-25, `-s <session_id>` resumes rather than forks and
@@ -241,6 +294,7 @@ class FakeHerdr:
         self.prompts.append((target, text))
         self._prompted.add(target)
         stage = int(target.split("-")[1])
+        self.work(stage, text, Path(self._agent_cwd[target]))
         screens = self.screens.get(stage, [""])
         for index in range(self.polls_per_stage):
             screen = screens[min(index, len(screens) - 1)]
@@ -257,6 +311,29 @@ class FakeHerdr:
         if self.settles.get(stage):
             return self.settles[stage].pop(0)
         return self.settle_status
+
+    def work(self, stage: int, text: str, worktree: Path) -> None:
+        if stage in self.hooks:
+            self.hooks[stage](worktree, text)
+        elif stage == 3:
+            _write_and_commit(
+                worktree,
+                {"tests/test_thing.py": _test_file(TEST_NAMES)},
+                "test: the acceptance tests",
+            )
+        elif stage == 4 and text.startswith(CI_FIX_PROMPT):
+            self.fix_rounds += 1
+            for marker in sorted(worktree.glob(".ci-red-*"))[:1]:
+                marker.unlink()
+            _write_and_commit(
+                worktree,
+                {f"src/fix_{self.fix_rounds}.py": "FIXED = True\n"},
+                f"fix: ci round {self.fix_rounds}",
+            )
+        elif stage == 4 and text != FALLBACK_CONTINUE_PROMPT:
+            _write_and_commit(
+                worktree, {"src/thing.py": "THING = 1\n"}, "feat: the thing"
+            )
 
     def pane_close(self, pane_id: str) -> None:
         self.closed_panes.append(pane_id)
@@ -345,7 +422,7 @@ class FakeGh:
 class PipelineFixture:
     """A prepared run: real bare origin, real branch, real committed spec + issue."""
 
-    def __init__(self, tmp_path: Path, *, issue_status: str = "done") -> None:
+    def __init__(self, tmp_path: Path, *, issue_status: str = "open") -> None:
         self.tmp_path = tmp_path
         self.origin = tmp_path / "origin.git"
         _init_bare_git_repo(self.origin)
@@ -364,10 +441,12 @@ class PipelineFixture:
         spec_path = self.worktree / "docs" / "pipeline" / "runs" / RUN_ID / "spec.md"
         spec_path.parent.mkdir(parents=True)
         spec_path.write_text(SPEC_BODY)
-        (self.worktree / "tests").mkdir()
-        (self.worktree / "tests" / "test_thing.py").write_text(
-            "\n".join(f"def {name}() -> None:\n    pass\n" for name in TEST_NAMES)
-        )
+        # What the repo already has: state.json and the red markers are never swept into
+        # a commit, and `scripts/ci-check.sh` is the repo's CI entry point. The stub is
+        # red while any `.ci-red-*` marker exists, which a fix round removes.
+        (self.worktree / ".gitignore").write_text("state.json\n.ci-red-*\n")
+        self.ci_script = self.worktree / "scripts" / "ci-check.sh"
+        self.write_ci_script(CI_STUB)
         self.issue_rel = "docs/process/issues/056-orchestrator-stage-loop-in-code.md"
         issue_path = self.worktree / self.issue_rel
         issue_path.parent.mkdir(parents=True, exist_ok=True)
@@ -383,6 +462,20 @@ class PipelineFixture:
         self.heartbeat_dir.mkdir()
         self.prompts_dir = REPO_ROOT / "docs" / "pipeline" / "stages"
         self.write_state()
+
+    def write_ci_script(self, body: str) -> None:
+        self.ci_script.parent.mkdir(parents=True, exist_ok=True)
+        self.ci_script.write_text(body)
+        self.ci_script.chmod(0o755)
+
+    def commit_all(self, message: str) -> None:
+        _git(self.worktree, "add", "-A")
+        _git(self.worktree, "commit", "-m", message)
+
+    def red(self, rounds: int) -> None:
+        """Make the CI check fail until `rounds` fix rounds have run."""
+        for n in range(rounds):
+            (self.worktree / f".ci-red-{n}").write_text("red\n")
 
     def write_state(self) -> None:
         self.state_json.write_text(
@@ -466,9 +559,9 @@ def test_pipeline_run_records_real_stage_sessions(prepared: PipelineFixture) -> 
     sessions = prepared.state()["stage_sessions"]
     # Every id is the one the started agent really reported, not a value any model
     # supplied: the fake only answers `agent_session_id` for a name it was started under.
-    assert {int(k) for k in sessions} == {1, 2, 3, 5, 6}
+    assert {int(k) for k in sessions} == {1, 2, 3, 4, 6, 7}
     for stage, session_id in sessions.items():
-        if int(stage) == 6:
+        if int(stage) == 7:
             assert session_id == REUSED_SESSION_ID  # G-16 declared reuse
         else:
             assert session_id == SESSION_IDS[int(stage)]
@@ -478,7 +571,7 @@ def test_pipeline_run_records_real_stage_sessions(prepared: PipelineFixture) -> 
     # not be read must abort rather than record a guess.
     orphan = FakeHerdr(SESSION_IDS)
     orphan.session_ids = {}
-    # Its own starting state: the run above left `current_stage` at 6, and a loop that
+    # Its own starting state: the run above left `current_stage` at 7, and a loop that
     # correctly skips finished stages would otherwise have nothing left to do here.
     prepared.write_state()
     result = run_pipeline(
@@ -512,6 +605,13 @@ class SpecWritingHerdr(FakeHerdr):
         if int(target.split("-")[1]) == 1:
             self.spec_path.parent.mkdir(parents=True, exist_ok=True)
             self.spec_path.write_text(SPEC_BODY)
+            wt = Path(self._agent_cwd[target])
+            _git(wt, "add", "-A")
+            subprocess.run(
+                ["git", "-C", str(wt), "commit", "-m", "spec: v1"],
+                capture_output=True,
+                check=False,
+            )
         return super().agent_prompt_wait_with_watchdog(target=target, **kwargs)
 
 
@@ -570,7 +670,7 @@ def test_pipeline_run_retries_a_stage_prompt_rejected_while_the_agent_starts(
     assert client.stalled[0] == f"pl-1-{RUN_ID}".lower()
     # One delivered prompt per agent stage, despite each one's first attempt stalling.
     delivered = [target for target, _text in client.prompts]
-    assert len(delivered) == len(set(delivered)) == 5
+    assert len(delivered) == len(set(delivered)) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -581,41 +681,42 @@ def test_pipeline_run_retries_a_stage_prompt_rejected_while_the_agent_starts(
 def test_pipeline_run_aborts_on_gate_failure(prepared: PipelineFixture) -> None:
     client = _client()
     gh = FakeGh()
-    gh.head_ref = "auto/pipeline-some-other-run"  # gate 4's right-head check fails
+    gh.head_ref = "auto/pipeline-some-other-run"  # gate 5's right-head check fails
 
     outcome, client, _gh = _run(prepared, client=client, gh=gh)
 
     assert outcome.outcome == "failed"
-    assert outcome.reason == "gate_4_failed"
-    # Stages 5 and 6 never started — the abort happened at stage 4's gate.
+    assert outcome.reason == "gate_5_failed"
+    # Stages 6 and 7 never started — the abort happened at stage 5's gate.
     started = [call["name"] for call in client.started]
-    assert started == [f"pl-{n}-{RUN_ID}".lower() for n in (1, 2, 3)]
+    assert started == [f"pl-{n}-{RUN_ID}".lower() for n in (1, 2, 3, 4)]
     # The report names the gate that failed and why, near the top where tick greps it.
     report_text = prepared.report.read_text()
     assert "## Outcome: failed" in report_text
-    assert "gate 4" in report_text
+    assert "gate 5" in report_text
     assert "auto/pipeline-some-other-run" in report_text
     assert client.notifications  # the human is told, not just the report
 
 
-def test_pipeline_does_not_push_or_open_a_pr_when_the_issue_is_not_done(
+def test_pipeline_does_not_push_or_open_a_pr_when_the_issue_cannot_be_flipped(
     tmp_path: Path,
 ) -> None:
-    """PR #159: stage 3 never flipped the issue, stage 4 opened the PR anyway, and only
-    gate 4 — after the PR existed — noticed its "Closes" line was false."""
-    prepared = PipelineFixture(tmp_path, issue_status="open")
+    """PR #159: the issue was never flipped and the PR opened anyway; only gate 5, after
+    the PR existed, noticed its "Closes" line was false. The flip is code now, and an
+    issue it cannot flip (no `status: open` to rewrite) stops the run before any push."""
+    prepared = PipelineFixture(tmp_path, issue_status="blocked")
 
     outcome, client, gh = _run(prepared)
 
     assert outcome.outcome == "failed"
-    assert outcome.reason == "issue_not_done"
+    assert outcome.reason == "issue_flip_failed"
     assert gh.created == []
     assert not _git(
         prepared.worktree, "ls-remote", "--heads", "origin", BRANCH
     ).stdout.strip()
-    assert "status: done" in prepared.report.read_text()
+    assert "status: open" in prepared.report.read_text()
     started = [call["name"] for call in client.started]
-    assert started == [f"pl-{n}-{RUN_ID}".lower() for n in (1, 2, 3)]
+    assert started == [f"pl-{n}-{RUN_ID}".lower() for n in (1, 2, 3, 4)]
 
 
 def test_pr_body_reads_a_capitalised_problem_heading() -> None:
@@ -639,7 +740,7 @@ def test_pipeline_run_turns_a_gh_error_in_a_gate_into_a_failed_report(
     outcome, _, _ = _run(prepared, gh=gh)
 
     assert outcome.outcome == "failed"
-    assert outcome.reason == "gate_5_failed"
+    assert outcome.reason == "gate_6_failed"
     report_text = prepared.report.read_text()
     assert "## Outcome: failed" in report_text
     assert "HTTP 401" in report_text
@@ -660,9 +761,13 @@ def test_pipeline_run_writes_heartbeat(prepared: PipelineFixture) -> None:
     assert heartbeat.exists()
     lines = [line for line in heartbeat.read_text().splitlines() if line.strip()]
     # One line per poll of every stage, at the path `pipeline_watchdog.is_stalled`
-    # reads — five agent stages x 4 polls, written by code, not by a model.
-    assert len(lines) == used_client.polls == 5 * 4
+    # reads — six agent stages x 4 polls, written by code, not by a model.
     assert all("stage" in line for line in lines)
+    stage_lines = [line for line in lines if "stage=5" not in line]
+    assert len(stage_lines) == used_client.polls == 6 * 4
+    # Stage 5 has no agent to poll, but its CI check beats too (see
+    # `test_pipeline_ci_check_keeps_the_heartbeat_alive`).
+    assert any("stage=5" in line for line in lines)
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +892,7 @@ def _export(*, error: dict[str, Any] | None) -> str:
         last_info["error"] = error
     return json.dumps(
         {
-            "info": {"id": SESSION_IDS[3], "title": "New session"},
+            "info": {"id": SESSION_IDS[4], "title": "New session"},
             "messages": [
                 {
                     "info": {"role": "assistant", "modelID": "big-pickle"},
@@ -833,23 +938,24 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_provider_err
     """Run 20261010T050000Z: Zen 400'd stage 3 mid-implementation, herdr settled the
     pane `blocked`, and the night ended `stage_blocked`. A provider error is now one
     resume of the same session on the stage's fallback model, not the end of the run."""
-    export = ErrorsOnce(SESSION_IDS[3])
-    client = _client(settles={3: ["blocked", "idle"]})
+    export = ErrorsOnce(SESSION_IDS[4])
+    client = _client(settles={4: ["blocked", "idle"]})
 
     outcome, client, _gh = _run(prepared, client=client, session_export=export)
 
     assert outcome.outcome == "ok", outcome
-    stage3 = [c for c in client.started if c["name"] == f"pl-3-{RUN_ID}".lower()]
+    stage3 = [c for c in client.started if c["name"] == f"pl-4-{RUN_ID}".lower()]
     assert [(c["model"], c["session_id"]) for c in stage3] == [
         ("opencode/big-pickle", None),
-        (AUTHOR_FALLBACK_MODEL, SESSION_IDS[3]),
+        (AUTHOR_FALLBACK_MODEL, SESSION_IDS[4]),
     ]
     # The resume is told why the model changed, not re-sent the whole stage prompt.
-    stage3_prompts = [t for n, t in client.prompts if n == f"pl-3-{RUN_ID}".lower()]
+    stage3_prompts = [t for n, t in client.prompts if n == f"pl-4-{RUN_ID}".lower()]
     assert stage3_prompts[1] == FALLBACK_CONTINUE_PROMPT
-    # One session for stage 3 either way, so stage 6 still resumes the work it did.
-    assert prepared.state()["stage_sessions"]["3"] == SESSION_IDS[3]
-    assert prepared.state()["stage_sessions"]["6"] == SESSION_IDS[3]
+    # One session for the implement stage either way, so stage 7 still resumes the work
+    # it did.
+    assert prepared.state()["stage_sessions"]["4"] == SESSION_IDS[4]
+    assert prepared.state()["stage_sessions"]["7"] == SESSION_IDS[4]
     report_text = prepared.report.read_text()
     assert "## Outcome: ok" in report_text
     assert f"resumed its session on {AUTHOR_FALLBACK_MODEL}" in report_text
@@ -861,7 +967,7 @@ def test_pipeline_run_does_not_fall_back_on_a_blocked_stage_without_a_provider_e
 ) -> None:
     """`blocked` is also a real permission prompt, which another model would hit just
     the same. Only an `APIError` in the session record earns the fallback."""
-    client = _client(settles={3: ["blocked"]})
+    client = _client(settles={4: ["blocked"]})
 
     outcome, client, _gh = _run(
         prepared, client=client, session_export=lambda _id: _export(error=None)
@@ -869,7 +975,7 @@ def test_pipeline_run_does_not_fall_back_on_a_blocked_stage_without_a_provider_e
 
     assert outcome.outcome == "failed"
     assert outcome.reason == "stage_blocked"
-    assert [c["model"] for c in client.started if c["name"].startswith("pl-3-")] == [
+    assert [c["model"] for c in client.started if c["name"].startswith("pl-4-")] == [
         "opencode/big-pickle"
     ]
     assert client.closed_panes
@@ -881,12 +987,12 @@ def test_pipeline_run_falls_back_when_a_provider_error_settles_idle(
     """Nothing guarantees a provider error settles `blocked`. An `idle` settle on a
     half-done stage 3 would pass gate 3, which only checks the tests exist — so the
     session is read on every settle, not only a failed one."""
-    outcome, client, _gh = _run(prepared, session_export=ErrorsOnce(SESSION_IDS[3]))
+    outcome, client, _gh = _run(prepared, session_export=ErrorsOnce(SESSION_IDS[4]))
 
     assert outcome.outcome == "ok", outcome
     resumed = [c for c in client.started if c["model"] == AUTHOR_FALLBACK_MODEL]
     assert [(c["name"], c["session_id"]) for c in resumed] == [
-        (f"pl-3-{RUN_ID}".lower(), SESSION_IDS[3])
+        (f"pl-4-{RUN_ID}".lower(), SESSION_IDS[4])
     ]
     assert "resumed its session on" in prepared.report.read_text()
 
@@ -916,15 +1022,15 @@ def test_pipeline_run_reports_the_fallback_when_it_also_fails(
 ) -> None:
     """One fallback, never a chain: a stage that fails on its fallback too ends the run,
     and the report says the fallback was tried."""
-    client = _client(settles={3: ["blocked", "blocked"]})
+    client = _client(settles={4: ["blocked", "blocked"]})
 
     outcome, client, _gh = _run(
-        prepared, client=client, session_export=ErrorsOnce(SESSION_IDS[3])
+        prepared, client=client, session_export=ErrorsOnce(SESSION_IDS[4])
     )
 
     assert outcome.outcome == "failed"
     assert outcome.reason == "stage_blocked"
-    assert len([c for c in client.started if c["name"].startswith("pl-3-")]) == 2
+    assert len([c for c in client.started if c["name"].startswith("pl-4-")]) == 2
     report_text = prepared.report.read_text()
     assert f"resumed its session on {AUTHOR_FALLBACK_MODEL}" in report_text
 
@@ -955,23 +1061,36 @@ def test_stage_fallbacks_stay_off_zen_and_keep_the_review_independent() -> None:
     # A fallback on the same provider as its primary would share its bad night.
     assert all(not s.fallback_model.startswith("opencode/") for s in agent_stages)  # type: ignore[union-attr]
     # Whichever model writes the code, the reviewer's family is a different one.
-    author_models = {by_stage[3].model, by_stage[3].fallback_model}
-    reviewer_models = {by_stage[5].model, by_stage[5].fallback_model}
-    assert all("nemotron" in m for m in reviewer_models)  # type: ignore[operator]
-    assert not any("nemotron" in m for m in author_models)  # type: ignore[operator]
+    assert not stage_families(by_stage[6]) & stage_families(by_stage[4])
+    assert stage_families(by_stage[6]) == {"nvidia"}
+
+
+def test_test_author_model_is_independent_of_implementer() -> None:
+    """The test author is not the model its tests are meant to check: primary and
+    fallback of stage 3 are in different families from primary and fallback of stage 4.
+    Compared by declared family, not by substring of the model id, and a model with no
+    declared family is an error rather than a silent pass."""
+    by_stage = {s.stage: s for s in STAGES}
+    author, implementer = by_stage[TEST_AUTHOR_STAGE], by_stage[IMPLEMENT_STAGE]
+
+    assert author.model and author.fallback_model
+    assert implementer.model and implementer.fallback_model
+    assert not stage_families(author) & stage_families(implementer)
+    with pytest.raises(ValueError, match="no model family"):
+        model_family("opencode/some-model-nobody-declared")
 
 
 # ---------------------------------------------------------------------------
-# 6. stage 4 opens the PR with no agent at all
+# 6. stage 5 opens the PR with no agent at all
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_stage4_opens_pr_without_agent(prepared: PipelineFixture) -> None:
+def test_pipeline_stage5_opens_pr_without_agent(prepared: PipelineFixture) -> None:
     outcome, client, gh = _run(prepared)
 
     assert outcome.outcome == "ok"
-    # No pl-4 agent exists at any point — this stage is git + gh and nothing else.
-    assert not [call for call in client.started if call["name"].startswith("pl-4")]
+    # No pl-5 agent exists at any point — this stage is git + gh and nothing else.
+    assert not [call for call in client.started if call["name"].startswith("pl-5")]
     assert len(gh.created) == 1
     created = gh.created[0]
     assert created["branch"] == BRANCH
@@ -983,9 +1102,9 @@ def test_pipeline_stage4_opens_pr_without_agent(prepared: PipelineFixture) -> No
     assert f"Closes issue 056 (`{prepared.issue_rel}`)" in created["body"]
     # Issue ids are file numbers; `#056` would link an unrelated GitHub issue or PR.
     assert "#056" not in created["body"]
-    # pr_number is written to state.json *before* gate 4 runs, so the gate can read it.
+    # pr_number is written to state.json *before* gate 5 runs, so the gate can read it.
     assert prepared.state()["pr_number"] == gh.pr_number
-    # Gate 4's two conditions both held: the right head branch, and the issue file
+    # Gate 5's two conditions both held: the right head branch, and the issue file
     # committed as `status: done` on the branch.
     assert gh.head_ref == BRANCH
     assert _git(prepared.worktree, "show", f"HEAD:{prepared.issue_rel}").stdout.count(
@@ -1028,14 +1147,14 @@ def test_pipeline_run_stage_sessions_satisfy_declared_layout(
     state = prepared.state()
     sessions = {int(k): v for k, v in state["stage_sessions"].items()}
 
-    # Every stage 1..6 is covered by the run; stage 4 starts no agent so it records
-    # nothing, and stage 6's declared reuse (G-16) records stage 3's id verbatim.
-    assert set(sessions) == {1, 2, 3, 5, 6}
-    assert sessions[6] == sessions[3] == REUSED_SESSION_ID
-    # The four independent stages are distinct real ids; the reused one does not count
+    # Every stage 1..7 is covered by the run; stage 5 starts no agent so it records
+    # nothing, and stage 7's declared reuse (G-16) records stage 4's id verbatim.
+    assert set(sessions) == {1, 2, 3, 4, 6, 7}
+    assert sessions[7] == sessions[4] == REUSED_SESSION_ID
+    # The five independent stages are distinct real ids; the reused one does not count
     # toward the distinct total, which is what `validate_stage_sessions` enforces.
-    independent = [sessions[stage] for stage in (1, 2, 3, 5)]
-    assert len(set(independent)) == 4
+    independent = [sessions[stage] for stage in (1, 2, 3, 4, 6)]
+    assert len(set(independent)) == 5
     assert all(re.match(r"^ses_[A-Za-z0-9]{20,}$", v) for v in sessions.values())
     # current_stage reached the end of the workflow.
     assert state["current_stage"] == len(STAGES)
@@ -1051,14 +1170,33 @@ def test_pipeline_run_stage_sessions_satisfy_declared_layout(
 def test_stages_table_matches_the_prompt_files_on_disk() -> None:
     prompts_dir = REPO_ROOT / "docs" / "pipeline" / "stages"
 
-    assert [s.stage for s in STAGES] == [1, 2, 3, 4, 5, 6]
+    assert [s.stage for s in STAGES] == [1, 2, 3, 4, 5, 6, 7]
     for spec in STAGES:
         if spec.model is None:
             assert spec.prompt_file is None
             assert spec.isolation == "none"
             continue
         assert spec.prompt_file is not None
-        assert (prompts_dir / spec.prompt_file).is_file(), spec.prompt_file
+        prompt = prompts_dir / spec.prompt_file
+        assert prompt.is_file(), spec.prompt_file
+        # The file is named for its stage and says so in its heading.
+        assert spec.prompt_file == f"stage-{spec.stage}.md"
+        assert prompt.read_text().startswith(f"# Stage {spec.stage} — ")
+    # No prompt file on disk that the table does not name.
+    assert {p.name for p in prompts_dir.glob("stage-*.md")} == {
+        s.prompt_file for s in STAGES if s.prompt_file
+    }
+    # The stages the loop treats by role are the ones the table says they are.
+    by_stage = {s.stage: s for s in STAGES}
+    assert by_stage[TEST_AUTHOR_STAGE].prompt_file == "stage-3.md"
+    assert by_stage[IMPLEMENT_STAGE].reuses_stage is None
+    assert by_stage[PR_STAGE].model is None
+    assert by_stage[7].reuses_stage == IMPLEMENT_STAGE
+    # Everything else that carries a stage number follows the table: `ps`'s denominator
+    # and the CLI-visible gate tokens (every stage with a gate token, plus `ci`).
+    assert TOTAL_PIPELINE_STAGES == len(STAGES)
+    assert set(GATE_STAGE_CHOICES) <= {str(s.stage) for s in STAGES} | {"ci"}
+    assert PR_GATE_STAGES <= set(GATE_STAGE_CHOICES)
 
 
 def test_stages_declare_the_documented_models_and_timeouts() -> None:
@@ -1066,16 +1204,19 @@ def test_stages_declare_the_documented_models_and_timeouts() -> None:
 
     assert by_stage[1].model == "opencode/muse-spark-1.3-contributor-free"
     assert by_stage[2].model == "opencode/muse-spark-1.3-contributor-free"
-    assert by_stage[3].model == "opencode/big-pickle"
-    assert by_stage[4].model is None
-    assert by_stage[5].model == "opencode/nemotron-3-ultra-free"
-    # The reviewer is never the author's model (independent review).
-    assert by_stage[5].model != by_stage[3].model
-    assert by_stage[6].reuses_stage == 3
+    assert by_stage[3].model == "opencode/muse-spark-1.3-contributor-free"
+    assert by_stage[3].fallback_model == REVIEWER_FALLBACK_MODEL
+    assert by_stage[4].model == "opencode/big-pickle"
+    assert by_stage[5].model is None
+    assert by_stage[6].model == "opencode/nemotron-3-ultra-free"
+    # The reviewer is never the implementer's model (independent review).
+    assert by_stage[6].model != by_stage[4].model
+    assert by_stage[7].reuses_stage == 4
     assert all(s.start_timeout_ms == 120_000 for s in STAGES)
     assert by_stage[1].timeout_ms == by_stage[2].timeout_ms == 3_600_000
-    assert by_stage[3].timeout_ms == 5_400_000
-    assert by_stage[5].timeout_ms == 3_600_000
+    assert by_stage[3].timeout_ms == 3_600_000
+    assert by_stage[4].timeout_ms == 5_400_000
+    assert by_stage[6].timeout_ms == 3_600_000
 
 
 def test_prompt_substitution_uses_only_state_json_values(
@@ -1090,19 +1231,14 @@ def test_prompt_substitution_uses_only_state_json_values(
     assert "$WT" not in stage1
     assert RUN_ID in stage1
     assert str(prepared.worktree) in stage1
-    # Stage 3 must keep the issue-close instruction (spec v2 §3: the flip rides the PR).
-    stage3 = texts[f"pl-3-{RUN_ID}".lower()]
-    assert prepared.issue_rel in stage3
-    assert "status: done" in stage3
-    # The flip commit names the real issue id, not the template's old literal `NN`.
-    assert "chore: mark issue 056 done" in stage3
-    # Stage 3's local gate is CI's gate: PR #159 opened with mypy errors without it.
-    assert "uv run mypy" in stage3
-    # Stage 6 is prompted with the PR number, and resumes stage 3's session.
-    stage6 = texts[f"pl-6-{RUN_ID}".lower()]
-    assert "$PR_NUMBER" not in stage6
-    assert "42" in stage6
-    resumed = [call for call in client.started if call["name"].startswith("pl-6")]
+    # The test author and the implementer both read the spec at its real path.
+    for stage in (3, 4):
+        assert str(prepared.worktree) in texts[f"pl-{stage}-{RUN_ID}".lower()]
+    # Stage 7 is prompted with the PR number, and resumes stage 4's session.
+    stage7 = texts[f"pl-7-{RUN_ID}".lower()]
+    assert "$PR_NUMBER" not in stage7
+    assert "42" in stage7
+    resumed = [call for call in client.started if call["name"].startswith("pl-7")]
     assert resumed and resumed[0]["session_id"] == REUSED_SESSION_ID
 
 
@@ -1143,7 +1279,7 @@ def test_pipeline_run_classifies_an_unreadable_herdr_start_as_failed(
     assert "## Outcome: failed" in prepared.report.read_text()
 
 
-def test_gate_client_protocol_is_satisfied_by_the_real_client() -> None:
+def test_gate_clprotocol_is_satisfied_by_the_real_client() -> None:
     """`run_pipeline` takes a `GhClient`, and stage 4 needs a `pr create` on it — a
     protocol without that method would only fail at 03:00, in production."""
     assert hasattr(GhClient, "pr_create")
@@ -1255,3 +1391,479 @@ def test_gate3_test_names_reads_a_test_name_ending_a_line(
     spec_text: str, expected: list[str]
 ) -> None:
     assert gate3_test_names(spec_text) == expected
+
+
+# ---------------------------------------------------------------------------
+# Issue 059: bookkeeping in code, CI fix loop, test author / implementer split
+# ---------------------------------------------------------------------------
+
+LEFTOVER_MESSAGE = "feat: issue 056 — uncommitted implementer work"
+FLIP_MESSAGE = "chore: mark issue 056 done (merging this PR closes it)"
+
+
+def _remote_branch(prepared: PipelineFixture) -> str:
+    return _git(
+        prepared.worktree, "ls-remote", "--heads", "origin", BRANCH
+    ).stdout.strip()
+
+
+def _commit_named(prepared: PipelineFixture, grep: str) -> str:
+    sha = _git(prepared.worktree, "log", "-1", "--format=%H", f"--grep={grep}").stdout
+    assert sha.strip(), f"no commit matching {grep!r}"
+    return sha.strip()
+
+
+def _files_in(prepared: PipelineFixture, sha: str) -> list[str]:
+    return _git(
+        prepared.worktree, "show", "--name-only", "--format=", sha
+    ).stdout.split()
+
+
+def test_pipeline_commits_leftover_implementer_work(
+    prepared: PipelineFixture,
+) -> None:
+    """PR #159's implementer left 2,644 lines uncommitted and they were swept into a
+    `chore: mark issue NN done` commit. Code commits them now, saying what happened."""
+    client = _client()
+    client.hooks[4] = lambda wt, text: _write(
+        wt, {"src/left_over.py": "LEFT_OVER = 1\n"}
+    )
+
+    outcome, _cl, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    sha = _commit_named(prepared, LEFTOVER_MESSAGE)
+    assert _files_in(prepared, sha) == ["src/left_over.py"]
+    assert not _git(prepared.worktree, "status", "--porcelain").stdout.strip()
+    assert LEFTOVER_MESSAGE in prepared.report.read_text()
+
+
+def test_pipeline_ci_check_fix_loop_recovers(prepared: PipelineFixture) -> None:
+    prepared.red(2)
+    client = _client()
+
+    outcome, client, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    # Two fix rounds, each a resume of the implementer's own session (the same agent
+    # name and recorded session id), carrying the failure output.
+    fixes = [
+        (name, text) for name, text in client.prompts if text.startswith(CI_FIX_PROMPT)
+    ]
+    assert [name for name, _ in fixes] == [f"pl-4-{RUN_ID}".lower()] * 2
+    assert all("ci is red" in text for _, text in fixes)
+    resumed = [
+        c
+        for c in client.started
+        if c["name"] == f"pl-4-{RUN_ID}".lower() and c["session_id"] is not None
+    ]
+    assert [c["session_id"] for c in resumed] == [SESSION_IDS[4]] * 2
+    # The session map is untouched by a fix round.
+    assert prepared.state()["stage_sessions"]["4"] == SESSION_IDS[4]
+    assert "CI check went green after 2 fix round(s)" in prepared.report.read_text()
+    assert _remote_branch(prepared)
+
+
+def test_pipeline_ci_check_gives_up_after_two_rounds(prepared: PipelineFixture) -> None:
+    prepared.red(3)
+
+    outcome, client, gh = _run(prepared)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "ci_check_failed"
+    assert client.fix_rounds == 2
+    assert gh.created == []
+    assert not _remote_branch(prepared)
+    report_text = prepared.report.read_text()
+    assert "## Outcome: failed (ci_check_failed)" in report_text
+    assert "ci is red" in report_text
+    assert tick._classify_pipeline_outcome(report_text) == (
+        "failed",
+        "ci_check_failed",
+    )
+
+
+def test_pipeline_flips_issue_in_code(prepared: PipelineFixture) -> None:
+    outcome, _cl, _gh = _run(prepared)
+
+    assert outcome.outcome == "ok", outcome
+    sha = _commit_named(prepared, FLIP_MESSAGE)
+    assert _files_in(prepared, sha) == [prepared.issue_rel]
+    assert (
+        "status: done"
+        in _git(prepared.worktree, "show", f"HEAD:{prepared.issue_rel}").stdout
+    )
+    # No prompt asks a model to flip the issue, name the commit, or know the issue file.
+    for prompt in prepared.prompts_dir.glob("stage-*.md"):
+        text = prompt.read_text()
+        for forbidden in ("status: done", "mark issue", "ISSUE_FILE", "ISSUE_ID"):
+            assert forbidden not in text, f"{prompt.name} mentions {forbidden!r}"
+
+
+def test_test_author_stage_touches_only_tests(prepared: PipelineFixture) -> None:
+    outcome, _cl, _gh = _run(prepared)
+
+    assert outcome.outcome == "ok", outcome
+    sha = _commit_named(prepared, "test: the acceptance tests")
+    assert _files_in(prepared, sha) == ["tests/test_thing.py"]
+    assert prepared.state()["stage_bases"]["3"]
+
+    # A test author that also writes feature code fails gate 3, naming the file.
+    other = PipelineFixture(prepared.tmp_path / "other")
+    client = _client()
+    client.hooks[3] = lambda wt, text: _write_and_commit(
+        wt,
+        {
+            "tests/test_thing.py": _test_file(TEST_NAMES),
+            "src/sneaked_in.py": "X = 1\n",
+        },
+        "test: tests and a bit of feature",
+    )
+
+    result, _cl, gh = _run(other, client=client)
+
+    assert result.outcome == "failed"
+    assert result.reason == "gate_3_failed"
+    assert "src/sneaked_in.py" in other.report.read_text()
+    assert gh.created == []
+
+
+def test_test_author_that_commits_nothing_fails_gate_3(
+    prepared: PipelineFixture,
+) -> None:
+    client = _client()
+    client.hooks[3] = lambda wt, text: None
+
+    outcome, _cl, _gh = _run(prepared, client=client)
+
+    assert outcome.reason == "gate_3_failed"
+    assert "committed nothing" in prepared.report.read_text()
+
+
+def test_leftover_test_author_work_is_committed_by_code(
+    prepared: PipelineFixture,
+) -> None:
+    client = _client()
+    client.hooks[3] = lambda wt, text: _write(
+        wt, {"tests/test_thing.py": _test_file(TEST_NAMES)}
+    )
+
+    outcome, _cl, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    sha = _commit_named(prepared, "test: issue 056 — uncommitted test-author work")
+    assert _files_in(prepared, sha) == ["tests/test_thing.py"]
+
+
+def test_implementer_cannot_remove_named_tests(prepared: PipelineFixture) -> None:
+    client = _client()
+
+    def rename_one_delete_the_other(wt: Path, text: str) -> None:
+        _write_and_commit(
+            wt,
+            {
+                "tests/test_thing.py": _test_file(("test_renamed_thing",)),
+                "src/thing.py": "THING = 1\n",
+            },
+            "feat: the thing, and tidy the tests",
+        )
+
+    client.hooks[4] = rename_one_delete_the_other
+
+    outcome, _cl, gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "gate_4_failed"
+    report_text = prepared.report.read_text()
+    assert "test_the_thing_works" in report_text
+    assert "test_the_second_thing_works" in report_text
+    assert gh.created == []
+    assert not _remote_branch(prepared)
+
+
+def test_a_ci_fix_round_cannot_remove_a_named_test_either(
+    prepared: PipelineFixture,
+) -> None:
+    """A fix round is where a model is tempted to delete the test that will not go green,
+    so the named-test check runs again after the last one."""
+    prepared.red(1)
+    client = _client()
+
+    def hook(wt: Path, text: str) -> None:
+        if text.startswith(CI_FIX_PROMPT):
+            for marker in wt.glob(".ci-red-*"):
+                marker.unlink()
+            _write_and_commit(
+                wt,
+                {"tests/test_thing.py": _test_file(("test_the_second_thing_works",))},
+                "fix: make ci green by deleting a test",
+            )
+        else:
+            _write_and_commit(wt, {"src/thing.py": "THING = 1\n"}, "feat: the thing")
+
+    client.hooks[4] = hook
+
+    outcome, _cl, gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "named_test_removed"
+    assert "test_the_thing_works" in prepared.report.read_text()
+    assert gh.created == []
+    assert not _remote_branch(prepared)
+
+
+def test_pr_body_discloses_implementer_test_edits(prepared: PipelineFixture) -> None:
+    client = _client()
+
+    def edit_one_reformat_the_other(wt: Path, text: str) -> None:
+        _write_and_commit(
+            wt,
+            {
+                "tests/test_thing.py": (
+                    "def test_the_thing_works() -> None:\n    assert True\n\n\n"
+                    "# only a comment and spacing changed here\n"
+                    "def   test_the_second_thing_works() -> None:\n\n    pass\n"
+                ),
+                "src/thing.py": "THING = 1\n",
+            },
+            "feat: the thing, and fix a test",
+        )
+
+    client.hooks[4] = edit_one_reformat_the_other
+
+    outcome, _cl, gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    body = gh.created[0]["body"]
+    heading = "## Tests changed by the implementer"
+    section = body.split(heading)[1].split("\n## ")[0]
+    assert "`test_the_thing_works`" in section
+    # A reformat is not an edit: only a changed body is disclosed.
+    assert "test_the_second_thing_works" not in section
+
+
+def test_pr_body_says_none_when_the_implementer_edited_no_tests(
+    prepared: PipelineFixture,
+) -> None:
+    _outcome, _cl, gh = _run(prepared)
+
+    assert "## Tests changed by the implementer\n\nnone\n" in gh.created[0]["body"]
+
+
+def test_pipeline_ci_fix_loop_respects_deadline(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared.red(1)
+    real_check = pipeline_run._run_ci_check
+    checked: list[bool] = []
+
+    def check_then_pass_the_deadline(*args: Any, **kwargs: Any) -> tuple[int, str]:
+        result = real_check(*args, **kwargs)
+        checked.append(True)
+        return result
+
+    monkeypatch.setattr(pipeline_run, "_run_ci_check", check_then_pass_the_deadline)
+    deadline = int(time.time()) + 36000
+
+    outcome, client, gh = _run(
+        prepared, clock=lambda: deadline + 1 if checked else time.time()
+    )
+
+    assert outcome.outcome == "partial"
+    assert outcome.reason == "partial_deadline"
+    assert client.fix_rounds == 0
+    assert not any(text.startswith(CI_FIX_PROMPT) for _, text in client.prompts)
+    assert gh.created == []
+    assert not _remote_branch(prepared)
+    assert "## Outcome: partial (deadline exceeded)" in prepared.report.read_text()
+
+
+def test_pr_preflight_rejects_empty_problem(prepared: PipelineFixture) -> None:
+    spec_path = Path(prepared.state()["artifact_paths"]["spec"])
+    spec_path.write_text(
+        SPEC_BODY.replace(
+            "The thing is not done. Stage workers need a spec that says what to build.\n",
+            "",
+        )
+    )
+    prepared.commit_all("spec: v2 with an empty problem")
+
+    outcome, _cl, gh = _run(prepared)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "pr_preflight_failed"
+    assert "problem" in prepared.report.read_text()
+    assert gh.created == []
+    assert not _remote_branch(prepared)
+
+
+def _script_sleeping(seconds: float) -> str:
+    return f'#!/usr/bin/env bash\nsleep {seconds}\necho "slow but green"\n'
+
+
+def test_run_ci_check_beats_while_it_runs_and_enforces_its_timeout(
+    prepared: PipelineFixture,
+) -> None:
+    """The watchdog reaps a run whose heartbeat is 20 minutes old, and a check may run
+    longer than that: it has to keep the heartbeat fresh itself while it runs."""
+    prepared.write_ci_script(_script_sleeping(0.8))
+    beats: list[int] = []
+
+    code, output = pipeline_run._run_ci_check(
+        prepared.worktree,
+        timeout_s=30,
+        interval_s=0.1,
+        on_poll=lambda: beats.append(1),
+    )
+
+    assert code == 0
+    assert "slow but green" in output
+    assert len(beats) >= 3
+
+    prepared.write_ci_script(_script_sleeping(30))
+    started = time.monotonic()
+    code, output = pipeline_run._run_ci_check(
+        prepared.worktree, timeout_s=0.5, interval_s=0.1, on_poll=lambda: None
+    )
+    assert code == 124
+    assert "timed out" in output
+    assert time.monotonic() - started < 10
+
+
+def test_pipeline_ci_check_keeps_the_heartbeat_alive(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long-running check writes intermediate heartbeat lines, not only one before and
+    one after."""
+    monkeypatch.setattr(pipeline_run, "CI_HEARTBEAT_INTERVAL_S", 0.1)
+    prepared.write_ci_script(_script_sleeping(1.0))
+    prepared.commit_all("ci: a slow check")
+
+    outcome, _cl, _gh = _run(prepared)
+
+    assert outcome.outcome == "ok", outcome
+    lines = heartbeat_log_path(prepared.heartbeat_dir, RUN_ID).read_text().splitlines()
+    # One line before the check, one after, and at least three while it ran.
+    assert len([line for line in lines if "stage=5" in line]) >= 5
+
+
+def test_stage_bases_are_write_once(prepared: PipelineFixture) -> None:
+    state = pipeline_run._State.read(prepared.state_json)
+    state = pipeline_run._record_base(state, prepared.state_json, 3, _git_runner)
+    first = state.stage_bases["3"]
+    assert first == _git(prepared.worktree, "rev-parse", "HEAD").stdout.strip()
+
+    _write_and_commit(prepared.worktree, {"tests/x.py": "X = 1\n"}, "test: later")
+    again = pipeline_run._record_base(state, prepared.state_json, 3, _git_runner)
+
+    assert again.stage_bases["3"] == first
+    assert prepared.state()["stage_bases"] == {"3": first}
+
+
+def test_tick_files_a_failed_ci_check_under_its_own_reason() -> None:
+    assert tick._classify_pipeline_outcome(
+        "## Outcome: failed (ci_check_failed)\n"
+    ) == (
+        "failed",
+        "ci_check_failed",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Review of PR #161
+# ---------------------------------------------------------------------------
+
+
+def test_uncommitted_stage_2_spec_edit_is_swept_not_blamed_on_the_test_author(
+    prepared: PipelineFixture,
+) -> None:
+    """Gate 2 never checks the v2 commit. A stage 2 that edits spec.md without committing
+    must not leave it for stage 3's sweep, which would fold it into the test author's
+    commit and fail gate 3's tests-only check."""
+    client = _client()
+    client.hooks[2] = lambda wt, text: _write(
+        wt, {f"docs/pipeline/runs/{RUN_ID}/spec.md": SPEC_BODY + "\nv2 note\n"}
+    )
+
+    outcome, _cl, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    sha = _commit_named(prepared, "spec: v2 — uncommitted stage-2 work")
+    assert _files_in(prepared, sha) == [
+        f"docs/pipeline/runs/{RUN_ID}/spec.md",
+    ]
+    tests_commit = _commit_named(prepared, "test: the acceptance tests")
+    assert _files_in(prepared, tests_commit) == ["tests/test_thing.py"]
+
+
+def test_an_unreadable_base_commit_fails_gate_4_instead_of_passing_it(
+    prepared: PipelineFixture,
+) -> None:
+    """A git failure reading the base used to read as "no named tests at the base", so
+    nothing could be reported removed and the gate passed having checked nothing."""
+    state = prepared.state()
+    state["stage_bases"] = {"4": "0" * 40}
+    prepared.state_json.write_text(json.dumps(state))
+
+    outcome, _cl, gh = _run(prepared)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "gate_4_failed"
+    assert "named_test_read_failed" in prepared.report.read_text()
+    assert gh.created == []
+
+
+def test_files_the_ci_check_rewrites_are_committed_before_the_push(
+    prepared: PipelineFixture,
+) -> None:
+    """`uv run` inside the check rewrites a tracked `uv.lock` when `pyproject.toml`
+    changed without relocking. Left dirty, the re-sign before the push fails and the
+    change never reaches the PR."""
+    (prepared.worktree / "uv.lock").write_text("# lock\n")
+    prepared.write_ci_script(CI_STUB + 'echo "# relocked" >> uv.lock\n')
+    prepared.commit_all("ci: a check that relocks")
+
+    outcome, _cl, _gh = _run(prepared)
+
+    assert outcome.outcome == "ok", outcome
+    sha = _commit_named(prepared, "files changed by the CI check")
+    assert _files_in(prepared, sha) == ["uv.lock"]
+    assert not _git(prepared.worktree, "status", "--porcelain").stdout.strip()
+    remote_head = _remote_branch(prepared).split()[0]
+    assert remote_head == _git(prepared.worktree, "rev-parse", "HEAD").stdout.strip()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_an_issue_file_that_cannot_be_written_is_an_issue_flip_failure(
+    prepared: PipelineFixture,
+) -> None:
+    """An `OSError` escaping the flip was filed as `state_unreadable`."""
+    (prepared.worktree / prepared.issue_rel).chmod(0o444)
+
+    outcome, _cl, gh = _run(prepared)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "issue_flip_failed"
+    assert gh.created == []
+
+
+def test_a_check_that_exits_while_being_killed_is_still_a_timeout(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`killpg` raises `ProcessLookupError` if the check exits at that moment; that was an
+    unhandled `OSError`, filed as `state_unreadable`."""
+    real_killpg = os.killpg
+
+    def killpg_then_race(pid: int, sig: int) -> None:
+        real_killpg(pid, sig)
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "killpg", killpg_then_race)
+    prepared.write_ci_script(_script_sleeping(30))
+
+    code, output = pipeline_run._run_ci_check(
+        prepared.worktree, timeout_s=0.3, interval_s=0.1, on_poll=lambda: None
+    )
+
+    assert code == 124
+    assert "timed out" in output

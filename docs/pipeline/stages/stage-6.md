@@ -1,3 +1,3 @@
-# Stage 6 — Address comments
+# Stage 6 — Code review
 
-Run the `address-pr-comments` skill against PR `$PR_NUMBER`. The skill fetches all unresolved inline review threads, assesses their validity, fixes valid ones, commits and pushes, then replies to every thread with the outcome.
+Run the code-review skill against PR `$PR_NUMBER`. Ensure output contains structured `blocking`/`non-blocking` tier labels.
