@@ -73,6 +73,8 @@ def stage_families(spec: StageSpec) -> set[str]:
 # The stages `pipeline_run` has to treat differently, by role. Named here, next to the
 # table, so a renumbering is one edit and a test can check each still points at the stage
 # it means (test_stages_table_matches_the_prompt_files_on_disk).
+# Stage 2 commits the spec the later stages are diffed against, so code sweeps it too.
+SPEC_REVIEW_STAGE = 2
 TEST_AUTHOR_STAGE = 3
 IMPLEMENT_STAGE = 4
 # The stage with no agent: bookkeeping, then the PR.

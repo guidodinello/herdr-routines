@@ -17,11 +17,15 @@ work of one stage. Everything else is code:
   next stage and names itself and its reason in the terminal report.
 - The liveness heartbeat is written from inside the shared wait loop's poll closure, so
   it advances whether or not anything remembers to advance it.
-- The deadline comes from `state.json` and is checked between stages, never mid-stage.
-- Stage 5 does the bookkeeping the implementer prompt used to ask a model to remember
-  (issue 059): sweep leftover work into a commit, run `scripts/ci-check.sh` with a fix
-  loop that resumes the implementer's session, flip the issue to `status: done`, check
-  the PR's preconditions. A model does the work that needs judgment; code does the
+- The deadline comes from `state.json` and is checked between stages, never mid-stage;
+  the one exception is stage 5's CI fix loop, which checks it before each fix round,
+  because a round is a whole agent turn it cannot finish past the deadline.
+- Leftover work is swept into a commit after stages 2, 3 and 4 (so each stage's gate and
+  base commit see a clean tree), and again after every CI fix round and after a green
+  check. Stage 5 does the rest of the bookkeeping the implementer prompt used to ask a
+  model to remember (issue 059): run `scripts/ci-check.sh` with a fix loop that resumes
+  the implementer's session, flip the issue to `status: done`, check the PR's
+  preconditions. A model does the work that needs judgment; code does the
   bookkeeping and checks what a model claims.
 
 `RunOutcome.outcome` is `ok | partial | failed` — `ok`, not `done`.
@@ -41,6 +45,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
@@ -64,6 +69,7 @@ from herdr_routines.pipeline_prepare import write_state_json, write_terminal_rep
 from herdr_routines.pipeline_stages import (
     IMPLEMENT_STAGE,
     PR_STAGE,
+    SPEC_REVIEW_STAGE,
     STAGES,
     TEST_AUTHOR_STAGE,
     StageSpec,
@@ -673,6 +679,11 @@ def _sweep_message(state: _State, stage: int) -> str | None:
     """The commit message for a stage's leftover work, or None for a stage that is not
     swept."""
     issue = _issue_id(state.issue_source) or "unknown"
+    if stage == SPEC_REVIEW_STAGE:
+        # Gate 2 never checks the v2 commit. Left uncommitted, spec.md would be swept
+        # into stage 3's commit and fail gate 3's tests-only check for a slip that is
+        # not the test author's.
+        return f"spec: v2 — uncommitted stage-2 work (issue {issue})"
     if stage == TEST_AUTHOR_STAGE:
         return f"test: issue {issue} — uncommitted test-author work"
     if stage == IMPLEMENT_STAGE:
@@ -687,32 +698,28 @@ def _named_test_defs(
 
     Read from the commit (`git show`), not the working tree, and compared as syntax
     trees: a reformat or a comment is not an edit, a changed assertion is. A file that
-    does not parse contributes nothing, so a named test inside it reads as removed."""
+    does not parse contributes nothing, so a named test inside it reads as removed.
+
+    A git failure is an `_Abort`, never an empty result: an unreadable base would make
+    every named test look absent from it, so nothing could be reported removed and the
+    check would pass having checked nothing."""
     found: dict[str, list[str]] = {}
-    listing = runner(
-        [
-            "git",
-            "-C",
-            str(state.worktree),
-            "ls-tree",
-            "-r",
-            "--name-only",
-            rev,
-            "tests",
-        ],
-        timeout_s=GIT_TIMEOUT_S,
+    listing = _git_out(
+        state,
+        runner,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        rev,
+        "tests",
+        what="named_test_read_failed",
     )
-    if listing[0] != 0:
-        return found
-    for path in listing[1].splitlines():
+    for path in listing.splitlines():
         if not path.endswith(".py"):
             continue
-        code, source, _stderr = runner(
-            ["git", "-C", str(state.worktree), "show", f"{rev}:{path}"],
-            timeout_s=GIT_TIMEOUT_S,
+        source = _git_out(
+            state, runner, "show", f"{rev}:{path}", what="named_test_read_failed"
         )
-        if code != 0:
-            continue
         try:
             tree = ast.parse(source)
         except SyntaxError:
@@ -809,7 +816,9 @@ def _run_ci_check(
             except subprocess.TimeoutExpired:
                 on_poll()
                 if time.monotonic() >= deadline:
-                    os.killpg(proc.pid, signal.SIGKILL)
+                    # The check can exit between the timeout and the kill.
+                    with suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
                     code = 124
                     break
@@ -864,7 +873,12 @@ def _ci_fix_loop(
     implementer's `pl-<N>-` agent and its recorded session id), not a new one, so it
     also falls back to the stage's fallback model on a provider error. Raises `_Abort`:
     `ci_check_failed` once the rounds are spent, `partial_deadline` (outcome `partial`)
-    when a round would start past the deadline, and nothing has been pushed either way."""
+    when a round would start past the deadline, and nothing has been pushed either way.
+
+    A check that times out (exit 124) is fed to the implementer like any other failure,
+    on purpose: a hung test is the implementer's own to fix, and it may spend up to
+    `MAX_CI_FIX_ROUNDS` more rounds on it. The deadline check before each round is what
+    bounds the cost, so a timeout gets no abort reason of its own."""
     implementer = next(s for s in STAGES if s.stage == IMPLEMENT_STAGE)
     session_id = state.stage_sessions.get(str(IMPLEMENT_STAGE))
     beat = _heartbeat_hook(heartbeat, PR_STAGE, clock)
@@ -962,7 +976,10 @@ def _flip_issue(state: _State, runner: Runner) -> None:
             "issue_flip_failed",
             detail=f"{state.issue_source} has no frontmatter `status: open` to flip",
         )
-    path.write_text(_STATUS_OPEN_RE.sub("status: done", head, count=1) + sep + rest)
+    try:
+        path.write_text(_STATUS_OPEN_RE.sub("status: done", head, count=1) + sep + rest)
+    except OSError as e:
+        raise _Abort("issue_flip_failed", detail=f"{path}: {e}") from e
     issue = _issue_id(state.issue_source) or "unknown"
     _git_out(state, runner, "add", state.issue_source, what="issue_flip_failed")
     _git_out(
@@ -1019,6 +1036,17 @@ def _bookkeeping(
         runner=runner,
         notes=notes,
     )
+    # `uv run` inside the check can rewrite a tracked file (`uv.lock` after an unlocked
+    # `pyproject.toml` change). Committed here, so it reaches the PR and the tree is clean
+    # for the re-sign before the push.
+    swept = _sweep(
+        state,
+        runner,
+        f"chore: issue {_issue_id(state.issue_source) or 'unknown'} — "
+        "files changed by the CI check",
+    )
+    if swept:
+        notes.append(swept)
     removed, edited = _named_test_changes(
         state, runner, _base_for(state, IMPLEMENT_STAGE), spec_text
     )

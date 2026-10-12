@@ -22,6 +22,7 @@ PR view). Neither can be exercised for real from a test, and both have a seam al
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1766,3 +1767,103 @@ def test_tick_files_a_failed_ci_check_under_its_own_reason() -> None:
         "failed",
         "ci_check_failed",
     )
+
+
+# ---------------------------------------------------------------------------
+# Review of PR #161
+# ---------------------------------------------------------------------------
+
+
+def test_uncommitted_stage_2_spec_edit_is_swept_not_blamed_on_the_test_author(
+    prepared: PipelineFixture,
+) -> None:
+    """Gate 2 never checks the v2 commit. A stage 2 that edits spec.md without committing
+    must not leave it for stage 3's sweep, which would fold it into the test author's
+    commit and fail gate 3's tests-only check."""
+    client = _client()
+    client.hooks[2] = lambda wt, text: _write(
+        wt, {f"docs/pipeline/runs/{RUN_ID}/spec.md": SPEC_BODY + "\nv2 note\n"}
+    )
+
+    outcome, _cl, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    sha = _commit_named(prepared, "spec: v2 — uncommitted stage-2 work")
+    assert _files_in(prepared, sha) == [
+        f"docs/pipeline/runs/{RUN_ID}/spec.md",
+    ]
+    tests_commit = _commit_named(prepared, "test: the acceptance tests")
+    assert _files_in(prepared, tests_commit) == ["tests/test_thing.py"]
+
+
+def test_an_unreadable_base_commit_fails_gate_4_instead_of_passing_it(
+    prepared: PipelineFixture,
+) -> None:
+    """A git failure reading the base used to read as "no named tests at the base", so
+    nothing could be reported removed and the gate passed having checked nothing."""
+    state = prepared.state()
+    state["stage_bases"] = {"4": "0" * 40}
+    prepared.state_json.write_text(json.dumps(state))
+
+    outcome, _cl, gh = _run(prepared)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "gate_4_failed"
+    assert "named_test_read_failed" in prepared.report.read_text()
+    assert gh.created == []
+
+
+def test_files_the_ci_check_rewrites_are_committed_before_the_push(
+    prepared: PipelineFixture,
+) -> None:
+    """`uv run` inside the check rewrites a tracked `uv.lock` when `pyproject.toml`
+    changed without relocking. Left dirty, the re-sign before the push fails and the
+    change never reaches the PR."""
+    (prepared.worktree / "uv.lock").write_text("# lock\n")
+    prepared.write_ci_script(CI_STUB + 'echo "# relocked" >> uv.lock\n')
+    prepared.commit_all("ci: a check that relocks")
+
+    outcome, _cl, _gh = _run(prepared)
+
+    assert outcome.outcome == "ok", outcome
+    sha = _commit_named(prepared, "files changed by the CI check")
+    assert _files_in(prepared, sha) == ["uv.lock"]
+    assert not _git(prepared.worktree, "status", "--porcelain").stdout.strip()
+    remote_head = _remote_branch(prepared).split()[0]
+    assert remote_head == _git(prepared.worktree, "rev-parse", "HEAD").stdout.strip()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_an_issue_file_that_cannot_be_written_is_an_issue_flip_failure(
+    prepared: PipelineFixture,
+) -> None:
+    """An `OSError` escaping the flip was filed as `state_unreadable`."""
+    (prepared.worktree / prepared.issue_rel).chmod(0o444)
+
+    outcome, _cl, gh = _run(prepared)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "issue_flip_failed"
+    assert gh.created == []
+
+
+def test_a_check_that_exits_while_being_killed_is_still_a_timeout(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`killpg` raises `ProcessLookupError` if the check exits at that moment; that was an
+    unhandled `OSError`, filed as `state_unreadable`."""
+    real_killpg = os.killpg
+
+    def killpg_then_race(pid: int, sig: int) -> None:
+        real_killpg(pid, sig)
+        raise ProcessLookupError
+
+    monkeypatch.setattr(os, "killpg", killpg_then_race)
+    prepared.write_ci_script(_script_sleeping(30))
+
+    code, output = pipeline_run._run_ci_check(
+        prepared.worktree, timeout_s=0.3, interval_s=0.1, on_poll=lambda: None
+    )
+
+    assert code == 124
+    assert "timed out" in output

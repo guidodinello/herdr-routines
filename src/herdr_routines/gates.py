@@ -10,11 +10,11 @@ only invoke (via ``herdr-routines gate --stage ci|7 --pr <n>``) and read an exit
 from — it cannot rewrite them.
 
 Gate 3's lint widening (``ruff format --check .`` and ``ruff check .`` alongside
-pytest) stays prompt text: it's a command the implementer runs on their own tree
-before ever opening a PR, not a verdict the orchestrator computes about someone
-else's PR. ``GATE3_LINT_TEST_CHECKS`` below only pins that the widened check set fails
-on a lint error even with green tests (test_gate3_fails_on_lint_error) — it is reused
-from the same ``run_checks`` machinery as ``auto_fix.py``, not exposed as a CLI stage.
+pytest) is not a CLI stage and no prompt carries it any more: since issue 059 stage 5
+runs ``scripts/ci-check.sh`` (CI's own commands) in code before the PR, with a fix loop.
+``GATE3_LINT_TEST_CHECKS`` below only pins that the widened check set fails on a lint
+error even with green tests (test_gate3_fails_on_lint_error) — it is reused from the
+same ``run_checks`` machinery as ``auto_fix.py``.
 """
 
 from __future__ import annotations
@@ -695,9 +695,9 @@ def gate3_test_names_present(
     must not satisfy this. Plain Python rather than `rg`, so the verdict does not depend
     on which binaries the host happens to have on PATH (CI has no `rg`).
 
-    Deliberately *not* the lint/pytest half of gate 3 — that stays prose (see this
-    module's docstring). This function is the part that is mechanical enough to stop
-    trusting a model with it."""
+    Deliberately *not* the lint/pytest half: `pipeline_run` runs `scripts/ci-check.sh`
+    for that (see this module's docstring). This function is the part that is
+    mechanical enough to stop trusting a model with it."""
     names = gate3_test_names(spec_text)
     if not names:
         return GateVerdict(
