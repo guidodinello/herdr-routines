@@ -636,9 +636,15 @@ class GateOutcome:
 class GateCheck:
     """A single check in the gate model."""
 
-    kind: str  # "pr_health" | "command"
+    kind: str  # "pr_health" | "command" | "github_event"
     command: str | None = None
     timeout_ms: int = 120_000
+    # -- kind: github_event (issue 014) -----------------------------------------
+    # Mirror of config.GateCheck's event fields so run_checks and the event poll see
+    # the same shape whichever GateCheck type a caller holds.
+    query: str | None = None
+    repo: str | None = None
+    match: dict[str, Any] | None = None
 
 
 def run_checks(
@@ -925,3 +931,269 @@ def attempt_count_for_gate_branch(
         ):
             count += 1
     return count
+
+
+# ---------------------------------------------------------------------------
+# github_event check kind (issue 014, spec v2)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class GithubEvent:
+    """One polled, dedupable GitHub event for a `github_event` check.
+
+    `event_id` is the stable dedup key (the spec's `extra.event_id`); re-polls that
+    return an ID already in `last_seen_event_ids` are clean no-ops. `payload` is the
+    raw read the poll produced so the seeded prompt can quote real fields."""
+
+    event_id: str
+    number: int
+    title: str
+    head_ref: str | None
+    label: str | None
+    payload: dict[str, Any]
+
+
+def _label_names(labels: Any) -> list[str]:
+    """Flatten the label shapes gh returns (`[{"name": ...}, ...]`) to bare names."""
+    if not isinstance(labels, list):
+        return []
+    names: list[str] = []
+    for lbl in labels:
+        if isinstance(lbl, dict) and isinstance(lbl.get("name"), str):
+            names.append(lbl["name"])
+    return names
+
+
+def _event_matches(event: dict[str, Any], match: dict[str, Any]) -> bool:
+    """Elevate the config-level `match` mapping to a predicate over one polled event."""
+    label = match.get("label")
+    if label is not None and (
+        not isinstance(label, str) or label not in _label_names(event.get("labels"))
+    ):
+        return False
+    author = match.get("author")
+    if author is not None:
+        auth = event.get("author", {})
+        login = auth.get("login") if isinstance(auth, dict) else None
+        if login != author:
+            return False
+    branch = match.get("branch")
+    return not (branch is not None and event.get("headRefName") != branch)
+
+
+def poll_github_event(
+    gh: GhClient, *, owner: str, repo: str, check: GateCheck
+) -> list[GithubEvent]:
+    """Read-only poll for a `github_event` check (spec v2 §2).
+
+    Always raises on a failing `gh` call (auth, rate limit, transient error) so the
+    tick can fail closed as a gate error — the "unverifiable ≠ green" rule that
+    `commit_check_runs` already follows. One list query plus per-event detail only;
+    detail (title/head ref) is cheap REST data already present in the list/poll
+    shapes. The `title` field may be left empty by queries whose list shape lacks it;
+    the tick enriches new events right before dispatch."""
+    query = check.query or "prs:labels"
+    match = check.match or {}
+
+    if query == "prs:labels":
+        raw = gh.pr_list(owner=owner, repo=repo, state="open", limit=100)
+        match_label = (
+            match.get("label") if isinstance(match.get("label"), str) else None
+        )
+        result: list[GithubEvent] = []
+        for pr in raw:
+            if not isinstance(pr, dict):
+                continue
+            number = pr.get("number")
+            if not isinstance(number, int) or not _event_matches(pr, match):
+                continue
+            # The dedup key is the event's *own* label (the matched one when configured,
+            # else the first label the PR carries), so `evt-pr-<n>-<label>` is stable
+            # and self-describing rather than depending on the match config.
+            names = sorted(_label_names(pr.get("labels")))
+            label = (
+                match_label
+                if match_label is not None
+                else (names[0] if names else None)
+            )
+            head_ref = pr.get("headRefName")
+            suffix = f"-{label}" if label else ""
+            result.append(
+                GithubEvent(
+                    event_id=f"evt-pr-{number}{suffix}",
+                    number=number,
+                    title="",
+                    head_ref=head_ref if isinstance(head_ref, str) else None,
+                    label=label,
+                    payload=pr,
+                )
+            )
+        return result
+
+    if query == "ci:failed":
+        raw = gh.pr_list(owner=owner, repo=repo, state="open", limit=100)
+        result = []
+        for pr in raw:
+            if not isinstance(pr, dict) or not _event_matches(pr, match):
+                continue
+            number = pr.get("number")
+            if not isinstance(number, int):
+                continue
+            try:
+                view = gh.pr_view(owner=owner, repo=repo, number=number)
+            except Exception as e:  # noqa: BLE001 — a failing detail read is not a failing CI
+                log.warning("gh pr view %d failed for ci:failed: %s", number, e)
+                continue
+            rollup = view.get("statusCheckRollup") if isinstance(view, dict) else None
+            failing = False
+            if isinstance(rollup, list):
+                failing = any(
+                    isinstance(c, dict) and c.get("state") in FAILING_CI_STATES
+                    for c in rollup
+                )
+            if not failing:
+                continue
+            title = view.get("title") if isinstance(view, dict) else ""
+            head_ref = view.get("headRefName") if isinstance(view, dict) else None
+            result.append(
+                GithubEvent(
+                    event_id=f"evt-ci-{number}",
+                    number=number,
+                    title=title if isinstance(title, str) else "",
+                    head_ref=head_ref if isinstance(head_ref, str) else None,
+                    label=None,
+                    payload=pr,
+                )
+            )
+        return result
+
+    if query == "issues:opened":
+        gql = """
+        query($owner: String!, $repo: String!, $searchQuery: String!) {
+          search(query: $searchQuery, type: ISSUE, first: 50) {
+            nodes {
+              ... on Issue { id number title labels(first: 10) { nodes { name } } }
+            }
+          }
+        }
+        """
+        data = gh.graphql(
+            gql,
+            owner=owner,
+            repo=repo,
+            searchQuery=f"repo:{owner}/{repo} is:issue is:open",
+        )
+        nodes: list[Any] = []
+        if isinstance(data, dict):
+            payload = data.get("data")
+            if isinstance(payload, dict):
+                search = payload.get("search")
+                if isinstance(search, dict) and isinstance(search.get("nodes"), list):
+                    nodes = search["nodes"]
+        issue_events: list[GithubEvent] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            number = node.get("number")
+            if not isinstance(number, int):
+                continue
+            labels = node.get("labels")
+            names = (
+                _label_names(labels.get("nodes")) if isinstance(labels, dict) else []
+            )
+            label = match.get("label") if isinstance(match.get("label"), str) else None
+            if label is not None and label not in names:
+                continue
+            title = node.get("title")
+            issue_events.append(
+                GithubEvent(
+                    event_id=f"evt-issue-{number}",
+                    number=number,
+                    title=title if isinstance(title, str) else "",
+                    head_ref=None,
+                    label=label,
+                    payload=node,
+                )
+            )
+        return issue_events
+
+    log.warning("unknown github_event query %r — nothing to poll", query)
+    return []
+
+
+def enrich_event_detail(
+    gh: GhClient, event: GithubEvent, *, owner: str, repo: str
+) -> GithubEvent:
+    """Best-effort detail fill-in (title, head ref) for a new event right before the
+    prompt is built. Only called for events about to dispatch, so a clean tick never
+    pays for it (spec v2 §2: "per-new-event detail only"). Never raises: an event whose
+    detail cannot be read still dispatches with what the list poll already returned."""
+    try:
+        view = gh.pr_view(owner=owner, repo=repo, number=event.number)
+    except Exception as e:  # noqa: BLE001 — detail is best-effort, never blocks dispatch
+        log.warning(
+            "gh pr view %d failed for new event %s: %s", event.number, event.event_id, e
+        )
+        return event
+    if not isinstance(view, dict):
+        return event
+    title = view.get("title")
+    head_ref = view.get("headRefName")
+    return GithubEvent(
+        event_id=event.event_id,
+        number=event.number,
+        title=title if isinstance(title, str) and title else event.title,
+        head_ref=head_ref if isinstance(head_ref, str) and head_ref else event.head_ref,
+        label=event.label,
+        payload=event.payload,
+    )
+
+
+def attempt_count_for_event(history_path: Path, job_name: str, event_id: str) -> int:
+    """Prior real fix-attempt count for one `event_id` (issue 014 retry budget keyed
+    per event, mirroring the pr-number key of pr-target mode). Terminal states only —
+    skipped/max_attempts records must not increment the budget, same rule as
+    attempt_count_for_pr."""
+    records = read_job(history_path, job_name)
+    count = 0
+    for r in records:
+        if (
+            r.state in _COUNTABLE_STATES
+            and r.extra
+            and r.extra.get("event_id") == event_id
+        ):
+            count += 1
+    return count
+
+
+def build_event_fix_prompt(
+    job_name: str,
+    event: GithubEvent,
+    owner_repo: str,
+    report_path: str,
+    base: str,
+) -> str:
+    """Build the prompt for an event-triggered worker: seeded with the event payload
+    (its stable id, number, title and labels) so the agent knows what fired (spec v2 §2)."""
+    label_line = f"Label: {event.label}\n" if event.label else ""
+    return textwrap.dedent(f"""\
+        You are responding to a GitHub event on {owner_repo}. Work in the checked-out worktree.
+
+        Job: {job_name}
+        Event: {event.event_id}
+        PR/Issue: #{event.number}
+        Title: {event.title}
+        {label_line}Report: {report_path}
+
+        Instructions:
+        1. Read the event details above and make the changes they call for.
+        2. Verify with `uv run pytest -q` (and `uv run ruff check src/` if the repo lints).
+        3. Commit your changes with a descriptive message.
+        4. Create a branch `auto/{job_name}-<timestamp>`, push it, and open a PR
+           targeting {base} with `gh pr create --base {base}`.
+
+        Write a summary of what you did to: {report_path}
+
+        Bounded work: complete the change and push, then stop.
+    """)
