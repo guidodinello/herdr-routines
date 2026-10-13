@@ -324,8 +324,11 @@ def _register_then_tick(
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
 
     run_tick(config, history_path, client=client, now=at)  # type: ignore[arg-type]
-    outcome = run_tick(  # type: ignore[arg-type]
-        config, history_path, client=client, now=at + timedelta(minutes=1)
+    outcome = run_tick(
+        config,
+        history_path,
+        client=client,  # type: ignore[arg-type]
+        now=at + timedelta(minutes=1),
     )
     return history_path, outcome
 
@@ -428,14 +431,20 @@ def test_github_event_repoll_dedups_same_event(
 
     t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
-    run_tick(  # type: ignore[arg-type]
-        config, history_path, client=client, now=t0 + timedelta(minutes=1)
+    run_tick(
+        config,
+        history_path,
+        client=client,  # type: ignore[arg-type]
+        now=t0 + timedelta(minutes=1),
     )
     assert len(client.tab_creates) == 1, "first sight of the event must dispatch once"
 
     # Same event returned again: no second worker.
-    run_tick(  # type: ignore[arg-type]
-        config, history_path, client=client, now=t0 + timedelta(minutes=2)
+    run_tick(
+        config,
+        history_path,
+        client=client,  # type: ignore[arg-type]
+        now=t0 + timedelta(minutes=2),
     )
     assert len(client.tab_creates) == 1, "re-poll dispatched a duplicate worker"
 
@@ -445,9 +454,9 @@ def test_github_event_repoll_dedups_same_event(
     assert terminal.extra is not None
     assert terminal.extra.get("gate") == "passed"
     seen = terminal.extra.get("last_seen_event_ids")
-    assert isinstance(seen, list) and any(
-        str(EVENT_NUMBER) in str(e) for e in seen
-    ), "clean re-poll must record the deduped event ID"
+    assert isinstance(seen, list) and any(str(EVENT_NUMBER) in str(e) for e in seen), (
+        "clean re-poll must record the deduped event ID"
+    )
 
 
 # -- AC 4: budget taps out -------------------------------------------------------
@@ -490,8 +499,11 @@ def test_github_event_budget_exceeded_skips_with_notify(
     monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
     monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
-    run_tick(  # type: ignore[arg-type]
-        config, history_path, client=client, now=t0 + timedelta(minutes=60)
+    run_tick(
+        config,
+        history_path,
+        client=client,  # type: ignore[arg-type]
+        now=t0 + timedelta(minutes=60),
     )
 
     assert client.tab_creates == [], "over-budget event dispatched a worker"
@@ -653,7 +665,7 @@ def test_github_event_history_example_and_timeout_docs(
             },
         ),
     )
-    (records := read_job(history_path, "on-label-pr"))
+    records = read_job(history_path, "on-label-pr")
     assert len(records) == 1
     assert records[0].extra is not None
     assert records[0].extra["gate"] == "passed"
@@ -661,9 +673,7 @@ def test_github_event_history_example_and_timeout_docs(
     assert records[0].extra["event_id"] == EVENT_ID
 
     # --- the shipped example carries a validating github_event sample ----------
-    example = (
-        Path(__file__).resolve().parent.parent / "deploy" / "jobs.example.yaml"
-    )
+    example = Path(__file__).resolve().parent.parent / "deploy" / "jobs.example.yaml"
     example_text = example.read_text()
     assert "github_event" in example_text, (
         "deploy/jobs.example.yaml must document a github_event job"
@@ -675,8 +685,7 @@ def test_github_event_history_example_and_timeout_docs(
         for j in raw["jobs"]
         if isinstance(j, dict)
         and any(
-            isinstance(c, dict) and "github_event" in c
-            for c in (j.get("checks") or [])
+            isinstance(c, dict) and "github_event" in c for c in (j.get("checks") or [])
         )
     ]
     assert sample_jobs, "example must contain a job with a github_event check"
@@ -694,9 +703,7 @@ def test_github_event_history_example_and_timeout_docs(
     def _flagged(job: Job, timeout_s: int) -> bool:
         unit = tmp_path / f"unit-{timeout_s}.service"
         unit.write_text(f"[Service]\nTimeoutStartSec={timeout_s}\n")
-        return bool(
-            cli._check_systemd_timeout(RoutinesConfig(jobs=(job,)), unit)
-        )
+        return bool(cli._check_systemd_timeout(RoutinesConfig(jobs=(job,)), unit))
 
     repo = tmp_path / "repo"
     base_job = _make_event_job(repo)
@@ -737,7 +744,5 @@ def test_github_event_review_tiers_present() -> None:
     assert len(lines) >= 7, f"expected >=7 criteria, got {len(lines)}"
     for line in lines:
         assert "Test: test_github_event_" in line, f"missing test name: {line}"
-        assert ("blocking" in line) or ("non-blocking" in line), (
-            f"missing tier: {line}"
-        )
+        assert ("blocking" in line) or ("non-blocking" in line), f"missing tier: {line}"
         assert "confidence:" in line, f"missing confidence: {line}"
