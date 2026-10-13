@@ -39,6 +39,7 @@ from herdr_routines.auto_fix import (
     build_pr_agent_name,
     build_worker_agent_name,
     enrich_event_detail,
+    event_worktree_slug,
     fetch_failing_checks,
     fetch_thread_bodies,
     is_eligible,
@@ -1203,13 +1204,23 @@ def _last_seen_event_ids(history_path: Path, job_name: str) -> list[str]:
     return seen
 
 
+def _event_target(check: GateCheck) -> str:
+    """The event's own kind for the history `target` field: an `issues:opened` poll
+    fires on issues, every other query fires on PRs. Kept distinct from `job.target`
+    (where a fix lands) so an issue event is never recorded as a PR."""
+    return "issue" if check.query == "issues:opened" else "pr"
+
+
 def _resolve_event_owner_repo(job: Job, check: GateCheck) -> tuple[str, str]:
     """owner/repo for the event poll: the check's explicit `repo:` when set, else the
-    job repo's `origin` remote. Raises on a missing/unparseable remote so the caller
-    can fail closed rather than silently poll the wrong repo."""
+    job's managed-clone `repository:` URL, else the job repo's `origin` remote. Raises
+    on a missing/unparseable source so the caller can fail closed rather than silently
+    poll the wrong repo."""
     if check.repo:
         owner, repo_name = check.repo.split("/", 1)
         return owner, repo_name
+    if job.repository:
+        return repo_owner_and_name(job.repository)
     proc = subprocess.run(
         ["git", "-C", str(job.repo), "remote", "get-url", "origin"],
         capture_output=True,
@@ -1218,7 +1229,11 @@ def _resolve_event_owner_repo(job: Job, check: GateCheck) -> tuple[str, str]:
         check=False,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"git remote failed: {proc.stderr.strip()}")
+        raise RuntimeError(
+            "cannot resolve owner/repo for github_event check: set the check's "
+            "'repo:', the job's 'repository:', or an 'origin' git remote "
+            f"(git remote failed: {proc.stderr.strip()})"
+        )
     return repo_owner_and_name(proc.stdout.strip())
 
 
@@ -1236,6 +1251,7 @@ def _process_event_target(
     `max_workers_per_tick`). No new event → clean pass, no agent, no worktree; a
     poll failure fails closed as a gate error (never a silent green)."""
     gh = RealGhClient()
+    event_target = _event_target(check)
 
     try:
         ensure_repo(job)
@@ -1254,7 +1270,7 @@ def _process_event_target(
                     "gate": "failed",
                     "reason": reason,
                     "error": str(e),
-                    "target": "pr",
+                    "target": event_target,
                 },
             ),
         )
@@ -1281,7 +1297,7 @@ def _process_event_target(
                     "gate": "failed",
                     "reason": "repo_detection_failed",
                     "error": str(e),
-                    "target": "pr",
+                    "target": event_target,
                 },
             ),
         )
@@ -1310,7 +1326,7 @@ def _process_event_target(
                     "gate": "failed",
                     "reason": "github_event_poll_failed",
                     "error": str(e),
-                    "target": "pr",
+                    "target": event_target,
                     "query": check.query,
                 },
             ),
@@ -1338,7 +1354,7 @@ def _process_event_target(
                 run_id=run_id,
                 extra={
                     "gate": "passed",
-                    "target": "pr",
+                    "target": event_target,
                     "query": check.query,
                     "polled": len(events),
                     "last_seen_event_ids": last_seen,
@@ -1370,7 +1386,7 @@ def _process_event_target(
                         "event_id": event.event_id,
                         "event_number": event.number,
                         "attempt": attempt,
-                        "target": "pr",
+                        "target": event_target,
                     },
                 ),
             )
@@ -1405,7 +1421,7 @@ def _process_event_target(
             "report_path": worker_outcome.get("report_path"),
             "report_written": worker_outcome.get("report_written", False),
             "final_agent_status": worker_outcome.get("final_agent_status"),
-            "target": "pr",
+            "target": event_target,
         }
         if worker_outcome.get("error") is not None:
             extra_record["error"] = worker_outcome["error"]
@@ -1435,7 +1451,7 @@ def _process_event_target(
             run_id=run_id,
             extra={
                 "gate": "failed" if any_failed else "passed",
-                "target": "pr",
+                "target": event_target,
                 "query": check.query,
                 "polled": len(events),
                 "new": len(new_events),
@@ -1521,7 +1537,9 @@ def _dispatch_event_worker(
         prompt_text, report_path=report_path, job_name=job.name, run_id=event_run_id
     )
 
-    wt_path = Path(job.repo) / ".worktrees" / f"event-{event.event_id}"
+    wt_path = (
+        Path(job.repo) / ".worktrees" / f"event-{event_worktree_slug(event.event_id)}"
+    )
     try:
         subprocess.run(
             ["git", "-C", str(job.repo), "worktree", "remove", "--force", str(wt_path)],

@@ -33,6 +33,15 @@ from typing import Any
 import pytest
 import yaml
 
+from herdr_routines.auto_fix import (
+    GateCheck as AutoFixGateCheck,
+)
+from herdr_routines.auto_fix import (
+    build_event_fix_prompt,
+    enrich_event_detail,
+    event_worktree_slug,
+    poll_github_event,
+)
 from herdr_routines.config import ConfigError, GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import run_tick
@@ -227,6 +236,42 @@ class EventGhClient:
     ) -> list[dict[str, object]]:
         self.calls.append(f"pr_review_comments:{number}")
         return []
+
+    def pr_create(
+        self, *, owner: str, repo: str, branch: str, title: str, body: str
+    ) -> int:
+        self.calls.append(f"pr_create:{branch}")
+        return 1
+
+
+class CiGhClient(EventGhClient):
+    """EventGhClient whose `graphql` read returns one open PR's status rollup, so
+    the batched `ci:failed` poll can be exercised without any per-PR `pr_view`."""
+
+    def __init__(self, *, ci_state: str = "FAILURE", **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.ci_state = ci_state
+
+    def graphql(self, query: str, **variables: str) -> dict[str, object]:
+        self.calls.append("graphql")
+        return {
+            "data": {
+                "repository": {
+                    "pullRequests": {
+                        "nodes": [
+                            {
+                                "number": EVENT_NUMBER,
+                                "title": EVENT_TITLE,
+                                "headRefName": EVENT_BRANCH,
+                                "author": {"login": self.user},
+                                "labels": {"nodes": [{"name": EVENT_LABEL}]},
+                                "statusCheckRollup": {"state": self.ci_state},
+                            }
+                        ]
+                    }
+                }
+            }
+        }
 
 
 class RecordingHerdrClient:
@@ -746,3 +791,100 @@ def test_github_event_review_tiers_present() -> None:
         assert "Test: test_github_event_" in line, f"missing test name: {line}"
         assert ("blocking" in line) or ("non-blocking" in line), f"missing tier: {line}"
         assert "confidence:" in line, f"missing confidence: {line}"
+
+
+# -- Review fixes: issue events, batched ci:failed, slug, prompt -----------------
+
+
+def test_issue_event_enrichment_skips_pr_view() -> None:
+    """`issues:opened` events carry issue numbers, so enrichment must not hit the
+    PR-only `pr_view` (which would fail and quietly drop the title)."""
+    gh = EventGhClient(events=True)
+    check = AutoFixGateCheck(kind="github_event", query="issues:opened", match={})
+    events = poll_github_event(gh, owner="test", repo="repo", check=check)
+    assert len(events) == 1
+    event = events[0]
+    assert event.is_issue is True
+    assert event.title == EVENT_TITLE
+
+    before = len(gh.calls)
+    detailed = enrich_event_detail(gh, event, owner="test", repo="repo")
+    assert detailed is event
+    assert not any(c.startswith("pr_view") for c in gh.calls[before:]), (
+        "issue enrichment must not call the PR-only pr_view endpoint"
+    )
+
+
+def test_ci_failed_polls_once_without_per_pr_view() -> None:
+    """`ci:failed` batches the status rollup into one GraphQL read instead of a
+    `pr_list` + per-PR `pr_view` N+1."""
+    gh = CiGhClient(ci_state="FAILURE")
+    check = AutoFixGateCheck(kind="github_event", query="ci:failed", match={})
+    events = poll_github_event(gh, owner="owner", repo="repo", check=check)
+    assert [e.event_id for e in events] == [f"evt-ci-{EVENT_NUMBER}"]
+    assert events[0].title == EVENT_TITLE
+    assert gh.calls == ["graphql"], f"ci:failed must be one batched read, got {gh.calls}"
+
+    # A green rollup yields no events.
+    clean = CiGhClient(ci_state="SUCCESS")
+    assert poll_github_event(clean, owner="owner", repo="repo", check=check) == []
+
+
+def test_event_worktree_slug_is_filesystem_safe() -> None:
+    """A label with spaces/slashes in the event id must not leak into the worktree
+    path, and distinct ids must slug apart."""
+    assert event_worktree_slug(EVENT_ID) == EVENT_ID
+    dirty = "evt-pr-42-review needed/now"
+    slug = event_worktree_slug(dirty)
+    assert " " not in slug and "/" not in slug
+    assert slug.startswith("evt-pr-42-review-needed-now")
+    assert event_worktree_slug("evt-pr-42-a b") != event_worktree_slug("evt-pr-42-a-b")
+
+
+def test_build_event_fix_prompt_matches_worktree_checkout() -> None:
+    """The publish step must reflect the worktree `_dispatch_event_worker` prepared:
+    a PR event is on its head branch (no new branch), an issue event gets a PR."""
+    pr_event = poll_github_event(
+        EventGhClient(events=True),
+        owner="test",
+        repo="repo",
+        check=AutoFixGateCheck(kind="github_event", query="prs:labels", match={}),
+    )[0]
+    prompt = build_event_fix_prompt(
+        job_name="on-label-pr",
+        event=pr_event,
+        owner_repo="test/repo",
+        report_path="/tmp/report.md",
+        base="main",
+    )
+    assert EVENT_BRANCH in prompt
+    assert "already checked out" in prompt
+    assert "Create a branch" not in prompt
+
+    issue_event = poll_github_event(
+        EventGhClient(events=True),
+        owner="test",
+        repo="repo",
+        check=AutoFixGateCheck(kind="github_event", query="issues:opened", match={}),
+    )[0]
+    issue_prompt = build_event_fix_prompt(
+        job_name="on-label-pr",
+        event=issue_event,
+        owner_repo="test/repo",
+        report_path="/tmp/report.md",
+        base="main",
+    )
+    assert "Create a branch" in issue_prompt
+    assert "gh pr create --base main" in issue_prompt
+
+
+def test_github_event_empty_match_validates(tmp_config_path: Path) -> None:
+    """An empty `match: {}` is a valid mapping — `ci:failed` jobs may want every
+    failing PR without label/branch/author filters."""
+    from herdr_routines.config import load_config
+
+    tmp_config_path.write_text(_event_job_yaml(match="{}"))
+    cfg = load_config(tmp_config_path)
+    job = cfg.job("on-label-pr")
+    assert job is not None and job.checks is not None
+    assert job.checks[0].match == {}

@@ -927,9 +927,11 @@ def _build_job(
                             "string or null"
                         )
                     evt_match = evt.get("match")
-                    if not isinstance(evt_match, dict) or not evt_match:
+                    if evt_match is None:
+                        evt_match = {}
+                    if not isinstance(evt_match, dict):
                         raise ConfigError(
-                            f"{label}: 'checks[{ci}].match' must be a non-empty mapping"
+                            f"{label}: 'checks[{ci}].match' must be a mapping or null"
                         )
                     unknown_match = set(evt_match) - VALID_GITHUB_EVENT_MATCH_KEYS
                     if unknown_match:

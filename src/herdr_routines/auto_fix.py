@@ -944,7 +944,11 @@ class GithubEvent:
 
     `event_id` is the stable dedup key (the spec's `extra.event_id`); re-polls that
     return an ID already in `last_seen_event_ids` are clean no-ops. `payload` is the
-    raw read the poll produced so the seeded prompt can quote real fields."""
+    raw read the poll produced so the seeded prompt can quote real fields.
+
+    `is_issue` distinguishes an `issues:opened` event (an issue number, no head ref)
+    from a PR-backed event, so detail enrichment and history `target` never treat an
+    issue as a PR."""
 
     event_id: str
     number: int
@@ -952,16 +956,23 @@ class GithubEvent:
     head_ref: str | None
     label: str | None
     payload: dict[str, Any]
+    is_issue: bool = False
 
 
 def _label_names(labels: Any) -> list[str]:
-    """Flatten the label shapes gh returns (`[{"name": ...}, ...]`) to bare names."""
+    """Flatten the label shapes gh returns to bare names. Handles both the REST
+    ``[{"name": ...}, ...]`` list and the GraphQL ``{"nodes": [{"name": ...}]}``
+    wrapper, plus a bare list of strings."""
+    if isinstance(labels, dict):
+        labels = labels.get("nodes")
     if not isinstance(labels, list):
         return []
     names: list[str] = []
     for lbl in labels:
         if isinstance(lbl, dict) and isinstance(lbl.get("name"), str):
             names.append(lbl["name"])
+        elif isinstance(lbl, str):
+            names.append(lbl)
     return names
 
 
@@ -1032,30 +1043,45 @@ def poll_github_event(
         return result
 
     if query == "ci:failed":
-        raw = gh.pr_list(owner=owner, repo=repo, state="open", limit=100)
+        # One GraphQL read for every open PR plus its status rollup, rather than a
+        # `pr_list` + per-PR `pr_view` N+1 (which could trip rate limits on a busy
+        # repo). A failing `gh` call raises, so the tick still fails closed.
+        gql = """
+        query($owner: String!, $repo: String!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequests(first: 100, states: OPEN) {
+              nodes {
+                number
+                title
+                headRefName
+                author { login }
+                labels(first: 20) { nodes { name } }
+                statusCheckRollup { state }
+              }
+            }
+          }
+        }
+        """
+        data = gh.graphql(gql, owner=owner, repo=repo)
+        nodes = _graphql_nodes(
+            data, "data", "repository", "pullRequests", "nodes"
+        )
         result = []
-        for pr in raw:
+        for pr in nodes:
             if not isinstance(pr, dict) or not _event_matches(pr, match):
                 continue
             number = pr.get("number")
             if not isinstance(number, int):
                 continue
-            try:
-                view = gh.pr_view(owner=owner, repo=repo, number=number)
-            except Exception as e:  # noqa: BLE001 — a failing detail read is not a failing CI
-                log.warning("gh pr view %d failed for ci:failed: %s", number, e)
-                continue
-            rollup = view.get("statusCheckRollup") if isinstance(view, dict) else None
-            failing = False
-            if isinstance(rollup, list):
-                failing = any(
-                    isinstance(c, dict) and c.get("state") in FAILING_CI_STATES
-                    for c in rollup
-                )
+            rollup = pr.get("statusCheckRollup")
+            failing = (
+                isinstance(rollup, dict)
+                and rollup.get("state") in FAILING_CI_STATES
+            )
             if not failing:
                 continue
-            title = view.get("title") if isinstance(view, dict) else ""
-            head_ref = view.get("headRefName") if isinstance(view, dict) else None
+            title = pr.get("title")
+            head_ref = pr.get("headRefName")
             result.append(
                 GithubEvent(
                     event_id=f"evt-ci-{number}",
@@ -1084,13 +1110,7 @@ def poll_github_event(
             repo=repo,
             searchQuery=f"repo:{owner}/{repo} is:issue is:open",
         )
-        nodes: list[Any] = []
-        if isinstance(data, dict):
-            payload = data.get("data")
-            if isinstance(payload, dict):
-                search = payload.get("search")
-                if isinstance(search, dict) and isinstance(search.get("nodes"), list):
-                    nodes = search["nodes"]
+        nodes = _graphql_nodes(data, "data", "search", "nodes")
         issue_events: list[GithubEvent] = []
         for node in nodes:
             if not isinstance(node, dict):
@@ -1099,9 +1119,7 @@ def poll_github_event(
             if not isinstance(number, int):
                 continue
             labels = node.get("labels")
-            names = (
-                _label_names(labels.get("nodes")) if isinstance(labels, dict) else []
-            )
+            names = _label_names(labels)
             label = match.get("label") if isinstance(match.get("label"), str) else None
             if label is not None and label not in names:
                 continue
@@ -1114,6 +1132,7 @@ def poll_github_event(
                     head_ref=None,
                     label=label,
                     payload=node,
+                    is_issue=True,
                 )
             )
         return issue_events
@@ -1122,13 +1141,48 @@ def poll_github_event(
     return []
 
 
+def _graphql_nodes(data: object, *path: str) -> list[Any]:
+    """Walk a nested GraphQL response down ``path`` and return the node list, or an
+    empty list when any hop is missing/wrong-shaped. Keeps the poll parsers free of
+    the repeated isinstance ladder."""
+    node: Any = data
+    for key in path:
+        if not isinstance(node, dict):
+            return []
+        node = node.get(key)
+    return node if isinstance(node, list) else []
+
+
+_SLUG_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def event_worktree_slug(event_id: str) -> str:
+    """A filesystem-safe slug for an event's worktree directory.
+
+    ``event_id`` can embed a GitHub label (e.g. ``evt-pr-42-review/needed``), and
+    labels may contain spaces or characters that are illegal in a path segment.
+    Replace runs of unsafe characters with ``-``; when that changes the id, append a
+    short hash so two distinct events can never slug to the same directory."""
+    slug = _SLUG_UNSAFE_RE.sub("-", event_id).strip("-")
+    if slug == event_id:
+        return slug or "event"
+    digest = hashlib.sha1(event_id.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{digest}" if slug else digest
+
+
 def enrich_event_detail(
     gh: GhClient, event: GithubEvent, *, owner: str, repo: str
 ) -> GithubEvent:
     """Best-effort detail fill-in (title, head ref) for a new event right before the
     prompt is built. Only called for events about to dispatch, so a clean tick never
     pays for it (spec v2 §2: "per-new-event detail only"). Never raises: an event whose
-    detail cannot be read still dispatches with what the list poll already returned."""
+    detail cannot be read still dispatches with what the list poll already returned.
+
+    Issue events are returned unchanged: an issue has no PR head ref, and its title
+    already came from the `issues:opened` search read — `pr_view` would fail on an
+    issue number, so it must not be called for one."""
+    if event.is_issue:
+        return event
     try:
         view = gh.pr_view(owner=owner, repo=repo, number=event.number)
     except Exception as e:  # noqa: BLE001 — detail is best-effort, never blocks dispatch
@@ -1147,6 +1201,7 @@ def enrich_event_detail(
         head_ref=head_ref if isinstance(head_ref, str) and head_ref else event.head_ref,
         label=event.label,
         payload=event.payload,
+        is_issue=event.is_issue,
     )
 
 
@@ -1175,8 +1230,24 @@ def build_event_fix_prompt(
     base: str,
 ) -> str:
     """Build the prompt for an event-triggered worker: seeded with the event payload
-    (its stable id, number, title and labels) so the agent knows what fired (spec v2 §2)."""
+    (its stable id, number, title and labels) so the agent knows what fired (spec v2 §2).
+
+    The publish step matches how `_dispatch_event_worker` prepared the worktree: a PR
+    event is already checked out at its head branch (commit + push updates that PR), an
+    issue event has no head branch (branch off the base and open a PR)."""
     label_line = f"Label: {event.label}\n" if event.label else ""
+    if event.head_ref:
+        publish_step = (
+            f"4. The worktree is already checked out at the event's head branch "
+            f"`{event.head_ref}`; commit your changes there and push to update the "
+            "existing PR that fired this event."
+        )
+    else:
+        publish_step = (
+            f"4. Create a branch `auto/{job_name}-<timestamp>` from the current "
+            f"checkout, push it, and open a PR targeting {base} with "
+            f"`gh pr create --base {base}`."
+        )
     return textwrap.dedent(f"""\
         You are responding to a GitHub event on {owner_repo}. Work in the checked-out worktree.
 
@@ -1190,8 +1261,7 @@ def build_event_fix_prompt(
         1. Read the event details above and make the changes they call for.
         2. Verify with `uv run pytest -q` (and `uv run ruff check src/` if the repo lints).
         3. Commit your changes with a descriptive message.
-        4. Create a branch `auto/{job_name}-<timestamp>`, push it, and open a PR
-           targeting {base} with `gh pr create --base {base}`.
+        {publish_step}
 
         Write a summary of what you did to: {report_path}
 
