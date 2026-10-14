@@ -1,7 +1,7 @@
 ---
 id: "024"
 title: "Spawn a session on the fly from Telegram"
-status: open
+status: done
 priority: low
 area: infra
 ---
