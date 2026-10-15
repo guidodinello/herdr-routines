@@ -162,9 +162,9 @@ Curated into issue files 2026-08-27. Time-gated items were promoted to
   [`018`](docs/process/issues/018-model-selection-per-job.md)
 - **Log rotation** — `done`, `low`. Size/age rotation of `history.jsonl` +
   opt-in reports prune. → [`021`](docs/process/issues/021-log-rotation.md)
-- **API / webhook trigger** — `open`, `low`. Unblocked 2026-09-29: its gate,
-  issue 015 (babysit-prs, the gh-api-polling pattern this generalizes), has
-  shipped; transport is settled as poll-based. →
+- **API / webhook trigger** — `done` (PR #162, 2026-10-15). Shipped as the
+  poll-based `github_event` gate check (`prs:labels` | `issues:opened` |
+  `ci:failed`), generalizing issue 015's gh-api polling; no listener, no tunnel. →
   [`014`](docs/process/issues/014-api-webhook-trigger.md)
 - **Docker image for trivial multi-host setup** — `blocked`: PTY-in-container
   worry resolved; now gated on a secret-injection + image-architecture

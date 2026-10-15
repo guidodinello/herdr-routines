@@ -80,6 +80,34 @@ jobs:
     start_timeout_ms: 120000
     on_missed: log
 
+  # event-triggered job (issue 014): `github_event` is a poll predicate, same shape as
+  # pr_health — `cron` is the poll cadence, not the event. Each tick reads `gh` and diffs
+  # the returned event IDs against `last_seen_event_ids`; a new matching event dispatches
+  # one worker (capped by max_workers_per_tick), a clean poll costs only the read-only
+  # `gh api` call. No listener, no tunnel, no inbound reachability. v1 closed `query` set:
+  # prs:labels | issues:opened | ci:failed; `match` accepts label/branch/author.
+  - name: on-ready-for-agent-pr
+    enabled: true
+    cron: "*/10 * * * *" # poll cadence (every 10 min), not the event itself
+    repo: /home/guido/projects/herdr-routines
+    workspace: worktree
+    base: main
+    kind: gated
+    max_workers_per_tick: 1 # one fix worker per new event, ≤1/tick
+    max_attempts_per_target: 3 # retry budget, keyed per event_id
+    checks:
+      - github_event: # builtin: poll matching events, never spawns on a clean tick
+          query: prs:labels
+          repo: owner/repo # optional; defaults to the job repo's origin remote
+          match: { label: "ready-for-agent" }
+          timeout_ms: 60000
+    agent_kind: opencode
+    model: null
+    prompt: "" # empty = engine prompt seeded with the event payload
+    timeout_ms: 1800000
+    start_timeout_ms: 120000
+    on_missed: log
+
   # Proposed (docs/pipeline/features/gate-trigger-standing-job.md): a repository-hygiene
   # routine. Same job shape as babysit-prs but checks are commands — the agent runs ONLY when
   # a check exits non-zero (e.g. ruff+mypy). All commands passing -> done, no agent, no PR.
