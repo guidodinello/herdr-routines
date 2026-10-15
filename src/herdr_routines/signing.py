@@ -76,7 +76,7 @@ def resign_local_commits(worktree: Path, *, base: str) -> int:
     """Re-sign, in place, every unsigned commit on the branch checked out at ``worktree``
     since ``origin/<base>``. Returns how many were unsigned (0 = nothing done).
 
-    For a branch that is not on origin yet — the pipeline's stage 4 calls this just before
+    For a branch that is not on origin yet — the pipeline's stage 5 calls this just before
     its push, so the rewrite needs no force-push and the worktree stays the source of
     truth for the stages after it. Same no-op and merge-commit rules as
     ``resign_unsigned_branch``; refuses a worktree with uncommitted changes, which a

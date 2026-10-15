@@ -395,14 +395,15 @@ def test_system_boot_epoch_none_when_unreadable(tmp_path: Path) -> None:
 
 def test_validate_stage_sessions_accepts_distinct_real_ids() -> None:
     ok = {
-        "current_stage": 6,
+        "current_stage": 7,
         "stage_sessions": {
             "1": "ses_f9f8186e3ffeY07GblyzaVJP01",
             "2": "ses_f9f7ee0e7ffeEXZ9pkSIMNPhmC",
             "3": "ses_f9a578e4effegxE5jPbimAei1R",
             "4": "ses_f9a446f22ffe4EQX3KWOAwetPz",
-            "5": "ses_a1b2c3d4e5f6a1b2c3d4e5f6a1",
             "6": "ses_b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            # Stage 7 reuses stage 4's session by declaration.
+            "7": "ses_f9a446f22ffe4EQX3KWOAwetPz",
         },
     }
     assert validate_stage_sessions(ok) is None

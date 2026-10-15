@@ -17,11 +17,11 @@ from herdr_routines.gates import (
     ReviewThread,
     evaluate_ci_checks,
     evaluate_commit_checks,
-    evaluate_gate6,
+    evaluate_gate7,
     gate3_result,
     run_ci_gate,
-    run_gate5,
     run_gate6,
+    run_gate7,
 )
 from tests.test_auto_fix import FakeGhClient as AutoFixFakeGhClient
 
@@ -150,9 +150,9 @@ def test_gate3_passes_when_all_green() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_ci_failure_routes_to_stage6() -> None:
+def test_pipeline_ci_failure_routes_to_stage7() -> None:
     """A FAILURE conclusion fails the CI gate rather than being silently accepted —
-    this is the signal the orchestrator routes into stage 6 as a must-fix item
+    this is the signal the orchestrator routes into stage 7 as a must-fix item
     instead of reaching `## Outcome: ok`."""
     checks: list[dict[str, object]] = [
         {"name": "Lint Python", "status": "COMPLETED", "conclusion": "FAILURE"},
@@ -256,7 +256,7 @@ def test_gate6_fails_on_unreplied_thread() -> None:
             is_resolved=False, comment_count=1, first_comment_body="[non-blocking] fyi"
         )
     ]
-    verdict = evaluate_gate6(threads)
+    verdict = evaluate_gate7(threads)
     assert verdict.passed is False
     assert "no reply" in (verdict.reason or "")
 
@@ -267,7 +267,7 @@ def test_gate6_passes_on_replied_nonblocking() -> None:
             is_resolved=False, comment_count=2, first_comment_body="[non-blocking] fyi"
         )
     ]
-    verdict = evaluate_gate6(threads)
+    verdict = evaluate_gate7(threads)
     assert verdict.passed is True
 
 
@@ -280,14 +280,14 @@ def test_blocking_tag_match_excludes_non_blocking() -> None:
             is_resolved=False, comment_count=2, first_comment_body="[blocking] fix this"
         )
     ]
-    assert evaluate_gate6(blocking_replied).passed is False
+    assert evaluate_gate7(blocking_replied).passed is False
 
     non_blocking_replied = [
         ReviewThread(
             is_resolved=False, comment_count=2, first_comment_body="[non-blocking] fyi"
         )
     ]
-    assert evaluate_gate6(non_blocking_replied).passed is True
+    assert evaluate_gate7(non_blocking_replied).passed is True
 
 
 def test_gate6_resolved_threads_are_ignored() -> None:
@@ -296,7 +296,7 @@ def test_gate6_resolved_threads_are_ignored() -> None:
             is_resolved=True, comment_count=1, first_comment_body="[blocking] old"
         )
     ]
-    assert evaluate_gate6(threads).passed is True
+    assert evaluate_gate7(threads).passed is True
 
 
 def test_run_gate6_parses_graphql_response() -> None:
@@ -323,7 +323,7 @@ def test_run_gate6_parses_graphql_response() -> None:
             }
         }
     )
-    verdict = run_gate6(gh, owner="o", repo="r", pr=81)
+    verdict = run_gate7(gh, owner="o", repo="r", pr=81)
     assert verdict.passed is False
     assert gh.graphql_calls == 1
 
@@ -463,7 +463,7 @@ def test_gate5_rejects_nonblocking_only_review() -> None:
     only_non_blocking = FakeGhClient(
         pr_views=[{"reviews": [{"body": "### non-blocking\n[non-blocking] tidy this"}]}]
     )
-    verdict = run_gate5(only_non_blocking, owner="o", repo="r", pr=7)
+    verdict = run_gate6(only_non_blocking, owner="o", repo="r", pr=7)
     assert verdict.passed is False
     assert verdict.reason is not None and BLOCKING_TAG in verdict.reason
 
@@ -477,17 +477,17 @@ def test_gate5_rejects_nonblocking_only_review() -> None:
             }
         ]
     )
-    assert run_gate5(structured, owner="o", repo="r", pr=7).passed is True
+    assert run_gate6(structured, owner="o", repo="r", pr=7).passed is True
 
     # The bare word, unbracketed, is the substring trap itself: not a tier label.
     unbracketed = FakeGhClient(
         pr_views=[{"reviews": [{"body": "this is blocking-ish, probably fine"}]}]
     )
-    assert run_gate5(unbracketed, owner="o", repo="r", pr=7).passed is False
+    assert run_gate6(unbracketed, owner="o", repo="r", pr=7).passed is False
 
     # No review at all is not a pass either.
     assert (
-        run_gate5(FakeGhClient(pr_views=[{}]), owner="o", repo="r", pr=7).passed
+        run_gate6(FakeGhClient(pr_views=[{}]), owner="o", repo="r", pr=7).passed
         is False
     )
 
@@ -500,12 +500,14 @@ def test_gate5_reads_blocking_labels_from_inline_review_comments() -> None:
         pr_views=[{"reviews": [{"body": "Found 1 blocking issue(s)."}, {"body": ""}]}],
         inline_comments=[{"body": "**[blocking]** this is wrong"}],
     )
-    assert run_gate5(gh, owner="o", repo="r", pr=7).passed is True
+    assert run_gate6(gh, owner="o", repo="r", pr=7).passed is True
 
 
-def test_gate5_is_not_a_cli_stage() -> None:
-    """Gate 3 stays prose by design (issue 034), so `3` must never appear in the
-    CLI's `--stage` choices — its lint/pytest verdict is the implementer's own-tree
-    check, with Gate CI as the authoritative one."""
+def test_gates_3_and_4_are_not_cli_stages() -> None:
+    """Gates 3 and 4 are git checks `pipeline_run` runs on its own worktree (the test
+    author touched only tests/, the implementer removed no named test), so `3` and `4`
+    must never appear in the CLI's `--stage` choices. Every other stage keeps its own
+    number as its gate token (issue 059 renumbered them 1-7)."""
     assert "3" not in GATE_STAGE_CHOICES
-    assert set(GATE_STAGE_CHOICES) == {"1", "2", "4", "5", "6", "ci"}
+    assert "4" not in GATE_STAGE_CHOICES
+    assert set(GATE_STAGE_CHOICES) == {"1", "2", "5", "6", "7", "ci"}

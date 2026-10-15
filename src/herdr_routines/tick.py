@@ -1429,10 +1429,7 @@ def _process_pr_target(
             _notify(
                 client,
                 f"herdr-routines: {job.name} failed",
-                body=(
-                    f"{dispatched_count} dispatched, {failed_count} failed, "
-                    f"{skipped_count} skipped"
-                ),
+                body=f"{dispatched_count} dispatched, {skipped_count} skipped",
                 sound="request",
             )
         return summary, True
@@ -2519,7 +2516,7 @@ def _bare_pipeline_run_id(job_name: str, run_id: str) -> str:
 
 def _pipeline_stage_independence_issue(bare_run_id: str) -> str | None:
     """design.md G-17 gate: reason string if this run's `state.json` `stage_sessions`
-    show the 6-fresh-session contract was faked, else None. None also when state.json is
+    show the per-stage fresh-session contract was faked, else None. None also when state.json is
     gone/unreadable — a human may gc that worktree (G-14), and "can't check" must not
     turn a clean run red."""
     state_path = pipeline_state_json_path(default_worktrees_root(), bare_run_id)
@@ -2574,6 +2571,8 @@ def _classify_pipeline_outcome(report_text: str) -> tuple[str, str | None]:
             return "failed", "watchdog_killed"
         if "quota_exhausted" in status:
             return "failed", "quota_exhausted"
+        if "ci_check_failed" in status:
+            return "failed", "ci_check_failed"
         return "failed", "orchestrator_failed"
     return "interrupted_unknown", "outcome_marker_unrecognized"
 
@@ -3191,6 +3190,7 @@ def _pr_worker_is_live(client: HerdrClient, job_name: str, pr_number: int) -> bo
 # a per-repo checkout, a read-only worktree, one review agent per PR, and a post-condition
 # that re-reads the PR for the marker. The after-condition, not the worker's own settle
 # status, is what decides `done` — an unverifiable review is never green.
+
 
 def _process_review_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime

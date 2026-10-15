@@ -29,7 +29,7 @@ TIMEOUT_EXIT_CODE = 124
 
 # The branch every pipeline PR is opened against (the pipeline's human merge gate is
 # `main`; `pipeline-launch.sh` never pushed elsewhere). A module constant rather than a
-# parameter because there is exactly one caller (stage 4) and one correct answer.
+# parameter because there is exactly one caller (stage 5) and one correct answer.
 DEFAULT_PR_BASE = "main"
 # Only count real fix attempts toward the retry budget — skipped records the tick
 # appends each time a PR exceeds max_attempts must not increment the counter,
@@ -70,7 +70,7 @@ class GhClient(Protocol):
         self, *, owner: str, repo: str, number: int
     ) -> list[dict[str, object]]:
         """Every inline review comment on the PR (REST ``pulls/{n}/comments``). Raises
-        ``RuntimeError`` when the query fails. Gate 5 needs this because the
+        ``RuntimeError`` when the query fails. Gate 6 needs this because the
         ``code-review`` skill puts its ``[blocking]`` tags on inline comments, which
         ``gh pr view --json comments,reviews`` never returns."""
         ...
@@ -79,8 +79,8 @@ class GhClient(Protocol):
         self, *, owner: str, repo: str, branch: str, title: str, body: str
     ) -> int:
         """Open a PR from ``branch`` and return its number. Raises ``RuntimeError`` on
-        any failure — stage 4 of the pipeline (issue 056 phase C) turns that into a
-        gate-4 failure hours later, so it must never be a silent no-op."""
+        any failure — stage 5 of the pipeline (issue 056 phase C) turns that into a
+        gate-5 failure hours later, so it must never be a silent no-op."""
         ...
 
     def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
@@ -210,9 +210,9 @@ class RealGhClient:
                 str(number),
                 "--repo",
                 f"{owner}/{repo}",
-                # `state`/`url` for stage 4's gate 4 (issue 056 phase C), which has to
+                # `state`/`url` for stage 5's gate 5 (issue 056 phase C), which has to
                 # confirm the PR it just opened is the live one on the right head;
-                # `comments`/`reviews` for gate 5's tier-label check. Both are additive:
+                # `comments`/`reviews` for gate 6's tier-label check. Both are additive:
                 # `statusCheckRollup` is still there for the CI gate.
                 "--json",
                 "statusCheckRollup,headRefName,state,url,comments,reviews",
@@ -883,8 +883,7 @@ def attempt_count_for_target(history_path: Path, job_name: str, target_key: str)
         if not r.extra or r.extra.get("target_key") != target_key:
             continue
         if r.state == "done" or (
-            r.state == "failed"
-            and r.extra.get("reason") in _REVIEW_COUNTABLE_FAILURES
+            r.state == "failed" and r.extra.get("reason") in _REVIEW_COUNTABLE_FAILURES
         ):
             count += 1
     return count
