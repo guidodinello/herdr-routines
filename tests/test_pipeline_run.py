@@ -26,14 +26,14 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from herdr_routines import tick
-from herdr_routines.auto_fix import GhClient
+from herdr_routines.auto_fix import GhClient, ReviewSearch
 from herdr_routines.gates import gate3_test_names
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.pipeline_run import (
@@ -339,6 +339,19 @@ class FakeGh:
         if self.inline_comments_error is not None:
             raise RuntimeError(self.inline_comments_error)
         return []
+
+    # kind: review (issue 055) members of the GhClient protocol; the pipeline never
+    # calls them.
+    def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
+        return ReviewSearch(prs=())
+
+    def pr_review_bodies(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[str] | None:
+        return []
+
+    def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
+        return None
 
 
 class PipelineFixture:

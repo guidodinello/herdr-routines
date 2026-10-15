@@ -88,6 +88,7 @@ from herdr_routines.pipeline_watchdog import (
 )
 from herdr_routines.repos import _ensure_checkout, ensure_repo
 from herdr_routines.review_scan import (
+    REVIEW_FAILURE_DISPOSITIONS,
     Candidate,
     apply_attempt_budget,
     apply_marker_guard,
@@ -1428,7 +1429,10 @@ def _process_pr_target(
             _notify(
                 client,
                 f"herdr-routines: {job.name} failed",
-                body=f"{dispatched_count} dispatched, {skipped_count} skipped",
+                body=(
+                    f"{dispatched_count} dispatched, {failed_count} failed, "
+                    f"{skipped_count} skipped"
+                ),
                 sound="request",
             )
         return summary, True
@@ -3188,21 +3192,6 @@ def _pr_worker_is_live(client: HerdrClient, job_name: str, pr_number: int) -> bo
 # that re-reads the PR for the marker. The after-condition, not the worker's own settle
 # status, is what decides `done` — an unverifiable review is never green.
 
-# Target dispositions that count as this tick having failed. Skips (over cap, marker,
-# budget, head-branch collision, live agent) are not failures.
-_REVIEW_FAILURE_DISPOSITIONS = frozenset(
-    {
-        "review_not_posted",
-        "review_verification_failed",
-        "agent_start_failed",
-        "agent_prompt_failed",
-        "worktree_failed",
-        "repo_info_failed",
-        "clone_failed",
-    }
-)
-
-
 def _process_review_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
@@ -3346,6 +3335,7 @@ def _review_terminal_failure(
         "candidates": 0,
         "dispatched": 0,
         "skipped": 0,
+        "failed": 0,
         "repos_failed": 0,
     }
     if error is not None:
@@ -3400,16 +3390,21 @@ def _review_cycle(
         (cand, cand.skip_reason or "skipped") for cand in outcome.skipped
     ]
 
-    dispatchable, marker_skipped = apply_marker_guard(gh, job.name, outcome.candidates)
-    rows.extend(
-        (cand, cand.skip_reason or "review_already_posted") for cand in marker_skipped
-    )
-
+    # The attempt budget is a local history read, so it runs first; the marker guard
+    # costs one `gh pr view` per candidate and only sees what the budget let through.
     dispatchable, budget_skipped = apply_attempt_budget(
-        history_path, job.name, dispatchable, max_attempts=job.max_attempts_per_target
+        history_path,
+        job.name,
+        outcome.candidates,
+        max_attempts=job.max_attempts_per_target,
     )
     rows.extend(
         (cand, cand.skip_reason or "max_attempts_exceeded") for cand in budget_skipped
+    )
+
+    dispatchable, marker_skipped = apply_marker_guard(gh, job.name, dispatchable)
+    rows.extend(
+        (cand, cand.skip_reason or "review_already_posted") for cand in marker_skipped
     )
 
     to_dispatch, over_cap = cap_candidates(dispatchable, job.max_workers_per_tick)
@@ -3467,10 +3462,11 @@ def _review_cycle(
             rows.append((cand, disposition))
             if disposition == "dispatched":
                 dispatched_count += 1
-            elif disposition in _REVIEW_FAILURE_DISPOSITIONS:
+            elif disposition in REVIEW_FAILURE_DISPOSITIONS:
                 any_failed = True
 
-    skipped_count = len(rows) - dispatched_count
+    failed_count = sum(1 for _, d in rows if d in REVIEW_FAILURE_DISPOSITIONS)
+    skipped_count = len(rows) - dispatched_count - failed_count
 
     try:
         reports_dir = default_reports_dir()
@@ -3494,7 +3490,8 @@ def _review_cycle(
     summary = (
         f"{job.name}: done (enumerated={outcome.enumerated}, "
         f"candidates={len(outcome.candidates)}, dispatched={dispatched_count}, "
-        f"skipped={skipped_count}, repos_failed={repos_failed})"
+        f"skipped={skipped_count}, failed={failed_count}, "
+        f"repos_failed={repos_failed})"
     )
 
     append(
@@ -3511,6 +3508,7 @@ def _review_cycle(
                 "candidates": len(outcome.candidates),
                 "dispatched": dispatched_count,
                 "skipped": skipped_count,
+                "failed": failed_count,
                 "repos_failed": repos_failed,
             },
         ),
@@ -3521,7 +3519,10 @@ def _review_cycle(
             _notify(
                 client,
                 f"herdr-routines: {job.name} failed",
-                body=f"{dispatched_count} dispatched, {skipped_count} skipped",
+                body=(
+                    f"{dispatched_count} dispatched, {failed_count} failed, "
+                    f"{skipped_count} skipped"
+                ),
                 sound="request",
             )
         return summary, True
@@ -3638,28 +3639,11 @@ def _dispatch_review_target(
 
     wt_path = checkout / ".worktrees" / f"review-pr{cand.number}"
 
-    # Never steal another owner's worktree holding the head branch (issue 036 redux).
-    existing = _find_existing_worktree(checkout, cand.head_ref)
-    if existing is not None and existing != wt_path:
-        append(
-            history_path,
-            _review_target_record(
-                job=job,
-                cand=cand,
-                run_id=run_id,
-                now=now,
-                state="skipped",
-                attempt=attempt,
-                agent_name=None,
-                pane_id=None,
-                report_path=None,
-                verified=None,
-                reason="head_branch_checked_out",
-            ),
-        )
-        return "head_branch_checked_out"
-
-    # Reuse our own clean worktree; force-remove a stale one before re-adding.
+    # A review needs no branch, so the worktree is a detached HEAD at origin/<headRef>:
+    # it never creates a local branch in the shared checkout and never contends with
+    # another worktree (e.g. the orchestrator's) that has the head branch checked out.
+    # Our own clean worktree is reused (moved to the fresh head); a dirty one is
+    # force-removed and re-added.
     if wt_path.exists():
         reusable, why = _worktree_reuse_check(wt_path)
         if not reusable:
@@ -3668,6 +3652,7 @@ def _dispatch_review_target(
             )
             _cleanup_worktree(checkout, wt_path)
 
+    head = f"origin/{cand.head_ref}"
     try:
         fetch = subprocess.run(
             ["git", "-C", str(checkout), "fetch", "origin", cand.head_ref],
@@ -3678,26 +3663,26 @@ def _dispatch_review_target(
         )
         if fetch.returncode != 0:
             raise RuntimeError(f"git fetch failed: {fetch.stderr.strip()}")
-        if not wt_path.exists():
-            proc = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(checkout),
-                    "worktree",
-                    "add",
-                    "-B",
-                    cand.head_ref,
-                    str(wt_path),
-                    f"origin/{cand.head_ref}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
+        if wt_path.exists():
+            step = "git checkout"
+            argv = ["git", "-C", str(wt_path), "checkout", "--detach", head]
+        else:
+            step = "git worktree add"
+            argv = [
+                "git",
+                "-C",
+                str(checkout),
+                "worktree",
+                "add",
+                "--detach",
+                str(wt_path),
+                head,
+            ]
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60, check=False
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"{step} failed: {proc.stderr.strip()}")
     except Exception as e:  # noqa: BLE001
         _cleanup_worktree(checkout, wt_path)
         append(

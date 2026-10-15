@@ -846,7 +846,10 @@ def build_review_prompt(
            this exact marker, POST NOTHING and stop:
                {marker}
         2. Otherwise run the `code-review` skill against {url} in single-session mode.
-        3. Post exactly one review. Tag every finding `blocking` or `non-blocking`.
+        3. Post exactly one review as a COMMENT review (`gh pr review --comment`), never
+           approve or request changes: GitHub rejects both on a PR you authored, and the
+           blocking tier already carries the verdict. Tag every finding `blocking` or
+           `non-blocking`.
         4. End the posted review body with this exact marker line:
                {marker}
 
@@ -858,18 +861,30 @@ def build_review_prompt(
     """)
 
 
+# Failure reasons that still consume a review target's budget: the agent ran to settle,
+# so a review may well have landed (an unread or missing marker). Re-dispatching would
+# risk a duplicate review. Every other failure (worktree, agent start/prompt) happens
+# before the agent could post anything and must not burn the target's only attempt.
+_REVIEW_COUNTABLE_FAILURES = frozenset(
+    {"review_not_posted", "review_verification_failed"}
+)
+
+
 def attempt_count_for_target(history_path: Path, job_name: str, target_key: str) -> int:
-    """Count prior review-attempt records for this job+target_key that were real
-    attempts (done or failed — not skipped). Sibling of ``attempt_count_for_pr``, keyed
-    on the full ``owner/repo#N`` so ``#7`` in one repo is independent of ``#7`` in
-    another. Skipped/max_attempts_exceeded records must not consume budget."""
+    """Count prior review attempts for this job+target_key: ``done`` records plus
+    ``failed`` records whose agent actually ran (``_REVIEW_COUNTABLE_FAILURES``).
+    Sibling of ``attempt_count_for_pr``, keyed on the full ``owner/repo#N`` so ``#7``
+    in one repo is independent of ``#7`` in another. Skips and pre-agent infra failures
+    must not consume budget — with the default budget of 1, a transient failure would
+    otherwise exclude the PR forever."""
     records = read_job(history_path, job_name)
     count = 0
     for r in records:
-        if (
-            r.state in _COUNTABLE_STATES
-            and r.extra
-            and r.extra.get("target_key") == target_key
+        if not r.extra or r.extra.get("target_key") != target_key:
+            continue
+        if r.state == "done" or (
+            r.state == "failed"
+            and r.extra.get("reason") in _REVIEW_COUNTABLE_FAILURES
         ):
             count += 1
     return count

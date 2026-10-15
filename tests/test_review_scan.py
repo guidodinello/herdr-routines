@@ -55,11 +55,12 @@ NOW = datetime(2026, 10, 10, 8, 30, 0, tzinfo=UTC)
 # ---------------------------------------------------------------------------
 
 
-def _git(*args: str, cwd: Path) -> None:
+def _git(*args: str, cwd: Path) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
     )
     assert proc.returncode == 0, proc.stderr
+    return proc.stdout
 
 
 def _load_jobs(tmp_path: Path, *jobs: dict[str, Any]) -> Any:
@@ -424,13 +425,16 @@ def test_review_scan_selects_open_non_draft_prs(tmp_path: Path) -> None:
     assert "review-requested:@me" in REVIEW_SEARCH_QUALIFIERS["review_requested"]
 
     job = _review_job(tmp_path, select=("author", "review_requested"))
-    gh = ReviewGh(prs=(_pr(1), _pr(2, mode="review_requested")))
+    # A review_requested PR is someone else's by definition: its author never matches
+    # the login, and that must not skip it as author_mismatch.
+    gh = ReviewGh(prs=(_pr(1), _pr(2, author="teammate", mode="review_requested")))
     outcome = scan_review_targets(gh, job, login="me")  # type: ignore[arg-type]
     assert outcome is not None
     assert len(gh.search_calls) == 1  # one batched call, not one per mode
     modes, _limit = gh.search_calls[0]
     assert modes == ("author", "review_requested")
     assert {c.number for c in outcome.candidates} == {1, 2}
+    assert outcome.skipped == ()
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +605,19 @@ def test_review_attempts_are_counted_per_target_key(tmp_path: Path) -> None:
             extra={"target_key": "other/repo#7"},
         ),
     )
+    # Failures before the agent could post (infra) never consume budget; failures
+    # after it ran to settle (a review may have landed) always do.
+    for reason in ("worktree_failed", "agent_start_failed", "agent_prompt_failed"):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=NOW,
+                job="review-my-prs",
+                state="failed",
+                run_id="r",
+                extra={"target_key": "acme/widgets#8", "reason": reason},
+            ),
+        )
 
     assert (
         attempt_count_for_target(history_path, "review-my-prs", "acme/widgets#7") == 2
@@ -609,6 +626,21 @@ def test_review_attempts_are_counted_per_target_key(tmp_path: Path) -> None:
     assert (
         attempt_count_for_target(history_path, "review-my-prs", "acme/widgets#8") == 0
     )
+    for i, reason in enumerate(("review_not_posted", "review_verification_failed")):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=NOW,
+                job="review-my-prs",
+                state="failed",
+                run_id="r",
+                extra={"target_key": "acme/widgets#11", "reason": reason},
+            ),
+        )
+        assert (
+            attempt_count_for_target(history_path, "review-my-prs", "acme/widgets#11")
+            == i + 1
+        )
 
     def _c(key: str) -> Candidate:
         owner, _, rest = key.partition("/")
@@ -668,6 +700,7 @@ def test_review_report_lists_candidates_and_skips() -> None:
         (_c("acme/widgets#1"), "dispatched"),
         (_c("acme/widgets#2", "review_already_posted"), "review_already_posted"),
         (_c("acme/widgets#3", "routine_owned_branch"), "routine_owned_branch"),
+        (_c("acme/widgets#4"), "review_not_posted"),
     ]
     report = render_review_report(
         job_name="review-my-prs",
@@ -685,7 +718,9 @@ def test_review_report_lists_candidates_and_skips() -> None:
     assert "**Enumerated**: 4" in report
     assert "**Candidates**: 2" in report
     assert "**Dispatched**: 1" in report
-    assert "**Skipped**: 2" in report
+    assert "acme/widgets#4: review_not_posted" in report
+    assert "**Skipped**: 2" in report  # a failure is not a skip
+    assert "**Failed**: 1" in report
     assert "**Repos failed**: 1" in report
     assert "**Search truncated**: author" in report
 
@@ -742,16 +777,17 @@ def test_review_dispatch_creates_per_repo_checkout(
 
 
 # ---------------------------------------------------------------------------
-# AC 11 — another owner's worktree holding the head branch is not contested
+# AC 11 — a detached review worktree never contends for the PR head branch
 # ---------------------------------------------------------------------------
 
 
-def test_review_dispatch_skips_other_worktrees_head_branch(
+def test_review_dispatch_does_not_contend_for_head_branch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     base = tmp_path / "repos"
     origin, checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
+    # Another owner (e.g. the orchestrator) has the PR head branch checked out.
     other_wt = tmp_path / "orchestrator-worktree"
     _git(
         "worktree",
@@ -762,32 +798,30 @@ def test_review_dispatch_skips_other_worktrees_head_branch(
         "origin/feature-x",
         cwd=checkout,
     )
+    branches_before = _git("branch", "--list", cwd=checkout)
 
     job = _review_job(tmp_path, repo=base)
-    gh = ReviewGh(
-        prs=(_pr(1),),
-        repo_infos={
-            ("acme", "widgets"): {"clone_url": str(origin), "default_branch": "main"}
-        },
-    )
+    info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
+    gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
     monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
 
-    summary, failed = _run_cycle(
+    _, failed = _run_cycle(
         job,
         tmp_path / "state" / "history.jsonl",
         gh,
         client,
         run_id="review-my-prs-20261010T083000Z",
     )
+    # The review still runs, on a detached HEAD, without touching the other worktree
+    # or creating a local branch in the shared checkout.
     assert failed is False
-    # Nothing dispatched: the worker was never started and no review agent ran.
-    assert client.tabs == []
-    assert client.started == []
-    assert other_wt.is_dir()  # the other owner's worktree is untouched
+    assert len(client.started) == 1
+    assert other_wt.is_dir()
+    assert _git("branch", "--list", cwd=checkout) == branches_before
     record = _terminal(tmp_path / "state" / "history.jsonl", job.name)
     assert record.state == "done"
-    assert record.extra is not None and "dispatched" in record.extra
+    assert record.extra is not None and record.extra["dispatched"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -807,8 +841,7 @@ def test_review_dispatch_reuses_own_review_worktree(
     _git(
         "worktree",
         "add",
-        "-B",
-        "feature-x",
+        "--detach",
         str(wt_path),
         "origin/feature-x",
         cwd=checkout,
@@ -850,8 +883,7 @@ def test_review_dispatch_reuses_own_review_worktree(
     _git(
         "worktree",
         "add",
-        "-B",
-        "feature-x",
+        "--detach",
         str(dirty),
         "origin/feature-x",
         cwd=checkout,
@@ -958,7 +990,7 @@ def test_review_verification_is_fail_closed(
     base = tmp_path / "repos"
     origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
     job = _review_job(tmp_path, repo=base)
-    info = {"clone_url": str(origin), "default_branch": "main"}
+    info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
 
     # (a) marker present → done + verified True + gate passed.
     gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
@@ -1082,6 +1114,8 @@ def test_review_prompt_is_read_only_and_idempotent() -> None:
     assert "code-review" in prompt
     assert "blocking" in prompt and "non-blocking" in prompt
     assert "single-session" in prompt
+    # A COMMENT review is the only kind GitHub accepts on the user's own PR.
+    assert "gh pr review --comment" in prompt
     assert "$ROUTINE_REPORT" in prompt
     assert "## Outcome:" in prompt
     # Idempotence: the exact marker is embedded and the agent must re-check it first.
@@ -1104,7 +1138,7 @@ def test_review_is_not_repeated_across_ticks(
     base = tmp_path / "repos"
     origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
     job = _review_job(tmp_path, repo=base)
-    info = {"clone_url": str(origin), "default_branch": "main"}
+    info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
     history = tmp_path / "state" / "history.jsonl"
 
     gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})

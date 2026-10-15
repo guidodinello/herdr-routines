@@ -9,6 +9,11 @@
 # Re-review is bounded by two guards: a content marker inside each posted review
 # (skip `review_already_posted`) and a per-target attempt budget
 # (`max_attempts_per_target` defaults to 1 for this kind).
+#
+# Reviews run sequentially inside one tick and the tick waits for each, so every other
+# job's schedule waits too: worst case is
+# max_workers_per_tick * (start_timeout_ms + timeout_ms) — 3 * (2 + 15) = 51 min here.
+# Raise either knob only with that budget in mind.
 enabled: false
 cron: "30 8 * * *"
 kind: review
@@ -21,7 +26,7 @@ max_attempts_per_target: 1 # one review per target; the marker guard does the re
 agent_kind: opencode
 model: null
 prompt: "" # empty = engine-injected read-only review prompt (see build_review_prompt)
-timeout_ms: 1800000
+timeout_ms: 900000 # 15 min per review; see the tick-blocking note above
 start_timeout_ms: 120000
 on_missed: log
 notify_policy: on-finding

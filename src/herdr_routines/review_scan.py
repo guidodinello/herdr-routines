@@ -28,6 +28,20 @@ from herdr_routines.config import Job
 
 log = get_logger(__name__)
 
+# Target dispositions that count as this tick having failed. Skips (over cap, marker,
+# budget, live agent) are not failures, and neither is a verified "dispatched".
+REVIEW_FAILURE_DISPOSITIONS = frozenset(
+    {
+        "review_not_posted",
+        "review_verification_failed",
+        "agent_start_failed",
+        "agent_prompt_failed",
+        "worktree_failed",
+        "repo_info_failed",
+        "clone_failed",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Candidate:
@@ -82,8 +96,11 @@ def _skip_reason(
     pr: ReviewPR, *, login: str, include_auto_branches: bool
 ) -> str | None:
     """The first applicable skip reason, or None. Order is checked against the issue's
-    table: author first (a stale login), then the double-review guard, then forks."""
-    if pr.author != login:
+    table: author first (a stale login), then the double-review guard, then forks.
+
+    ``author_mismatch`` applies only to the ``author`` mode: a ``review_requested`` PR is
+    by definition someone else's, so its author never matches ``login``."""
+    if pr.mode == "author" and pr.author != login:
         return "author_mismatch"
     if pr.head_ref.startswith("auto/") and not include_auto_branches:
         return "routine_owned_branch"
@@ -209,7 +226,8 @@ def render_review_report(
     with its disposition. Every candidate appears — including skips and why — so the
     report is the audit trail that stands in for a dry-run subcommand in phase A."""
     dispatched = sum(1 for _, disposition in rows if disposition == "dispatched")
-    skipped = len(rows) - dispatched
+    failed = sum(1 for _, d in rows if d in REVIEW_FAILURE_DISPOSITIONS)
+    skipped = len(rows) - dispatched - failed
     lines = [
         f"# Review tick report: {run_id}",
         "",
@@ -220,6 +238,7 @@ def render_review_report(
         f"- **Candidates**: {candidate_count}",
         f"- **Dispatched**: {dispatched}",
         f"- **Skipped**: {skipped}",
+        f"- **Failed**: {failed}",
         f"- **Repos failed**: {repos_failed}",
     ]
     if truncated_modes:
