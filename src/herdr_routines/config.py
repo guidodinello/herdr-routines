@@ -83,10 +83,16 @@ VALID_NOTIFY_POLICIES = frozenset({"always", "terminal", "on-finding", "on-failu
 # "gated" = gate checks + fix dispatch (_process_gated_job); "pipeline" = detached
 # systemd-run launch (_process_pipeline_job); "audit" = report-diff gate job (issue 057):
 # schedule an audit skill, parse its findings manifest, diff against the ledger, and
-# dispatch fixes only for new/regressed findings. Gate mode is no longer an orthogonal
-# axis:
+# dispatch fixes only for new/regressed findings; "review" = cross-repo @me PR review
+# job (issue 055): one batched search, one review per unreviewed open PR, verified by a
+# content marker. Gate mode is no longer an orthogonal axis:
 # (the old `checks is not None` discriminator); kind is the exhaustive SSOT.
-VALID_JOB_KINDS = frozenset({"routine", "gated", "pipeline", "audit"})
+VALID_JOB_KINDS = frozenset({"routine", "gated", "pipeline", "audit", "review"})
+
+# Recognized values for a kind: review job's `select` list (issue 055). "author" is the
+# default-worthy one; "review_requested" is opt-in because it puts the routine in someone
+# else's PR queue.
+VALID_REVIEW_SELECT = frozenset({"author", "review_requested"})
 
 # Closed set of known terminal RunOutcome.reason values eligible for retry.
 # Derived from runner.py + tick.py failure sites. Unknown strings in retry_on
@@ -180,6 +186,10 @@ _JOB_ALLOWED_KEYS = (
             "ledger_retention_days",
             "adopt_baseline",
             "fix_prompt",
+            # kind: review (issue 055). Deliberately NOT in _DEFAULTS_ALLOWED_KEYS:
+            # what a review job watches is per-job identity, not a shared default.
+            "select",
+            "include_auto_branches",
         }
     )
 )
@@ -230,6 +240,9 @@ _JOB_DEFAULTS = {
     "ledger_retention_days": 90,
     "adopt_baseline": True,
     "fix_prompt": "",
+    # kind: review (issue 055). None for every other kind.
+    "select": None,
+    "include_auto_branches": False,
 }
 
 
@@ -348,11 +361,11 @@ class Job:
     # Retry budget keyed per target (per gate branch for base, per PR number for pr).
     max_attempts_per_target: int = 3
     # Scheduling-only mode discriminator (issue 026, unified in 049):
-    # "routine" | "gated" | "pipeline" | "audit". kind is the exhaustive single source
-    # of truth for how a job is dispatched; it never serializes into history.jsonl
+    # "routine" | "gated" | "pipeline" | "audit" | "review". kind is the exhaustive single
+    # source of truth for how a job is dispatched; it never serializes into history.jsonl
     # (records store job name / state / run_id / outcome extras; status/scheduled join
     # live config + history by job name only — see cli.py:432-434 / cli.py:481).
-    kind: Literal["routine", "gated", "pipeline", "audit"] = "routine"
+    kind: Literal["routine", "gated", "pipeline", "audit", "review"] = "routine"
     # Prompt source file, read by the pipeline launcher script (not by `load_config`).
     # Required for kind: pipeline; a plain routine may also use it as an I/O convenience.
     prompt_file: str | None = None
@@ -383,6 +396,13 @@ class Job:
     # The fix worker's prompt template, seeded with $ROUTINE_FINDINGS. Empty = the
     # built-in default. NOT inheritable via defaults.yaml.
     fix_prompt: str = ""
+    # -- kind: review (issue 055) --------------------------------------------------
+    # Which PR sets to watch: a non-empty, duplicate-free subset of
+    # {author, review_requested}. Required for kind: review, None otherwise.
+    select: tuple[str, ...] | None = None
+    # Opt in to reviewing `auto/*` (pipeline-owned) branches too; default off so a
+    # pipeline PR is never reviewed twice.
+    include_auto_branches: bool = False
 
     @property
     def agent_name(self) -> str:
@@ -727,32 +747,56 @@ def _build_job(
     except (ValueError, KeyError) as e:
         raise ConfigError(f"{label}: invalid cron expression {cron!r}: {e}") from e
 
+    # kind is read here (not only where its rules live below) because a
+    # `kind: review` job has no single checkout: it derives `repo` from the managed
+    # base dir and never calls `ensure_repo`, so the repo/repository machinery must be
+    # bypassed before it runs.
+    kind = merged["kind"]
+    if kind not in VALID_JOB_KINDS:
+        raise ConfigError(f"{label}: 'kind' must be one of {sorted(VALID_JOB_KINDS)}")
+
     repo_raw = merged["repo"]
     repository = merged["repository"]
 
-    # URL-shape validation for repository
-    if repository is not None:
-        if not isinstance(repository, str) or not repository:
-            raise ConfigError(f"{label}: 'repository' must be a non-empty string")
-        if not _is_valid_repo_url(repository):
-            raise ConfigError(
-                f"{label}: 'repository' must be a git URL "
-                "(https://, ssh://, git@host:, or git://) — bare paths rejected"
-            )
-
-    # Conditional repo requirement
-    if repo_raw is None and repository is None:
-        raise ConfigError(f"{label}: missing 'repo' or 'repository'")
-
-    if repo_raw is None:
-        # repository present, repo absent → derive deterministic path
+    if kind == "review":
         from herdr_routines.repos import default_repos_dir
 
-        repo = default_repos_dir() / name
+        for not_applicable in ("repo", "repository", "workspace", "checks"):
+            if not_applicable in raw_job:
+                raise ConfigError(
+                    f"{label}: '{not_applicable}' is not applicable to kind: review "
+                    "(the job has no single checkout or gate; per-repo checkouts are "
+                    "discovered at tick time)"
+                )
+        # Overload is safe only because `ensure_repo` is never called with a review job
+        # (see repos.ensure_repo): `repo` is just the base dir per-repo checkouts land
+        # under, `<base>/<owner>/<repo>`.
+        repo = default_repos_dir()
+        repository = None
     else:
-        if not isinstance(repo_raw, str) or not repo_raw:
-            raise ConfigError(f"{label}: 'repo' must be a non-empty string path")
-        repo = Path(repo_raw).expanduser()
+        # URL-shape validation for repository
+        if repository is not None:
+            if not isinstance(repository, str) or not repository:
+                raise ConfigError(f"{label}: 'repository' must be a non-empty string")
+            if not _is_valid_repo_url(repository):
+                raise ConfigError(
+                    f"{label}: 'repository' must be a git URL "
+                    "(https://, ssh://, git@host:, or git://) — bare paths rejected"
+                )
+
+        # Conditional repo requirement
+        if repo_raw is None and repository is None:
+            raise ConfigError(f"{label}: missing 'repo' or 'repository'")
+
+        if repo_raw is None:
+            # repository present, repo absent → derive deterministic path
+            from herdr_routines.repos import default_repos_dir
+
+            repo = default_repos_dir() / name
+        else:
+            if not isinstance(repo_raw, str) or not repo_raw:
+                raise ConfigError(f"{label}: 'repo' must be a non-empty string path")
+            repo = Path(repo_raw).expanduser()
 
     workspace = merged["workspace"]
     if workspace not in VALID_WORKSPACE_MODES:
@@ -1064,6 +1108,37 @@ def _build_job(
     elif "audit" in raw_job:
         raise ConfigError(f"{label}: 'audit' requires kind: audit")
 
+    # -- kind: review (issue 055) -------------------------------------------------------
+    select: tuple[str, ...] | None = None
+    include_auto_branches = merged["include_auto_branches"]
+    if kind == "review":
+        select_raw = merged.get("select")
+        if not isinstance(select_raw, list) or not select_raw:
+            raise ConfigError(
+                f"{label}: kind: review requires a non-empty 'select' list "
+                f"drawn from {sorted(VALID_REVIEW_SELECT)}"
+            )
+        if len(set(select_raw)) != len(select_raw):
+            raise ConfigError(f"{label}: 'select' must not contain duplicates")
+        for si, mode in enumerate(select_raw):
+            if not isinstance(mode, str) or mode not in VALID_REVIEW_SELECT:
+                raise ConfigError(
+                    f"{label}: 'select[{si}]' must be one of {sorted(VALID_REVIEW_SELECT)}"
+                )
+        select = tuple(select_raw)
+        if not isinstance(include_auto_branches, bool):
+            raise ConfigError(f"{label}: 'include_auto_branches' must be a boolean")
+    elif "select" in raw_job or "include_auto_branches" in raw_job:
+        raise ConfigError(
+            f"{label}: 'select'/'include_auto_branches' require kind: review"
+        )
+
+    # A review that landed is never redone, and a review that failed to land is a miss to
+    # report, not to retry — so the budget is 1 unless the job explicitly asks otherwise.
+    max_attempts_per_target = merged["max_attempts_per_target"]
+    if kind == "review" and "max_attempts_per_target" not in raw_job:
+        max_attempts_per_target = 1
+
     if kind == "pipeline":
         if checks is not None:
             raise ConfigError(
@@ -1139,6 +1214,14 @@ def _build_job(
     # gated work, and the audit itself has no PR to gate on.
     if kind == "audit":
         target = "base"
+
+    # A review job's target is always a PR ("pr"), and only "pr" is accepted.
+    if kind == "review":
+        if target is not None and target != "pr":
+            raise ConfigError(
+                f"{label}: 'target' must be absent or 'pr' for kind: review"
+            )
+        target = "pr"
 
     if target == "base" and kind == "gated" and (not isinstance(base, str) or not base):
         raise ConfigError(
@@ -1250,7 +1333,7 @@ def _build_job(
         checks=checks,
         target=target,
         max_workers_per_tick=merged["max_workers_per_tick"],
-        max_attempts_per_target=merged["max_attempts_per_target"],
+        max_attempts_per_target=max_attempts_per_target,
         kind=kind,
         prompt_file=prompt_file,
         deadline_ms=deadline_ms,
@@ -1262,4 +1345,6 @@ def _build_job(
         ledger_retention_days=merged["ledger_retention_days"],
         adopt_baseline=merged["adopt_baseline"],
         fix_prompt=fix_prompt,
+        select=select,
+        include_auto_branches=include_auto_branches,
     )
