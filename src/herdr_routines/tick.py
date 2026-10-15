@@ -23,8 +23,10 @@ from logger import get_logger
 from herdr_routines.auto_fix import (
     EligiblePR,
     GateCheck,
+    GithubEvent,
     PRInfo,
     RealGhClient,
+    attempt_count_for_event,
     attempt_count_for_gate_branch,
     attempt_count_for_pr,
     attempt_count_for_target,
@@ -32,6 +34,7 @@ from herdr_routines.auto_fix import (
     build_audit_fix_prompt,
     build_audit_prompt,
     build_base_fix_prompt,
+    build_event_fix_prompt,
     build_fix_prompt,
     build_gate_worker_agent_name,
     build_pr_agent_name,
@@ -39,10 +42,13 @@ from herdr_routines.auto_fix import (
     build_review_agent_prefix,
     build_review_prompt,
     build_worker_agent_name,
+    enrich_event_detail,
+    event_worktree_slug,
     fetch_failing_checks,
     fetch_thread_bodies,
     is_eligible,
     list_open_prs,
+    poll_github_event,
     repo_owner_and_name,
     review_marker,
     review_target_hash,
@@ -1170,6 +1176,20 @@ def _process_gated_job(
         ),
     )
 
+    # github_event (issue 014) is a poll predicate: same schedule guards as every
+    # gated job, but its "gate" is a diff against last-seen event IDs rather than a
+    # pr/base fix path — the event itself decides, so it routes to its own target.
+    for check in job.checks:
+        if check.kind == "github_event":
+            return _process_event_target(
+                job,
+                history_path,
+                client=client,
+                now=now,
+                run_id=run_id,
+                check=check,  # type: ignore[arg-type]
+            )
+
     if job.target == "pr":
         return _process_pr_target(
             job, history_path, client=client, now=now, run_id=run_id
@@ -1178,6 +1198,528 @@ def _process_gated_job(
         return _process_base_target(
             job, history_path, client=client, now=now, run_id=run_id
         )
+
+
+def _last_seen_event_ids(history_path: Path, job_name: str) -> list[str]:
+    """The event IDs the most recent poll already handled: the `last_seen_event_ids`
+    of the latest terminal record that carries one (a failed poll carries none and
+    leaves the watermark where it was).
+
+    The latest watermark, not a union over all history: an event that clears and
+    comes back (CI red again on the same PR, a label removed and re-added) is absent
+    from the poll in between, so it drops out of the watermark and fires again."""
+    for r in reversed(read_job(history_path, job_name)):
+        ids = r.extra.get("last_seen_event_ids") if r.extra else None
+        if isinstance(ids, list):
+            return [e for e in ids if isinstance(e, str)]
+    return []
+
+
+def _event_target(check: GateCheck) -> str:
+    """The event's own kind for the history `target` field: an `issues:opened` poll
+    fires on issues, every other query fires on PRs. Kept distinct from `job.target`
+    (where a fix lands) so an issue event is never recorded as a PR."""
+    return "issue" if check.query == "issues:opened" else "pr"
+
+
+def _resolve_event_owner_repo(job: Job, check: GateCheck) -> tuple[str, str]:
+    """owner/repo for the event poll: the check's explicit `repo:` when set, else the
+    job's managed-clone `repository:` URL, else the job repo's `origin` remote. Raises
+    on a missing/unparseable source so the caller can fail closed rather than silently
+    poll the wrong repo."""
+    if check.repo:
+        owner, repo_name = check.repo.split("/", 1)
+        return owner, repo_name
+    if job.repository:
+        return repo_owner_and_name(job.repository)
+    proc = subprocess.run(
+        ["git", "-C", str(job.repo), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "cannot resolve owner/repo for github_event check: set the check's "
+            "'repo:', the job's 'repository:', or an 'origin' git remote "
+            f"(git remote failed: {proc.stderr.strip()})"
+        )
+    return repo_owner_and_name(proc.stdout.strip())
+
+
+def _process_event_target(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    run_id: str,
+    check: GateCheck,
+) -> tuple[str, bool]:
+    """Event-triggered gate (issue 014): poll `gh` for matching events, diff the IDs
+    against `last_seen_event_ids`, and dispatch one worker per new event (capped by
+    `max_workers_per_tick`). No new event → clean pass, no agent, no worktree; a
+    poll failure fails closed as a gate error (never a silent green)."""
+    gh = RealGhClient()
+    event_target = _event_target(check)
+
+    try:
+        ensure_repo(job)
+    except (RuntimeError, OSError) as e:
+        reason = (
+            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
+        )
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": reason,
+                    "error": str(e),
+                    "target": event_target,
+                },
+            ),
+        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=reason,
+                sound="request",
+            )
+        return f"{job.name}: failed ({reason})", True
+
+    try:
+        owner, repo_name = _resolve_event_owner_repo(job, check)
+    except Exception as e:  # noqa: BLE001
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": "repo_detection_failed",
+                    "error": str(e),
+                    "target": event_target,
+                },
+            ),
+        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="repo_detection_failed",
+                sound="request",
+            )
+        return f"{job.name}: failed (repo_detection_failed)", True
+
+    # Fail closed: an auth/rate-limit/transient `gh` failure is a gate ERROR, never
+    # "no events" — the same rule commit_check_runs follows (unverifiable != green).
+    try:
+        events = poll_github_event(gh, owner=owner, repo=repo_name, check=check)
+    except Exception as e:  # noqa: BLE001
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                run_id=run_id,
+                extra={
+                    "gate": "failed",
+                    "reason": "github_event_poll_failed",
+                    "error": str(e),
+                    "target": event_target,
+                    "query": check.query,
+                },
+            ),
+        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body="github_event_poll_failed",
+                sound="request",
+            )
+        return f"{job.name}: failed (github_event_poll_failed)", True
+
+    seen = set(_last_seen_event_ids(history_path, job.name))
+    new_events = [e for e in events if e.event_id not in seen]
+    # The watermark is the polled events that need nothing more: already seen, or
+    # handled this tick (worker done, or budget exhausted). An over-cap event or one
+    # whose worker failed stays out of it, so the next tick retries it until the
+    # per-event budget taps out.
+    handled: set[str] = set()
+
+    def _watermark() -> list[str]:
+        return [e.event_id for e in events if e.event_id in seen | handled]
+
+    if not new_events:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="done",
+                run_id=run_id,
+                extra={
+                    "gate": "passed",
+                    "target": event_target,
+                    "query": check.query,
+                    "polled": len(events),
+                    "last_seen_event_ids": _watermark(),
+                },
+            ),
+        )
+        if _notify_gate(job, "success"):
+            _notify(client, f"herdr-routines: {job.name} done", sound="done")
+        return f"{job.name}: done (no new events)", False
+
+    dispatchable = new_events[: job.max_workers_per_tick]
+    skipped_over_cap = len(new_events) - len(dispatchable)
+
+    dispatched_count = 0
+    skipped_count = 0
+    any_failed = False
+    for event in dispatchable:
+        attempt = attempt_count_for_event(history_path, job.name, event.event_id)
+        if attempt >= job.max_attempts_per_target:
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    run_id=run_id,
+                    extra={
+                        "reason": "max_attempts_exceeded",
+                        "event_id": event.event_id,
+                        "event_number": event.number,
+                        "attempt": attempt,
+                        "target": event_target,
+                    },
+                ),
+            )
+            if _notify_gate(job, "failure"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} skipped",
+                    body=f"max_attempts_exceeded for {event.event_id}",
+                    sound="request",
+                )
+            skipped_count += 1
+            handled.add(event.event_id)
+            continue
+
+        detailed = enrich_event_detail(gh, event, owner=owner, repo=repo_name)
+        agent_name = build_worker_agent_name(job.name, event.number, run_id)
+        worker_outcome = _dispatch_event_worker(
+            job=job,
+            event=detailed,
+            run_id=run_id,
+            owner=owner,
+            repo=repo_name,
+            client=client,
+        )
+
+        extra_record: dict[str, Any] = {
+            "event_id": event.event_id,
+            "event_number": event.number,
+            "attempt": attempt,
+            "reason": "gate_failed",
+            "fix_worker_agent": agent_name,
+            "pane_id": worker_outcome.get("pane_id"),
+            "report_path": worker_outcome.get("report_path"),
+            "report_written": worker_outcome.get("report_written", False),
+            "final_agent_status": worker_outcome.get("final_agent_status"),
+            "target": event_target,
+        }
+        if worker_outcome.get("error") is not None:
+            extra_record["error"] = worker_outcome["error"]
+
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state=worker_outcome.get("state", "failed"),
+                run_id=run_id,
+                extra=extra_record,
+            ),
+        )
+
+        if worker_outcome.get("state") in ("failed", "interrupted_unknown"):
+            any_failed = True
+        else:
+            handled.add(event.event_id)
+        dispatched_count += 1
+
+    state = "failed" if any_failed else "done"
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state=state,
+            run_id=run_id,
+            extra={
+                "gate": "failed" if any_failed else "passed",
+                "target": event_target,
+                "query": check.query,
+                "polled": len(events),
+                "new": len(new_events),
+                "dispatched": dispatched_count,
+                "skipped": skipped_count,
+                "skipped_over_cap": skipped_over_cap,
+                "last_seen_event_ids": _watermark(),
+            },
+        ),
+    )
+
+    summary = (
+        f"{job.name}: {state} "
+        f"(polled={len(events)}, new={len(new_events)}, "
+        f"dispatched={dispatched_count}, skipped={skipped_count})"
+    )
+    if any_failed:
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=f"{dispatched_count} dispatched, {skipped_count} skipped",
+                sound="request",
+            )
+        return summary, True
+
+    if _notify_gate(job, "finding" if dispatched_count > 0 else "success"):
+        _notify(client, f"herdr-routines: {job.name} done", sound="done")
+    return summary, False
+
+
+def _dispatch_event_worker(
+    *,
+    job: Job,
+    event: GithubEvent,
+    run_id: str,
+    owner: str,
+    repo: str,
+    client: HerdrClient,
+) -> dict[str, Any]:
+    """Dispatch one fix worker for a new GitHub event. Mirrors `_dispatch_fix_worker`
+    but seeds `build_event_fix_prompt` from the event payload instead of PR CI/threads.
+    The worker checks out the event's head branch when the event carries one (a PR
+    event), else a detached base checkout."""
+    from herdr_routines.runner import (
+        _capture_visible_tail,
+        _close_run_pane,
+        _prompt_with_watchdog,
+        _wait_for_agent_ready,
+        default_reports_dir,
+        substitute_prompt,
+    )
+
+    agent_name = build_worker_agent_name(job.name, event.number, run_id)
+    event_run_id = f"{run_id}-evt{event.number}"
+    report_path = default_reports_dir() / f"auto-event-{run_id}-{event.number}.md"
+
+    try:
+        ensure_repo(job)
+    except (RuntimeError, OSError) as e:
+        reason = (
+            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
+        )
+        return {"state": "failed", "reason": reason, "error": str(e)}
+
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {
+            "state": "failed",
+            "reason": "report_dir_creation_failed",
+            "error": str(e),
+        }
+
+    prompt_text = job.prompt or build_event_fix_prompt(
+        job_name=job.name,
+        event=event,
+        owner_repo=f"{owner}/{repo}",
+        report_path=str(report_path),
+        base=job.base,
+    )
+    prompt_text = substitute_prompt(
+        prompt_text, report_path=report_path, job_name=job.name, run_id=event_run_id
+    )
+
+    # A PR event's head branch may already be checked out elsewhere (the
+    # orchestrator retains its worktree, or babysit's fix worker holds it); git
+    # refuses a second `worktree add` on it, so reuse that checkout instead, exactly
+    # like _dispatch_fix_worker (issue 036).
+    existing_wt = (
+        _find_existing_worktree(job.repo, event.head_ref) if event.head_ref else None
+    )
+    if existing_wt is not None:
+        ok, detail = _worktree_reuse_check(existing_wt)
+        if not ok:
+            return {
+                "state": "failed",
+                "reason": "worktree_reuse_not_clean",
+                "error": f"existing worktree {existing_wt} for {event.head_ref}: {detail}",
+            }
+        wt_path = existing_wt
+    else:
+        wt_path = (
+            Path(job.repo)
+            / ".worktrees"
+            / f"event-{event_worktree_slug(event.event_id)}"
+        )
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(job.repo),
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(wt_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            target_ref = event.head_ref or job.base
+            if event.head_ref:
+                proc = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(job.repo),
+                        "worktree",
+                        "add",
+                        str(wt_path),
+                        target_ref,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            else:
+                proc = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(job.repo),
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(wt_path),
+                        target_ref,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            if proc.returncode != 0:
+                raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
+        except Exception as e:  # noqa: BLE001
+            return {
+                "state": "failed",
+                "reason": "worktree_creation_failed",
+                "error": str(e),
+            }
+
+    pane_id: str | None = None
+    try:
+        pane_id = client.tab_create(cwd=str(wt_path), label=agent_name)
+        client.agent_start(
+            name=agent_name,
+            kind=job.agent_kind,
+            pane_id=pane_id,
+            start_timeout_ms=job.start_timeout_ms,
+            model=job.model,
+        )
+    except (HerdrCliError, OSError) as e:
+        if pane_id is not None:
+            try:
+                client.pane_close(pane_id)
+            except Exception as e2:  # noqa: BLE001
+                log.debug("error closing pane %s after start failure: %s", pane_id, e2)
+        return {
+            "state": "failed",
+            "reason": "agent_start_failed",
+            "error": str(e),
+            "pane_id": pane_id,
+        }
+
+    ready, last_error = _wait_for_agent_ready(
+        client, agent_name, timeout_s=job.start_timeout_ms / 1000
+    )
+    if not ready:
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=event_run_id
+        )
+        _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+        return {
+            "state": "failed",
+            "reason": "agent_not_interactive",
+            "error": last_error,
+            "pane_id": pane_id,
+        }
+
+    try:
+        settled_status = _prompt_with_watchdog(
+            client,
+            job_name=agent_name,
+            target=agent_name,
+            text=prompt_text,
+            timeout_ms=job.timeout_ms,
+            markers=job.failure_markers or ("Free usage exceeded",),
+            prompt_text=prompt_text,
+        )
+    except Exception as e:  # noqa: BLE001
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=event_run_id
+        )
+        _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+        return {
+            "state": "failed",
+            "reason": "agent_prompt_failed",
+            "error": str(e),
+            "pane_id": pane_id,
+        }
+
+    _capture_visible_tail(
+        client, agent_name, reports_dir=report_path.parent, run_id=event_run_id
+    )
+
+    report_written = report_path.exists()
+    session_id: str | None = None
+    try:
+        session_id = client.agent_session_id(agent_name)
+    except Exception as e:  # noqa: BLE001
+        log.debug("could not read session id for %s: %s", agent_name, e)
+
+    _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
+
+    return {
+        "state": "done" if settled_status in ("idle", "done") else "failed",
+        "pane_id": pane_id,
+        "report_path": str(report_path) if report_written else None,
+        "report_written": report_written,
+        "final_agent_status": settled_status,
+        "session_id": session_id,
+    }
 
 
 def _process_pr_target(

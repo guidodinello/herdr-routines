@@ -18,7 +18,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -194,8 +194,18 @@ _JOB_ALLOWED_KEYS = (
     )
 )
 
-VALID_CHECK_KINDS = frozenset({"pr_health", "command"})
+VALID_CHECK_KINDS = frozenset({"pr_health", "command", "github_event"})
 VALID_TARGETS = frozenset({"pr", "base"})
+
+# Closed set of `github_event` query strings (issue 014, spec v2 §1). A poll-based
+# event predicate, not freeform GH search: the accepted shapes are what the poll
+# function knows how to diff deterministically.
+VALID_GITHUB_EVENT_QUERIES = frozenset({"prs:labels", "issues:opened", "ci:failed"})
+
+# Allowed keys inside a `github_event.match` mapping. Deliberately tiny for v1: the
+# powerset of matchable payload fields grows with the query set, and there are no real
+# callers beyond the labelled-PR case yet. Closing it here keeps config pure.
+VALID_GITHUB_EVENT_MATCH_KEYS = frozenset({"label", "branch", "author"})
 
 _JOB_DEFAULTS = {
     "enabled": True,
@@ -284,9 +294,16 @@ class Retention:
 class GateCheck:
     """A single check in the unified gate model."""
 
-    kind: str  # "pr_health" | "command"
+    kind: str  # "pr_health" | "command" | "github_event"
     command: str | None = None
     timeout_ms: int = 120_000
+    # -- kind: github_event (issue 014) -----------------------------------------
+    # The poll predicate's own knobs: a closed `query` string, an optional explicit
+    # `repo: owner/repo` (default: the job's repo), and a `match` mapping validated
+    # against VALID_GITHUB_EVENT_MATCH_KEYS. `timeout_ms` bounds one poll.
+    query: str | None = None
+    repo: str | None = None
+    match: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -882,29 +899,33 @@ def _build_job(
             checks = None
         else:
             parsed_checks: list[GateCheck] = []
-            has_pr_health = False
-            has_command = False
+            check_kinds: set[str] = set()
             for ci, c in enumerate(checks_raw):
                 if not isinstance(c, dict):
                     raise ConfigError(f"{label}: 'checks[{ci}]' must be a mapping")
-                unknown_ck = set(c) - {"pr_health", "command", "timeout_ms"}
+                unknown_ck = set(c) - {
+                    "pr_health",
+                    "command",
+                    "github_event",
+                    "timeout_ms",
+                }
                 if unknown_ck:
                     raise ConfigError(
                         f"{label}: 'checks[{ci}]' has unknown key(s): {sorted(unknown_ck)}"
                     )
-                if "pr_health" in c and "command" in c:
+                present_kinds = [
+                    k for k in ("pr_health", "command", "github_event") if k in c
+                ]
+                if len(present_kinds) != 1:
                     raise ConfigError(
-                        f"{label}: 'checks[{ci}]' cannot have both 'pr_health' and 'command'"
-                    )
-                if "pr_health" not in c and "command" not in c:
-                    raise ConfigError(
-                        f"{label}: 'checks[{ci}]' must have either 'pr_health' or 'command'"
+                        f"{label}: 'checks[{ci}]' must have either 'pr_health', "
+                        "'command' or 'github_event' (exactly one)"
                     )
                 if "pr_health" in c:
-                    has_pr_health = True
+                    check_kinds.add("pr_health")
                     parsed_checks.append(GateCheck(kind="pr_health"))
-                else:
-                    has_command = True
+                elif "command" in c:
+                    check_kinds.add("command")
                     cmd = c["command"]
                     if not isinstance(cmd, str) or not cmd:
                         raise ConfigError(
@@ -918,14 +939,80 @@ def _build_job(
                     parsed_checks.append(
                         GateCheck(kind="command", command=cmd, timeout_ms=ct)
                     )
+                else:
+                    check_kinds.add("github_event")
+                    evt = c["github_event"]
+                    if evt is not None:
+                        if not isinstance(evt, dict):
+                            raise ConfigError(
+                                f"{label}: 'checks[{ci}].github_event' "
+                                "must be a mapping or null"
+                            )
+                    else:
+                        evt = {}
+                    unknown_evt = set(evt) - {"query", "repo", "match", "timeout_ms"}
+                    if unknown_evt:
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].github_event' has unknown key(s): "
+                            f"{sorted(unknown_evt)}"
+                        )
+                    evt_query = evt.get("query")
+                    if evt_query not in VALID_GITHUB_EVENT_QUERIES:
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].query' must be one of "
+                            f"{sorted(VALID_GITHUB_EVENT_QUERIES)}"
+                        )
+                    evt_repo = evt.get("repo")
+                    if evt_repo is not None and (
+                        not isinstance(evt_repo, str)
+                        or not re.fullmatch(r"[^/\s]+/[^/\s]+", evt_repo)
+                    ):
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].repo' must be 'owner/name' or null"
+                        )
+                    evt_match = evt.get("match")
+                    if evt_match is None:
+                        evt_match = {}
+                    if not isinstance(evt_match, dict):
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].match' must be a mapping or null"
+                        )
+                    unknown_match = set(evt_match) - VALID_GITHUB_EVENT_MATCH_KEYS
+                    if unknown_match:
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].match' has unknown key(s): "
+                            f"{sorted(unknown_match)}"
+                        )
+                    # An issue has no head branch, so `branch` could never match one.
+                    if evt_query == "issues:opened" and "branch" in evt_match:
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].match.branch' does not apply to "
+                            "query issues:opened"
+                        )
+                    et = evt.get("timeout_ms", 120_000)
+                    if not isinstance(et, int) or isinstance(et, bool) or et <= 0:
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].timeout_ms' must be a positive integer"
+                        )
+                    parsed_checks.append(
+                        GateCheck(
+                            kind="github_event",
+                            query=evt_query,
+                            repo=evt_repo,
+                            match=evt_match,
+                            timeout_ms=et,
+                        )
+                    )
 
-            if has_pr_health and has_command:
+            if len(check_kinds) > 1:
                 raise ConfigError(
-                    f"{label}: 'checks' cannot mix 'pr_health' and 'command' kinds"
+                    f"{label}: 'checks' cannot mix {sorted(check_kinds)} kinds"
                 )
 
             checks = tuple(parsed_checks)
-            inferred_target = "pr" if has_pr_health else "base"
+            inferred_target = (
+                "pr" if check_kinds <= {"pr_health", "github_event"} else "base"
+            )
 
     for int_key in ("max_workers_per_tick", "max_attempts_per_target"):
         value = merged[int_key]
