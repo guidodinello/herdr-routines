@@ -17,8 +17,9 @@ Contract pinned for the stage-4 implementation:
   - ``handle_spawn_message(text, chat_id, *, allowed_chat_id, aliases, client,
     reply) -> str`` — event handler. ``aliases`` maps alias -> ``{"repo":
     <path>, "agent_kind": <kind>, "workspace": <mode>}``. ``client`` is a
-    HerdrClient-like with ``workspace_create(*, cwd, label=None, ...)`` and
-    ``agent_start(*, name, kind, pane_id, start_timeout_ms, ...)``. ``reply``
+    HerdrClient-like with ``worktree_create_full(*, cwd, branch, base, label=None)``
+    (``workspace: worktree``) or ``tab_create(*, cwd, label=None)`` (``workspace:
+    root``), and ``agent_start(*, name, kind, pane_id, start_timeout_ms, ...)``. ``reply``
     is a ``Callable[[str], None]`` sending the in-chat reply; the handler
     also returns that reply text.
   - ``is_authorized(chat_id, allowed_chat_id) -> bool`` if a pure auth helper
@@ -40,7 +41,7 @@ from typing import Any
 
 import pytest
 
-from herdr_routines.herdr import HerdrCliError
+from herdr_routines.herdr import HerdrCliError, WorktreeInfo
 
 
 def _spawn_module():
@@ -63,8 +64,9 @@ def _aliases(
 class FakeSpawnClient:
     """HerdrClient-like double recording workspace/agent calls.
 
-    ``workspace_create`` returns a workspace id; ``tab_create`` a pane id.
-    ``fail_at`` raises on that method ("workspace_create" or "agent_start").
+    ``worktree_create_full`` (recorded in ``workspace_calls``) returns a worktree whose
+    root pane is ``pane_id``; ``tab_create`` returns ``pane_id`` too.
+    ``fail_at`` raises on that method ("worktree_create_full" or "agent_start").
     ``collide_once`` fails the first ``agent_start`` with ``agent_name_taken``
     (code + ``is already used`` message, matching runner._is_agent_name_taken).
     """
@@ -87,13 +89,17 @@ class FakeSpawnClient:
         self.agent_calls: list[dict[str, Any]] = []
         self.tab_calls: list[dict[str, Any]] = []
 
-    def workspace_create(
-        self, *, cwd: str, label: str | None = None, env: dict[str, str] | None = None
-    ) -> str:
-        self.workspace_calls.append({"cwd": cwd, "label": label, "env": env})
-        if self.fail_at == "workspace_create":
+    def worktree_create_full(
+        self, *, cwd: str, branch: str, base: str, label: str | None = None
+    ) -> WorktreeInfo:
+        self.workspace_calls.append(
+            {"cwd": cwd, "branch": branch, "base": base, "label": label}
+        )
+        if self.fail_at == "worktree_create_full":
             raise self.fail_with or HerdrCliError("herdr down", exit_code=1)
-        return self.workspace_id
+        return WorktreeInfo(
+            path=f"{cwd}/.worktrees/{branch}", branch=branch, root_pane_id=self.pane_id
+        )
 
     def tab_create(self, *, cwd: str, label: str | None = None) -> str:
         self.tab_calls.append({"cwd": cwd, "label": label})
@@ -364,6 +370,21 @@ def test_spawn_alias_map_validation(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="(?i)duplicate"):
         load_config(dup_path)
 
+    # `base` (the branch a worktree spawn starts from) defaults to main and flows into
+    # the handler's alias table; an empty one is rejected.
+    from herdr_routines.telegram_spawn import alias_table
+
+    assert cfg.telegram_spawn is not None
+    assert alias_table(cfg.telegram_spawn)["nightly"]["base"] == "main"
+    based_path = tmp_path / "based.yaml"
+    based_path.write_text(_spawn_config_text(good_repo) + "      base: develop\n")
+    based = load_config(based_path).telegram_spawn
+    assert based is not None and alias_table(based)["nightly"]["base"] == "develop"
+    empty_base_path = tmp_path / "empty-base.yaml"
+    empty_base_path.write_text(_spawn_config_text(good_repo) + "      base: ''\n")
+    with pytest.raises(ConfigError, match="base"):
+        load_config(empty_base_path)
+
 
 # 6. Untrusted token: validated shape, shell-less argv only. --------------------
 
@@ -440,17 +461,67 @@ def test_spawn_success_replies_with_pane_handle(
         client=client,
     )
 
+    # workspace: worktree runs on a fresh branch's worktree, never in the checkout.
     assert len(client.workspace_calls) == 1
     assert client.workspace_calls[0]["cwd"] == str(repo)
+    branch = client.workspace_calls[0]["branch"]
+    assert re.fullmatch(r"auto/spawn-nightly-audit-\d+", branch), branch
+    assert client.workspace_calls[0]["base"] == "main"
+    assert client.tab_calls == []
     assert len(client.agent_calls) == 1
     started = client.agent_calls[0]
     assert started["kind"] == "claude"
-    assert started["pane_id"], "agent start needs an existing pane"
+    assert started["pane_id"] == "w7:p1", "agent starts in the worktree's root pane"
     name = started["name"]
     assert re.fullmatch(r"rt-nightly-audit-\d+", name), name
-    # Reply carries the handle the phone steers with: workspace/pane id + agent name.
-    assert "w7" in result
+    # Reply carries the handle the phone steers with: pane id, branch and agent name.
+    assert "w7:p1" in result
+    assert branch in result
     assert name in result
+
+
+def test_spawn_root_mode_opens_a_tab_in_the_checkout(tmp_path: Path) -> None:
+    mod = _spawn_module()
+    repo = _git_repo(tmp_path / "repo-root")
+    aliases = _aliases(repo)
+    aliases["nightly-audit"]["workspace"] = "root"
+    client = FakeSpawnClient()
+
+    result, _ = _handle(
+        mod,
+        "/run nightly-audit",
+        12345,
+        allowed_chat_id=12345,
+        aliases=aliases,
+        client=client,
+    )
+
+    assert client.workspace_calls == [], "root mode creates no worktree"
+    assert [c["cwd"] for c in client.tab_calls] == [str(repo)]
+    assert client.agent_calls[0]["pane_id"] == "w7:p1"
+    assert "w7:p1" in result
+
+
+def test_spawn_agent_name_fits_the_32_char_cap(tmp_path: Path) -> None:
+    """Aliases may be 24 chars; the agent name (and its -r1 retry) must still fit
+    herdr's 32-char name cap, or a long alias could never start."""
+    mod = _spawn_module()
+    repo = _git_repo(tmp_path / "repo-long")
+    long_alias = "a-very-long-alias-name-x"  # 24 chars
+    client = FakeSpawnClient(collide_once=True)
+
+    _handle(
+        mod,
+        f"/run {long_alias}",
+        12345,
+        allowed_chat_id=12345,
+        aliases=_aliases(repo, name=long_alias),
+        client=client,
+    )
+
+    names = [c["name"] for c in client.agent_calls]
+    assert len(names) == 2
+    assert all(len(n) <= 32 for n in names), names
 
 
 # 8. Name collision: retry with a unique suffixed name. -------------------------
@@ -497,7 +568,7 @@ def test_spawn_failure_replies_with_short_error(
 
     from herdr_routines.history import TERMINAL_STATES
 
-    for fail_at in ("workspace_create", "agent_start"):
+    for fail_at in ("worktree_create_full", "agent_start"):
         appended.clear()
         client = FakeSpawnClient(fail_at=fail_at)
         result, _ = _handle(

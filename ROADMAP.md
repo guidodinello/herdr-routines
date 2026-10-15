@@ -197,9 +197,11 @@ files 2026-08-27.
   follow-ups (laptop `herdr.push` cleanup, the `pane.agent_status_changed`
   race verification) are logged in the file. →
   [`023`](docs/process/issues/023-replace-herdr-push-telegram.md)
-- **Spawn a session on the fly from Telegram** — `open`, `low`. Cold-start
-  `/run <job>` mapping to `workspace create` + `agent start`; transport is
-  settled by [`023`]. →
+- **Spawn a session on the fly from Telegram** — `done` (PR #163, 2026-10-15).
+  `/run <alias>` / `/start <alias>` from the one allowlisted chat starts an agent
+  in a fresh worktree (or the checkout, `workspace: root`) via the
+  `spawn-from-telegram` entrypoint, which the bridge must call per inbound
+  message (see `deploy/README.md`). →
   [`024`](docs/process/issues/024-spawn-session-from-telegram.md)
 - **Review `@me` PRs across repos** — `done` (PR #159, 2026-10-15; ships disabled as
   `deploy/jobs.d/review-my-prs.yaml`). A cross-repo `kind: review` job: one batched `gh` search for open PRs authored by me

@@ -118,8 +118,9 @@ commented block in [`jobs.example.yaml`](jobs.example.yaml) to set thresholds, a
 
 The `herdr-telegram-bridge` plugin (issue 023) steers *existing* panes by replying to a
 notification. The cold-start path complements it: a bare `/run <alias>` or `/start <alias>`
-message, with no notification to reply to, creates a workspace + pane against the mapped
-checkout and replies with the handle the reply-to-steer flow then uses.
+message, with no notification to reply to, starts an agent against the mapped checkout (in a
+fresh `auto/spawn-<alias>-<ts>` worktree by default, laid out exactly like a `workspace:
+worktree` job run) and replies with the pane handle the reply-to-steer flow then uses.
 
 Configure it with a top-level `telegram_spawn:` block in `jobs.yaml` (or a `telegram_spawn.yaml`
 sibling in a `jobs.d/` layout — see the commented block in
@@ -132,7 +133,9 @@ telegram_spawn:
     - alias: nightly           # the token after /run or /start
       repo: /home/guido/projects/fitted
       agent_kind: opencode     # optional, default claude
-      workspace: worktree      # optional, default worktree
+      workspace: worktree      # optional, default worktree (a fresh branch's worktree;
+                               # `root` runs in the checkout itself)
+      base: main               # optional, default main: the branch a worktree spawn starts from
 ```
 
 `uv run herdr-routines validate` rejects an empty `allowed_chat_id`, a duplicate alias, and an

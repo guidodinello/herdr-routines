@@ -6,9 +6,11 @@ cold-start path: a bare ``/run <job>`` or ``/start <repo>`` message creates a wo
 and starts an agent against the mapped checkout, then replies with the pane handle the
 phone steers with.
 
-The handler deliberately reuses the launcher mechanics rather than inventing a layout:
-``HerdrClient.workspace_create`` opens a workspace, ``HerdrClient.tab_create`` opens the
-pane ``agent start`` needs, and ``HerdrClient.agent_start`` starts the agent with the
+The handler deliberately reuses the launcher mechanics rather than inventing a layout,
+exactly as ``runner.execute_run`` does per ``workspace`` mode: ``worktree`` opens a fresh
+branch's worktree in its own workspace (``HerdrClient.worktree_create_full``), ``root``
+opens a tab in the checkout itself (``HerdrClient.tab_create``); either yields the pane
+``agent start`` needs, and ``HerdrClient.agent_start`` starts the agent with the
 shell-less argv ``build_agent_start_args`` builds. Nothing here interpolates the
 phone-supplied token into a shell: the token passes a strict ``[a-z][a-z0-9_-]*`` parse
 and an explicit allowlist lookup, and reaches Herdr only as an argv element.
@@ -26,7 +28,7 @@ from typing import Any, Protocol
 
 from logger import get_logger
 
-from herdr_routines.herdr import HerdrCliError
+from herdr_routines.herdr import HerdrCliError, WorktreeInfo
 from herdr_routines.runner import _is_agent_name_taken
 
 log = get_logger(__name__)
@@ -53,10 +55,10 @@ _TARGET_RE = re.compile(r"[a-z][a-z0-9_-]*")
 # ``start_timeout_ms`` from, so it uses the same default a plain routine job gets.
 DEFAULT_START_TIMEOUT_MS = 120_000
 
-# Every spawned workspace is forked with this env so ``herdr`` calls made *inside* the
-# agent settle normally instead of going ``blocked`` — same rationale as
-# ``pipeline_prepare.SHARED_WORKSPACE_ENV``.
-_SPAWN_WORKSPACE_ENV = {"HERDR_ENV": "1"}
+# Agent names are capped at 32 chars (herdr's NAME_RE). ``rt-`` + the alias + ``-`` + a
+# 10-digit epoch + a possible ``-r1`` retry suffix must fit, so the alias part is cut to
+# this many chars (aliases themselves may be up to 24).
+_NAME_ALIAS_CHARS = 13
 
 # The generic auth refusal. Deliberately free of the mapping and the allowed chat id so a
 # rejected sender cannot learn either (spec criterion 2).
@@ -69,9 +71,9 @@ class SpawnClient(Protocol):
     Structural on purpose: the real client and the tier-1 ``FakeSpawnClient`` both satisfy
     it without either depending on this module."""
 
-    def workspace_create(
-        self, *, cwd: str, label: str | None = None, env: dict[str, str] | None = None
-    ) -> str: ...
+    def worktree_create_full(
+        self, *, cwd: str, branch: str, base: str, label: str | None = None
+    ) -> WorktreeInfo: ...
 
     def tab_create(self, *, cwd: str, label: str | None = None) -> str: ...
 
@@ -130,6 +132,7 @@ def alias_table(spawn: Any) -> dict[str, dict[str, str]]:
             "repo": str(a.repo),
             "agent_kind": a.agent_kind,
             "workspace": a.workspace,
+            "base": a.base,
         }
         for a in spawn.aliases
     }
@@ -171,19 +174,26 @@ def handle_spawn_message(
         return _reply(reply, f"Target {target!r} is misconfigured (no repo).")
     kind = str(spec.get("agent_kind") or "claude")
     mode = str(spec.get("workspace") or "worktree")
-    base_name = f"rt-{target}-{int(time.time())}"
+    base = str(spec.get("base") or "main")
+    stamp = int(time.time())
+    base_name = f"rt-{target[:_NAME_ALIAS_CHARS]}-{stamp}"
 
+    # Same per-mode layout as runner.execute_run: a worktree run never edits the
+    # checkout the scheduler syncs; a root run works in the checkout itself.
     try:
-        workspace_id = client.workspace_create(
-            cwd=repo, label=f"spawn-{target}", env=dict(_SPAWN_WORKSPACE_ENV)
-        )
+        if mode == "worktree":
+            info = client.worktree_create_full(
+                cwd=repo,
+                branch=f"auto/spawn-{target}-{stamp}",
+                base=base,
+                label=base_name,
+            )
+            pane_id = info.root_pane_id
+            where = f"branch {info.branch} (worktree {info.path})"
+        else:
+            pane_id = client.tab_create(cwd=repo, label=base_name)
+            where = f"checkout {repo}"
     except (HerdrCliError, OSError) as e:
-        return _reply(reply, f"spawn failed: {e}")
-
-    try:
-        pane_id = client.tab_create(cwd=repo, label=base_name)
-    except (HerdrCliError, OSError) as e:
-        _best_effort(client, "workspace_close", workspace_id)
         return _reply(reply, f"spawn failed: {e}")
 
     name = base_name
@@ -204,8 +214,7 @@ def handle_spawn_message(
 
     return _reply(
         reply,
-        f"Spawned {name}; workspace {workspace_id}, pane {pane_id}, mode {mode}. "
-        "Reply to this message to steer it.",
+        f"Spawned {name} on {where}, pane {pane_id}. Reply to this message to steer it.",
     )
 
 

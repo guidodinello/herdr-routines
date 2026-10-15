@@ -166,7 +166,9 @@ _NON_JOB_FILENAMES = frozenset(
 # Recognized keys under `telegram_spawn:` / an alias record (issue 024). Anything else is a
 # typo and rejected, same posture as `retention:` and `defaults:`.
 _TELEGRAM_SPAWN_ALLOWED_KEYS = frozenset({"allowed_chat_id", "aliases"})
-_SPAWN_ALIAS_ALLOWED_KEYS = frozenset({"alias", "repo", "agent_kind", "workspace"})
+_SPAWN_ALIAS_ALLOWED_KEYS = frozenset(
+    {"alias", "repo", "agent_kind", "workspace", "base"}
+)
 _JOB_ALLOWED_KEYS = (
     _JOB_REQUIRED_KEYS
     | _DEFAULTS_ALLOWED_KEYS
@@ -296,12 +298,14 @@ class SpawnAlias:
 
     ``alias`` is the token a phone types in ``/run <alias>``; it is validated against the
     same ``[a-z][a-z0-9_-]*`` shape the parser enforces, so it can never be interpolated
-    into a shell. ``agent_kind``/``workspace`` mirror the ``Job`` fields they map onto."""
+    into a shell. ``agent_kind``/``workspace``/``base`` mirror the ``Job`` fields they map
+    onto; ``base`` is the branch a ``worktree`` spawn branches from."""
 
     alias: str
     repo: Path
     agent_kind: str = "claude"
     workspace: str = "worktree"
+    base: str = "main"
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,8 +834,11 @@ def _build_spawn_alias(raw: object, *, label: str) -> SpawnAlias:
             f"{label} ({alias!r}): 'workspace' must be one of "
             f"{sorted(VALID_WORKSPACE_MODES)}"
         )
+    base = raw.get("base", "main")
+    if not isinstance(base, str) or not base:
+        raise ConfigError(f"{label} ({alias!r}): 'base' must be a non-empty string")
     return SpawnAlias(
-        alias=alias, repo=repo, agent_kind=agent_kind, workspace=workspace
+        alias=alias, repo=repo, agent_kind=agent_kind, workspace=workspace, base=base
     )
 
 
