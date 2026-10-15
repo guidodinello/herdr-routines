@@ -1,0 +1,32 @@
+# Example job (issue 055): review open PRs you authored or were asked to review,
+# across every repo, in one tick. Ships DISABLED — enable it only if you want the
+# pipeline posting reviews on your behalf.
+#
+# `kind: review` takes NO `repo`/`repository`/`workspace`/`checks`: it has no single
+# checkout, and one checkout per distinct PR repo is created lazily under the managed
+# base dir (`repos.default_repos_dir()`) at tick time. Those keys are rejected at load.
+#
+# Re-review is bounded by two guards: a content marker inside each posted review
+# (skip `review_already_posted`) and a per-target attempt budget
+# (`max_attempts_per_target` defaults to 1 for this kind).
+#
+# Reviews run sequentially inside one tick and the tick waits for each, so every other
+# job's schedule waits too: worst case is
+# max_workers_per_tick * (start_timeout_ms + timeout_ms) — 3 * (2 + 15) = 51 min here.
+# Raise either knob only with that budget in mind.
+enabled: false
+cron: "30 8 * * *"
+kind: review
+select:
+  - author # PRs you opened
+  - review_requested # PRs where you are the requested reviewer
+include_auto_branches: false # do not review pipeline-owned auto/ branches
+max_workers_per_tick: 3 # one review agent per PR, <=3/tick
+max_attempts_per_target: 1 # one review per target; the marker guard does the rest
+agent_kind: opencode
+model: null
+prompt: "" # empty = engine-injected read-only review prompt (see build_review_prompt)
+timeout_ms: 900000 # 15 min per review; see the tick-blocking note above
+start_timeout_ms: 120000
+on_missed: log
+notify_policy: on-finding

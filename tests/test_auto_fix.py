@@ -5,6 +5,7 @@ docs/pipeline/runs/20260829T050025Z/spec.md.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ import pytest
 
 from herdr_routines.auto_fix import (
     PRInfo,
+    ReviewSearch,
     attempt_count_for_pr,
     build_fix_prompt,
     build_pr_agent_name,
@@ -113,6 +115,28 @@ class FakeGhClient:
         self, *, owner: str, repo: str, number: int
     ) -> list[dict[str, object]]:
         return []
+
+    # issue 055 widened the GhClient protocol with the review-search trio; these stubs
+    # keep the static (mypy) and runtime protocol-conformance checks green.
+    def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
+        self.calls.append("search_prs")
+        if self.raise_on == "search_prs":
+            raise RuntimeError("gh api graphql failed")
+        return None
+
+    def pr_review_bodies(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[str] | None:
+        self.calls.append(f"pr_review_bodies:{owner}/{repo}#{number}")
+        if self.raise_on == "pr_review_bodies":
+            raise RuntimeError("gh pr view bodies failed")
+        return None
+
+    def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
+        self.calls.append(f"repo_info:{owner}/{repo}")
+        if self.raise_on == "repo_info":
+            raise RuntimeError("gh api repo failed")
+        return None
 
 
 class FakeFullClient:
