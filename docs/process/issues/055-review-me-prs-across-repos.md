@@ -1,7 +1,7 @@
 ---
 id: "055"
 title: "Review `@me` PRs across repos: a cross-repo `kind: review` job that posts one review per open PR"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---

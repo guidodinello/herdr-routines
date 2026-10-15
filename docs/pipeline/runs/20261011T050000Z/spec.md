@@ -52,10 +52,11 @@ Phase B (dispatch + verify). Per the issue design:
   `repos.ensure_repo` into `repos._ensure_checkout(clone_url, dest, base)` with
   `ensure_repo` delegating (babysit behavior unchanged). Checkout at
   `<base>/<owner>/<repo>` on the repo's own default branch; per-PR `git fetch
-  origin <headRef>` + worktree from `origin/<headRef>` at
-  `<checkout>/.worktrees/review-pr<N>`. Reuse own clean worktree via existing
-  `_worktree_reuse_check`; stale → force-remove + re-add; other owner's worktree
-  holding head branch → `skipped (head_branch_checked_out)`; remove worktree
+  origin <headRef>` + detached worktree at `origin/<headRef>` in
+  `<checkout>/.worktrees/review-pr<N>` (no local branch, so another owner's worktree
+  on the head branch is never contended — amended in review, replacing a
+  `head_branch_checked_out` skip). Reuse own clean worktree via existing
+  `_worktree_reuse_check` (moved to the fresh head); stale → force-remove + re-add; remove worktree
   `--force` after settle (success or failure). Clone/sync failure fails only that
   repo's targets.
 - **Agent identity:** `rt-<job>-rv<h6>`, `h6 = sha1("job|target_key")[:6]` + run tail;
@@ -87,7 +88,7 @@ Phase B (dispatch + verify). Per the issue design:
   `test_review_report_lists_candidates_and_skips`,
   `test_shipped_review_job_config_validates`; Phase B:
   `test_review_dispatch_creates_per_repo_checkout`,
-  `test_review_dispatch_skips_other_worktrees_head_branch`,
+  `test_review_dispatch_does_not_contend_for_head_branch`,
   `test_review_dispatch_reuses_own_review_worktree`,
   `test_review_dispatch_removes_worktree_after_settle`,
   `test_review_verification_is_fail_closed`,
@@ -120,7 +121,7 @@ Phase B (dispatch + verify). Per the issue design:
    `max_attempts_per_target: 1` to one extra review, never a loop. Criteria 6/7/17.
 2. **Worktree contention (issue 036 redux):** fighting another owner's branch or
    leaving a worktree behind recreates the collision; mitigated by
-   `head_branch_checked_out` skip + forced post-settle removal. Criteria 10–12.
+   detached review worktrees (no branch to contend for) + forced post-settle removal. Criteria 10–12.
 3. **Fail-open reads:** search failure or unverifiable post-condition must never read
    as "nothing to do" / `done` — both fail closed. Criteria 6/13.
 4. **Per-repo failure blast radius:** one bad clone must not sink the tick — isolate
@@ -151,7 +152,7 @@ Each item states its tier (`blocking` or `non-blocking`) and a `confidence:` tie
 8. [non-blocking, confidence: medium] Aggregate `reports/review-<run_id>.md` lists every candidate with disposition plus skip reasons and counts (`enumerated`, `candidates`, `dispatched`, `skipped`, `repos_failed`). Test: test_review_report_lists_candidates_and_skips
 9. [non-blocking, confidence: medium] Shipped example `deploy/jobs.d/review-my-prs.yaml` is disabled by default and passes `kind: review` validation. Test: test_shipped_review_job_config_validates
 10. [blocking, confidence: high] Dispatch creates per-repo checkout at `<base>/<owner>/<repo>` on the repo's default branch via extracted `_ensure_checkout` with per-repo GraphQL default-branch lookup cached per tick. Test: test_review_dispatch_creates_per_repo_checkout
-11. [blocking, confidence: medium] Dispatch skips `head_branch_checked_out` when another owner's worktree holds the PR head branch instead of fighting it. Test: test_review_dispatch_skips_other_worktrees_head_branch
+11. [blocking, confidence: medium] Dispatch uses a detached worktree, so another owner's worktree holding the PR head branch is neither touched nor contended, and no local branch is created in the shared checkout. Test: test_review_dispatch_does_not_contend_for_head_branch
 12. [non-blocking, confidence: medium] Dispatch reuses the job's own clean review worktree at `<checkout>/.worktrees/review-pr<N>` and force-removes plus re-adds a stale one. Test: test_review_dispatch_reuses_own_review_worktree
 13. [blocking, confidence: medium] Dispatch removes the per-PR worktree with `--force` after settle on both success and failure paths. Test: test_review_dispatch_removes_worktree_after_settle
 14. [blocking, confidence: high] Post-condition re-queries review bodies: marker present yields `done` + `verified: True` + `gate: passed`; absent yields `failed (review_not_posted)`; read failure yields `failed (review_verification_failed)`, never `done`. Test: test_review_verification_is_fail_closed
