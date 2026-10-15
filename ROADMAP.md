@@ -201,8 +201,8 @@ files 2026-08-27.
   `/run <job>` mapping to `workspace create` + `agent start`; transport is
   settled by [`023`]. →
   [`024`](docs/process/issues/024-spawn-session-from-telegram.md)
-- **Review `@me` PRs across repos** — `open`, `medium`. A cross-repo
-  `kind: review` job: one batched `gh` search for open PRs authored by me
+- **Review `@me` PRs across repos** — `done` (PR #159, 2026-10-15; ships disabled as
+  `deploy/jobs.d/review-my-prs.yaml`). A cross-repo `kind: review` job: one batched `gh` search for open PRs authored by me
   (or `review-requested`) across all repos, one worktree per dispatched PR, one
   posted review each. Distinct from `babysit-prs` (issue 015), which only watches
   PRs a routine itself opened (`auto/*`); that `auto/` slice is excluded here too,

@@ -818,7 +818,12 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     problems.extend(config.errors)
 
     for job in config.jobs:
-        if job.repository is not None:
+        if job.kind == "review":
+            # kind: review has no single checkout: `repo` is the managed base dir, and
+            # per-repo checkouts are created lazily at tick time. Nothing on disk to
+            # validate here.
+            pass
+        elif job.repository is not None:
             # Repository jobs: skip existence/.git errors, warn if not yet cloned
             if not job.repo.exists():
                 warnings.append(
@@ -852,9 +857,10 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                 )
         elif (
             job.enabled
-            # gated and audit jobs inject their own prompts when `prompt` is empty, and
-            # an audit's verdict is its manifest, not $ROUTINE_REPORT.
-            and job.kind not in ("gated", "audit")
+            # gated, audit, and review jobs inject their own prompts when `prompt` is
+            # empty; an audit's verdict is its manifest and a review's is its posted
+            # review marker, neither of which is $ROUTINE_REPORT.
+            and job.kind not in ("gated", "audit", "review")
             and "$ROUTINE_REPORT" not in job.prompt
         ):
             # A run only settles as "done" when the report file exists and is non-empty (see
@@ -960,6 +966,16 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
                 + GATE_SLOP_S
                 + job.audit.timeout_ms / 1000
                 + job.timeout_ms / 1000
+            )
+            continue
+        # kind: review (issue 055) dispatches up to max_workers_per_tick read-only review
+        # agents sequentially in one tick, each bounded by start + run + slop.
+        if job.kind == "review":
+            total_job_seconds += (
+                GATE_SLOP_S
+                + job.max_workers_per_tick
+                * (job.start_timeout_ms + job.timeout_ms)
+                / 1000
             )
             continue
         if job.kind == "gated" and job.target is not None:
