@@ -114,6 +114,48 @@ commented block in [`jobs.example.yaml`](jobs.example.yaml) to set thresholds, a
 `prune` on a timer only once you have read its `--dry-run` output — see
 [`../docs/plan-v1.md`](../docs/plan-v1.md#retention).
 
+## Cold-start spawn from Telegram (issue 024)
+
+The `herdr-telegram-bridge` plugin (issue 023) steers *existing* panes by replying to a
+notification. The cold-start path complements it: a bare `/run <alias>` or `/start <alias>`
+message, with no notification to reply to, starts an agent against the mapped checkout (in a
+fresh `auto/spawn-<alias>-<ts>` worktree by default, laid out exactly like a `workspace:
+worktree` job run) and replies with the pane handle the reply-to-steer flow then uses.
+
+Configure it with a top-level `telegram_spawn:` block in `jobs.yaml` (or a `telegram_spawn.yaml`
+sibling in a `jobs.d/` layout — see the commented block in
+[`jobs.example.yaml`](jobs.example.yaml)):
+
+```yaml
+telegram_spawn:
+  allowed_chat_id: 123456789   # REQUIRED: the only chat that may spawn. Empty = validate fails.
+  aliases:
+    - alias: nightly           # the token after /run or /start
+      repo: /home/guido/projects/fitted
+      agent_kind: opencode     # optional, default claude
+      workspace: worktree      # optional, default worktree (a fresh branch's worktree;
+                               # `root` runs in the checkout itself)
+      base: main               # optional, default main: the branch a worktree spawn starts from
+```
+
+`uv run herdr-routines validate` rejects an empty `allowed_chat_id`, a duplicate alias, and an
+alias whose `repo` does not exist or is not a git checkout — at load time, not at spawn time on
+someone's phone.
+
+**Wiring the inbound message.** The bridge's poller calls the event entrypoint once per inbound
+message and sends back whatever it prints:
+
+```sh
+uv run herdr-routines spawn-from-telegram --chat-id "$CHAT_ID" --text "$MESSAGE_TEXT"
+# or the PATH-agnostic shim (also accepts TELEGRAM_CHAT_ID / TELEGRAM_MESSAGE_TEXT):
+scripts/herdr-spawn-from-telegram.sh --chat-id "$CHAT_ID" --text "$MESSAGE_TEXT"
+```
+
+The handler is event-only: it writes no `tick.lock`, no history terminal state, and owns no
+timer — the systemd `herdr-routines.timer` stays the sole scheduler. Secrets (the bot token)
+stay in the bridge's own secrets file; only the non-secret `allowed_chat_id` and alias map live
+in the host-specific jobs config, which is not committed.
+
 ## Manual smoke checklist
 
 A green test suite proves the code matches our model of the `herdr` CLI — it does not prove

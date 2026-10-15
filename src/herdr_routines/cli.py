@@ -82,6 +82,7 @@ from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
 from herdr_routines.self_update import default_state_path, run_self_update
 from herdr_routines.table import render_table
+from herdr_routines.telegram_spawn import alias_table, handle_spawn_message
 from herdr_routines.tick import (
     _build_pipeline_launch_argv,
     default_lock_path,
@@ -600,6 +601,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_self_update.set_defaults(handler=_cmd_self_update)
 
+    # Cold-start spawn from Telegram (issue 024). The inbound-message glue: the bridge
+    # plugin/bot calls this with one message's text + chat_id, and the handler either
+    # replies in-chat (printed to stdout, to be sent back by the caller) or drops the
+    # message. It is an event handler, not a scheduler: no clock, no lock.
+    p_spawn = sub.add_parser(
+        "spawn-from-telegram",
+        help="handle one inbound Telegram message: cold-start a mapped session on /run or /start",
+    )
+    p_spawn.add_argument("--text", required=True, help="the raw message text")
+    p_spawn.add_argument(
+        "--chat-id", required=True, help="the sender's Telegram chat id (the auth gate)"
+    )
+    p_spawn.set_defaults(handler=_cmd_spawn_from_telegram)
+
     return parser
 
 
@@ -1029,6 +1044,35 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         log.error("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
     return 0 if outcome.state == "done" else 1
+
+
+def _cmd_spawn_from_telegram(args: argparse.Namespace) -> int:
+    """Event entrypoint for the inbound-message bridge (issue 024).
+
+    Loads the configured allowlist + alias map, hands one message to the pure spawn
+    handler, and prints the reply to stdout for the caller (bot/poller) to send back.
+    Never touches the tick lock or history — a cold spawn is an event, not a scheduled
+    run — and the systemd timer stays the sole scheduler."""
+    config = _load_config_or_exit(args)
+    spawn = config.telegram_spawn
+    if spawn is None:
+        log.error("telegram_spawn is not configured; nothing to spawn")
+        return 1
+    handle_spawn_message(
+        args.text,
+        args.chat_id,
+        allowed_chat_id=spawn.allowed_chat_id,
+        aliases=alias_table(spawn),
+        client=HerdrClient(),
+        reply=_print_reply,
+    )
+    return 0
+
+
+def _print_reply(text: str) -> None:
+    """Print the in-chat reply the bridge sends back; a dropped message prints nothing."""
+    if text:
+        print(text)
 
 
 def _cmd_run_audit(job: Job, *, run_id: str, now: datetime) -> int:

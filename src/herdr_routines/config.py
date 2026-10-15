@@ -157,7 +157,18 @@ _RETENTION_ALLOWED_KEYS = frozenset(
 # in load_config_dir; `retention.yaml` is its issue-021 twin (the directory-layout spelling
 # of the top-level `retention:` block).
 _RETENTION_FILENAME = "retention.yaml"
-_NON_JOB_FILENAMES = frozenset({"defaults.yaml", _RETENTION_FILENAME})
+# The directory-layout spelling of the top-level `telegram_spawn:` block (issue 024).
+# Recognized as a non-job file, like the two above, so it is never loaded as a job.
+_TELEGRAM_SPAWN_FILENAME = "telegram_spawn.yaml"
+_NON_JOB_FILENAMES = frozenset(
+    {"defaults.yaml", _RETENTION_FILENAME, _TELEGRAM_SPAWN_FILENAME}
+)
+# Recognized keys under `telegram_spawn:` / an alias record (issue 024). Anything else is a
+# typo and rejected, same posture as `retention:` and `defaults:`.
+_TELEGRAM_SPAWN_ALLOWED_KEYS = frozenset({"allowed_chat_id", "aliases"})
+_SPAWN_ALIAS_ALLOWED_KEYS = frozenset(
+    {"alias", "repo", "agent_kind", "workspace", "base"}
+)
 _JOB_ALLOWED_KEYS = (
     _JOB_REQUIRED_KEYS
     | _DEFAULTS_ALLOWED_KEYS
@@ -291,6 +302,42 @@ class Retention:
 
 
 @dataclass(frozen=True, slots=True)
+class SpawnAlias:
+    """One cold-start target alias (issue 024): a Telegram-facing name resolving to the
+    checkout an agent should be started against via ``telegram_spawn.handle_spawn_message``.
+
+    ``alias`` is the token a phone types in ``/run <alias>``; it is validated against the
+    same ``[a-z][a-z0-9_-]*`` shape the parser enforces, so it can never be interpolated
+    into a shell. ``agent_kind``/``workspace``/``base`` mirror the ``Job`` fields they map
+    onto; ``base`` is the branch a ``worktree`` spawn branches from."""
+
+    alias: str
+    repo: Path
+    agent_kind: str = "claude"
+    workspace: str = "worktree"
+    base: str = "main"
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramSpawn:
+    """The ``telegram_spawn:`` block (issue 024): the single allowlisted ``chat_id`` that
+    may cold-start a session, plus the static alias map it may resolve.
+
+    A missing block (``RoutinesConfig.telegram_spawn is None``) means the feature is not
+    configured at all — the bridge simply has no spawn entrypoint. A present block with an
+    empty/absent ``allowed_chat_id`` is a load error (fail-closed, never allow-all)."""
+
+    allowed_chat_id: str
+    aliases: tuple[SpawnAlias, ...] = ()
+
+    def alias(self, name: str) -> SpawnAlias | None:
+        for a in self.aliases:
+            if a.alias == name:
+                return a
+        return None
+
+
+@dataclass(frozen=True, slots=True)
 class GateCheck:
     """A single check in the unified gate model."""
 
@@ -418,6 +465,9 @@ class RoutinesConfig:
     # if explicitly asked" — a config that never mentions `retention:` behaves exactly as
     # it did before this block existed.
     retention: Retention = field(default_factory=Retention)
+    # Cold-start spawn config (issue 024). None = the Telegram spawn entrypoint is not
+    # configured; a present block must carry a non-empty `allowed_chat_id`.
+    telegram_spawn: TelegramSpawn | None = None
 
     def job(self, name: str) -> Job | None:
         for j in self.jobs:
@@ -500,7 +550,13 @@ def _load_config_file(path: Path) -> RoutinesConfig:
             f"unsupported config version: {version!r} (only 1 is supported)"
         )
 
-    unknown_top = set(raw) - {"version", "defaults", "jobs", "retention"}
+    unknown_top = set(raw) - {
+        "version",
+        "defaults",
+        "jobs",
+        "retention",
+        "telegram_spawn",
+    }
     if unknown_top:
         raise ConfigError(f"unknown top-level key(s): {sorted(unknown_top)}")
 
@@ -533,7 +589,16 @@ def _load_config_file(path: Path) -> RoutinesConfig:
         seen_names.add(job.name)
         jobs.append(job)
 
-    return RoutinesConfig(jobs=tuple(jobs), retention=retention)
+    raw_telegram = raw.get("telegram_spawn")
+    telegram_spawn = (
+        _build_telegram_spawn(raw_telegram, "telegram_spawn")
+        if raw_telegram is not None
+        else None
+    )
+
+    return RoutinesConfig(
+        jobs=tuple(jobs), retention=retention, telegram_spawn=telegram_spawn
+    )
 
 
 def load_config_dir(path: Path) -> RoutinesConfig:
@@ -571,6 +636,13 @@ def load_config_dir(path: Path) -> RoutinesConfig:
     if retention_path.exists():
         raw_retention = _load_yaml_or_error(retention_path, kind="retention")
         retention = _build_retention(raw_retention, str(retention_path))
+
+    # --- load telegram_spawn.yaml (optional, issue 024) --------------------------
+    telegram_spawn: TelegramSpawn | None = None
+    telegram_path = path / _TELEGRAM_SPAWN_FILENAME
+    if telegram_path.exists():
+        raw_telegram = _load_yaml_or_error(telegram_path, kind="telegram_spawn")
+        telegram_spawn = _build_telegram_spawn(raw_telegram, str(telegram_path))
 
     # --- discover job files (sorted, exclude the two non-job files) ---------------
     job_files = sorted(
@@ -636,7 +708,12 @@ def load_config_dir(path: Path) -> RoutinesConfig:
         for err in errors:
             log.warning("config: %s", err)
 
-    return RoutinesConfig(jobs=tuple(jobs), errors=tuple(errors), retention=retention)
+    return RoutinesConfig(
+        jobs=tuple(jobs),
+        errors=tuple(errors),
+        retention=retention,
+        telegram_spawn=telegram_spawn,
+    )
 
 
 def _load_yaml_or_error(path: Path, *, kind: str) -> dict:
@@ -700,6 +777,85 @@ def _build_retention(raw: dict, label: str) -> Retention:
         history_max_bytes=_optional_positive_int("history_max_bytes"),
         history_max_age_days=_optional_positive_int("history_max_age_days"),
         reports_max_age_days=reports_max_age_days,
+    )
+
+
+def _build_telegram_spawn(raw: object, label: str) -> TelegramSpawn:
+    """Build a :class:`TelegramSpawn` from a parsed ``telegram_spawn:`` mapping (issue 024).
+
+    Fails closed: a missing/empty ``allowed_chat_id`` is a load error, never "allow all".
+    Each alias resolves to an existing git checkout; a bad repo or a duplicated alias is
+    rejected here, at load time, rather than at spawn time on someone's phone."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{label}: 'telegram_spawn' must be a mapping")
+    unknown = set(raw) - _TELEGRAM_SPAWN_ALLOWED_KEYS
+    if unknown:
+        raise ConfigError(f"{label}: unknown key(s): {sorted(unknown)}")
+
+    allowed_raw = raw.get("allowed_chat_id")
+    if allowed_raw is None:
+        raise ConfigError(
+            f"{label}: 'allowed_chat_id' is required (refusing to treat unset as allow-all)"
+        )
+    allowed = str(allowed_raw).strip()
+    if not allowed:
+        raise ConfigError(f"{label}: 'allowed_chat_id' must be non-empty")
+
+    raw_aliases = raw.get("aliases") or []
+    if not isinstance(raw_aliases, list):
+        raise ConfigError(f"{label}: 'aliases' must be a list")
+
+    aliases: list[SpawnAlias] = []
+    seen: set[str] = set()
+    for i, raw_alias in enumerate(raw_aliases):
+        alias = _build_spawn_alias(raw_alias, label=f"{label}: aliases[{i}]")
+        if alias.alias in seen:
+            raise ConfigError(f"{label}: duplicate alias {alias.alias!r}")
+        seen.add(alias.alias)
+        aliases.append(alias)
+    return TelegramSpawn(allowed_chat_id=allowed, aliases=tuple(aliases))
+
+
+def _build_spawn_alias(raw: object, *, label: str) -> SpawnAlias:
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{label}: alias record must be a mapping")
+    unknown = set(raw) - _SPAWN_ALIAS_ALLOWED_KEYS
+    if unknown:
+        raise ConfigError(f"{label}: unknown key(s): {sorted(unknown)}")
+
+    alias = raw.get("alias")
+    if not isinstance(alias, str) or not NAME_RE.match(alias):
+        raise ConfigError(
+            f"{label}: 'alias' must match {NAME_RE.pattern} (max 24 chars)"
+        )
+
+    repo_raw = raw.get("repo")
+    if not isinstance(repo_raw, str) or not repo_raw:
+        raise ConfigError(f"{label} ({alias!r}): 'repo' is required")
+    repo = Path(repo_raw).expanduser()
+    if not repo.exists():
+        raise ConfigError(f"{label} ({alias!r}): repo path does not exist: {repo_raw}")
+    if not (repo / ".git").exists():
+        raise ConfigError(
+            f"{label} ({alias!r}): repo path is not a git checkout: {repo_raw}"
+        )
+
+    agent_kind = raw.get("agent_kind", "claude")
+    if agent_kind not in VALID_AGENT_KINDS:
+        raise ConfigError(
+            f"{label} ({alias!r}): 'agent_kind' must be one of {sorted(VALID_AGENT_KINDS)}"
+        )
+    workspace = raw.get("workspace", "worktree")
+    if workspace not in VALID_WORKSPACE_MODES:
+        raise ConfigError(
+            f"{label} ({alias!r}): 'workspace' must be one of "
+            f"{sorted(VALID_WORKSPACE_MODES)}"
+        )
+    base = raw.get("base", "main")
+    if not isinstance(base, str) or not base:
+        raise ConfigError(f"{label} ({alias!r}): 'base' must be a non-empty string")
+    return SpawnAlias(
+        alias=alias, repo=repo, agent_kind=agent_kind, workspace=workspace, base=base
     )
 
 

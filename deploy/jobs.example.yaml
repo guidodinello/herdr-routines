@@ -135,3 +135,18 @@ jobs:
   #   timeout_ms: 1800000
   #   start_timeout_ms: 120000
   #   on_missed: log
+
+# telegram_spawn: # optional (issue 024): cold-start a session from a cold Telegram
+#   # message. The bridge's poller calls `herdr-routines spawn-from-telegram` (or the
+#   # scripts/herdr-spawn-from-telegram.sh shim) with the sender's chat id and the
+#   # message text; a `/run <alias>` or `/start <alias>` from the one allowlisted chat
+#   # opens a worktree (or a tab, workspace: root), starts an agent against it, and
+#   # replies with the pane handle the existing reply-to-steer flow then uses.
+#   allowed_chat_id: 123456789 # REQUIRED when the block is present. Must be non-empty:
+#                              # an unset value is a config error, never "allow all".
+#   aliases:
+#     - alias: nightly # the token typed after /run or /start (same [a-z][a-z0-9_-] shape)
+#       repo: /home/guido/projects/fitted # must exist and be a git checkout, or validate fails
+#       agent_kind: opencode # optional, default claude
+#       workspace: worktree # optional, default worktree (`root` = in the checkout itself)
+#       base: main # optional, default main: the branch a worktree spawn starts from
