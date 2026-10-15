@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 import subprocess as _sp
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from herdr_routines.auto_fix import (
     GateCheck as AutoFixGateCheck,
 )
 from herdr_routines.auto_fix import (
+    ReviewSearch,
     build_event_fix_prompt,
     enrich_event_detail,
     event_worktree_slug,
@@ -242,6 +244,18 @@ class EventGhClient:
     ) -> int:
         self.calls.append(f"pr_create:{branch}")
         return 1
+
+    # kind: review (issue 055) members of the GhClient protocol; never polled here.
+    def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
+        return ReviewSearch(prs=())
+
+    def pr_review_bodies(
+        self, *, owner: str, repo: str, number: int
+    ) -> list[str] | None:
+        return []
+
+    def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
+        return None
 
 
 class CiGhClient(EventGhClient):
@@ -665,6 +679,14 @@ def test_github_event_config_validation(
     with pytest.raises(ConfigError):
         _load(_event_job_yaml(match="{bogus_key: 1}"))
 
+    # An issue has no branch, so `match.branch` with issues:opened can never match.
+    with pytest.raises(ConfigError, match="branch"):
+        _load(_event_job_yaml(query="issues:opened", match="{branch: main}"))
+
+    # `repo:` must be owner/name, not a bare name the poll cannot split.
+    with pytest.raises(ConfigError, match="owner/name"):
+        _load(_event_job_yaml().replace("repo: owner/repo", "repo: justaname"))
+
     # Mixing github_event with pr_health / command in one job is rejected.
     with pytest.raises(ConfigError, match="mix"):
         _load(
@@ -823,7 +845,9 @@ def test_ci_failed_polls_once_without_per_pr_view() -> None:
     events = poll_github_event(gh, owner="owner", repo="repo", check=check)
     assert [e.event_id for e in events] == [f"evt-ci-{EVENT_NUMBER}"]
     assert events[0].title == EVENT_TITLE
-    assert gh.calls == ["graphql"], f"ci:failed must be one batched read, got {gh.calls}"
+    assert gh.calls == ["graphql"], (
+        f"ci:failed must be one batched read, got {gh.calls}"
+    )
 
     # A green rollup yields no events.
     clean = CiGhClient(ci_state="SUCCESS")
@@ -888,3 +912,156 @@ def test_github_event_empty_match_validates(tmp_config_path: Path) -> None:
     job = cfg.job("on-label-pr")
     assert job is not None and job.checks is not None
     assert job.checks[0].match == {}
+
+
+# -- dedup watermark: retry, over-cap and re-fire ----------------------------------
+
+
+class ScriptedEventGh(EventGhClient):
+    """EventGhClient whose `pr_list` returns whichever labelled PRs `numbers` holds
+    right now, so a test can add, keep or clear events between ticks."""
+
+    def __init__(self, numbers: list[int]) -> None:
+        super().__init__(events=True)
+        self.numbers = numbers
+
+    def pr_list(
+        self, *, owner: str, repo: str, state: str, limit: int
+    ) -> list[dict[str, object]]:
+        self._maybe_raise("pr_list")
+        return [
+            {
+                "number": n,
+                "headRefName": f"feature-{n}",
+                "author": {"login": self.user},
+                "url": f"https://github.com/{owner}/{repo}/pull/{n}",
+                "labels": [{"name": EVENT_LABEL}],
+            }
+            for n in self.numbers
+        ]
+
+
+class StatusHerdrClient(RecordingHerdrClient):
+    """RecordingHerdrClient whose worker settles with the next status from
+    `statuses` (then "idle"), to drive a failed worker."""
+
+    def __init__(self, statuses: list[str]) -> None:
+        super().__init__()
+        self.statuses = statuses
+
+    def agent_prompt_wait_with_watchdog(
+        self,
+        *,
+        target: str,
+        text: str,
+        timeout_ms: int,
+        poll_interval_s: float = 30.0,
+        on_poll: Any = None,
+    ) -> str:
+        self.prompts.append(text)
+        return self.statuses.pop(0) if self.statuses else "idle"
+
+
+def _event_ticks(
+    job: Job,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gh: EventGhClient,
+    client: RecordingHerdrClient,
+) -> Any:
+    """Register the job, then return a `tick(minute)` callable for later ticks."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(jobs=(job,))
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+
+    def tick(minute: int) -> None:
+        run_tick(
+            config,
+            history_path,
+            client=client,  # type: ignore[arg-type]
+            now=t0 + timedelta(minutes=minute),
+        )
+
+    return tick
+
+
+def _dispatched_numbers(client: RecordingHerdrClient) -> list[int]:
+    return [int(m.group(1)) for p in client.prompts if (m := re.search(r"#(\d+)", p))]
+
+
+def test_github_event_over_cap_event_dispatches_on_a_later_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An event left over by `max_workers_per_tick` is not marked seen: the next
+    tick dispatches it instead of dropping it forever."""
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo, max_workers_per_tick=1)
+    gh = ScriptedEventGh([7, 8])
+    client = RecordingHerdrClient()
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    tick(1)
+    tick(2)
+    tick(3)
+    assert sorted(_dispatched_numbers(client)) == [7, 8]
+
+
+def test_github_event_failed_worker_retries_until_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed worker leaves its event out of the watermark, so later ticks retry it;
+    once the per-event budget is spent it is skipped (with one notify) and seen."""
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo, max_attempts_per_target=2)
+    gh = ScriptedEventGh([7])
+    client = StatusHerdrClient(["failed", "failed"])
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    for minute in range(1, 6):
+        tick(minute)
+
+    assert _dispatched_numbers(client) == [7, 7], "two attempts, then the budget"
+    skipped = [n for n in client.notifications if "skipped" in n[0].lower()]
+    assert len(skipped) == 1, "budget exhaustion notifies once, not every tick"
+
+
+def test_github_event_refires_after_it_clears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The watermark is the latest poll, not all history: an event that clears and
+    comes back (CI red again, a label re-added) dispatches again."""
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo)
+    gh = ScriptedEventGh([7])
+    client = RecordingHerdrClient()
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    tick(1)  # fires
+    tick(2)  # same event: deduped
+    gh.numbers = []
+    tick(3)  # cleared
+    gh.numbers = [7]
+    tick(4)  # back: fires again
+    assert _dispatched_numbers(client) == [7, 7]
+
+
+def test_real_pr_list_requests_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`prs:labels` matches on `labels`, so the real `gh pr list` must ask for them
+    (the fakes above always return labels, which hid their absence)."""
+    from herdr_routines.auto_fix import RealGhClient
+
+    seen: list[list[str]] = []
+
+    def _run(self: RealGhClient, argv: list[str]) -> tuple[int, str, str]:
+        seen.append(argv)
+        return 0, "[]", ""
+
+    monkeypatch.setattr(RealGhClient, "_run", _run)
+    RealGhClient().pr_list(owner="o", repo="r", state="open", limit=10)
+    fields = seen[0][seen[0].index("--json") + 1].split(",")
+    assert "labels" in fields

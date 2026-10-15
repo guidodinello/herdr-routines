@@ -1201,22 +1201,18 @@ def _process_gated_job(
 
 
 def _last_seen_event_ids(history_path: Path, job_name: str) -> list[str]:
-    """The event IDs this job has already observed, in first-seen order.
+    """The event IDs the most recent poll already handled: the `last_seen_event_ids`
+    of the latest terminal record that carries one (a failed poll carries none and
+    leaves the watermark where it was).
 
-    Read from the `last_seen_event_ids` list every terminal event record carries, so
-    the watermark survives history rotation (read_job spans rolls) and is independent
-    of whether a previous tick dispatched or merely re-polled."""
-    seen: list[str] = []
-    for r in read_job(history_path, job_name):
-        if r.extra is None:
-            continue
-        ids = r.extra.get("last_seen_event_ids")
-        if not isinstance(ids, list):
-            continue
-        for e in ids:
-            if isinstance(e, str) and e not in seen:
-                seen.append(e)
-    return seen
+    The latest watermark, not a union over all history: an event that clears and
+    comes back (CI red again on the same PR, a label removed and re-added) is absent
+    from the poll in between, so it drops out of the watermark and fires again."""
+    for r in reversed(read_job(history_path, job_name)):
+        ids = r.extra.get("last_seen_event_ids") if r.extra else None
+        if isinstance(ids, list):
+            return [e for e in ids if isinstance(e, str)]
+    return []
 
 
 def _event_target(check: GateCheck) -> str:
@@ -1356,8 +1352,15 @@ def _process_event_target(
         return f"{job.name}: failed (github_event_poll_failed)", True
 
     seen = set(_last_seen_event_ids(history_path, job.name))
-    last_seen = [e.event_id for e in events]
     new_events = [e for e in events if e.event_id not in seen]
+    # The watermark is the polled events that need nothing more: already seen, or
+    # handled this tick (worker done, or budget exhausted). An over-cap event or one
+    # whose worker failed stays out of it, so the next tick retries it until the
+    # per-event budget taps out.
+    handled: set[str] = set()
+
+    def _watermark() -> list[str]:
+        return [e.event_id for e in events if e.event_id in seen | handled]
 
     if not new_events:
         append(
@@ -1372,7 +1375,7 @@ def _process_event_target(
                     "target": event_target,
                     "query": check.query,
                     "polled": len(events),
-                    "last_seen_event_ids": last_seen,
+                    "last_seen_event_ids": _watermark(),
                 },
             ),
         )
@@ -1413,6 +1416,7 @@ def _process_event_target(
                     sound="request",
                 )
             skipped_count += 1
+            handled.add(event.event_id)
             continue
 
         detailed = enrich_event_detail(gh, event, owner=owner, repo=repo_name)
@@ -1454,6 +1458,8 @@ def _process_event_target(
 
         if worker_outcome.get("state") in ("failed", "interrupted_unknown"):
             any_failed = True
+        else:
+            handled.add(event.event_id)
         dispatched_count += 1
 
     state = "failed" if any_failed else "done"
@@ -1473,7 +1479,7 @@ def _process_event_target(
                 "dispatched": dispatched_count,
                 "skipped": skipped_count,
                 "skipped_over_cap": skipped_over_cap,
-                "last_seen_event_ids": last_seen,
+                "last_seen_event_ids": _watermark(),
             },
         ),
     )
@@ -1552,59 +1558,86 @@ def _dispatch_event_worker(
         prompt_text, report_path=report_path, job_name=job.name, run_id=event_run_id
     )
 
-    wt_path = (
-        Path(job.repo) / ".worktrees" / f"event-{event_worktree_slug(event.event_id)}"
+    # A PR event's head branch may already be checked out elsewhere (the
+    # orchestrator retains its worktree, or babysit's fix worker holds it); git
+    # refuses a second `worktree add` on it, so reuse that checkout instead, exactly
+    # like _dispatch_fix_worker (issue 036).
+    existing_wt = (
+        _find_existing_worktree(job.repo, event.head_ref) if event.head_ref else None
     )
-    try:
-        subprocess.run(
-            ["git", "-C", str(job.repo), "worktree", "remove", "--force", str(wt_path)],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
+    if existing_wt is not None:
+        ok, detail = _worktree_reuse_check(existing_wt)
+        if not ok:
+            return {
+                "state": "failed",
+                "reason": "worktree_reuse_not_clean",
+                "error": f"existing worktree {existing_wt} for {event.head_ref}: {detail}",
+            }
+        wt_path = existing_wt
+    else:
+        wt_path = (
+            Path(job.repo)
+            / ".worktrees"
+            / f"event-{event_worktree_slug(event.event_id)}"
         )
-        target_ref = event.head_ref or job.base
-        if event.head_ref:
-            proc = subprocess.run(
+        try:
+            subprocess.run(
                 [
                     "git",
                     "-C",
                     str(job.repo),
                     "worktree",
-                    "add",
+                    "remove",
+                    "--force",
                     str(wt_path),
-                    target_ref,
                 ],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=15,
                 check=False,
             )
-        else:
-            proc = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(job.repo),
-                    "worktree",
-                    "add",
-                    "--detach",
-                    str(wt_path),
-                    target_ref,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        if proc.returncode != 0:
-            raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
-    except Exception as e:  # noqa: BLE001
-        return {
-            "state": "failed",
-            "reason": "worktree_creation_failed",
-            "error": str(e),
-        }
+            target_ref = event.head_ref or job.base
+            if event.head_ref:
+                proc = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(job.repo),
+                        "worktree",
+                        "add",
+                        str(wt_path),
+                        target_ref,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            else:
+                proc = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(job.repo),
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(wt_path),
+                        target_ref,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            if proc.returncode != 0:
+                raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
+        except Exception as e:  # noqa: BLE001
+            return {
+                "state": "failed",
+                "reason": "worktree_creation_failed",
+                "error": str(e),
+            }
 
     pane_id: str | None = None
     try:

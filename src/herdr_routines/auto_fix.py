@@ -47,7 +47,8 @@ class GhClient(Protocol):
     def pr_list(
         self, *, owner: str, repo: str, state: str, limit: int
     ) -> list[dict[str, object]]:
-        """Return open PRs with number, headRefName, author, url."""
+        """Return open PRs with number, headRefName, author, url, labels (labels are
+        what a `github_event` `prs:labels` poll matches on)."""
         ...
 
     def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
@@ -191,7 +192,7 @@ class RealGhClient:
                 "--limit",
                 str(limit),
                 "--json",
-                "number,headRefName,author,url",
+                "number,headRefName,author,url,labels",
             ]
         )
         if exit_code != 0:
@@ -1350,9 +1351,7 @@ def poll_github_event(
         }
         """
         data = gh.graphql(gql, owner=owner, repo=repo)
-        nodes = _graphql_nodes(
-            data, "data", "repository", "pullRequests", "nodes"
-        )
+        nodes = _graphql_nodes(data, "data", "repository", "pullRequests", "nodes")
         result = []
         for pr in nodes:
             if not isinstance(pr, dict) or not _event_matches(pr, match):
@@ -1362,8 +1361,7 @@ def poll_github_event(
                 continue
             rollup = pr.get("statusCheckRollup")
             failing = (
-                isinstance(rollup, dict)
-                and rollup.get("state") in FAILING_CI_STATES
+                isinstance(rollup, dict) and rollup.get("state") in FAILING_CI_STATES
             )
             if not failing:
                 continue
@@ -1386,7 +1384,9 @@ def poll_github_event(
         query($owner: String!, $repo: String!, $searchQuery: String!) {
           search(query: $searchQuery, type: ISSUE, first: 50) {
             nodes {
-              ... on Issue { id number title labels(first: 10) { nodes { name } } }
+              ... on Issue {
+                id number title author { login } labels(first: 10) { nodes { name } }
+              }
             }
           }
         }
@@ -1405,11 +1405,9 @@ def poll_github_event(
             number = node.get("number")
             if not isinstance(number, int):
                 continue
-            labels = node.get("labels")
-            names = _label_names(labels)
-            label = match.get("label") if isinstance(match.get("label"), str) else None
-            if label is not None and label not in names:
+            if not _event_matches(node, match):
                 continue
+            label = match.get("label") if isinstance(match.get("label"), str) else None
             title = node.get("title")
             issue_events.append(
                 GithubEvent(

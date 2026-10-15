@@ -964,11 +964,11 @@ def _build_job(
                         )
                     evt_repo = evt.get("repo")
                     if evt_repo is not None and (
-                        not isinstance(evt_repo, str) or not evt_repo
+                        not isinstance(evt_repo, str)
+                        or not re.fullmatch(r"[^/\s]+/[^/\s]+", evt_repo)
                     ):
                         raise ConfigError(
-                            f"{label}: 'checks[{ci}].repo' must be a non-empty "
-                            "string or null"
+                            f"{label}: 'checks[{ci}].repo' must be 'owner/name' or null"
                         )
                     evt_match = evt.get("match")
                     if evt_match is None:
@@ -982,6 +982,12 @@ def _build_job(
                         raise ConfigError(
                             f"{label}: 'checks[{ci}].match' has unknown key(s): "
                             f"{sorted(unknown_match)}"
+                        )
+                    # An issue has no head branch, so `branch` could never match one.
+                    if evt_query == "issues:opened" and "branch" in evt_match:
+                        raise ConfigError(
+                            f"{label}: 'checks[{ci}].match.branch' does not apply to "
+                            "query issues:opened"
                         )
                     et = evt.get("timeout_ms", 120_000)
                     if not isinstance(et, int) or isinstance(et, bool) or et <= 0:
