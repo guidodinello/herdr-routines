@@ -1,7 +1,7 @@
 """Cold-start spawn from Telegram (issue 024).
 
 An *event handler* for inbound Telegram messages — not a scheduler, not a daemon. It
-complements the ``herdr-telegram-bridge`` reply-to-steer flow (issue 023) with a
+complements the Telegram bot's reply-to-steer flow (issue 023) with a
 cold-start path: a bare ``/run <job>`` or ``/start <repo>`` message creates a workspace
 and starts an agent against the mapped checkout, then replies with the pane handle the
 phone steers with.

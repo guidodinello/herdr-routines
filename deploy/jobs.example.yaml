@@ -72,7 +72,7 @@ jobs:
     max_workers_per_tick: 3 # one fix worker per flagged PR, ≤3/tick
     max_attempts_per_target: 3 # retry budget, keyed per PR
     checks:
-      - pr_health # builtin: CI red OR review threads unresolved; polls gh, never spawns
+      - pr_health: null # builtin: CI red OR review threads unresolved; polls gh, never spawns
     agent_kind: opencode
     model: null
     prompt: "" # empty = pipeline-injected fix prompt template (seeded with the flagged PR's output)
@@ -86,6 +86,8 @@ jobs:
   # one worker (capped by max_workers_per_tick), a clean poll costs only the read-only
   # `gh api` call. No listener, no tunnel, no inbound reachability. v1 closed `query` set:
   # prs:labels | issues:opened | ci:failed; `match` accepts label/branch/author.
+  # The first successful `issues:opened` poll adopts the issues already open as a
+  # baseline and dispatches nothing; prs:labels and ci:failed fire on the first poll.
   - name: on-ready-for-agent-pr
     enabled: true
     cron: "*/10 * * * *" # poll cadence (every 10 min), not the event itself
