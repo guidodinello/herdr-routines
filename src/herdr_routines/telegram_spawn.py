@@ -2,18 +2,19 @@
 
 An *event handler* for inbound Telegram messages — not a scheduler, not a daemon. It
 complements the Telegram bot's reply-to-steer flow (issue 023) with a
-cold-start path: a bare ``/run <job>`` or ``/start <repo>`` message creates a workspace
-and starts an agent against the mapped checkout, then replies with the pane handle the
-phone steers with.
+cold-start path: a ``/run <alias> [harness] [model]`` or ``/start <alias> ...`` message
+creates a workspace and starts an agent against the mapped checkout, then replies with the
+pane handle the phone steers with.
 
 The handler deliberately reuses the launcher mechanics rather than inventing a layout,
 exactly as ``runner.execute_run`` does per ``workspace`` mode: ``worktree`` opens a fresh
 branch's worktree in its own workspace (``HerdrClient.worktree_create_full``), ``root``
 opens a tab in the checkout itself (``HerdrClient.tab_create``); either yields the pane
 ``agent start`` needs, and ``HerdrClient.agent_start`` starts the agent with the
-shell-less argv ``build_agent_start_args`` builds. Nothing here interpolates the
-phone-supplied token into a shell: the token passes a strict ``[a-z][a-z0-9_-]*`` parse
-and an explicit allowlist lookup, and reaches Herdr only as an argv element.
+shell-less argv ``build_agent_start_args`` builds. Nothing here interpolates a
+phone-supplied token into a shell: the alias passes a strict ``[a-z][a-z0-9_-]*`` parse
+and an explicit allowlist lookup, the harness must be a known agent kind, the model must
+match ``_MODEL_RE``, and each reaches Herdr only as an argv element.
 
 Event-only by contract (spec criterion 10): no lock file, no clock, no history
 terminal-state writes. The timer that already schedules jobs stays the sole scheduler.
@@ -24,10 +25,12 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from logger import get_logger
 
+from herdr_routines.config import AGENT_MODEL_FLAGS, VALID_AGENT_KINDS
 from herdr_routines.herdr import HerdrCliError, WorktreeInfo
 from herdr_routines.runner import _is_agent_name_taken
 
@@ -36,6 +39,7 @@ log = get_logger(__name__)
 __all__ = [
     "DEFAULT_START_TIMEOUT_MS",
     "SpawnClient",
+    "SpawnCommand",
     "alias_table",
     "handle_spawn_message",
     "is_authorized",
@@ -50,6 +54,13 @@ _COMMAND_VERBS = frozenset({"/run", "/start"})
 # denylist: anything with a shell metacharacter, a path separator, an uppercase letter, or
 # a leading dash is simply not a target.
 _TARGET_RE = re.compile(r"[a-z][a-z0-9_-]*")
+
+# A model id as the harnesses spell them (``opus``, ``claude-sonnet-5-5``,
+# ``opencode/big-pickle``, ``openrouter/vendor/model:free``). It must start alphanumeric,
+# so it can never read as a flag to the harness it is passed to.
+_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+
+_USAGE = "Usage: /run <alias> [harness] [model]"
 
 # How long ``agent start`` may take. A cold spawn has no per-job config to inherit
 # ``start_timeout_ms`` from, so it uses the same default a plain routine job gets.
@@ -89,24 +100,46 @@ class SpawnClient(Protocol):
     ) -> None: ...
 
 
-def parse_spawn_command(text: str) -> str | None:
-    """Return the single target token of a cold-start command, or None.
+@dataclass(frozen=True, slots=True)
+class SpawnCommand:
+    """A parsed cold-start command. ``agent_kind``/``model`` are None when not given, so
+    the alias's own defaults apply."""
 
-    ``/run <t>`` and ``/start <t>`` parse when they carry exactly one token of the shape
-    ``[a-z][a-z0-9_-]*``. Zero tokens, extra args, non-command text, an unknown verb, and
-    an ill-shaped token all return None — a loose parse would spawn the wrong checkout, or
-    hand a shell metacharacter to the launcher (spec criterion 1/6)."""
+    target: str
+    agent_kind: str | None = None
+    model: str | None = None
+
+
+def _is_spawn_verb(text: object) -> bool:
+    """Whether ``text`` starts with a cold-start verb, well-formed or not."""
+    parts = text.split() if isinstance(text, str) else []
+    return bool(parts) and parts[0] in _COMMAND_VERBS
+
+
+def parse_spawn_command(text: str) -> SpawnCommand | None:
+    """Parse ``/run <alias> [harness] [model]`` (or ``/start ...``), or return None.
+
+    The alias must have the shape ``[a-z][a-z0-9_-]*``. A second token that names a known
+    agent kind is the harness, and a third token is then the model; any other second token
+    is the model for the alias's own harness, so ``/run x opus`` works too. Anything else
+    (no alias, extra tokens, an unknown verb, an ill-shaped alias or model) returns None:
+    a loose parse would spawn the wrong checkout, or hand a flag-like or shell-like token
+    to the launcher (spec criterion 1/6)."""
     if not isinstance(text, str):
         return None
     parts = text.split()
-    if len(parts) != 2:
+    if not 2 <= len(parts) <= 4 or parts[0] not in _COMMAND_VERBS:
         return None
-    verb, token = parts
-    if verb not in _COMMAND_VERBS:
+    target, *rest = parts[1:]
+    if not _TARGET_RE.fullmatch(target):
         return None
-    if not _TARGET_RE.fullmatch(token):
+    agent_kind = rest.pop(0) if rest and rest[0] in VALID_AGENT_KINDS else None
+    if len(rest) > 1:
         return None
-    return token
+    model = rest[0] if rest else None
+    if model is not None and not _MODEL_RE.fullmatch(model):
+        return None
+    return SpawnCommand(target=target, agent_kind=agent_kind, model=model)
 
 
 def is_authorized(chat_id: Any, allowed_chat_id: Any) -> bool:
@@ -123,7 +156,7 @@ def is_authorized(chat_id: Any, allowed_chat_id: Any) -> bool:
     return str(chat_id).strip() == allowed
 
 
-def alias_table(spawn: Any) -> dict[str, dict[str, str]]:
+def alias_table(spawn: Any) -> dict[str, dict[str, str | None]]:
     """Turn a ``config.TelegramSpawn`` into the plain ``alias -> record`` mapping
     ``handle_spawn_message`` consumes. Kept here so the bridge glue has one canonical
     adapter and the handler stays free of any config import."""
@@ -133,6 +166,7 @@ def alias_table(spawn: Any) -> dict[str, dict[str, str]]:
             "agent_kind": a.agent_kind,
             "workspace": a.workspace,
             "base": a.base,
+            "model": a.model,
         }
         for a in spawn.aliases
     }
@@ -149,30 +183,46 @@ def handle_spawn_message(
 ) -> str:
     """Handle one inbound Telegram message; return (and send) the in-chat reply text.
 
-    Order is the contract: parse, then auth, then map — a rejected message reaches no
-    Herdr call. On success the reply carries the workspace id, pane id, and agent name so
-    the existing reply-to-steer flow can take over; every failure is surfaced as a short
+    Order is the contract: verb, then auth, then parse, then map — a rejected message
+    reaches no Herdr call, and only the allowlisted chat learns the usage or the aliases.
+    On success the reply carries the harness, model, pane id, and agent name so the
+    existing reply-to-steer flow can take over; every failure is surfaced as a short
     in-chat error and never a fabricated terminal state."""
-    target = parse_spawn_command(text)
-    if target is None:
+    if not _is_spawn_verb(text):
         # Not a cold-start command: drop silently (no reply, no Herdr call).
         return ""
 
     if not is_authorized(chat_id, allowed_chat_id):
         return _reply(reply, _REFUSAL)
 
-    spec = aliases.get(target)
-    if spec is None:
-        valid = ", ".join(sorted(aliases))
+    valid = ", ".join(sorted(aliases)) or "(none configured)"
+    command = parse_spawn_command(text)
+    if command is None:
         return _reply(
             reply,
-            f"Unknown target {target!r}. Valid targets: {valid or '(none configured)'}.",
+            f"{_USAGE}. Targets: {valid}. A model needs one of: "
+            f"{', '.join(sorted(AGENT_MODEL_FLAGS))}.",
         )
+    target = command.target
+
+    spec = aliases.get(target)
+    if spec is None:
+        return _reply(reply, f"Unknown target {target!r}. Valid targets: {valid}.")
 
     repo = str(spec.get("repo") or "")
     if not repo:
         return _reply(reply, f"Target {target!r} is misconfigured (no repo).")
-    kind = str(spec.get("agent_kind") or "claude")
+    alias_kind = str(spec.get("agent_kind") or "claude")
+    kind = command.agent_kind or alias_kind
+    # The alias's default model belongs to its own harness; picking another harness
+    # without a model starts that harness on its default.
+    model = command.model or (spec.get("model") if kind == alias_kind else None)
+    if model is not None and kind not in AGENT_MODEL_FLAGS:
+        return _reply(
+            reply,
+            f"Harness {kind!r} takes no model. A model needs one of: "
+            f"{', '.join(sorted(AGENT_MODEL_FLAGS))}.",
+        )
     mode = str(spec.get("workspace") or "worktree")
     base = str(spec.get("base") or "main")
     stamp = int(time.time())
@@ -198,7 +248,7 @@ def handle_spawn_message(
 
     name = base_name
     try:
-        _start_agent(client, name=name, kind=kind, pane_id=pane_id)
+        _start_agent(client, name=name, kind=kind, model=model, pane_id=pane_id)
     except (HerdrCliError, OSError) as e:
         if not _is_agent_name_taken(e):
             _best_effort(client, "pane_close", pane_id)
@@ -207,23 +257,27 @@ def handle_spawn_message(
         # rather than letting a cold spawn wedge until a manual reap (issue 051).
         name = f"{base_name}-r1"
         try:
-            _start_agent(client, name=name, kind=kind, pane_id=pane_id)
+            _start_agent(client, name=name, kind=kind, model=model, pane_id=pane_id)
         except (HerdrCliError, OSError) as retry_error:
             _best_effort(client, "pane_close", pane_id)
             return _reply(reply, f"spawn failed: {retry_error}")
 
     return _reply(
         reply,
-        f"Spawned {name} on {where}, pane {pane_id}. Reply to this message to steer it.",
+        f"Spawned {name} ({kind}{f' {model}' if model else ''}) on {where}, "
+        f"pane {pane_id}. Reply to this message to steer it.",
     )
 
 
-def _start_agent(client: SpawnClient, *, name: str, kind: str, pane_id: str) -> None:
+def _start_agent(
+    client: SpawnClient, *, name: str, kind: str, model: str | None, pane_id: str
+) -> None:
     client.agent_start(
         name=name,
         kind=kind,
         pane_id=pane_id,
         start_timeout_ms=DEFAULT_START_TIMEOUT_MS,
+        model=model,
     )
 
 

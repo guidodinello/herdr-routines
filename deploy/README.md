@@ -116,7 +116,7 @@ commented block in [`jobs.example.yaml`](jobs.example.yaml) to set thresholds, a
 
 ## Cold-start spawn from Telegram (issue 024)
 
-The Telegram bot (issue 023) steers *existing* panes by replying to a notification. The cold-start path complements it: a bare `/run <alias>` or `/start <alias>`
+The Telegram bot (issue 023) steers *existing* panes by replying to a notification. The cold-start path complements it: a `/run <alias>` or `/start <alias>`
 message, with no notification to reply to, starts an agent against the mapped checkout (in a
 fresh `auto/spawn-<alias>-<ts>` worktree by default, laid out exactly like a `workspace:
 worktree` job run) and replies with the pane handle the reply-to-steer flow then uses.
@@ -135,7 +135,21 @@ telegram_spawn:
       workspace: worktree      # optional, default worktree (a fresh branch's worktree;
                                # `root` runs in the checkout itself)
       base: main               # optional, default main: the branch a worktree spawn starts from
+      model: opencode/big-pickle # optional: default model for agent_kind (claude, codex, opencode)
 ```
+
+The message can pick the harness and model: `/run <alias> [harness] [model]`.
+
+| Message | Starts |
+|---|---|
+| `/run nightly` | the alias's `agent_kind`, with its `model` if set |
+| `/run nightly opus` | the alias's `agent_kind` with model `opus` |
+| `/run nightly claude` | Claude on its default model (the alias's `model` belongs to its own harness) |
+| `/run nightly opencode opencode/big-pickle` | opencode with that model |
+
+The harness must be a known `agent_kind`. A model works only with claude, codex and opencode, and
+must start with a letter or digit, so it never reads as a flag. A malformed `/run` from the allowed
+chat gets a usage reply listing the aliases; any other chat gets the generic refusal.
 
 `uv run herdr-routines validate` rejects an empty `allowed_chat_id`, a duplicate alias, and an
 alias whose `repo` does not exist or is not a git checkout — at load time, not at spawn time on

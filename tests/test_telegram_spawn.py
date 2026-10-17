@@ -191,15 +191,17 @@ def test_spawn_parses_cold_start_command() -> None:
     mod = _spawn_module()
     parse = mod.parse_spawn_command
 
-    assert parse("/run nightly-audit") == "nightly-audit"
-    assert parse("/start myrepo") == "myrepo"
-    assert parse("  /run nightly-audit  ") == "nightly-audit"
+    assert parse("/run nightly-audit").target == "nightly-audit"
+    assert parse("/start myrepo").target == "myrepo"
+    assert parse("  /run nightly-audit  ").target == "nightly-audit"
 
     for bad in (
         "/run",  # zero tokens
         "/start",  # zero tokens
-        "/run a b",  # extra args
-        "/start a b c",  # extra args
+        "/run a opus b",  # a model is the last token
+        "/start a claude b c",  # extra args
+        "/run a -m",  # a model never reads as a flag
+        "/run a $(id)",  # nor as shell
         "hello world",  # non-command text
         "",  # empty
         "run nightly-audit",  # missing slash
@@ -211,7 +213,7 @@ def test_spawn_parses_cold_start_command() -> None:
     # Rejected messages reach no Herdr call.
     client = FakeSpawnClient()
     repo = _git_repo(Path("/tmp") / "x")
-    for bad in ("/run", "/run a b", "hello world", ""):
+    for bad in ("/run", "/run a -m", "hello world", ""):
         sent: list[str] = []
         mod.handle_spawn_message(
             bad,
@@ -641,3 +643,127 @@ def test_spawn_has_no_scheduler_side_effects(
     assert "systemd" not in source
     assert "systemctl" not in source
     assert "default_lock_path" not in source
+
+
+# Harness and model from the message (/run <alias> [harness] [model]). -----------
+
+
+def test_spawn_parses_optional_harness_and_model() -> None:
+    parse = _spawn_module().parse_spawn_command
+
+    def parsed(text: str) -> tuple[str, str | None, str | None]:
+        cmd = parse(text)
+        assert cmd is not None, f"{text!r} must parse"
+        return cmd.target, cmd.agent_kind, cmd.model
+
+    assert parsed("/run x opencode") == ("x", "opencode", None)
+    assert parsed("/run x opus") == ("x", None, "opus")
+    assert parsed("/run x claude sonnet") == ("x", "claude", "sonnet")
+    assert parsed("/run x opencode opencode/big-pickle") == (
+        "x",
+        "opencode",
+        "opencode/big-pickle",
+    )
+
+
+def test_spawn_starts_the_requested_harness_and_model(tmp_path: Path) -> None:
+    mod = _spawn_module()
+    client = FakeSpawnClient()
+
+    result, _ = _handle(
+        mod,
+        "/run nightly-audit opencode opencode/big-pickle",
+        12345,
+        allowed_chat_id=12345,
+        aliases=_aliases(_git_repo(tmp_path / "repo")),
+        client=client,
+    )
+
+    started = client.agent_calls[0]
+    assert (started["kind"], started["model"]) == ("opencode", "opencode/big-pickle")
+    assert "(opencode opencode/big-pickle)" in result
+    # The bot finds the pane to steer by this exact phrase.
+    assert ", pane w7:p1. Reply to this message" in result
+
+
+def test_spawn_alias_model_applies_only_to_its_own_harness(tmp_path: Path) -> None:
+    mod = _spawn_module()
+    aliases = _aliases(_git_repo(tmp_path / "repo"))
+    aliases["nightly-audit"]["model"] = "opus"
+
+    for text, expected in (
+        ("/run nightly-audit", ("claude", "opus")),
+        ("/run nightly-audit sonnet", ("claude", "sonnet")),
+        ("/run nightly-audit codex", ("codex", None)),
+    ):
+        client = FakeSpawnClient()
+        _handle(mod, text, 12345, allowed_chat_id=12345, aliases=aliases, client=client)
+        started = client.agent_calls[0]
+        assert (started["kind"], started["model"]) == expected, text
+
+
+def test_spawn_rejects_a_model_for_a_harness_without_a_model_flag(
+    tmp_path: Path,
+) -> None:
+    mod = _spawn_module()
+    client = FakeSpawnClient()
+
+    result, _ = _handle(
+        mod,
+        "/run nightly-audit gemini pro",
+        12345,
+        allowed_chat_id=12345,
+        aliases=_aliases(_git_repo(tmp_path / "repo")),
+        client=client,
+    )
+
+    assert client.workspace_calls == [] and client.agent_calls == []
+    assert "'gemini' takes no model" in result
+
+
+def test_spawn_malformed_command_gets_usage_only_in_the_allowed_chat(
+    tmp_path: Path,
+) -> None:
+    mod = _spawn_module()
+    aliases = _aliases(_git_repo(tmp_path / "repo"))
+
+    usage, _ = _handle(
+        mod,
+        "/run",
+        12345,
+        allowed_chat_id=12345,
+        aliases=aliases,
+        client=FakeSpawnClient(),
+    )
+    assert usage.startswith("Usage: /run <alias> [harness] [model]")
+    assert "nightly-audit" in usage
+
+    refused, _ = _handle(
+        mod,
+        "/run",
+        999,
+        allowed_chat_id=12345,
+        aliases=aliases,
+        client=FakeSpawnClient(),
+    )
+    assert "nightly-audit" not in refused and "Usage" not in refused
+
+
+def test_spawn_alias_model_is_validated_and_reaches_the_handler(
+    tmp_path: Path,
+) -> None:
+    from herdr_routines.config import ConfigError, load_config
+
+    mod = _spawn_module()
+    repo = _git_repo(tmp_path / "repo")
+    cfg_path = tmp_path / "jobs.yaml"
+
+    cfg_path.write_text(_spawn_config_text(repo) + "      model: opus\n")
+    spawn = load_config(cfg_path).telegram_spawn
+    assert spawn is not None
+    assert mod.alias_table(spawn)["nightly"]["model"] == "opus"
+
+    bad = _spawn_config_text(repo).replace("agent_kind: claude", "agent_kind: gemini")
+    cfg_path.write_text(bad + "      model: pro\n")
+    with pytest.raises(ConfigError, match="'model' is not supported"):
+        load_config(cfg_path)
