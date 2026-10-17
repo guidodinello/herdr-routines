@@ -1029,6 +1029,16 @@ def test_repo_url_example_and_docs() -> None:
     assert "repository:" in text
 
 
+def test_jobs_example_yaml_loads_as_a_whole() -> None:
+    """Every active job in deploy/jobs.example.yaml validates. The other example
+    tests read single jobs from it, which let a bare-string `- pr_health` check
+    in babysit-prs slip past (issue #164)."""
+    example = Path(__file__).resolve().parent.parent / "deploy" / "jobs.example.yaml"
+    with pytest.warns(DeprecationWarning, match="single file"):
+        cfg = load_config(example)
+    assert {"babysit-prs", "on-ready-for-agent-pr"} <= {j.name for j in cfg.jobs}
+
+
 def test_repo_url_validation_and_derivation(tmp_config_path: Path) -> None:
     """Config validation: URL-shape accepted, bare paths rejected, repo derived from name."""
     # Valid URLs accepted

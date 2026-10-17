@@ -116,8 +116,7 @@ commented block in [`jobs.example.yaml`](jobs.example.yaml) to set thresholds, a
 
 ## Cold-start spawn from Telegram (issue 024)
 
-The `herdr-telegram-bridge` plugin (issue 023) steers *existing* panes by replying to a
-notification. The cold-start path complements it: a bare `/run <alias>` or `/start <alias>`
+The Telegram bot (issue 023) steers *existing* panes by replying to a notification. The cold-start path complements it: a bare `/run <alias>` or `/start <alias>`
 message, with no notification to reply to, starts an agent against the mapped checkout (in a
 fresh `auto/spawn-<alias>-<ts>` worktree by default, laid out exactly like a `workspace:
 worktree` job run) and replies with the pane handle the reply-to-steer flow then uses.
@@ -142,8 +141,22 @@ telegram_spawn:
 alias whose `repo` does not exist or is not a git checkout — at load time, not at spawn time on
 someone's phone.
 
-**Wiring the inbound message.** The bridge's poller calls the event entrypoint once per inbound
-message and sends back whatever it prints:
+**Wiring the inbound message.** The bot that polls Telegram must call the event entrypoint
+once per `/run` or `/start` message and send back whatever it prints. Telegram allows one
+`getUpdates` consumer per bot token, so this has to be the bot already running, not a second
+poller. On the Pi that bot is `relay/herdr_telegram.py` from the
+[`guidodinello/herdr-remote`](https://github.com/guidodinello/herdr-remote) fork (branch
+`pi-deploy`, unit `herdr-telegram.service`). It runs the hook when `HERDR_TG_SPAWN_CMD` is set
+in `~/.config/herdr-remote/config.env`:
+
+```sh
+HERDR_TG_SPAWN_CMD=/home/guido/projects/herdr-routines/scripts/herdr-spawn-from-telegram.sh
+HERDR_ROUTINES_BIN=/home/guido/projects/herdr-routines/.venv/bin/herdr-routines
+```
+
+With it set, `/run <alias>` and `/start <alias>` spawn, and a bare `/start` still shows the
+bot's dashboard. Set `allowed_chat_id` to the same chat as the bot's `HERDR_TG_CHAT_ID`. The
+entrypoint and shim, for any other caller:
 
 ```sh
 uv run herdr-routines spawn-from-telegram --chat-id "$CHAT_ID" --text "$MESSAGE_TEXT"

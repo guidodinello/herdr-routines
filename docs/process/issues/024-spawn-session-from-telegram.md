@@ -28,3 +28,10 @@ missing is a mapping from "which repo/job" to `herdr workspace create` +
 - **2026-08-27**: curated from `ROADMAP.md` Parking Lot §. Scope shrank once
   the transport question was settled by issue 023 — this is now just the
   cold-start mapping.
+- **2026-10-16**: wiring follow-up (GitHub #164). The bot on the Pi is
+  `relay/herdr_telegram.py` from the `guidodinello/herdr-remote` fork, not the
+  `cokekitten/herdr-telegram-bridge` plugin issue 023 names; that plugin is not
+  installed. The bot had no per-message hook, so the fork gained an opt-in
+  `HERDR_TG_SPAWN_CMD` that runs `scripts/herdr-spawn-from-telegram.sh` for
+  `/run <alias>` and `/start <alias>` (a bare `/start` stays its dashboard).
+  See `deploy/README.md` § Cold-start spawn from Telegram.

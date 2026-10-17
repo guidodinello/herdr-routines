@@ -1065,3 +1065,89 @@ def test_real_pr_list_requests_labels(monkeypatch: pytest.MonkeyPatch) -> None:
     RealGhClient().pr_list(owner="o", repo="r", state="open", limit=10)
     fields = seen[0][seen[0].index("--json") + 1].split(",")
     assert "labels" in fields
+
+
+class ScriptedIssueGh(EventGhClient):
+    """EventGhClient whose `issues:opened` search returns whichever issues `numbers`
+    holds right now; `fail` makes the next poll raise, as an auth error would."""
+
+    def __init__(self, numbers: list[int]) -> None:
+        super().__init__(events=True)
+        self.numbers = numbers
+        self.fail = False
+
+    def graphql(self, query: str, **variables: str) -> dict[str, object]:
+        self._maybe_raise("graphql")
+        if self.fail:
+            raise RuntimeError("gh api graphql failed: rate limit exceeded")
+        nodes = [
+            {"id": f"I_{n}", "number": n, "title": f"Issue {n}", "labels": []}
+            for n in self.numbers
+        ]
+        return {"data": {"search": {"nodes": nodes}}}
+
+
+def _issue_job(repo: Path) -> Job:
+    check = GateCheck(kind="github_event", query="issues:opened", match={})
+    return _make_event_job(repo, checks=(check,), max_workers_per_tick=5)
+
+
+def test_issues_opened_first_poll_adopts_open_issues_as_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enabling an `issues:opened` job dispatches nothing for the issues already
+    open: the first poll records them as seen, and only an issue opened after
+    that gets a worker (issue #164)."""
+    repo = _init_repo(tmp_path)
+    job = _issue_job(repo)
+    gh = ScriptedIssueGh([3, 4])
+    client = RecordingHerdrClient()
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    tick(1)
+    assert client.tab_creates == [], "first poll dispatched on pre-existing issues"
+    history_path = tmp_path / "state" / "history.jsonl"
+    terminal = read_job(history_path, job.name)[-1]
+    assert terminal.state == "done"
+    assert terminal.extra is not None
+    assert terminal.extra.get("gate") == "baseline"
+    assert terminal.extra.get("last_seen_event_ids") == ["evt-issue-3", "evt-issue-4"]
+
+    gh.numbers = [3, 4, 5]
+    tick(2)
+    assert _dispatched_numbers(client) == [5]
+
+
+def test_issues_opened_failed_first_poll_does_not_count_as_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed poll records no watermark, so the next successful poll is still the
+    first one and adopts the baseline rather than dispatching every open issue."""
+    repo = _init_repo(tmp_path)
+    job = _issue_job(repo)
+    gh = ScriptedIssueGh([3, 4])
+    client = RecordingHerdrClient()
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    gh.fail = True
+    tick(1)
+    gh.fail = False
+    tick(2)
+    assert client.tab_creates == []
+
+
+def test_issues_opened_empty_baseline_still_counts_as_polled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first poll that finds no open issues is a baseline too (an empty one): the
+    first issue opened after it is new and dispatches."""
+    repo = _init_repo(tmp_path)
+    job = _issue_job(repo)
+    gh = ScriptedIssueGh([])
+    client = RecordingHerdrClient()
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    tick(1)
+    gh.numbers = [9]
+    tick(2)
+    assert _dispatched_numbers(client) == [9]

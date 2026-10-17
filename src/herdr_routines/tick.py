@@ -1200,10 +1200,11 @@ def _process_gated_job(
         )
 
 
-def _last_seen_event_ids(history_path: Path, job_name: str) -> list[str]:
+def _last_seen_event_ids(history_path: Path, job_name: str) -> list[str] | None:
     """The event IDs the most recent poll already handled: the `last_seen_event_ids`
     of the latest terminal record that carries one (a failed poll carries none and
-    leaves the watermark where it was).
+    leaves the watermark where it was). None when no poll has ever succeeded, which
+    is not the same as an empty watermark.
 
     The latest watermark, not a union over all history: an event that clears and
     comes back (CI red again on the same PR, a label removed and re-added) is absent
@@ -1212,7 +1213,7 @@ def _last_seen_event_ids(history_path: Path, job_name: str) -> list[str]:
         ids = r.extra.get("last_seen_event_ids") if r.extra else None
         if isinstance(ids, list):
             return [e for e in ids if isinstance(e, str)]
-    return []
+    return None
 
 
 def _event_target(check: GateCheck) -> str:
@@ -1351,7 +1352,37 @@ def _process_event_target(
             )
         return f"{job.name}: failed (github_event_poll_failed)", True
 
-    seen = set(_last_seen_event_ids(history_path, job.name))
+    last_seen = _last_seen_event_ids(history_path, job.name)
+    if last_seen is None and check.query == "issues:opened":
+        # First successful poll: every open issue would look new and get a fix worker.
+        # Adopt them as the baseline instead, so only issues opened from now on fire.
+        # prs:labels and ci:failed keep firing on the first poll; a labelled PR or a
+        # red CI that already exists is usually exactly what the job is for.
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="done",
+                run_id=run_id,
+                extra={
+                    "gate": "baseline",
+                    "target": event_target,
+                    "query": check.query,
+                    "polled": len(events),
+                    "last_seen_event_ids": [e.event_id for e in events],
+                },
+            ),
+        )
+        if _notify_gate(job, "finding" if events else "success"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} baseline",
+                body=f"baseline adopted ({len(events)} open issues)",
+            )
+        return f"{job.name}: done (baseline, {len(events)} open issues adopted)", False
+
+    seen = set(last_seen or [])
     new_events = [e for e in events if e.event_id not in seen]
     # The watermark is the polled events that need nothing more: already seen, or
     # handled this tick (worker done, or budget exhausted). An over-cap event or one
