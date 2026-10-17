@@ -167,7 +167,7 @@ _NON_JOB_FILENAMES = frozenset(
 # typo and rejected, same posture as `retention:` and `defaults:`.
 _TELEGRAM_SPAWN_ALLOWED_KEYS = frozenset({"allowed_chat_id", "aliases"})
 _SPAWN_ALIAS_ALLOWED_KEYS = frozenset(
-    {"alias", "repo", "agent_kind", "workspace", "base"}
+    {"alias", "repo", "agent_kind", "workspace", "base", "model"}
 )
 _JOB_ALLOWED_KEYS = (
     _JOB_REQUIRED_KEYS
@@ -308,14 +308,16 @@ class SpawnAlias:
 
     ``alias`` is the token a phone types in ``/run <alias>``; it is validated against the
     same ``[a-z][a-z0-9_-]*`` shape the parser enforces, so it can never be interpolated
-    into a shell. ``agent_kind``/``workspace``/``base`` mirror the ``Job`` fields they map
-    onto; ``base`` is the branch a ``worktree`` spawn branches from."""
+    into a shell. ``agent_kind``/``workspace``/``base``/``model`` mirror the ``Job`` fields
+    they map onto; ``base`` is the branch a ``worktree`` spawn branches from. A message's
+    own harness/model (``/run <alias> [harness] [model]``) overrides these defaults."""
 
     alias: str
     repo: Path
     agent_kind: str = "claude"
     workspace: str = "worktree"
     base: str = "main"
+    model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,8 +856,21 @@ def _build_spawn_alias(raw: object, *, label: str) -> SpawnAlias:
     base = raw.get("base", "main")
     if not isinstance(base, str) or not base:
         raise ConfigError(f"{label} ({alias!r}): 'base' must be a non-empty string")
+    model = raw.get("model")
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ConfigError(f"{label} ({alias!r}): 'model' must be a non-empty string")
+    if model is not None and agent_kind not in AGENT_MODEL_FLAGS:
+        raise ConfigError(
+            f"{label} ({alias!r}): 'model' is not supported for agent_kind "
+            f"{agent_kind!r} (supported: {sorted(AGENT_MODEL_FLAGS)})"
+        )
     return SpawnAlias(
-        alias=alias, repo=repo, agent_kind=agent_kind, workspace=workspace, base=base
+        alias=alias,
+        repo=repo,
+        agent_kind=agent_kind,
+        workspace=workspace,
+        base=base,
+        model=model,
     )
 
 

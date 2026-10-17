@@ -151,4 +151,5 @@ jobs:
 #       repo: /home/guido/projects/fitted # must exist and be a git checkout, or validate fails
 #       agent_kind: opencode # optional, default claude
 #       workspace: worktree # optional, default worktree (`root` = in the checkout itself)
+#       model: opencode/big-pickle # optional default model; `/run <alias> [harness] [model]` overrides
 #       base: main # optional, default main: the branch a worktree spawn starts from
