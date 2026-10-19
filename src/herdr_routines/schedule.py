@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import TypedDict
+from typing import Literal, TypedDict
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
@@ -36,15 +36,24 @@ class _SkippedFields(TypedDict, total=False):
 
 
 @dataclass(frozen=True, slots=True)
-class ScheduleResult:
-    decision: Decision
-    occurrence: datetime | None = (
-        None  # the occurrence to run, or the one reported as missed
-    )
-    late_seconds: float | None = None
+class NotDue:
+    decision: Literal[Decision.NOT_DUE] = Decision.NOT_DUE
+
+
+@dataclass(frozen=True, slots=True)
+class Due:
+    """RUN or MISSED: both carry the occurrence they act on, so one class with a
+    `decision` tag is enough."""
+
+    decision: Literal[Decision.RUN, Decision.MISSED]
+    occurrence: datetime  # the occurrence to run, or the one reported as missed
+    late_seconds: float
     skipped_occurrences: int = 0  # earlier occurrences in the interval, collapsed
     skipped_first: datetime | None = None
     skipped_last: datetime | None = None
+
+
+ScheduleResult = NotDue | Due
 
 
 def occurrences_since(
@@ -101,7 +110,7 @@ def decide(
     occurrences = occurrences_since(cron, timezone, since, now)
 
     if not occurrences:
-        return ScheduleResult(decision=Decision.NOT_DUE)
+        return NotDue()
 
     latest = occurrences[-1]
     earlier = occurrences[:-1]
@@ -117,14 +126,14 @@ def decide(
         }
 
     if late <= grace:
-        return ScheduleResult(
+        return Due(
             decision=Decision.RUN,
             occurrence=latest,
             late_seconds=late.total_seconds(),
             **skipped_kwargs,
         )
 
-    return ScheduleResult(
+    return Due(
         decision=Decision.MISSED,
         occurrence=latest,
         late_seconds=late.total_seconds(),

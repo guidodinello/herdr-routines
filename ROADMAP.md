@@ -172,6 +172,13 @@ considered met). One-liner index; full detail in the issue file.
 - **Verify `systemctl --user` works inside the watchdog unit on the Pi** —
   operator check; if it fails, the watchdog never reaps. →
   [`063`](docs/process/issues/063-verify-watchdog-systemctl-on-pi.md)
+- **Enforce the `HistoryExtra` schema on write** — #195's typed history payloads
+  are opt-in; a `HistoryRecord` constructor would make a plain dict a type error. →
+  [`064`](docs/process/issues/064-enforce-history-extra-on-write.md)
+- **Type the remaining `Any` boundaries** — telegram_spawn's alias helpers, the
+  `auto_fix` runner seam and `GithubEvent.payload`, left over from the type-health
+  audit. →
+  [`065`](docs/process/issues/065-type-remaining-any-boundaries.md)
 
 ## Later
 

@@ -59,6 +59,7 @@ from herdr_routines.config import (
     DEFAULT_TRUSTED_REVIEW_AUTHORS,
     GateCheck,
     Job,
+    JobInvariantError,
     RoutinesConfig,
 )
 from herdr_routines.findings import (
@@ -297,8 +298,8 @@ def _process_audit_job(
     The schedule guards are a gated job's; when the cron fires, `_audit_cycle` runs the
     audit, diffs its findings against the ledger, and dispatches at most one fix worker.
     One run spans the audit and the fix worker, so staleness is judged against both."""
-    assert job.audit is not None
-    run_timeout_ms = job.audit.timeout_ms + job.timeout_ms
+    audit = job.require_audit()
+    run_timeout_ms = audit.timeout_ms + job.timeout_ms
 
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
@@ -355,7 +356,6 @@ def _process_audit_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         extra = HistoryExtra(
             reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
         )
@@ -374,7 +374,6 @@ def _process_audit_job(
             )
         return f"{job.name}: missed", False
 
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
 
     if result.skipped_occurrences:
@@ -746,7 +745,7 @@ def _run_audit(
 
     `audit.command`'s exit code is not the gate: non-zero is the healthy case for an
     audit, so only 127 (the binary is missing) is a failure."""
-    assert job.audit is not None
+    audit = job.require_audit()
 
     def _fail(reason: str, extra: HistoryExtra) -> tuple[str, bool]:
         return _record_audit_failure(
@@ -780,9 +779,9 @@ def _run_audit(
         return _fail("worktree_creation_failed", HistoryExtra(error=str(e)))
 
     try:
-        if job.audit.command is not None:
+        if audit.command is not None:
             command = substitute_prompt(
-                job.audit.command,
+                audit.command,
                 report_path=paths.audit_report,
                 job_name=job.name,
                 run_id=run_id,
@@ -796,7 +795,7 @@ def _run_audit(
             outcome = run_checks(
                 (
                     GateCheck(
-                        kind="command", command=command, timeout_ms=job.audit.timeout_ms
+                        kind="command", command=command, timeout_ms=audit.timeout_ms
                     ),
                 ),
                 cwd=str(wt_path),
@@ -817,12 +816,15 @@ def _run_audit(
                 )
             return None
 
-        assert job.audit.skill is not None
+        if audit.skill is None:
+            raise JobInvariantError(
+                f"job {job.name!r}: audit requires exactly one of 'skill'/'command'"
+            )
         agent_name = build_audit_agent_name(job.name, run_id)
         # A non-empty `prompt` is the audit itself, inline (for a repo without the skill);
         # the output contract around it is always the engine's.
         prompt_text = build_audit_prompt(
-            skill=job.audit.skill,
+            skill=audit.skill,
             base=job.base,
             report_path=str(paths.audit_report),
             findings_path=str(paths.manifest),
@@ -857,7 +859,7 @@ def _run_audit(
             agent_name=agent_name,
             wt_path=wt_path,
             prompt_text=prompt_text,
-            timeout_ms=job.audit.timeout_ms,
+            timeout_ms=audit.timeout_ms,
             tail_id=f"{run_id}-audit",
         )
         if run.reason is not None:
@@ -888,7 +890,7 @@ def _dispatch_audit_fix(
     """Phase 3: exactly one fix worker, in its own `audit-fix-<run_id>` worktree at
     `base`, told to push `auto/<job>-<run_id>` and open a PR. The worktree is removed
     after the worker settles; the branch it pushed survives."""
-    assert job.audit is not None
+    audit = job.require_audit()
     wt_path = Path(job.repo) / ".worktrees" / f"audit-fix-{run_id}"
     try:
         _add_worktree(job.repo, wt_path, job.base)
@@ -896,16 +898,16 @@ def _dispatch_audit_fix(
         return _AgentRun(reason="worktree_creation_failed", error=str(e))
 
     try:
-        if job.audit.command is not None:
-            recheck = f"`{job.audit.command}` (it writes the findings manifest)"
+        if audit.command is not None:
+            recheck = f"`{audit.command}` (it writes the findings manifest)"
         elif job.prompt is not None and job.prompt.strip():
             recheck = (
-                f"follow the `{job.audit.skill}` audit instructions in "
+                f"follow the `{audit.skill}` audit instructions in "
                 f"{paths.audit_instructions} to re-scan. Do not overwrite the "
                 f"audit's report or manifest"
             )
         else:
-            recheck = f"run the `{job.audit.skill}` skill and read its findings"
+            recheck = f"run the `{audit.skill}` skill and read its findings"
         prompt_text = job.fix_prompt or build_audit_fix_prompt(
             job_name=job.name,
             check=check,
@@ -950,7 +952,7 @@ def _diff_and_fix(
     Fail-closed on an unverifiable manifest or a corrupt ledger: record `failed`,
     notify, act on nothing. The ledger is written *before* the dispatch (write-ahead),
     so a dispatch that fails has still consumed its attempt."""
-    assert job.audit is not None
+    job.require_audit()  # fail before the ledger is written, not in the dispatch
 
     def _fail(reason: str) -> tuple[str, bool]:
         return _record_audit_failure(
@@ -1173,8 +1175,8 @@ def _process_gated_job(
 ) -> tuple[str, bool]:
     """Process a gated job: run checks, dispatch fix agent on failure.
     Handles both pr and base targets."""
-    assert job.checks is not None
-    assert job.target is not None
+    checks = job.require_checks()
+    target = job.require_target()
 
     # Standard guards (same as _process_job for regular jobs).
     if not has_ever_been_seen(history_path, job.name):
@@ -1232,7 +1234,6 @@ def _process_gated_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         extra = HistoryExtra(
             reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
         )
@@ -1252,7 +1253,6 @@ def _process_gated_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
 
     if result.skipped_occurrences:
@@ -1293,7 +1293,7 @@ def _process_gated_job(
     # github_event (issue 014) is a poll predicate: same schedule guards as every
     # gated job, but its "gate" is a diff against last-seen event IDs rather than a
     # pr/base fix path — the event itself decides, so it routes to its own target.
-    for check in job.checks:
+    for check in checks:
         if check.kind == "github_event":
             return _process_event_target(
                 job,
@@ -1305,7 +1305,7 @@ def _process_gated_job(
                 trusted_review_authors=trusted_review_authors,
             )
 
-    if job.target == "pr":
+    if target == "pr":
         return _process_pr_target(
             job,
             history_path,
@@ -2237,7 +2237,7 @@ def _process_base_target(
         substitute_prompt,
     )
 
-    assert job.checks is not None
+    checks = job.require_checks()
     gate_branch = build_branch_name(job.name, run_id)
 
     attempt = consecutive_base_gate_failures(history_path, job.name)
@@ -2323,7 +2323,7 @@ def _process_base_target(
             )
         return f"{job.name}: failed (worktree_creation_failed)", True
 
-    gate_outcome = run_checks(job.checks, cwd=str(wt_path))
+    gate_outcome = run_checks(checks, cwd=str(wt_path))
 
     try:
         subprocess.run(
@@ -2418,7 +2418,7 @@ def _process_base_target(
         gate_output=gate_outcome.combined_output,
         base=job.base,
         report_path=str(report_path),
-        checks=job.checks,
+        checks=checks,
     )
     prompt_text = substitute_prompt(
         prompt_text, report_path=report_path, job_name=job.name, run_id=run_id
@@ -3052,7 +3052,6 @@ def _process_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         extra = HistoryExtra(
             reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
         )
@@ -3072,7 +3071,6 @@ def _process_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
     if result.skipped_occurrences:
         append(
@@ -3420,16 +3418,15 @@ def pipeline_deadline_epoch(job: Job, now: datetime) -> int:
     handed to the orchestrator verbatim (`DEADLINE_EPOCH`). It used to be computed by the
     orchestrator model itself, and a fallback model once wrote a timestamp a year in the
     past, so the watchdog reaped a live run 15 min in (2026-09-28)."""
-    assert job.deadline_ms is not None  # config.py requires this for kind: pipeline
-    return int(now.timestamp()) + job.deadline_ms // 1000
+    return int(now.timestamp()) + job.require_deadline_ms() // 1000
 
 
 def _build_pipeline_launch_argv(
     job: Job, *, run_id: str, report_path: Path, unit_name: str, deadline_epoch: int
 ) -> list[str]:
-    assert job.deadline_ms is not None  # config.py requires this for kind: pipeline
-    assert job.prompt_file is not None
-    runtime_max_sec = (job.deadline_ms + PIPELINE_UNIT_MARGIN_MS) // 1000
+    deadline_ms = job.require_deadline_ms()
+    prompt_file = job.require_prompt_file()
+    runtime_max_sec = (deadline_ms + PIPELINE_UNIT_MARGIN_MS) // 1000
     script = job.repo / "scripts" / "pipeline-launch.sh"
     argv = [
         "systemd-run",
@@ -3451,9 +3448,9 @@ def _build_pipeline_launch_argv(
         "--agent-kind",
         job.agent_kind,
         "--prompt-file",
-        str(job.repo / job.prompt_file),
+        str(job.repo / prompt_file),
         "--wait-timeout-ms",
-        str(job.deadline_ms),
+        str(deadline_ms),
         "--deadline-epoch",
         str(deadline_epoch),
     ]
@@ -3479,7 +3476,8 @@ def _process_pipeline_job(
         if _pipeline_run_is_live(client, job, history_path, now=now):
             return f"{job.name}: skipped (already running)", False
 
-        assert open_run.run_id is not None
+        if open_run.run_id is None:
+            raise RuntimeError(f"{job.name}: open pipeline run record has no run_id")
         bare_run_id = _bare_pipeline_run_id(job.name, open_run.run_id)
         report_path = pipeline_report_path(bare_run_id)
         report_text = ""
@@ -3629,7 +3627,6 @@ def _process_pipeline_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         append(
             history_path,
             HistoryRecord(
@@ -3657,7 +3654,6 @@ def _process_pipeline_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
     bare_run_id = _bare_pipeline_run_id(job.name, run_id)
     return _launch_pipeline_run(
@@ -4060,7 +4056,6 @@ def _process_review_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         extra = HistoryExtra(
             reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
         )
@@ -4080,7 +4075,6 @@ def _process_review_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
 
     if result.skipped_occurrences:

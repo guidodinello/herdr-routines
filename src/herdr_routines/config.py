@@ -404,6 +404,11 @@ class AuditSpec:
     timeout_ms: int = 1_800_000
 
 
+class JobInvariantError(RuntimeError):
+    """A `Job` lacks a field its `kind` requires. `load_config` rejects such a job, so this
+    only fires on a `Job` built without validation (a programming error, not a bad file)."""
+
+
 @dataclass(frozen=True, slots=True)
 class Job:
     name: str
@@ -488,6 +493,36 @@ class Job:
     @property
     def agent_name(self) -> str:
         return f"rt-{self.name}"
+
+    def _missing(self, field: str) -> JobInvariantError:
+        return JobInvariantError(
+            f"job {self.name!r}: kind: {self.kind} requires {field!r}"
+        )
+
+    def require_audit(self) -> AuditSpec:
+        if self.audit is None:
+            raise self._missing("audit")
+        return self.audit
+
+    def require_checks(self) -> tuple[GateCheck, ...]:
+        if self.checks is None:
+            raise self._missing("checks")
+        return self.checks
+
+    def require_target(self) -> JobTarget:
+        if self.target is None:
+            raise self._missing("target")
+        return self.target
+
+    def require_deadline_ms(self) -> int:
+        if self.deadline_ms is None:
+            raise self._missing("deadline_ms")
+        return self.deadline_ms
+
+    def require_prompt_file(self) -> str:
+        if self.prompt_file is None:
+            raise self._missing("prompt_file")
+        return self.prompt_file
 
 
 @dataclass(frozen=True, slots=True)

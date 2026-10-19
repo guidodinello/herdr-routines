@@ -960,12 +960,12 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
         # sequence: slop + audit.timeout_ms + timeout_ms. A skill audit is an agent, so it
         # waits on start_timeout_ms too — one start per agent.
         if job.kind == "audit":
-            assert job.audit is not None  # guaranteed by config validation
-            agent_starts = 1 if job.audit.command is not None else 2
+            audit = job.require_audit()
+            agent_starts = 1 if audit.command is not None else 2
             total_job_seconds += (
                 agent_starts * job.start_timeout_ms / 1000
                 + GATE_SLOP_S
-                + job.audit.timeout_ms / 1000
+                + audit.timeout_ms / 1000
                 + job.timeout_ms / 1000
             )
             continue
@@ -979,10 +979,9 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
                 / 1000
             )
             continue
-        if job.kind == "gated" and job.target is not None:
-            assert job.checks is not None  # guaranteed by config validation
-            gate_time_s = sum(c.timeout_ms for c in job.checks) / 1000
-            if job.target == "base":
+        if job.kind == "gated":
+            gate_time_s = sum(c.timeout_ms for c in job.require_checks()) / 1000
+            if job.require_target() == "base":
                 total_job_seconds += (
                     job.start_timeout_ms / 1000
                     + GATE_SLOP_S
