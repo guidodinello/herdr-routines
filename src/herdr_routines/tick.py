@@ -78,6 +78,7 @@ from herdr_routines.herdr import (
 from herdr_routines.history import (
     TERMINAL_STATES,
     HistoryRecord,
+    HistoryState,
     append,
     find_stale_running,
     first_seen_at,
@@ -1501,7 +1502,7 @@ def _process_event_target(
             handled.add(event.event_id)
         dispatched_count += 1
 
-    state = "failed" if any_failed else "done"
+    state: HistoryState = "failed" if any_failed else "done"
     append(
         history_path,
         HistoryRecord(
@@ -2396,7 +2397,9 @@ def _process_base_target(
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
     _cleanup_worktree(job.repo, fix_wt_path)
 
-    state = "done" if settled_status in SETTLED_AGENT_STATUSES else "failed"
+    state: HistoryState = (
+        "done" if settled_status in SETTLED_AGENT_STATUSES else "failed"
+    )
     append(
         history_path,
         HistoryRecord(
@@ -3121,7 +3124,7 @@ def _pipeline_host_rebooted_mid_run(bare_run_id: str) -> bool:
     return host_rebooted_after_state_write(state_path, boot_epoch=system_boot_epoch())
 
 
-def _classify_pipeline_outcome(report_text: str) -> tuple[str, str | None]:
+def _classify_pipeline_outcome(report_text: str) -> tuple[HistoryState, str | None]:
     """(history_state, reason) from a terminal report's first `## Outcome:` line.
 
     `partial (deadline exceeded)` is tolerated content-wise (the orchestrator is
@@ -4143,7 +4146,7 @@ def _review_target_record(
     cand: Candidate,
     run_id: str,
     now: datetime,
-    state: str,
+    state: HistoryState,
     attempt: int,
     agent_name: str | None,
     pane_id: str | None,

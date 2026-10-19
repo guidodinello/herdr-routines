@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Final, TypedDict
+from typing import Final, Literal, TypedDict
 
 from herdr_routines.config import Job
 from herdr_routines.herdr import (
@@ -385,9 +385,12 @@ class _CommonOutcomeFields(TypedDict):
     reaped_stale_agent: bool
 
 
+RunState = Literal["done", "failed", "interrupted_unknown"]
+
+
 @dataclass(frozen=True, slots=True)
 class RunOutcome:
-    state: str  # "done" | "failed" | "interrupted_unknown" (see docs/plan-v1.md §4)
+    state: RunState  # see docs/plan-v1.md §4
     run_id: str
     reason: str | None = None
     error: str | None = None

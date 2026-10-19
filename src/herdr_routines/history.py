@@ -16,17 +16,23 @@ import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeIs, get_args
 
 from logger import get_logger
 
 log = get_logger(__name__)
 
-TERMINAL_STATES = frozenset(
-    {"done", "failed", "skipped", "missed", "interrupted_unknown"}
-)
-NON_TERMINAL_STATES = frozenset({"registered", "scheduled", "running"})
-ALL_STATES = TERMINAL_STATES | NON_TERMINAL_STATES
+TerminalState = Literal["done", "failed", "skipped", "missed", "interrupted_unknown"]
+NonTerminalState = Literal["registered", "scheduled", "running"]
+HistoryState = Literal[TerminalState, NonTerminalState]
+TERMINAL_STATES: frozenset[TerminalState] = frozenset(get_args(TerminalState))
+NON_TERMINAL_STATES: frozenset[NonTerminalState] = frozenset(get_args(NonTerminalState))
+ALL_STATES: frozenset[HistoryState] = TERMINAL_STATES | NON_TERMINAL_STATES
+
+
+def is_history_state(value: object) -> TypeIs[HistoryState]:
+    return value in ALL_STATES
+
 
 # How much slack beyond a job's own timeout before an orphaned "running" record is
 # considered stale rather than genuinely still in progress. See docs/plan-v1.md §4.
@@ -49,7 +55,7 @@ def default_history_path() -> Path:
 class HistoryRecord:
     ts: datetime
     job: str
-    state: str
+    state: HistoryState
     run_id: str | None = None
     extra: dict[str, Any] | None = None
 
@@ -68,10 +74,13 @@ class HistoryRecord:
     @staticmethod
     def from_dict(d: dict[str, Any]) -> HistoryRecord:
         ts = datetime.fromisoformat(d["ts"])
+        state = d["state"]
+        if not is_history_state(state):
+            raise ValueError(f"unknown history state {state!r}")
         known = {"ts", "job", "state", "run_id"}
         extra = {k: v for k, v in d.items() if k not in known} or None
         return HistoryRecord(
-            ts=ts, job=d["job"], state=d["state"], run_id=d.get("run_id"), extra=extra
+            ts=ts, job=d["job"], state=state, run_id=d.get("run_id"), extra=extra
         )
 
 
