@@ -19,13 +19,26 @@ from herdr_routines.auto_fix import (
     build_fix_prompt,
     build_pr_agent_name,
     build_worker_agent_name,
+    effective_trusted_authors,
+    fetch_thread_bodies,
     is_eligible,
     list_open_prs,
     repo_owner_and_name,
 )
-from herdr_routines.config import GateCheck, Job, RoutinesConfig
+from herdr_routines.config import (
+    DEFAULT_TRUSTED_REVIEW_AUTHORS,
+    GateCheck,
+    Job,
+    RoutinesConfig,
+)
 from herdr_routines.history import HistoryRecord, HistoryState, append, read_job
 from herdr_routines.tick import run_tick
+
+# The effective trusted set these tests run under: the authenticated user the fakes
+# report plus the default reviewer bot (what `effective_trusted_authors` builds).
+TRUSTED = effective_trusted_authors(
+    DEFAULT_TRUSTED_REVIEW_AUTHORS, viewer_login="testuser"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -210,12 +223,14 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
                 "number": 10,
                 "headRefName": "auto/fix-1",
                 "author": {"login": "testuser"},
+                "isCrossRepository": False,
                 "url": "https://github.com/test/repo/pull/10",
             },
             {
                 "number": 20,
                 "headRefName": "auto/fix-2",
                 "author": {"login": "testuser"},
+                "isCrossRepository": False,
                 "url": "https://github.com/test/repo/pull/20",
             },
         ],
@@ -251,7 +266,14 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
                                 "nodes": [
                                     {
                                         "isResolved": False,
-                                        "comments": {"nodes": [{"body": "fix this"}]},
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "author": {"login": "testuser"},
+                                                    "body": "fix this",
+                                                }
+                                            ]
+                                        },
                                     }
                                 ]
                             }
@@ -263,7 +285,12 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
     )
 
     open_prs = list_open_prs(
-        gh, owner="test", repo="repo", branch_prefix="auto/", author="testuser"
+        gh,
+        owner="test",
+        repo="repo",
+        branch_prefix="auto/",
+        author="testuser",
+        trusted_authors=TRUSTED,
     )
     assert len(open_prs) == 2
 
@@ -272,6 +299,7 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
         gh,
         owner="test",
         repo="repo",
+        trusted_authors=TRUSTED,
         pr=PRInfo(
             number=10,
             head_ref="auto/fix-1",
@@ -287,6 +315,7 @@ def test_auto_fix_finds_eligible_prs(tmp_path: Path) -> None:
         gh,
         owner="test",
         repo="repo",
+        trusted_authors=TRUSTED,
         pr=PRInfo(
             number=20,
             head_ref="auto/fix-2",
@@ -313,6 +342,7 @@ def test_auto_fix_ignores_non_auto_branch(tmp_path: Path) -> None:
                 "number": 30,
                 "headRefName": "feature/not-auto",
                 "author": {"login": "testuser"},
+                "isCrossRepository": False,
                 "url": "https://github.com/test/repo/pull/30",
             },
         ],
@@ -325,7 +355,12 @@ def test_auto_fix_ignores_non_auto_branch(tmp_path: Path) -> None:
     )
 
     open_prs = list_open_prs(
-        gh, owner="test", repo="repo", branch_prefix="auto/", author="testuser"
+        gh,
+        owner="test",
+        repo="repo",
+        branch_prefix="auto/",
+        author="testuser",
+        trusted_authors=TRUSTED,
     )
     assert len(open_prs) == 0
 
@@ -345,6 +380,7 @@ def test_auto_fix_ignores_foreign_author(tmp_path: Path) -> None:
                 "number": 40,
                 "headRefName": "auto/fix-foreign",
                 "author": {"login": "otheruser"},
+                "isCrossRepository": False,
                 "url": "https://github.com/test/repo/pull/40",
             },
         ],
@@ -357,7 +393,12 @@ def test_auto_fix_ignores_foreign_author(tmp_path: Path) -> None:
     )
 
     open_prs = list_open_prs(
-        gh, owner="test", repo="repo", branch_prefix="auto/", author="testuser"
+        gh,
+        owner="test",
+        repo="repo",
+        branch_prefix="auto/",
+        author="testuser",
+        trusted_authors=TRUSTED,
     )
     assert len(open_prs) == 0
 
@@ -377,6 +418,7 @@ def test_auto_fix_caps_max_prs_per_tick(tmp_path: Path) -> None:
                 "number": n,
                 "headRefName": f"auto/fix-{n}",
                 "author": {"login": "testuser"},
+                "isCrossRepository": False,
                 "url": f"https://github.com/test/repo/pull/{n}",
             }
             for n in [50, 10, 30, 20, 40]
@@ -391,14 +433,21 @@ def test_auto_fix_caps_max_prs_per_tick(tmp_path: Path) -> None:
     )
 
     open_prs = list_open_prs(
-        gh, owner="test", repo="repo", branch_prefix="auto/", author="testuser"
+        gh,
+        owner="test",
+        repo="repo",
+        branch_prefix="auto/",
+        author="testuser",
+        trusted_authors=TRUSTED,
     )
     assert len(open_prs) == 5
 
     # Check eligibility for all
     eligible = []
     for pr in open_prs:
-        elig = is_eligible(gh, owner="test", repo="repo", pr=pr)
+        elig = is_eligible(
+            gh, owner="test", repo="repo", pr=pr, trusted_authors=TRUSTED
+        )
         if elig is not None:
             eligible.append(elig)
 
@@ -761,7 +810,14 @@ def test_auto_fix_graphql_thread_eligibility(tmp_path: Path) -> None:
                                 "nodes": [
                                     {
                                         "isResolved": False,
-                                        "comments": {"nodes": [{"body": "blocking"}]},
+                                        "comments": {
+                                            "nodes": [
+                                                {
+                                                    "author": {"login": "testuser"},
+                                                    "body": "blocking",
+                                                }
+                                            ]
+                                        },
                                     }
                                 ]
                             }
@@ -782,34 +838,41 @@ def test_auto_fix_graphql_thread_eligibility(tmp_path: Path) -> None:
         )
 
     # PENDING: not failing
-    assert is_eligible(gh, owner="t", repo="r", pr=_pr(1)) is None
+    assert (
+        is_eligible(gh, owner="t", repo="r", pr=_pr(1), trusted_authors=TRUSTED) is None
+    )
 
     # IN_PROGRESS: not failing
-    assert is_eligible(gh, owner="t", repo="r", pr=_pr(2)) is None
+    assert (
+        is_eligible(gh, owner="t", repo="r", pr=_pr(2), trusted_authors=TRUSTED) is None
+    )
 
     # FAILURE: failing
-    elig3 = is_eligible(gh, owner="t", repo="r", pr=_pr(3))
+    elig3 = is_eligible(gh, owner="t", repo="r", pr=_pr(3), trusted_authors=TRUSTED)
     assert elig3 is not None
     assert elig3.reason == "ci_failure"
 
     # ERROR: failing
-    elig4 = is_eligible(gh, owner="t", repo="r", pr=_pr(4))
+    elig4 = is_eligible(gh, owner="t", repo="r", pr=_pr(4), trusted_authors=TRUSTED)
     assert elig4 is not None
     assert elig4.reason == "ci_failure"
 
     # TIMED_OUT: failing
-    elig5 = is_eligible(gh, owner="t", repo="r", pr=_pr(5))
+    elig5 = is_eligible(gh, owner="t", repo="r", pr=_pr(5), trusted_authors=TRUSTED)
     assert elig5 is not None
     assert elig5.reason == "ci_failure"
 
     # Unresolved thread
-    elig6 = is_eligible(gh, owner="t", repo="r", pr=_pr(6))
+    elig6 = is_eligible(gh, owner="t", repo="r", pr=_pr(6), trusted_authors=TRUSTED)
     assert elig6 is not None
     assert elig6.reason == "unresolved_threads"
 
     # GraphQL failure: falls back to empty (no crash)
     gh_fail = FakeGhClient(user="testuser", raise_on="graphql")
-    assert is_eligible(gh_fail, owner="t", repo="r", pr=_pr(999)) is None
+    assert (
+        is_eligible(gh_fail, owner="t", repo="r", pr=_pr(999), trusted_authors=TRUSTED)
+        is None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1265,7 +1328,7 @@ def test_auto_fix_pr_trigger_unchanged(tmp_history_path: Path) -> None:
     pr = PRInfo(
         number=1, head_ref="auto/fix-1", author="testuser", url="https://example.com"
     )
-    elig = is_eligible(gh, owner="t", repo="r", pr=pr)
+    elig = is_eligible(gh, owner="t", repo="r", pr=pr, trusted_authors=TRUSTED)
     assert elig is not None
     assert elig.reason == "ci_failure"
 
@@ -1434,46 +1497,278 @@ def test_base_gate_budget_skips_infra_and_skipped_records(
     assert consecutive_base_gate_failures(tmp_history_path, "repo-hygiene") == 0
 
 
-def _bot_pr(number: int, **overrides: object) -> dict[str, object]:
-    pr: dict[str, object] = {
-        "number": number,
-        "headRefName": "auto/bot-fix",
-        "author": {"login": "app/dependabot", "is_bot": True},
-        "url": f"https://github.com/test/repo/pull/{number}",
-        "isCrossRepository": False,
+# ---------------------------------------------------------------------------
+# Trusted review authors: only act on PRs and feedback from trusted authors
+# ---------------------------------------------------------------------------
+
+
+def _thread(login: str | None, body: str, *, resolved: bool = False) -> dict[str, Any]:
+    root: dict[str, Any] = {"body": body}
+    root["author"] = None if login is None else {"login": login}
+    return {
+        "id": f"PRRT_{body[:8]}",
+        "isResolved": resolved,
+        "comments": {"nodes": [root]},
     }
-    pr.update(overrides)
-    return pr
 
 
-def _listed_numbers(prs: list[dict[str, object]]) -> list[int]:
-    gh = FakeGhClient(user="testuser", prs=prs)
+def _threads_payload(*threads: dict[str, Any]) -> dict[str, object]:
+    return {
+        "data": {
+            "repository": {"pullRequest": {"reviewThreads": {"nodes": list(threads)}}}
+        }
+    }
+
+
+def _auto_pr(n: int = 7) -> PRInfo:
+    return PRInfo(
+        number=n,
+        head_ref=f"auto/fix-{n}",
+        author="testuser",
+        url=f"https://github.com/t/r/pull/{n}",
+    )
+
+
+def test_effective_trusted_authors_adds_the_viewer_and_casefolds() -> None:
+    trusted = effective_trusted_authors(
+        ["Copilot-Pull-Request-Reviewer"], viewer_login="Owner"
+    )
+    assert trusted == frozenset({"copilot-pull-request-reviewer", "owner"})
+    # An empty configured list still trusts the authenticated user.
+    assert effective_trusted_authors([], viewer_login="owner") == frozenset({"owner"})
+
+
+def test_untrusted_only_threads_are_not_eligible_and_never_reach_the_prompt() -> None:
+    gh = FakeGhClient(
+        review_threads={7: _threads_payload(_thread("drive-by", "UNTRUSTED TEXT"))}
+    )
+
+    assert (
+        is_eligible(gh, owner="t", repo="r", pr=_auto_pr(), trusted_authors=TRUSTED)
+        is None
+    )
+
+    bodies = fetch_thread_bodies(
+        gh, owner="t", repo="r", number=7, trusted_authors=TRUSTED
+    )
+    prompt = build_fix_prompt(
+        pr_number=7,
+        branch="auto/fix-7",
+        failing_checks="(no failing checks found)",
+        thread_bodies=bodies,
+        owner_repo="t/r",
+        report_path="/tmp/r.md",
+    )
+    assert "UNTRUSTED TEXT" not in bodies
+    assert "UNTRUSTED TEXT" not in prompt
+    assert bodies == "(no unresolved threads)"
+
+
+def test_threads_from_the_owner_and_copilot_are_included() -> None:
+    gh = FakeGhClient(
+        review_threads={
+            7: _threads_payload(
+                _thread("testuser", "OWNER NOTE"),
+                _thread("copilot-pull-request-reviewer", "COPILOT NOTE"),
+                _thread("drive-by", "UNTRUSTED TEXT"),
+                _thread("testuser", "RESOLVED NOTE", resolved=True),
+            )
+        }
+    )
+
+    elig = is_eligible(gh, owner="t", repo="r", pr=_auto_pr(), trusted_authors=TRUSTED)
+    assert elig is not None
+    assert elig.reason == "unresolved_threads"
+
+    bodies = fetch_thread_bodies(
+        gh, owner="t", repo="r", number=7, trusted_authors=TRUSTED
+    )
+    assert "OWNER NOTE" in bodies
+    assert "COPILOT NOTE" in bodies
+    assert "UNTRUSTED TEXT" not in bodies
+    assert "RESOLVED NOTE" not in bodies
+
+
+def test_trusted_login_match_is_case_insensitive() -> None:
+    gh = FakeGhClient(
+        review_threads={7: _threads_payload(_thread("TestUser", "OWNER NOTE"))}
+    )
+    assert is_eligible(gh, owner="t", repo="r", pr=_auto_pr(), trusted_authors=TRUSTED)
+
+
+def test_thread_from_a_deleted_account_is_untrusted() -> None:
+    gh = FakeGhClient(review_threads={7: _threads_payload(_thread(None, "GHOST TEXT"))})
+
+    assert (
+        is_eligible(gh, owner="t", repo="r", pr=_auto_pr(), trusted_authors=TRUSTED)
+        is None
+    )
+    bodies = fetch_thread_bodies(
+        gh, owner="t", repo="r", number=7, trusted_authors=TRUSTED
+    )
+    assert "GHOST TEXT" not in bodies
+
+
+def _listed(*prs: dict[str, object]) -> list[int]:
+    gh = FakeGhClient(prs=list(prs))
     return [
         p.number
         for p in list_open_prs(
-            gh, owner="test", repo="repo", branch_prefix="auto/", author="testuser"
+            gh,
+            owner="t",
+            repo="r",
+            branch_prefix="auto/",
+            author="testuser",
+            trusted_authors=TRUSTED,
         )
     ]
 
 
-def test_list_open_prs_accepts_same_repo_bot_pr() -> None:
-    assert _listed_numbers([_bot_pr(1)]) == [1]
+def _pr_payload(
+    n: int, login: str, *, is_bot: bool = False, cross: object = False
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "number": n,
+        "headRefName": f"auto/fix-{n}",
+        "author": {"login": login, "is_bot": is_bot},
+        "url": f"https://github.com/t/r/pull/{n}",
+    }
+    if cross is not None:
+        payload["isCrossRepository"] = cross
+    return payload
 
 
-def test_list_open_prs_rejects_cross_repo_bot_pr() -> None:
-    assert _listed_numbers([_bot_pr(2, isCrossRepository=True)]) == []
+def test_list_open_prs_includes_the_owners_pr() -> None:
+    assert _listed(_pr_payload(1, "testuser")) == [1]
 
 
-def test_list_open_prs_rejects_bot_pr_without_fork_field() -> None:
-    pr = _bot_pr(3)
-    del pr["isCrossRepository"]
-    assert _listed_numbers([pr]) == []
+def test_list_open_prs_excludes_an_untrusted_bot_on_an_auto_branch() -> None:
+    assert _listed(_pr_payload(2, "some-app[bot]", is_bot=True)) == []
 
 
-def test_list_open_prs_author_match_is_not_fork_checked() -> None:
-    pr = _bot_pr(
-        4,
-        author={"login": "testuser", "is_bot": False},
-        isCrossRepository=True,
+def test_list_open_prs_excludes_a_fork_pr_even_from_a_trusted_author() -> None:
+    assert _listed(_pr_payload(3, "testuser", cross=True)) == []
+    # A payload that does not say whether it is a fork is not guessed at.
+    assert _listed(_pr_payload(4, "testuser", cross=None)) == []
+
+
+def test_list_open_prs_includes_a_configured_trusted_author() -> None:
+    assert _listed(_pr_payload(5, "copilot-pull-request-reviewer", is_bot=True)) == [5]
+
+
+def test_real_pr_list_requests_is_cross_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from herdr_routines.auto_fix import RealGhClient
+
+    seen: list[list[str]] = []
+
+    def _run(self: RealGhClient, argv: list[str]) -> tuple[int, str, str]:
+        seen.append(argv)
+        return 0, "[]", ""
+
+    monkeypatch.setattr(RealGhClient, "_run", _run)
+    RealGhClient().pr_list(owner="o", repo="r", state="open", limit=10)
+    fields = seen[0][seen[0].index("--json") + 1].split(",")
+    assert "isCrossRepository" in fields
+    assert "author" in fields
+
+
+def test_review_threads_query_asks_for_the_root_comment_author() -> None:
+    gh = FakeGhClient()
+    seen: list[str] = []
+    original = gh.graphql
+
+    def _graphql(query: str, **variables: str) -> dict[str, object]:
+        seen.append(query)
+        return original(query, **variables)
+
+    gh.graphql = _graphql  # type: ignore[method-assign]
+    fetch_thread_bodies(gh, owner="t", repo="r", number=7, trusted_authors=TRUSTED)
+    assert "author { login }" in seen[0]
+
+
+@pytest.mark.parametrize(
+    ("configured", "expect_dispatch"),
+    [(DEFAULT_TRUSTED_REVIEW_AUTHORS, False), (("alice",), True)],
+)
+def test_tick_uses_the_configured_trusted_review_authors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: tuple[str, ...],
+    expect_dispatch: bool,
+) -> None:
+    """`RoutinesConfig.trusted_review_authors` reaches the pr_health path: a thread from
+    `alice` makes the owner's PR eligible (and reaches the worker prompt) only when
+    `alice` is configured as trusted."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = Job(
+        name="auto-fix-prs",
+        enabled=True,
+        cron="* * * * *",
+        repo=tmp_path,
+        workspace="worktree",
+        base="main",
+        agent_kind="claude",
+        model=None,
+        prompt="",
+        timeout_ms=5_000,
+        start_timeout_ms=30_000,
+        catch_up_minutes=120,
+        timezone="UTC",
+        on_missed="log",
+        checks=(GateCheck(kind="pr_health"),),
+        target="pr",
+        kind="gated",
     )
-    assert _listed_numbers([pr]) == [4]
+    config = RoutinesConfig(jobs=(job,), trusted_review_authors=configured)
+    gh = FakeGhClient(
+        prs=[_pr_payload(7, "testuser")],
+        review_threads={7: _threads_payload(_thread("alice", "ALICE NOTE"))},
+    )
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
+    monkeypatch.setattr(
+        "herdr_routines.tick.subprocess",
+        type(
+            "MockSubprocess",
+            (),
+            {
+                "run": staticmethod(
+                    lambda *a, **kw: type(
+                        "Result",
+                        (),
+                        {
+                            "returncode": 0,
+                            "stdout": "git@github.com:t/r.git",
+                            "stderr": "",
+                        },
+                    )()
+                ),
+            },
+        )(),
+    )
+    dispatched: list[dict[str, Any]] = []
+
+    def _dispatch(**kwargs: Any) -> dict[str, Any]:
+        dispatched.append(kwargs)
+        return {"state": "done"}
+
+    monkeypatch.setattr("herdr_routines.tick._dispatch_fix_worker", _dispatch)
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=FakeFullClient(), now=t0)  # type: ignore[arg-type]
+    outcome = run_tick(
+        config,
+        history_path,
+        client=FakeFullClient(),  # type: ignore[arg-type]
+        now=t0 + timedelta(minutes=1),
+    )
+
+    assert "enumerated=1" in outcome.summaries[0]
+    if expect_dispatch:
+        assert len(dispatched) == 1
+        assert "ALICE NOTE" in dispatched[0]["thread_bodies"]
+    else:
+        assert "eligible=0" in outcome.summaries[0]
+        assert dispatched == []

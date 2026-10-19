@@ -6,9 +6,10 @@ Pure: no filesystem access beyond reading YAML files, no subprocess, no clock re
 Supports two config layouts:
 - Legacy single file: ``jobs.yaml`` (deprecated, emits a warning when used).
 - Directory layout: ``jobs.d/`` with one ``<name>.yaml`` per job, an optional
-  ``defaults.yaml`` for shared fields, and an optional ``retention.yaml`` for the
-  state-dir retention policy (issue 021).  The loader picks directory over file
-  when both exist.
+  ``defaults.yaml`` for shared fields, an optional ``retention.yaml`` for the
+  state-dir retention policy (issue 021), and optional ``telegram_spawn.yaml`` /
+  ``trusted_review_authors.yaml`` twins of those top-level blocks.  The loader picks
+  directory over file when both exist.
 """
 
 from __future__ import annotations
@@ -165,8 +166,16 @@ _RETENTION_FILENAME = "retention.yaml"
 # The directory-layout spelling of the top-level `telegram_spawn:` block (issue 024).
 # Recognized as a non-job file, like the two above, so it is never loaded as a job.
 _TELEGRAM_SPAWN_FILENAME = "telegram_spawn.yaml"
+# The directory-layout spelling of the top-level `trusted_review_authors:` list. Its
+# document is the bare list itself, the same "file = the block's value" shape as above.
+_TRUSTED_REVIEW_AUTHORS_FILENAME = "trusted_review_authors.yaml"
 _NON_JOB_FILENAMES = frozenset(
-    {"defaults.yaml", _RETENTION_FILENAME, _TELEGRAM_SPAWN_FILENAME}
+    {
+        "defaults.yaml",
+        _RETENTION_FILENAME,
+        _TELEGRAM_SPAWN_FILENAME,
+        _TRUSTED_REVIEW_AUTHORS_FILENAME,
+    }
 )
 # Recognized keys under `telegram_spawn:` / an alias record (issue 024). Anything else is a
 # typo and rejected, same posture as `retention:` and `defaults:`.
@@ -278,6 +287,13 @@ DEFAULT_REPORTS_MAX_AGE_DAYS = 90
 # appending a handful of lines per run crosses 1 MiB in well under a day). A soft
 # `validate` warning, not a load error — same posture as the $ROUTINE_REPORT checks.
 TINY_HISTORY_MAX_BYTES = 1_048_576  # 1 MiB
+
+# The GitHub logins whose review feedback an unattended agent may act on when
+# `trusted_review_authors:` is absent. Copilot's PR reviewer posts as this login (a `Bot`
+# whose `authorAssociation` is `NONE`, so the login is the only usable signal). The
+# authenticated `gh` user is always added on top at runtime
+# (`auto_fix.effective_trusted_authors`), so it is never listed here.
+DEFAULT_TRUSTED_REVIEW_AUTHORS: tuple[str, ...] = ("copilot-pull-request-reviewer",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,6 +502,10 @@ class RoutinesConfig:
     # Cold-start spawn config (issue 024). None = the Telegram spawn entrypoint is not
     # configured; a present block must carry a non-empty `allowed_chat_id`.
     telegram_spawn: TelegramSpawn | None = None
+    # Review-comment and PR authors whose text unattended agents may act on (pr_health
+    # auto-fix, pipeline stage 7). A configured list replaces the default; the
+    # authenticated `gh` user is always trusted on top of it.
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS
 
     def job(self, name: str) -> Job | None:
         for j in self.jobs:
@@ -574,6 +594,7 @@ def _load_config_file(path: Path) -> RoutinesConfig:
         "jobs",
         "retention",
         "telegram_spawn",
+        "trusted_review_authors",
     }
     if unknown_top:
         raise ConfigError(f"unknown top-level key(s): {sorted(unknown_top)}")
@@ -614,8 +635,18 @@ def _load_config_file(path: Path) -> RoutinesConfig:
         else None
     )
 
+    raw_trusted = raw.get("trusted_review_authors")
+    trusted_review_authors = (
+        _build_trusted_review_authors(raw_trusted, "trusted_review_authors")
+        if raw_trusted is not None
+        else DEFAULT_TRUSTED_REVIEW_AUTHORS
+    )
+
     return RoutinesConfig(
-        jobs=tuple(jobs), retention=retention, telegram_spawn=telegram_spawn
+        jobs=tuple(jobs),
+        retention=retention,
+        telegram_spawn=telegram_spawn,
+        trusted_review_authors=trusted_review_authors,
     )
 
 
@@ -627,10 +658,12 @@ def load_config_dir(path: Path) -> RoutinesConfig:
         <path>/
             defaults.yaml    # optional; shared fields merged under each job
             retention.yaml   # optional; rotation / prune policy (issue 021)
-            <name>.yaml      # one per job; filename stem is the canonical name
+            telegram_spawn.yaml          # optional; the `telegram_spawn:` block
+            trusted_review_authors.yaml  # optional; a bare list of GitHub logins
+            <name>.yaml     # one per job; filename stem is the canonical name
 
-    Discovery is deterministic (``sorted()`` glob).  ``defaults.yaml`` and
-    ``retention.yaml`` are excluded from the job file list.
+    Discovery is deterministic (``sorted()`` glob).  Every non-job file above
+    (``_NON_JOB_FILENAMES``) is excluded from the job file list.
 
     Per-file YAML syntax errors surface the file name and do **not** prevent other
     jobs from loading (for diagnostics).  Unknown keys or bad values in one file also
@@ -661,6 +694,16 @@ def load_config_dir(path: Path) -> RoutinesConfig:
     if telegram_path.exists():
         raw_telegram = _load_yaml_or_error(telegram_path, kind="telegram_spawn")
         telegram_spawn = _build_telegram_spawn(raw_telegram, str(telegram_path))
+
+    # --- load trusted_review_authors.yaml (optional) -----------------------------
+    trusted_review_authors = DEFAULT_TRUSTED_REVIEW_AUTHORS
+    trusted_path = path / _TRUSTED_REVIEW_AUTHORS_FILENAME
+    if trusted_path.exists():
+        raw_trusted = _load_yaml_document(trusted_path)
+        if raw_trusted is not None:
+            trusted_review_authors = _build_trusted_review_authors(
+                raw_trusted, str(trusted_path)
+            )
 
     # --- discover job files (sorted, exclude the two non-job files) ---------------
     job_files = sorted(
@@ -731,21 +774,28 @@ def load_config_dir(path: Path) -> RoutinesConfig:
         errors=tuple(errors),
         retention=retention,
         telegram_spawn=telegram_spawn,
+        trusted_review_authors=trusted_review_authors,
     )
 
 
-def _load_yaml_or_error(path: Path, *, kind: str) -> dict[str, Any]:
-    """Read and parse a single YAML file.  Raises :class:`ConfigError` with the file
-    name embedded for clear diagnostics.  *kind* ("defaults" | "retention" | "job") only
-    shapes the error message."""
+def _load_yaml_document(path: Path) -> object:
+    """Read and parse one YAML file into whatever document it holds (``None`` when
+    empty). Raises :class:`ConfigError` with the file name embedded."""
     try:
         text = path.read_text()
     except OSError as e:
         raise ConfigError(f"cannot read {path}: {e}") from e
     try:
-        raw = yaml.safe_load(text)
+        return yaml.safe_load(text)
     except yaml.YAMLError as e:
         raise ConfigError(f"{path}: YAML syntax error: {e}") from e
+
+
+def _load_yaml_or_error(path: Path, *, kind: str) -> dict[str, Any]:
+    """Read and parse a single YAML file that must hold a mapping.  Raises
+    :class:`ConfigError` with the file name embedded for clear diagnostics.  *kind*
+    ("defaults" | "retention" | "job") only shapes the error message."""
+    raw = _load_yaml_document(path)
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -796,6 +846,28 @@ def _build_retention(raw: Mapping[str, object], label: str) -> Retention:
         history_max_age_days=_optional_positive_int("history_max_age_days"),
         reports_max_age_days=reports_max_age_days,
     )
+
+
+def _build_trusted_review_authors(raw: object, label: str) -> tuple[str, ...]:
+    """Validate a ``trusted_review_authors`` value: a list of non-empty GitHub logins.
+
+    A bare string is rejected rather than iterated, so ``trusted_review_authors: alice``
+    cannot silently become the set of single characters. An empty list is allowed: it
+    means "only the authenticated gh user". Duplicates are dropped, order kept."""
+    if not isinstance(raw, list):
+        raise ConfigError(
+            f"{label}: 'trusted_review_authors' must be a list of GitHub logins"
+        )
+    logins: list[str] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, str) or not entry.strip():
+            raise ConfigError(
+                f"{label}: trusted_review_authors[{i}] must be a non-empty string"
+            )
+        login = entry.strip()
+        if login not in logins:
+            logins.append(login)
+    return tuple(logins)
 
 
 def _build_telegram_spawn(raw: object, label: str) -> TelegramSpawn:

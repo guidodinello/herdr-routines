@@ -893,6 +893,7 @@ class EligiblePrGhClient:
                 "number": 42,
                 "headRefName": "auto/fix-42",
                 "author": {"login": "testuser", "is_bot": False},
+                "isCrossRepository": False,
                 "url": "https://github.com/test/repo/pull/42",
             }
         ]
@@ -2178,11 +2179,13 @@ def test_dispatch_failure_records_reason(
     )
     monkeypatch.setattr(
         "herdr_routines.tick.list_open_prs",
-        lambda gh, *, owner, repo, branch_prefix, author: [pr],
+        lambda gh, *, owner, repo, branch_prefix, author, trusted_authors: [pr],
     )
     monkeypatch.setattr(
         "herdr_routines.tick.is_eligible",
-        lambda gh, *, owner, repo, pr: EligiblePR(pr=pr, reason="unresolved_threads"),
+        lambda gh, *, owner, repo, pr, trusted_authors: EligiblePR(
+            pr=pr, reason="unresolved_threads"
+        ),
     )
     monkeypatch.setattr(
         "herdr_routines.tick._dispatch_fix_worker",
@@ -2957,7 +2960,12 @@ def _raising_process_job(*, open_running_for: set[str], raising: set[str]) -> An
     behind, jobs in `raising` then raise, everything else succeeds."""
 
     def fake(
-        job: Job, history_path: Path, *, client: Any, now: datetime
+        job: Job,
+        history_path: Path,
+        *,
+        client: Any,
+        now: datetime,
+        trusted_review_authors: tuple[str, ...] = (),
     ) -> tuple[str, bool]:
         if job.name in open_running_for:
             append(
