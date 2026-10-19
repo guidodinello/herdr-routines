@@ -676,6 +676,11 @@ def test_github_event_config_validation(
     with pytest.raises(ConfigError):
         _load(_event_job_yaml(match="{bogus_key: 1}"))
 
+    # A match value must be a non-empty string: a number or "" could never match.
+    for bad in ("{label: 123}", "{label: ''}", "{author: [a]}"):
+        with pytest.raises(ConfigError, match="non-empty string"):
+            _load(_event_job_yaml(match=bad))
+
     # An issue has no branch, so `match.branch` with issues:opened can never match.
     with pytest.raises(ConfigError, match="branch"):
         _load(_event_job_yaml(query="issues:opened", match="{branch: main}"))

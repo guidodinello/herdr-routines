@@ -1170,6 +1170,12 @@ def _build_job(
                             f"{label}: 'checks[{ci}].match' has unknown key(s): "
                             f"{sorted(unknown_match)}"
                         )
+                    for match_key, match_value in evt_match.items():
+                        if not isinstance(match_value, str) or not match_value:
+                            raise ConfigError(
+                                f"{label}: 'checks[{ci}].match.{match_key}' "
+                                "must be a non-empty string"
+                            )
                     # An issue has no head branch, so `branch` could never match one.
                     if evt_query == "issues:opened" and "branch" in evt_match:
                         raise ConfigError(
