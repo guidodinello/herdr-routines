@@ -84,19 +84,29 @@ def _ensure_checkout(clone_url: str | None, dest: Path, *, base: str) -> Path:
     return dest
 
 
+def _run_git(args: list[str], *, what: str) -> subprocess.CompletedProcess[str]:
+    """Run git with ``REPO_TIMEOUT_S``.  A timeout surfaces as ``RuntimeError`` — the
+    clone/sync failure every caller already guards — not ``TimeoutExpired``, which is a
+    ``SubprocessError`` and would escape their ``except (RuntimeError, OSError)``."""
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=REPO_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"git {what} timed out after {REPO_TIMEOUT_S}s") from e
+
+
 def _clone(url: str, dest: Path) -> None:
     """Clone *url* into *dest* atomically: clone to a tmp dir then rename.
     On failure the tmp dir is removed so the next tick retries a full clone."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(dir=dest.parent, suffix=".tmp"))
     try:
-        proc = subprocess.run(
-            ["git", "clone", url, str(tmp_dir / "checkout")],
-            capture_output=True,
-            text=True,
-            timeout=REPO_TIMEOUT_S,
-            check=False,
-        )
+        proc = _run_git(["git", "clone", url, str(tmp_dir / "checkout")], what="clone")
         if proc.returncode != 0:
             raise RuntimeError(
                 proc.stderr.strip() or f"git clone failed (rc={proc.returncode})"
@@ -112,34 +122,24 @@ def _fetch_and_fast_forward(checkout: Path, *, base: str = "main") -> None:
     """Fetch and fast-forward to ``origin/<base>``.  For detached HEAD (worktree
     base-target gate), fetch alone is enough."""
     # Fetch
-    proc = subprocess.run(
-        ["git", "-C", str(checkout), "fetch", "--prune", "origin"],
-        capture_output=True,
-        text=True,
-        timeout=REPO_TIMEOUT_S,
-        check=False,
+    proc = _run_git(
+        ["git", "-C", str(checkout), "fetch", "--prune", "origin"], what="fetch"
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "git fetch failed")
 
     # Check if detached — fetch alone is sufficient for detached HEAD
-    head_proc = subprocess.run(
+    head_proc = _run_git(
         ["git", "-C", str(checkout), "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True,
-        text=True,
-        timeout=REPO_TIMEOUT_S,
-        check=False,
+        what="rev-parse",
     )
     if head_proc.stdout.strip() == "HEAD":
         return
 
     # Fast-forward to origin/<base>
-    proc = subprocess.run(
+    proc = _run_git(
         ["git", "-C", str(checkout), "merge", "--ff-only", f"origin/{base}"],
-        capture_output=True,
-        text=True,
-        timeout=REPO_TIMEOUT_S,
-        check=False,
+        what="merge",
     )
     if proc.returncode != 0:
         raise RuntimeError(

@@ -175,6 +175,55 @@ class TickOutcome:
     any_job_failed: bool
 
 
+def _record_unexpected_failure(
+    job: Job, history_path: Path, *, now: datetime, error: Exception
+) -> str:
+    """Give a job whose processing raised unexpectedly a terminal `failed` record.
+
+    Closes the `running` records this tick wrote for the job (every `running` append in
+    this module uses `ts=now`, which is what scopes this to the current tick), or writes a
+    `run_id`-less `failed` when none was open so the occurrence is consumed rather than
+    re-raising every tick. A pipeline job's open records are left alone: its detached unit
+    may still be live and the pipeline watchdog owns finalising them. Best-effort: a
+    history write failing here must not abort the tick either."""
+    extra = {"reason": "unexpected_error", "error": repr(error)}
+    try:
+        records = read_job(history_path, job.name)
+        terminal_run_ids = {
+            r.run_id for r in records if r.state in TERMINAL_STATES and r.run_id
+        }
+        open_run_ids = [
+            r.run_id
+            for r in records
+            if r.state == "running"
+            and r.ts == now
+            and r.run_id
+            and r.run_id not in terminal_run_ids
+        ]
+        if job.kind == "pipeline" and open_run_ids:
+            log.warning(
+                "%s: leaving running record(s) %s open for the pipeline watchdog",
+                job.name,
+                open_run_ids,
+            )
+        else:
+            to_close: list[str | None] = [*open_run_ids] or [None]
+            for run_id in to_close:
+                append(
+                    history_path,
+                    HistoryRecord(
+                        ts=now,
+                        job=job.name,
+                        state="failed",
+                        run_id=run_id,
+                        extra=extra,
+                    ),
+                )
+    except Exception as e:  # noqa: BLE001 — see docstring
+        log.warning("%s: could not record unexpected failure: %s", job.name, e)
+    return f"{job.name}: failed (unexpected_error)"
+
+
 def run_tick(
     config: RoutinesConfig, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> TickOutcome:
@@ -194,7 +243,15 @@ def run_tick(
     for job in config.jobs:
         if not job.enabled:
             continue
-        summary, failed = _process_job(job, history_path, client=client, now=now)
+        try:
+            summary, failed = _process_job(job, history_path, client=client, now=now)
+        except Exception as e:
+            # One job's unexpected error must not skip the rest of the tick.
+            log.exception("%s: unexpected error (continuing)", job.name)
+            summary, failed = (
+                _record_unexpected_failure(job, history_path, now=now, error=e),
+                True,
+            )
         summaries.append(summary)
         any_job_failed = any_job_failed or failed
 
