@@ -1410,6 +1410,25 @@ def _cmd_pipeline_prepare(args: argparse.Namespace) -> int:
     return EXIT_FAILURE
 
 
+def _configured_trusted_review_authors(args: argparse.Namespace) -> tuple[str, ...]:
+    """`trusted_review_authors` from config, or ``()`` — only the authenticated gh user
+    — when the config cannot be read. `pipeline-run` runs in its own systemd unit and
+    must still write its report on a broken config, and the empty list is the narrowest
+    set there is: the built-in default would widen trust for an operator who configured
+    a list without it."""
+    path = args.config or default_config_path()
+    try:
+        return load_config(path).trusted_review_authors
+    except (ConfigError, OSError) as e:
+        log.warning(
+            "pipeline-run: could not read trusted_review_authors from %s (%s); "
+            "trusting only the authenticated gh user",
+            path,
+            e,
+        )
+        return ()
+
+
 def _cmd_pipeline_run(args: argparse.Namespace) -> int:
     """Mirrors `pipeline-prepare`'s exit-code contract: 0 ok, 1 partial/failed, 2 usage.
 
@@ -1424,6 +1443,7 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
         report=args.report,
         prompts_dir=args.prompts_dir,
         failure_markers=tuple(args.failure_marker or DEFAULT_FAILURE_MARKERS),
+        trusted_review_authors=_configured_trusted_review_authors(args),
     )
     if result.outcome == "ok":
         log.info(

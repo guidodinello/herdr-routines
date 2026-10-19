@@ -41,6 +41,7 @@ from herdr_routines.auto_fix import (
     build_review_prompt,
     build_worker_agent_name,
     consecutive_base_gate_failures,
+    effective_trusted_authors,
     enrich_event_detail,
     event_worktree_slug,
     fetch_failing_checks,
@@ -53,7 +54,12 @@ from herdr_routines.auto_fix import (
     review_target_hash,
     run_checks,
 )
-from herdr_routines.config import GateCheck, Job, RoutinesConfig
+from herdr_routines.config import (
+    DEFAULT_TRUSTED_REVIEW_AUTHORS,
+    GateCheck,
+    Job,
+    RoutinesConfig,
+)
 from herdr_routines.findings import (
     Finding,
     FindingDiff,
@@ -244,7 +250,13 @@ def run_tick(
         if not job.enabled:
             continue
         try:
-            summary, failed = _process_job(job, history_path, client=client, now=now)
+            summary, failed = _process_job(
+                job,
+                history_path,
+                client=client,
+                now=now,
+                trusted_review_authors=config.trusted_review_authors,
+            )
         except Exception as e:
             # One job's unexpected error must not skip the rest of the tick.
             log.exception("%s: unexpected error (continuing)", job.name)
@@ -1120,7 +1132,12 @@ def _live_audit_agent_exists(client: HerdrClient, job: Job) -> bool:
 
 
 def _process_gated_job(
-    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
 ) -> tuple[str, bool]:
     """Process a gated job: run checks, dispatch fix agent on failure.
     Handles both pr and base targets."""
@@ -1258,7 +1275,12 @@ def _process_gated_job(
 
     if job.target == "pr":
         return _process_pr_target(
-            job, history_path, client=client, now=now, run_id=run_id
+            job,
+            history_path,
+            client=client,
+            now=now,
+            run_id=run_id,
+            trusted_review_authors=trusted_review_authors,
         )
     else:
         return _process_base_target(
@@ -1820,9 +1842,19 @@ def _dispatch_event_worker(
 
 
 def _process_pr_target(
-    job: Job, history_path: Path, *, client: HerdrClient, now: datetime, run_id: str
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    run_id: str,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
 ) -> tuple[str, bool]:
-    """PR-target gate: enumerate eligible PRs, dispatch fix workers per flagged PR."""
+    """PR-target gate: enumerate eligible PRs, dispatch fix workers per flagged PR.
+
+    Only PRs and review threads from trusted authors (``trusted_review_authors`` plus
+    the authenticated gh user, `effective_trusted_authors`) are considered, so no other
+    account's text can make a PR eligible or reach a fix worker's prompt."""
     gh = RealGhClient()
 
     # Ensure repo checkout before any git remote / worktree operations
@@ -1904,13 +1936,21 @@ def _process_pr_target(
             )
         return f"{job.name}: failed (gh_auth_missing)", True
 
+    trusted = effective_trusted_authors(trusted_review_authors, viewer_login=author)
     open_prs = list_open_prs(
-        gh, owner=owner, repo=repo_name, branch_prefix="auto/", author=author
+        gh,
+        owner=owner,
+        repo=repo_name,
+        branch_prefix="auto/",
+        author=author,
+        trusted_authors=trusted,
     )
 
     eligible: list[EligiblePR] = []
     for pr_info in open_prs:
-        elig = is_eligible(gh, owner=owner, repo=repo_name, pr=pr_info)
+        elig = is_eligible(
+            gh, owner=owner, repo=repo_name, pr=pr_info, trusted_authors=trusted
+        )
         if elig is not None:
             eligible.append(elig)
 
@@ -1957,7 +1997,11 @@ def _process_pr_target(
             gh, owner=owner, repo=repo_name, number=elig_pr.pr.number
         )
         thread_bodies = fetch_thread_bodies(
-            gh, owner=owner, repo=repo_name, number=elig_pr.pr.number
+            gh,
+            owner=owner,
+            repo=repo_name,
+            number=elig_pr.pr.number,
+            trusted_authors=trusted,
         )
 
         worker_outcome = _dispatch_fix_worker(
@@ -2813,7 +2857,12 @@ def _retry_eligible(outcome: RunOutcome, job: Job) -> bool:
 
 
 def _process_job(
-    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
 ) -> tuple[str, bool]:
     # kind: pipeline dispatches a detached systemd-run unit and returns immediately —
     # tick must never block on the multi-hour orchestrator run (issue 026). Checked first
@@ -2831,7 +2880,13 @@ def _process_job(
     # Gated jobs follow the same schedule guards but run gate checks + dispatch
     # instead of execute_run when their cron fires (issue 049: kind is the SSOT).
     if job.kind == "gated":
-        return _process_gated_job(job, history_path, client=client, now=now)
+        return _process_gated_job(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+        )
 
     # Review jobs (issue 055) search across repos, dispatch one read-only review worker
     # per eligible open PR, and verify each posted review with a content marker. Same

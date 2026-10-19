@@ -114,6 +114,17 @@ commented block in [`jobs.example.yaml`](jobs.example.yaml) to set thresholds, a
 `prune` on a timer only once you have read its `--dry-run` output — see
 [`../docs/plan-v1.md`](../docs/plan-v1.md#retention).
 
+**Note on trusted review authors:** unattended agents only act on feedback from
+trusted authors. The `pr_health` auto-fix only considers PRs opened (from a branch in
+the repo itself, never a fork) and unresolved review threads started by a trusted login,
+and pipeline stage 7 is handed only the review threads and summaries those logins wrote.
+The trusted set is the top-level `trusted_review_authors:` list plus the authenticated
+`gh` user, resolved at runtime and never written into config. When the key is absent the
+list is `[copilot-pull-request-reviewer]` (Copilot's PR reviewer); a configured list
+replaces that default, and `[]` means "only the gh user". In a `jobs.d/` layout it lives
+in its own `trusted_review_authors.yaml` whose whole document is the list. See the
+commented block in [`jobs.example.yaml`](jobs.example.yaml).
+
 ## Cold-start spawn from Telegram (issue 024)
 
 The Telegram bot (issue 023) steers *existing* panes by replying to a notification. The cold-start path complements it: a `/run <alias>` or `/start <alias>`

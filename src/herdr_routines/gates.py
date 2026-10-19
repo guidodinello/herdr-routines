@@ -29,6 +29,7 @@ from pathlib import Path
 from herdr_routines.auto_fix import (
     GateOutcome,
     GhClient,
+    is_trusted_author,
     repo_owner_and_name,
     run_checks,
 )
@@ -259,7 +260,7 @@ query($owner: String!, $repo: String!, $pr: Int!) {
           isResolved
           comments(first: 100) {
             totalCount
-            nodes { body }
+            nodes { author { login } body }
           }
         }
       }
@@ -274,6 +275,9 @@ class ReviewThread:
     is_resolved: bool
     comment_count: int
     first_comment_body: str
+    # The root comment's author login; None when absent (a deleted account, or a
+    # payload that did not ask for it).
+    first_comment_author: str | None = None
 
 
 def _parse_review_threads(data: dict[str, object]) -> list[ReviewThread]:
@@ -299,25 +303,45 @@ def _parse_review_threads(data: dict[str, object]) -> list[ReviewThread]:
             else 0
         )
         first_body = ""
+        first_author: str | None = None
         if isinstance(comment_nodes, list) and comment_nodes:
             first = comment_nodes[0]
             if isinstance(first, dict):
                 first_body = str(first.get("body", ""))
+                author = first.get("author")
+                login = author.get("login") if isinstance(author, dict) else None
+                first_author = login if isinstance(login, str) and login else None
         result.append(
             ReviewThread(
                 is_resolved=bool(node.get("isResolved")),
                 comment_count=int(total_count) if isinstance(total_count, int) else 0,
                 first_comment_body=first_body,
+                first_comment_author=first_author,
             )
         )
     return result
 
 
-def evaluate_gate7(threads: Sequence[ReviewThread]) -> GateVerdict:
+def evaluate_gate7(
+    threads: Sequence[ReviewThread], *, trusted_authors: frozenset[str] | None = None
+) -> GateVerdict:
     """Reply coverage: every unresolved thread must carry at least one reply. Kept
     separate from — and in addition to — the blocking-tag check: neither the old
-    prose gate nor its stricter substitute counted replies at all (issue 035)."""
-    unresolved = [t for t in threads if not t.is_resolved]
+    prose gate nor its stricter substitute counted replies at all (issue 035).
+
+    With ``trusted_authors``, only threads opened by a trusted author count: stage 7 is
+    only given those threads to act on (`pipeline_run._review_feedback`), so a thread
+    from anyone else is not one it was asked to answer. None keeps every thread in
+    scope, which is what the standalone `gate 7` CLI checks."""
+    unresolved = [
+        t
+        for t in threads
+        if not t.is_resolved
+        and (
+            trusted_authors is None
+            or is_trusted_author(t.first_comment_author, trusted_authors)
+        )
+    ]
     unreplied = [t for t in unresolved if t.comment_count < MIN_REPLIED_COMMENT_COUNT]
     blocking = [t for t in unresolved if BLOCKING_TAG in t.first_comment_body]
 
@@ -334,13 +358,20 @@ def evaluate_gate7(threads: Sequence[ReviewThread]) -> GateVerdict:
     return GateVerdict(passed=False, reason="; ".join(reasons))
 
 
-def run_gate7(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
+def run_gate7(
+    gh: GhClient,
+    *,
+    owner: str,
+    repo: str,
+    pr: int,
+    trusted_authors: frozenset[str] | None = None,
+) -> GateVerdict:
     """Fetch review threads via GraphQL and evaluate reply coverage. `gh api
     repos/.../threads` 404s (verified against a live PR) — GraphQL is the only
     route to per-thread resolution state."""
     data = gh.graphql(GATE7_REVIEW_THREADS_QUERY, owner=owner, repo=repo, pr=str(pr))
     threads = _parse_review_threads(data)
-    return evaluate_gate7(threads)
+    return evaluate_gate7(threads, trusted_authors=trusted_authors)
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +631,7 @@ def run_stage_gate(
     pr: int | None = None,
     branch: str | None = None,
     runner: Callable[..., tuple[int, str, str]] | None = None,
+    trusted_authors: frozenset[str] | None = None,
 ) -> GateVerdict:
     """Dispatch one gate by its CLI stage token. Raises `ValueError` for an unknown token
     or a missing requirement, so the CLI can exit 2 / the pipeline can abort rather than
@@ -635,7 +667,9 @@ def run_stage_gate(
     if token == "7":
         if pr is None:
             raise ValueError("gate 7 requires a PR number")
-        return run_gate7(gh, owner=owner, repo=repo, pr=pr)
+        return run_gate7(
+            gh, owner=owner, repo=repo, pr=pr, trusted_authors=trusted_authors
+        )
     if token == "ci":
         if pr is None:
             raise ValueError("gate ci requires a PR number")

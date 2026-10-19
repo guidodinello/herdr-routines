@@ -1,5 +1,6 @@
-"""Absent values are ``None``, not ``""``: the review-search parser, the PR lister, the
-audit prompt builder and the job loader's ``prompt`` / ``fix_prompt``."""
+"""Absent values are ``None``, not ``""``: the review-search parser, the audit prompt
+builder and the job loader's ``prompt`` / ``fix_prompt``. The PR lister rejects a PR
+with no login instead of carrying an absent author."""
 
 from __future__ import annotations
 
@@ -101,23 +102,28 @@ def _listed(pr: dict[str, object]) -> list[PRInfo]:
         repo="r",
         branch_prefix="auto/",
         author="testuser",
+        trusted_authors=frozenset(),
     )
 
 
-def test_bot_pr_without_login_is_accepted_with_author_none() -> None:
-    (info,) = _listed(
-        {
-            "number": 1,
-            "headRefName": "auto/bot-fix",
-            "author": {"is_bot": True},
-            "url": "https://example.invalid/1",
-            "isCrossRepository": False,
-        }
+def test_bot_pr_without_login_is_rejected() -> None:
+    # Since #190 a PR is only accepted for a string login (operator or trusted author);
+    # a bot flag alone no longer qualifies, so PRInfo.author is never absent.
+    assert (
+        _listed(
+            {
+                "number": 1,
+                "headRefName": "auto/bot-fix",
+                "author": {"is_bot": True},
+                "url": "https://example.invalid/1",
+                "isCrossRepository": False,
+            }
+        )
+        == []
     )
-    assert info.author is None
 
 
-def test_pr_without_login_is_rejected_when_not_a_bot() -> None:
+def test_pr_without_login_is_rejected() -> None:
     assert (
         _listed(
             {
@@ -125,6 +131,7 @@ def test_pr_without_login_is_rejected_when_not_a_bot() -> None:
                 "headRefName": "auto/x",
                 "author": {},
                 "url": "https://example.invalid/1",
+                "isCrossRepository": False,
             }
         )
         == []
