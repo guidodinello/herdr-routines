@@ -58,7 +58,7 @@ class Candidate:
     created_at: str
     updated_at: str
     head_ref: str
-    author: str
+    author: str | None
     select_mode: str  # "author" | "review_requested"
     skip_reason: str | None = None
 
@@ -127,7 +127,7 @@ def scan_review_targets(
     skipped: list[Candidate] = []
     enumerated = 0
     for pr in result.prs:
-        if not pr.repo or pr.number <= 0 or pr.head_ref == "":
+        if pr.number <= 0:
             continue
         cand = _candidate(pr)
         if cand.target_key in seen:

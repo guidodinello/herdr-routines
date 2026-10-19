@@ -131,9 +131,9 @@ class ReviewPR:
     created_at: str
     updated_at: str
     head_ref: str
-    author: str
+    author: str | None  # None for a deleted ("ghost") author
     repo: str  # base repo "owner/name" (repository.nameWithOwner)
-    head_repo: str  # head repo "owner/name", or "" when unknown
+    head_repo: str | None  # head repo "owner/name", or None when unknown
     mode: (
         str  # the selected mode alias that returned it ("author" | "review_requested")
     )
@@ -840,26 +840,33 @@ def _parse_review_node(node: object, mode: str) -> ReviewPR | None:
     number = node.get("number")
     if not isinstance(number, int):
         return None
-    author_block = node.get("author")
-    login = author_block.get("login", "") if isinstance(author_block, dict) else ""
-    repo_block = node.get("repository")
-    repo = repo_block.get("nameWithOwner", "") if isinstance(repo_block, dict) else ""
-    head_block = node.get("headRepository")
-    head_repo = (
-        head_block.get("nameWithOwner", "") if isinstance(head_block, dict) else ""
-    )
+    login = _name_or_none(node.get("author"), "login")
+    repo = _name_or_none(node.get("repository"), "nameWithOwner")
+    head_ref = str(node.get("headRefName", ""))
+    # GraphQL marks both non-null; a node missing either is malformed and unreviewable.
+    if repo is None or not head_ref:
+        return None
     return ReviewPR(
         number=number,
         title=str(node.get("title", "")),
         url=str(node.get("url", "")),
         created_at=str(node.get("createdAt", "")),
         updated_at=str(node.get("updatedAt", "")),
-        head_ref=str(node.get("headRefName", "")),
-        author=str(login),
-        repo=str(repo),
-        head_repo=str(head_repo or ""),
+        head_ref=head_ref,
+        author=login,
+        repo=repo,
+        head_repo=_name_or_none(node.get("headRepository"), "nameWithOwner"),
         mode=mode,
     )
+
+
+def _name_or_none(block: object, key: str) -> str | None:
+    """``block[key]`` when it is a non-empty string, else None (null block, missing
+    key, or a non-string value all read as "unknown")."""
+    if not isinstance(block, dict):
+        return None
+    value = block.get(key)
+    return value if isinstance(value, str) and value else None
 
 
 def review_marker(job_name: str, target_key: str) -> str:
@@ -1199,12 +1206,12 @@ def build_audit_prompt(
     base: str,
     report_path: str,
     findings_path: str,
-    instructions: str = "",
+    instructions: str | None = None,
 ) -> str:
     """The prompt for an audit agent (`audit.skill`). With `instructions` (the job's
     `prompt`), the audit is described inline instead of loaded as a skill, for a repo
     that has no such skill. Either way the output contract below stays the engine's."""
-    if instructions.strip():
+    if instructions is not None and instructions.strip():
         what = (
             f"Run the `{skill}` audit described below against this repository.\n\n"
             f"{instructions.strip()}\n\n---\n\n"

@@ -838,7 +838,7 @@ def _run_audit(
         # Inline instructions are kept for the fix worker, which re-scans from them. Only
         # the instructions: the engine's wrapper tells the audit agent not to commit,
         # which a fix worker must not read as addressed to it.
-        if job.prompt.strip():
+        if job.prompt is not None and job.prompt.strip():
             try:
                 paths.audit_instructions.write_text(
                     substitute_prompt(
@@ -898,7 +898,7 @@ def _dispatch_audit_fix(
     try:
         if job.audit.command is not None:
             recheck = f"`{job.audit.command}` (it writes the findings manifest)"
-        elif job.prompt.strip():
+        elif job.prompt is not None and job.prompt.strip():
             recheck = (
                 f"follow the `{job.audit.skill}` audit instructions in "
                 f"{paths.audit_instructions} to re-scan. Do not overwrite the "
