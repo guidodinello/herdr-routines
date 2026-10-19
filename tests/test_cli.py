@@ -943,3 +943,32 @@ def test_pipeline_run_trusts_only_the_gh_user_when_config_is_unreadable(
     it falls back to the narrowest set (no configured logins, so only the gh user)."""
     args = argparse.Namespace(config=tmp_path / "missing.d")
     assert cli._configured_trusted_review_authors(args) == ()
+
+
+# -- tick lock: `tick` defers, manual `run` refuses, while another holder has it ---------
+
+
+def _prepare_run_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Config with one plain job `a` and the lock path under tmp_path; returns the lock path."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = _write_worktree_job_config(tmp_path, repo)
+    lock_path = tmp_path / "tick.lock"
+    monkeypatch.setattr(cli, "default_config_path", lambda: config_path)
+    monkeypatch.setattr(cli, "default_lock_path", lambda: lock_path)
+    return lock_path
+
+
+def test_cmd_tick_returns_zero_without_running_when_the_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = _prepare_run_cli(tmp_path, monkeypatch)
+
+    def fail_run_tick(*a, **kw):
+        raise AssertionError("run_tick must not run while another tick holds the lock")
+
+    monkeypatch.setattr(cli, "run_tick", fail_run_tick)
+    with cli.tick_lock(lock_path) as holder_acquired:
+        assert holder_acquired
+        assert cli.main(["tick"]) == 0
+
