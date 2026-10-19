@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -216,7 +216,7 @@ def _cycle(job: Job, client: _FakeHerdr, history: Path) -> tuple[str, bool]:
     )
 
 
-def _last(history: Path) -> tuple[HistoryRecord, dict[str, Any]]:
+def _last(history: Path) -> tuple[HistoryRecord, Mapping[str, Any]]:
     rec = read_job(history, "audit-type-health")[-1]
     return rec, rec.extra or {}
 

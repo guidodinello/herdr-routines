@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,77 @@ def test_append_and_read_round_trip(tmp_history_path: Path) -> None:
     assert got.run_id == "a-1"
     assert got.extra == {"pane_id": "w1:p1"}
     assert got.ts == T0
+
+
+def test_round_trip_is_byte_identical_and_keeps_key_order(
+    tmp_history_path: Path,
+) -> None:
+    """`extra` keys land in the JSONL in insertion order after the core fields, and a
+    record read back re-serializes to the exact line that was written."""
+    extra = {
+        "reason": "agent_start_failed",
+        "attempt": 2,
+        "late_seconds": 1.5,
+        "pane_id": None,
+        "report_written": False,
+        "last_seen_event_ids": ["a", "b"],
+    }
+    rec = HistoryRecord(ts=T0, job="a", state="failed", run_id="a-1", extra=extra)
+    append(tmp_history_path, rec)
+
+    [line] = tmp_history_path.read_text().splitlines()
+    assert line == rec.to_json_line()
+    assert list(json.loads(line)) == ["ts", "job", "state", "run_id", *extra]
+
+    [got] = read_all(tmp_history_path)
+    assert got.to_json_line() == line
+
+
+def test_read_back_keeps_unknown_extra_keys(tmp_history_path: Path) -> None:
+    """History files outlive the code that wrote them: keys no current writer emits
+    must survive read-back untouched."""
+    line = (
+        '{"ts": "2026-08-22T06:00:00Z", "job": "a", "state": "done", "run_id": "a-1",'
+        ' "run": "legacy-7", "gate": "passed"}'
+    )
+    tmp_history_path.write_text(line + "\n")
+
+    [got] = read_all(tmp_history_path)
+    assert got.extra == {"run": "legacy-7", "gate": "passed"}
+
+
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        pytest.param({"ts": 12345}, id="ts-not-str"),
+        pytest.param({"ts": None}, id="ts-null"),
+        pytest.param({"job": 7}, id="job-not-str"),
+        pytest.param({"run_id": 7}, id="run_id-not-str"),
+    ],
+)
+def test_mistyped_core_field_skips_only_that_line(
+    tmp_history_path: Path, bad_fields: dict[str, object]
+) -> None:
+    """A record whose core field has the wrong type is a bad line like any other: skipped
+    with a warning, neighbours still read. A non-str `ts` used to raise an uncaught
+    TypeError that aborted the whole read."""
+    good = {"ts": "2026-08-22T06:00:00Z", "job": "a", "state": "done", "run_id": "a-1"}
+    lines = [
+        json.dumps({**good, "run_id": "before"}),
+        json.dumps({**good, **bad_fields}),
+        json.dumps({**good, "run_id": "after"}),
+    ]
+    tmp_history_path.write_text("\n".join(lines) + "\n")
+
+    assert [r.run_id for r in read_all(tmp_history_path)] == ["before", "after"]
+
+
+def test_null_run_id_is_still_accepted(tmp_history_path: Path) -> None:
+    line = '{"ts": "2026-08-22T06:00:00Z", "job": "a", "state": "done", "run_id": null}'
+    tmp_history_path.write_text(line + "\n")
+
+    [got] = read_all(tmp_history_path)
+    assert got.run_id is None
 
 
 def test_read_all_on_missing_file_returns_empty(tmp_path: Path) -> None:

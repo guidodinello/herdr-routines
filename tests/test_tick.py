@@ -33,6 +33,9 @@ from herdr_routines.tick import (
     _is_job_agent,
     _live_agent_exists,
     _reap_agents_of_rebooted_run,
+    _WorkerFailed,
+    _WorkerResult,
+    _WorkerSettled,
     run_tick,
 )
 
@@ -1453,7 +1456,9 @@ def test_tick_dispatches_pipeline_launch_before_record(
     running = [r for r in records if r.state == "running"]
     assert len(running) == 1
     assert running[0].extra is not None
-    assert running[0].extra["unit"].startswith("herdr-pipeline-")
+    unit = running[0].extra["unit"]
+    assert isinstance(unit, str)
+    assert unit.startswith("herdr-pipeline-")
 
 
 def test_pipeline_deadline_is_computed_by_tick_and_recorded(
@@ -2146,8 +2151,8 @@ def test_dispatch_reuses_existing_worktree(
         thread_bodies="",
     )
 
-    assert outcome["state"] == "done"
-    assert outcome.get("reason") is None
+    assert isinstance(outcome, _WorkerSettled)
+    assert outcome.state == "done"
     # It must have run the agent in the orchestrator's existing worktree, not tried
     # (and failed) to create a second one at .worktrees/autofix-pr81.
     assert client.tab_create_cwd == str(other_wt)
@@ -2189,11 +2194,9 @@ def test_dispatch_failure_records_reason(
     )
     monkeypatch.setattr(
         "herdr_routines.tick._dispatch_fix_worker",
-        lambda **kwargs: {
-            "state": "failed",
-            "reason": "worktree_creation_failed",
-            "error": "boom: something specific",
-        },
+        lambda **kwargs: _WorkerFailed(
+            reason="worktree_creation_failed", error="boom: something specific"
+        ),
     )
 
     t0 = datetime.now(UTC).replace(microsecond=0)
@@ -2207,6 +2210,131 @@ def test_dispatch_failure_records_reason(
     assert dispatched.extra is not None
     assert dispatched.extra["reason"] == "worktree_creation_failed"
     assert dispatched.extra["error"] == "boom: something specific"
+
+
+_PR_RECORD_KEYS = [
+    "pr_number",
+    "headRefName",
+    "attempt",
+    "eligible_reason",
+    "fix_worker_agent",
+    "pane_id",
+    "report_path",
+    "report_written",
+    "final_agent_status",
+    "target",
+]
+
+
+@pytest.mark.parametrize(
+    ("worker_result", "state", "extra_values", "trailing_keys"),
+    [
+        pytest.param(
+            _WorkerFailed(reason="agent_start_failed", error="boom", pane_id="p1"),
+            "failed",
+            {
+                "pane_id": "p1",
+                "report_path": None,
+                "report_written": False,
+                "final_agent_status": None,
+                "reason": "agent_start_failed",
+                "error": "boom",
+            },
+            ["reason", "error"],
+            id="failure-with-pane",
+        ),
+        pytest.param(
+            _WorkerFailed(reason="clone_failed", error="nope"),
+            "failed",
+            {
+                "pane_id": None,
+                "report_path": None,
+                "report_written": False,
+                "final_agent_status": None,
+                "reason": "clone_failed",
+                "error": "nope",
+            },
+            ["reason", "error"],
+            id="failure-without-pane",
+        ),
+        pytest.param(
+            _WorkerSettled(
+                state="done",
+                pane_id="p2",
+                report_path="/reports/r.md",
+                report_bytes=12,
+                final_agent_status="idle",
+                session_id="sess-9",
+            ),
+            "done",
+            {
+                "pane_id": "p2",
+                "report_path": "/reports/r.md",
+                "report_written": True,
+                "final_agent_status": "idle",
+            },
+            [],
+            id="settled",
+        ),
+    ],
+)
+def test_dispatch_worker_result_history_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_result: _WorkerResult,
+    state: str,
+    extra_values: dict[str, Any],
+    trailing_keys: list[str],
+) -> None:
+    """The per-PR history record built from a fix-worker result: exact `extra` key order
+    (it is the JSONL column order), the values copied from the worker, and the optional
+    `reason`/`error` keys present only when the worker reported them."""
+    from herdr_routines.auto_fix import EligiblePR, PRInfo
+
+    history_path = tmp_path / "state" / "history.jsonl"
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+    job = make_auto_fix_job(tmp_path)
+    config = RoutinesConfig(jobs=(job,))
+    client = FakeFullClient()
+
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", MockGhClient)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+
+    pr = PRInfo(
+        number=81, head_ref="auto/pipeline-20260904T050000Z", author="bot", url=""
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick.list_open_prs",
+        lambda gh, *, owner, repo, branch_prefix, author, trusted_authors: [pr],
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick.is_eligible",
+        lambda gh, *, owner, repo, pr, trusted_authors: EligiblePR(
+            pr=pr, reason="unresolved_threads"
+        ),
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick._dispatch_fix_worker", lambda **kwargs: worker_result
+    )
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    run_tick(config, history_path, client=client, now=t0 + timedelta(minutes=1))  # type: ignore[arg-type]
+
+    [record] = [
+        r
+        for r in read_job(history_path, job.name)
+        if r.extra and r.extra.get("pr_number") == 81
+    ]
+    assert record.state == state
+    assert record.extra is not None
+    assert list(record.extra) == _PR_RECORD_KEYS + trailing_keys
+    assert record.extra["headRefName"] == "auto/pipeline-20260904T050000Z"
+    assert record.extra["eligible_reason"] == "unresolved_threads"
+    assert record.extra["target"] == "pr"
+    for key, value in extra_values.items():
+        assert record.extra[key] == value, key
 
 
 def test_live_agent_guard_matches_dispatch_name(tmp_path: Path) -> None:
@@ -2665,7 +2793,8 @@ def test_pipeline_workers_capture_tail_before_close(
         thread_bodies="",
     )
 
-    assert outcome["state"] == "done"
+    assert isinstance(outcome, _WorkerSettled)
+    assert outcome.state == "done"
     assert client.read_visible_before_close is True
     # Visible source used, not recent-unwrapped.
     assert "agent_read_visible" in client.calls
