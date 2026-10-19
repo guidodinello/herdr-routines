@@ -30,7 +30,11 @@ from typing import Any, Protocol
 
 from logger import get_logger
 
-from herdr_routines.config import AGENT_MODEL_FLAGS, VALID_AGENT_KINDS
+from herdr_routines.config import (
+    AGENT_MODEL_FLAGS,
+    VALID_AGENT_KINDS,
+    is_private_chat_id,
+)
 from herdr_routines.herdr import HerdrCliError, WorktreeInfo
 from herdr_routines.runner import _is_agent_name_taken
 
@@ -146,12 +150,15 @@ def is_authorized(chat_id: int | str, allowed_chat_id: int | str | None) -> bool
     """Whether ``chat_id`` matches the single configured allowlist value.
 
     Fails closed: ``None`` or an empty/whitespace ``allowed_chat_id`` authorizes nobody,
-    so an unset allowlist can never degrade to allow-all. Comparison is on the string form
+    so an unset allowlist can never degrade to allow-all. A non-private (group,
+    supergroup or channel) id is refused even when it equals the allowlist value: config
+    load already rejects one, and this keeps a group chat — where every member would be
+    authorized — out even if a caller bypasses that check. Comparison is on the string form
     because Telegram chat ids arrive as either an int or a string depending on transport."""
     if allowed_chat_id is None:
         return False
     allowed = str(allowed_chat_id).strip()
-    if not allowed:
+    if not allowed or not is_private_chat_id(allowed):
         return False
     return str(chat_id).strip() == allowed
 
