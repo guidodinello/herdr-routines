@@ -900,8 +900,6 @@ def attempt_count_for_target(history_path: Path, job_name: str, target_key: str)
 # Unified gate model (docs/pipeline/runs/20260830T050021Z/spec.md)
 # ---------------------------------------------------------------------------
 
-# _COUNTABLE_STATES is reused for gate budget (SSOT, no separate _COUNTABLE_STATES_GATE)
-
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
@@ -1215,20 +1213,20 @@ def build_audit_fix_prompt(
     )
 
 
-def attempt_count_for_gate_branch(
-    history_path: Path, job_name: str, gate_branch: str
-) -> int:
-    """Count prior terminal records for this job+gate_branch (base-target retry budget).
-    Keyed on job_name only (stable across runs) so the budget persists per job."""
-    records = read_job(history_path, job_name)
+def consecutive_base_gate_failures(history_path: Path, job_name: str) -> int:
+    """Base-target retry budget: failed gate attempts since the last passing run.
+    Keyed on job_name only (stable across runs); a passing gate resets the count.
+    Reads `gate`, not `state`: a fix agent that settles `done` still left the gate failed."""
     count = 0
-    for r in records:
-        if (
-            r.state in _COUNTABLE_STATES
-            and r.extra
-            and r.extra.get("target") == "base"
-            and r.extra.get("gate_branch") is not None
-        ):
+    for r in read_job(history_path, job_name):
+        if not r.extra or r.extra.get("target") != "base":
+            continue
+        gate = r.extra.get("gate")
+        if gate == "passed":
+            count = 0
+        # Records without a gate_branch (e.g. ensure_repo failures) are infra flakes,
+        # not gate attempts, so they do not spend budget.
+        elif gate == "failed" and r.extra.get("gate_branch") is not None:
             count += 1
     return count
 

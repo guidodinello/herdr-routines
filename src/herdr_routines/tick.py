@@ -26,7 +26,6 @@ from herdr_routines.auto_fix import (
     PRInfo,
     RealGhClient,
     attempt_count_for_event,
-    attempt_count_for_gate_branch,
     attempt_count_for_pr,
     attempt_count_for_target,
     build_audit_agent_name,
@@ -41,6 +40,7 @@ from herdr_routines.auto_fix import (
     build_review_agent_prefix,
     build_review_prompt,
     build_worker_agent_name,
+    consecutive_base_gate_failures,
     enrich_event_detail,
     event_worktree_slug,
     fetch_failing_checks,
@@ -2041,7 +2041,7 @@ def _process_base_target(
     assert job.checks is not None
     gate_branch = build_branch_name(job.name, run_id)
 
-    attempt = attempt_count_for_gate_branch(history_path, job.name, gate_branch)
+    attempt = consecutive_base_gate_failures(history_path, job.name)
     if attempt >= job.max_attempts_per_target:
         append(
             history_path,
