@@ -20,6 +20,7 @@ from herdr_routines import cli
 from herdr_routines.cli import _check_systemd_timeout, _cmd_validate, default_log_path
 from herdr_routines.config import GateCheck, Job, RoutinesConfig
 from herdr_routines.history import rolled_path
+from herdr_routines.runner import RunOutcome
 from herdr_routines.tick import TickOutcome
 
 
@@ -943,3 +944,76 @@ def test_pipeline_run_trusts_only_the_gh_user_when_config_is_unreadable(
     it falls back to the narrowest set (no configured logins, so only the gh user)."""
     args = argparse.Namespace(config=tmp_path / "missing.d")
     assert cli._configured_trusted_review_authors(args) == ()
+
+
+# -- tick lock: `tick` defers, manual `run` refuses, while another holder has it ---------
+
+
+def _prepare_run_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Config with one plain job `a` and the lock path under tmp_path; returns the lock path."""
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    config_path = _write_worktree_job_config(tmp_path, repo)
+    lock_path = tmp_path / "tick.lock"
+    monkeypatch.setattr(cli, "default_config_path", lambda: config_path)
+    monkeypatch.setattr(cli, "default_lock_path", lambda: lock_path)
+    return lock_path
+
+
+def test_cmd_tick_returns_zero_without_running_when_the_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = _prepare_run_cli(tmp_path, monkeypatch)
+
+    def fail_run_tick(*a, **kw):
+        raise AssertionError("run_tick must not run while another tick holds the lock")
+
+    monkeypatch.setattr(cli, "run_tick", fail_run_tick)
+    with cli.tick_lock(lock_path) as holder_acquired:
+        assert holder_acquired
+        assert cli.main(["tick"]) == 0
+
+
+def test_cmd_run_refuses_while_a_tick_holds_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual run of a plain job shares the `rt-<job>` agent name and the repo checkout
+    with the scheduled tick, so it must not overlap one."""
+    lock_path = _prepare_run_cli(tmp_path, monkeypatch)
+
+    def fail_execute_run(*a, **kw):
+        raise AssertionError("execute_run must not run while a tick holds the lock")
+
+    monkeypatch.setattr(cli, "execute_run", fail_execute_run)
+    with cli.tick_lock(lock_path) as holder_acquired:
+        assert holder_acquired
+        assert cli.main(["run", "a"]) == 1
+
+
+def test_cmd_run_holds_the_tick_lock_while_the_job_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = _prepare_run_cli(tmp_path, monkeypatch)
+    lock_free_during_run: list[bool] = []
+
+    def fake_execute_run(job, client, *, run_id):
+        with cli.tick_lock(lock_path) as acquired:
+            lock_free_during_run.append(acquired)
+        return RunOutcome(state="done", run_id=run_id)
+
+    monkeypatch.setattr(cli, "execute_run", fake_execute_run)
+    monkeypatch.setattr(cli, "HerdrClient", lambda: object())
+
+    assert cli.main(["run", "a"]) == 0
+    assert lock_free_during_run == [False]
+    with cli.tick_lock(lock_path) as acquired:
+        assert acquired, "the lock must be released once the run finishes"
+
+
+def test_cmd_run_dry_run_ignores_the_tick_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lock_path = _prepare_run_cli(tmp_path, monkeypatch)
+    with cli.tick_lock(lock_path) as holder_acquired:
+        assert holder_acquired
+        assert cli.main(["run", "a", "--dry-run"]) == 0
