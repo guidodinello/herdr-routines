@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -71,6 +72,12 @@ DEADLINE_GRACE_SECONDS = 30 * 60
 # (orchestrator-prompt.md Worker spawn template step 2); a gap several times that is
 # only plausible once nothing is polling any more.
 HEARTBEAT_STALE_SECONDS = 20 * 60
+
+# Must match the transient unit names tick and `herdr-routines run` launch with
+# (`herdr-pipeline-<run_id>`, plus an `-r<HHMMSS>` suffix on a resume). A drifted prefix
+# matches no unit, which reads as "not active".
+PIPELINE_UNIT_GLOB = "herdr-pipeline-{run_id}*"
+SYSTEMCTL_TIMEOUT_SECONDS = 10
 
 WORKTREE_GLOB = "auto-pipeline-*"
 STATE_JSON_NAME = "state.json"
@@ -418,6 +425,46 @@ def is_stalled(
     )
 
 
+def pipeline_unit_active(run_id: str) -> bool | None:
+    """Whether a systemd user unit for `run_id` is still running — the orchestrator's
+    own liveness, which heartbeat staleness only guesses at. The glob covers the original
+    unit and a resume's `-r<HHMMSS>` unit (a resumed run keeps tick's old recorded
+    deadline, so it can look long overdue while perfectly alive). `list-units` rather
+    than `is-active` because it exits 0 with no output when nothing matches, keeping "no
+    unit" apart from "systemctl failed". None means can't tell (no systemctl, no user
+    bus, timeout); callers must not reap on it."""
+    argv = [
+        "systemctl",
+        "--user",
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--state=active,activating,deactivating,reloading",
+        PIPELINE_UNIT_GLOB.format(run_id=run_id),
+    ]
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("%s: could not query systemd: %s", run_id, e)
+        return None
+    if result.returncode != 0:
+        log.warning(
+            "%s: systemctl exited %d: %s",
+            run_id,
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return None
+    return bool(result.stdout.strip())
+
+
 def _stage_from_agent_name(name: str, run_id: str) -> int | None:
     """Best-effort `N` out of a `pl-<N>-<run_id>` agent name; None if it doesn't parse
     (never fatal — the report still gets written either way)."""
@@ -539,6 +586,20 @@ def run_watchdog(
         if not is_stalled(
             run, now=now, heartbeat_dir=heartbeat_dir, boot_epoch=boot_epoch
         ):
+            continue
+        # Stale heartbeat is only a guess at death. A live unit (e.g. a resumed run, or an
+        # orchestrator blocked in a long call) is left alone, quietly: the watchdog fires
+        # every 15 min, so a notification would just repeat, and the unit is bounded by
+        # its own RuntimeMaxSec. "Can't tell" is treated the same — never reap on doubt.
+        unit_active = pipeline_unit_active(run.run_id)
+        if unit_active is not False:
+            log.warning(
+                "%s: looks stalled but %s; not reaping",
+                run.run_id,
+                "its systemd unit is still active"
+                if unit_active
+                else "systemd liveness is unknown",
+            )
             continue
         host_rebooted = _host_rebooted_after_last_state_write(
             run, boot_epoch=boot_epoch
