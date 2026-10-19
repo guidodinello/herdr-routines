@@ -160,6 +160,19 @@ considered met). One-liner index; full detail in the issue file.
   evidence). →
   [`033`](docs/process/issues/033-capture-tail-on-blocked.md)
 
+- **Split dispatch flows out of `tick.py`; table-drive `config._build_job`** —
+  the two least maintainable spots the 2026-10-19 code-health audit found. →
+  [`060`](docs/process/issues/060-split-tick-and-table-drive-build-job.md)
+- **Tick's pipeline in-flight guard should check systemd unit liveness** — the
+  watchdog learned it in PR #187; tick still trusts heartbeat staleness alone. →
+  [`061`](docs/process/issues/061-tick-in-flight-guard-unit-liveness.md)
+- **Tests for `tick.py`'s review and audit dispatch flows** — the largest
+  untested blocks in the audit's coverage run. →
+  [`062`](docs/process/issues/062-tick-dispatch-flow-tests.md)
+- **Verify `systemctl --user` works inside the watchdog unit on the Pi** —
+  operator check; if it fails, the watchdog never reaps. →
+  [`063`](docs/process/issues/063-verify-watchdog-systemctl-on-pi.md)
+
 ## Later
 
 Curated into issue files 2026-08-27. Time-gated items were promoted; items
