@@ -940,6 +940,14 @@ class GateCheck:
     match: dict[str, Any] | None = None
 
 
+def _timeout_text(value: bytes | str | None) -> str:
+    """`TimeoutExpired.stdout/.stderr` are raw bytes on POSIX even under `text=True`
+    (they come from `communicate()` before decoding); keep them rather than dropping."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else value.decode(errors="replace")
+
+
 def run_checks(
     checks: tuple[GateCheck, ...],
     *,
@@ -970,9 +978,11 @@ def run_checks(
                 )
                 return proc.returncode, proc.stdout, proc.stderr
             except _subprocess.TimeoutExpired as e:
-                stdout = e.stdout if isinstance(e.stdout, str) else ""
-                stderr = e.stderr if isinstance(e.stderr, str) else ""
-                return TIMEOUT_EXIT_CODE, stdout, stderr
+                return (
+                    TIMEOUT_EXIT_CODE,
+                    _timeout_text(e.stdout),
+                    _timeout_text(e.stderr),
+                )
             except OSError as e:
                 return 127, "", str(e)
 

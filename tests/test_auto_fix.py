@@ -1312,3 +1312,22 @@ def test_auto_fix_gate_review_tiers_present() -> None:
         for line in test_lines:
             assert "blocking" in line or "non-blocking" in line
             assert "confidence:" in line
+
+
+def test_run_checks_keeps_partial_output_on_timeout(tmp_path: Path) -> None:
+    """The default runner must keep what a timed-out command already printed: on POSIX
+    `TimeoutExpired.stdout/.stderr` are raw bytes, which an `isinstance(str)` guard dropped."""
+    from herdr_routines.auto_fix import GateCheck, run_checks
+
+    checks = (
+        GateCheck(
+            kind="command",
+            command="sh -c 'echo partial; echo oops >&2; sleep 5'",
+            timeout_ms=500,
+        ),
+    )
+    outcome = run_checks(checks, cwd=str(tmp_path))
+    result = outcome.results[0]
+    assert result.timed_out is True
+    assert "partial" in result.output
+    assert "oops" in result.output
