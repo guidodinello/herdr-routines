@@ -57,10 +57,13 @@ class FakeWatchdogClient:
     panes_by_run: dict[str, dict[str, str]] = field(default_factory=dict)
     blocked_panes_by_run: dict[str, dict[str, str]] = field(default_factory=dict)
     raise_on_list: bool = False
+    raise_os_error_for: set[str] = field(default_factory=set)
     closed_panes: list[str] = field(default_factory=list)
     notifications: list[tuple[str, str | None, str]] = field(default_factory=list)
 
     def live_pipeline_agent_panes(self, run_id: str) -> dict[str, str]:
+        if run_id in self.raise_os_error_for:
+            raise OSError("herdr socket vanished")
         if self.raise_on_list:
             raise HerdrCliError("server unreachable", exit_code=1)
         return self.panes_by_run.get(run_id, {})
@@ -849,3 +852,43 @@ def test_write_report_failure_leaves_no_partial_file(
         )
 
     assert list(reports_dir.iterdir()) == []
+
+
+# -- per-run error isolation -------------------------------------------------------------
+
+
+def test_run_watchdog_continues_after_one_run_raises(tmp_path: Path) -> None:
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "tmp"
+    heartbeat_dir.mkdir()
+    bad_run, good_run = "20260901T050016Z", "20260902T050016Z"
+    for run_id in (bad_run, good_run):
+        write_state_json(
+            worktrees_root,
+            run_id=run_id,
+            deadline_epoch=int(NOW.timestamp()) - DEADLINE_GRACE_SECONDS - 3600,
+        )
+        write_heartbeat(
+            heartbeat_dir,
+            run_id,
+            mtime=NOW.timestamp() - HEARTBEAT_STALE_SECONDS - 60,
+            text="stage 5 poll\n",
+        )
+    client = FakeWatchdogClient(
+        raise_os_error_for={bad_run},
+        panes_by_run={good_run: {f"pl-6-{good_run}".lower(): "w1:p1"}},
+    )
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        now=NOW,
+    )
+
+    assert [a.run_id for a in actions] == [good_run]
+    assert client.closed_panes == ["w1:p1"]
+    assert (reports_dir / f"pipeline-{good_run}.md").exists()
+    assert not (reports_dir / f"pipeline-{bad_run}.md").exists()
