@@ -600,6 +600,7 @@ def test_pipeline_structural_derivation(
     fake_prs = [
         {
             "headRefName": f"auto/pipeline-{run_id}",
+            "isCrossRepository": False,
             "number": 1,
             "title": "feat",
             "body": "",
@@ -765,3 +766,87 @@ def test_run_pick_feature_contract_unchanged(
     assert captured.out == ""
     assert captured.err.startswith("error: ")
     assert done.exists()
+
+
+# --- Issue 177: only this account's same-repo PRs hold a claim or block a pick -------
+
+
+def _fake_gh_pr_list(
+    monkeypatch: pytest.MonkeyPatch,
+    prs: list[dict[str, object]],
+    calls: list[list[str]],
+    *,
+    returncode: int = 0,
+) -> None:
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=returncode,
+            stdout=json.dumps(prs) if returncode == 0 else "",
+            stderr="" if returncode == 0 else "boom",
+        )
+
+    monkeypatch.setattr(pick_feature_module.subprocess, "run", fake_run)
+
+
+def test_open_pr_issue_ids_scans_only_own_same_repo_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The listing is scoped to ``--author @me`` (so another author's PR mentioning an
+    issue never reaches the parser), and a fork PR, or one whose payload does not say
+    it is same-repo, is ignored."""
+    prs: list[dict[str, object]] = [
+        {"isCrossRepository": False, "number": 1, "title": "x (issue 12)", "body": ""},
+        {"isCrossRepository": True, "number": 2, "title": "issue 13", "body": ""},
+        {"number": 3, "title": "issue 14", "body": ""},
+    ]
+    calls: list[list[str]] = []
+    _fake_gh_pr_list(monkeypatch, prs, calls)
+
+    assert pick_feature_module.open_pr_issue_ids(tmp_path) == frozenset({12})
+    (argv,) = calls
+    assert argv[argv.index("--author") + 1] == "@me"
+    assert "isCrossRepository" in argv[argv.index("--json") + 1]
+
+
+def test_open_pr_issue_ids_gh_failure_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gh failure still reads as "unknown, keep the claim" (None), never empty."""
+    _fake_gh_pr_list(monkeypatch, [], [], returncode=1)
+    assert pick_feature_module.open_pr_issue_ids(tmp_path) is None
+
+
+def test_fork_pr_mentioning_issue_does_not_block_pick(
+    issues_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fork PR on a pipeline-shaped head that names issue 028 no longer keeps 028
+    from being picked; the pipeline listing is scoped to ``--author @me``."""
+    _write_issue(issues_dir, "028-foo.md", id="028", title="Foo", status="open")
+    prs: list[dict[str, object]] = [
+        {
+            "headRefName": "auto/pipeline-20260906T050000Z",
+            "isCrossRepository": True,
+            "number": 7,
+            "title": "Closes issue 028",
+            "body": "issue 028",
+        }
+    ]
+    calls: list[list[str]] = []
+    _fake_gh_pr_list(monkeypatch, prs, calls)
+
+    out = io.StringIO()
+    code = run_pick_feature(
+        issues_dir,
+        out=out,
+        claims_path=tmp_path / "claims.json",
+        repo=tmp_path,
+        worktrees_root=tmp_path / "worktrees",
+        reports_dir=tmp_path / "reports",
+    )
+    assert code == 0
+    assert "Foo" in out.getvalue()
+    pr_lists = [c for c in calls if c[:3] == ["gh", "pr", "list"]]
+    assert pr_lists
+    assert all(c[c.index("--author") + 1] == "@me" for c in pr_lists)

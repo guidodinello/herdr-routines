@@ -155,23 +155,31 @@ def test_refinement_open_pr_slugs_filters_to_refinement_heads(
         # interaction — the head filter is what keeps it out).
         {
             "headRefName": "auto/pipeline-20260907T050000Z",
+            "isCrossRepository": False,
             "title": "feat: unify routines + pipeline",
             "body": f"{PR_MARKER_PREFIX} unify-routines-pipeline",
         },
         # A refinement PR with the marker → slug taken from the marker.
         {
             "headRefName": "auto/issue-refinement-20260908T220000Z",
+            "isCrossRepository": False,
             "title": "docs: refine issue 050 — audit skills",
             "body": f"body\n{PR_MARKER_PREFIX} audit-skills-as-gate-jobs\n",
         },
         # A refinement PR with no marker → slug falls back to the title.
         {
             "headRefName": "auto/issue-refinement-20260909T220000Z",
+            "isCrossRepository": False,
             "title": "review me prs across repos",
             "body": "no marker here",
         },
         # A human PR is ignored outright.
-        {"headRefName": "docs/hand-written", "title": "x", "body": "x"},
+        {
+            "headRefName": "docs/hand-written",
+            "isCrossRepository": False,
+            "title": "x",
+            "body": "x",
+        },
     ]
     monkeypatch.setattr(
         "herdr_routines.issue_refinement.subprocess.run",
@@ -188,6 +196,44 @@ def test_refinement_open_pr_slugs_filters_to_refinement_heads(
         lambda *a, **k: _FakeProc("", returncode=1, stderr="boom"),
     )
     assert refinement_open_pr_slugs(Path("/repo")) is None
+
+
+def test_refinement_open_pr_slugs_scans_only_own_same_repo_prs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only this account's PRs are listed (``--author @me``), and a fork PR — or one
+    whose payload does not say it is same-repo — never covers a bullet, even when it
+    carries a refinement-shaped head and the marker."""
+    prs = [
+        {
+            "headRefName": "auto/issue-refinement-20260910T220000Z",
+            "isCrossRepository": True,
+            "title": "docs: refine",
+            "body": f"{PR_MARKER_PREFIX} fork-slug",
+        },
+        {
+            "headRefName": "auto/issue-refinement-20260911T220000Z",
+            "title": "docs: refine",
+            "body": f"{PR_MARKER_PREFIX} unlabelled-slug",
+        },
+        {
+            "headRefName": "auto/issue-refinement-20260912T220000Z",
+            "isCrossRepository": False,
+            "title": "docs: refine",
+            "body": f"{PR_MARKER_PREFIX} own-slug",
+        },
+    ]
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_kwargs: object) -> _FakeProc:
+        calls.append(argv)
+        return _FakeProc(json.dumps(prs))
+
+    monkeypatch.setattr("herdr_routines.issue_refinement.subprocess.run", fake_run)
+    assert refinement_open_pr_slugs(Path("/repo")) == frozenset({"own-slug"})
+    (argv,) = calls
+    assert argv[argv.index("--author") + 1] == "@me"
+    assert "isCrossRepository" in argv[argv.index("--json") + 1]
 
 
 def test_issue_refinement_no_pipeline_overlap(

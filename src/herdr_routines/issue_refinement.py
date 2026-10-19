@@ -174,12 +174,26 @@ def refinement_open_pr_slugs(repo: Path) -> frozenset[str] | None:
     not pick", never "none found, pick anyway". Getting this backwards re-opens
     the same PR every night until a human closes it.
 
+    Only PRs opened by the authenticated gh account (``--author @me``, which the
+    job's own PRs are) from a branch in this repository are scanned: anyone can open
+    a PR carrying the marker, and that must not keep a bullet from being refined.
+
     Primary correlation is the ``Refines-Parking-Lot: <slug>`` body marker the
     job writes; PR-title tokens are a fallback when the marker is absent.
     """
     try:
         proc = subprocess.run(
-            ["gh", "pr", "list", "--state", "open", "--json", "headRefName,title,body"],
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--author",
+                "@me",
+                "--json",
+                "headRefName,title,body,isCrossRepository",
+            ],
             cwd=repo,
             capture_output=True,
             text=True,
@@ -203,7 +217,10 @@ def refinement_open_pr_slugs(repo: Path) -> frozenset[str] | None:
 
     slugs: set[str] = set()
     for item in data:
-        if not isinstance(item, dict):
+        # Same rule as `auto_fix.is_same_repo_pr` (mirrored, not imported, to keep
+        # this module off auto_fix's dependency graph): only an explicit
+        # ``isCrossRepository: false`` counts, so a fork PR never covers a bullet.
+        if not isinstance(item, dict) or item.get("isCrossRepository") is not False:
             continue
         head = item.get("headRefName")
         if not isinstance(head, str) or not head.startswith(
