@@ -53,6 +53,16 @@ def _stub_ensure_repo(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _pipeline_unit_not_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default the guard's systemd probe to "unit is gone", so tests never shell out to the
+    host's real systemctl (absent on macOS, no user bus on CI: it would read as "can't
+    tell" and block every stalled run). Tests of the liveness tie-breaker override it."""
+    monkeypatch.setattr(
+        "herdr_routines.tick.pipeline_unit_active", lambda run_id: False
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_pipeline_worktrees_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1968,13 +1978,12 @@ def test_tick_pipeline_overlap_guard_survives_without_orchestrator_agent(
     assert read_job(history_path, job.name)[-1].state == "running"
 
 
-def test_pipeline_guard_ignores_a_stalled_in_flight_run(
+def _stalled_pipeline_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A run hard-killed before it wrote its report leaves a `state.json` with no report
-    in a worktree nothing GCs. The overlap guard must not read that as in flight forever:
-    once the run is past deadline + grace with a quiet heartbeat (the watchdog's own
-    `is_stalled` rule), it stops blocking the pipeline."""
+) -> tuple[RoutinesConfig, FakePipelineClient, Path, str, datetime]:
+    """A dispatched pipeline run a day past its deadline with no heartbeat log and no
+    report: `is_stalled` calls it dead. Returns the config, client, history path, the run's
+    bare id and the tick time to run the next tick at."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(
@@ -2016,11 +2025,67 @@ def test_pipeline_guard_ignores_a_stalled_in_flight_run(
             }
         )
     )
+    return config, client, history_path, bare_run_id, t1 + timedelta(days=1)
 
-    # A day later: far past any deadline, no heartbeat log, no report.
-    t2 = t1 + timedelta(days=1)
+
+def test_pipeline_guard_ignores_a_stalled_in_flight_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run hard-killed before it wrote its report leaves a `state.json` with no report
+    in a worktree nothing GCs. The overlap guard must not read that as in flight forever:
+    once the run is past deadline + grace with a quiet heartbeat (the watchdog's own
+    `is_stalled` rule) and its systemd unit is gone, it stops blocking the pipeline."""
+    config, client, history_path, bare_run_id, t2 = _stalled_pipeline_run(
+        tmp_path, monkeypatch
+    )
+    queried: list[str] = []
+
+    def unit_gone(run_id: str) -> bool:
+        queried.append(run_id)
+        return False
+
+    monkeypatch.setattr("herdr_routines.tick.pipeline_unit_active", unit_gone)
+
     outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
     assert outcome.summaries != ("nightly-pipeline: skipped (already running)",)
+    assert queried == [bare_run_id]
+
+
+@pytest.mark.parametrize("unit_active", [True, None])
+def test_pipeline_guard_blocks_a_stalled_run_whose_unit_is_live_or_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unit_active: bool | None
+) -> None:
+    """A resumed run keeps tick's old recorded deadline, so a live but quiet one reads as
+    stalled. An active systemd unit (or one that can't be queried) means it may still be
+    running: a second night must not launch on top of it."""
+    config, client, history_path, _bare_run_id, t2 = _stalled_pipeline_run(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick.pipeline_unit_active", lambda run_id: unit_active
+    )
+
+    outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: skipped (already running)",)
+
+
+def test_pipeline_guard_does_not_query_systemd_for_a_healthy_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unit liveness is only the tie-breaker for a run `is_stalled` already flagged."""
+    config, client, history_path, _bare_run_id, t2 = _stalled_pipeline_run(
+        tmp_path, monkeypatch
+    )
+
+    def fail(run_id: str) -> bool:
+        raise AssertionError("systemd queried for a run that is not stalled")
+
+    monkeypatch.setattr("herdr_routines.tick.pipeline_unit_active", fail)
+
+    # One minute after dispatch: deadline hours away, so the run is not stalled.
+    t_healthy = t2 - timedelta(days=1) + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t_healthy)  # type: ignore[arg-type]
+    assert outcome.summaries == ("nightly-pipeline: skipped (already running)",)
 
 
 # ---------------------------------------------------------------------------
