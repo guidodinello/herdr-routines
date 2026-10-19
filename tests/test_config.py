@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from herdr_routines.config import (
     DEFAULT_TRUSTED_REVIEW_AUTHORS,
     PIPELINE_CATCH_UP_MINUTES,
     ConfigError,
+    Job,
+    JobInvariantError,
     load_config,
     load_config_dir,
 )
@@ -1743,3 +1746,70 @@ def test_trusted_review_authors_yaml_in_jobs_d_rejects_a_mapping(
     )
     with pytest.raises(ConfigError, match="must be a list"):
         load_config_dir(jobs_dir)
+
+
+# -- Job.require_* accessors -----------------------------------------------------------
+
+AUDIT_JOB = """
+version: 1
+jobs:
+  - name: nightly-type-audit
+    cron: "0 3 * * *"
+    repo: /repo/test
+    kind: audit
+    audit:
+      skill: type-health
+"""
+
+GATED_JOB = """
+version: 1
+jobs:
+  - name: babysit-prs
+    cron: "*/5 * * * *"
+    repo: /repo/test
+    kind: gated
+    checks:
+      - pr_health:
+"""
+
+
+def _loaded_job(tmp_config_path: Path, text: str, name: str) -> Job:
+    job = load_config(write(tmp_config_path, text)).job(name)
+    assert job is not None
+    return job
+
+
+def test_require_accessors_return_the_validated_fields(tmp_config_path: Path) -> None:
+    audit_job = _loaded_job(tmp_config_path, AUDIT_JOB, "nightly-type-audit")
+    assert audit_job.require_audit() is audit_job.audit
+    assert audit_job.require_audit().skill == "type-health"
+
+    gated_job = _loaded_job(tmp_config_path, GATED_JOB, "babysit-prs")
+    assert gated_job.require_checks() == gated_job.checks
+    assert gated_job.require_target() == "pr"
+
+    pipeline_job = _loaded_job(tmp_config_path, PIPELINE_MINIMAL, "nightly-pipeline")
+    assert pipeline_job.require_deadline_ms() == 25_200_000
+    assert pipeline_job.require_prompt_file() == "docs/pipeline/orchestrator-prompt.md"
+
+
+@pytest.mark.parametrize(
+    ("text", "name", "field", "accessor"),
+    [
+        (AUDIT_JOB, "nightly-type-audit", "audit", "require_audit"),
+        (GATED_JOB, "babysit-prs", "checks", "require_checks"),
+        (GATED_JOB, "babysit-prs", "target", "require_target"),
+        (PIPELINE_MINIMAL, "nightly-pipeline", "deadline_ms", "require_deadline_ms"),
+        (PIPELINE_MINIMAL, "nightly-pipeline", "prompt_file", "require_prompt_file"),
+    ],
+)
+def test_require_accessor_raises_naming_job_and_field(
+    tmp_config_path: Path, text: str, name: str, field: str, accessor: str
+) -> None:
+    """A Job that skipped validation raises JobInvariantError, not AssertionError, so the
+    check survives `python -O`; it is a RuntimeError, never a ConfigError (not a bad file)."""
+    job = dataclasses.replace(_loaded_job(tmp_config_path, text, name), **{field: None})
+    with pytest.raises(JobInvariantError, match=rf"job '{name}'.*requires '{field}'"):
+        getattr(job, accessor)()
+    assert not issubclass(JobInvariantError, ConfigError)
+    assert issubclass(JobInvariantError, RuntimeError)
