@@ -2042,29 +2042,6 @@ def _process_base_target(
     gate_branch = build_branch_name(job.name, run_id)
 
     attempt = consecutive_base_gate_failures(history_path, job.name)
-    if attempt >= job.max_attempts_per_target:
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="skipped",
-                run_id=run_id,
-                extra={
-                    "reason": "max_attempts_exceeded",
-                    "gate_branch": gate_branch,
-                    "attempt": attempt,
-                },
-            ),
-        )
-        if _notify_gate(job, "failure"):
-            _notify(
-                client,
-                f"herdr-routines: {job.name} skipped",
-                body="max_attempts_exceeded",
-                sound="request",
-            )
-        return f"{job.name}: skipped (max_attempts_exceeded)", False
 
     # Ensure repo checkout before any worktree creation
     try:
@@ -2182,6 +2159,32 @@ def _process_base_target(
         if _notify_gate(job, "success"):
             _notify(client, f"herdr-routines: {job.name} done", sound="done")
         return f"{job.name}: done (gate passed)", False
+
+    # The budget limits fix-agent dispatches, not gate runs: a passing gate above
+    # still records `passed` and resets it, so only a failing gate is skipped here.
+    if attempt >= job.max_attempts_per_target:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                run_id=run_id,
+                extra={
+                    "reason": "max_attempts_exceeded",
+                    "gate_branch": gate_branch,
+                    "attempt": attempt,
+                },
+            ),
+        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} skipped",
+                body="max_attempts_exceeded",
+                sound="request",
+            )
+        return f"{job.name}: skipped (max_attempts_exceeded)", False
 
     gate_output_path = default_reports_dir() / f"{run_id}-gate-output.txt"
     try:
