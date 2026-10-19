@@ -918,7 +918,7 @@ def test_execute_run_survives_unexpected_reap_exception(
     unexpected exceptions like AttributeError from a malformed agent list shape."""
 
     class ExplodingClient(ScriptedClient):
-        def settled_agent_pane(self, name):  # type: ignore[override]
+        def settled_agent_pane(self, name):
             self.calls.append("settled_agent_pane")
             raise AttributeError("'NoneType' object has no attribute 'get'")
 
@@ -1157,7 +1157,7 @@ class WatchdogClient(ScriptedClient):
         self.terminate_calls = 0
         self.polls_consumed = 0
 
-    def agent_prompt_wait_with_watchdog(  # type: ignore[override]
+    def agent_prompt_wait_with_watchdog(
         self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
     ):
         self.calls.append("agent_prompt_wait_with_watchdog")
@@ -1311,7 +1311,7 @@ def test_watchdog_tail_before_close_and_close_once(
             super().__init__(**kwargs)
             self.tail_exists_at_close: bool | None = None
 
-        def pane_close(self, pane_id):  # type: ignore[override]
+        def pane_close(self, pane_id):
             self.tail_exists_at_close = (
                 _isolated_reports_dir / f"{run_id}.tail.txt"
             ).exists()
