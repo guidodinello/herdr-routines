@@ -7,6 +7,7 @@ Pure filesystem — no herdr/subprocess except the optional diagnosis helpers in
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -31,6 +32,42 @@ _LEAK_GLOBS: list[tuple[str, bool]] = [
 ]
 
 
+# Upper bound on entries inspected per directory tree. A tree this large that we cannot
+# fully inspect is kept, never reaped on a partial look.
+_MAX_WALK_ENTRIES = 10_000
+
+
+class _WalkIncomplete(Exception):
+    """The tree could not be fully inspected (error or entry bound hit)."""
+
+
+def _is_fresh(entry: Path, cutoff: float) -> bool:
+    """True if *entry* or anything under it (symlinks not followed) was modified after
+    *cutoff*. A directory's own mtime only changes when its direct children do, so a
+    live writer deep in the tree leaves the top level looking old. Raises
+    `_WalkIncomplete` when the tree can't be fully inspected."""
+    if entry.lstat().st_mtime > cutoff:
+        return True
+    if not entry.is_dir():
+        return False
+    seen = 0
+
+    def on_error(exc: OSError) -> None:
+        raise _WalkIncomplete from exc
+
+    for root, dirs, files in os.walk(entry, followlinks=False, onerror=on_error):
+        for name in (*dirs, *files):
+            seen += 1
+            if seen > _MAX_WALK_ENTRIES:
+                raise _WalkIncomplete
+            try:
+                if os.lstat(os.path.join(root, name)).st_mtime > cutoff:
+                    return True
+            except OSError as exc:
+                raise _WalkIncomplete from exc
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class ReapResult:
     removed: int = 0
@@ -45,11 +82,13 @@ def reap_tmp(
     dry_run: bool = False,
 ) -> ReapResult:
     """Remove leaked files/dirs from *tmp_dir* that match known patterns and are older
-    than *max_age_s* seconds (mtime-based). Safe for concurrent use under tick.lock.
+    than *max_age_s* seconds. A directory's age is its newest mtime anywhere in its tree
+    (bounded walk), not its own mtime: pipeline, Telegram and manual agent runs write
+    into these dirs without holding tick.lock, and nested writes don't touch the top
+    level. A tree that can't be fully inspected is kept and counted as an error.
 
-    Only touches files/dirs at the top level of *tmp_dir* (no recursion beyond one
-    depth for pytest-of-*). Follows no symlinks. Per-entry try/except ensures a
-    single failure never aborts the sweep.
+    Only matches files/dirs at the top level of *tmp_dir*. Follows no symlinks.
+    Per-entry try/except ensures a single failure never aborts the sweep.
     """
     now = time.time()
     cutoff = now - max_age_s
@@ -62,17 +101,18 @@ def reap_tmp(
             # Top-level guard: glob should only match direct children, but belt-and-suspenders.
             if entry.parent != tmp_dir:
                 continue
-            try:
-                st = entry.stat()
-            except OSError:
-                errors += 1
-                continue
-
-            # Symlink safety: never follow or delete symlinks.
+            # Symlink safety: never follow or delete symlinks. Checked before any stat
+            # so a dangling or retargeted link is never judged by its target.
             if entry.is_symlink():
                 continue
 
-            if st.st_mtime > cutoff:
+            try:
+                fresh = _is_fresh(entry, cutoff)
+            except (OSError, _WalkIncomplete):
+                errors += 1
+                continue
+
+            if fresh:
                 skipped_fresh += 1
                 continue
 

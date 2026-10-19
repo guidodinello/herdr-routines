@@ -243,8 +243,13 @@ def test_prune_reports_survives_per_entry_error(
 # findings.py (issue 057 phase A) is reviewed and allowed on the same terms: its only
 # unlink is the `<job>.json.tmp` sibling `save_ledger` wrote itself, removed only when
 # `os.replace` fails. It never touches the ledger, a report, or a history roll.
+#
+# claims.py is reviewed and allowed on the same terms: its only unlink is the
+# `tempfile.mkstemp` file `save_claims` created itself, removed only when the write or
+# `os.replace` fails.
 _DELETE_CALL_RE = re.compile(r"\.(?:unlink|rmdir)\(|\bos\.remove\(|\bshutil\.rmtree\(")
 _EXPECTED_DELETERS = {
+    "claims.py",
     "findings.py",
     "gc.py",
     "pipeline_prepare.py",
