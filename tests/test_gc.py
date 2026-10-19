@@ -8,6 +8,7 @@ and blocks sockets/HerdrClient to prove the command is pure git + filesystem.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -262,6 +263,12 @@ def _squash_merge(repo: Path, branch: str, filename: str) -> None:
     _git(repo, "commit", "-m", f"squash-merge {branch} (#1)")
 
 
+def _merged_at_tip(repo: Path, branch: str) -> dict[str, list[gc.MergedPr]]:
+    """What `fetch_merged_pr_heads` returns for a PR whose head is `branch`'s current tip."""
+    tip = _git(repo, "rev-parse", branch).stdout.strip()
+    return {branch: [gc.MergedPr(head_oid=tip, merged_at=None)]}
+
+
 def test_gc_detects_squash_merged_branch(
     repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -274,7 +281,9 @@ def test_gc_detects_squash_merged_branch(
         "test setup bug: branch must NOT be an ancestor of base for this to test "
         "squash-merge detection rather than ordinary ancestry"
     )
-    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {branch: None})
+    monkeypatch.setattr(
+        gc, "fetch_merged_pr_heads", lambda repo_: _merged_at_tip(repo_, branch)
+    )
 
     code, out, _ = _gc(repo, capsys)
 
@@ -290,7 +299,9 @@ def test_gc_lists_squash_merged_pipeline_branch(
     kicks in for a still-unmerged, still-open, or still-in-flight pipeline branch)."""
     pipeline = "auto/pipeline-nightly-20260901T000000Z"
     _squash_merge(repo, pipeline, "pipeline.txt")
-    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {pipeline: None})
+    monkeypatch.setattr(
+        gc, "fetch_merged_pr_heads", lambda repo_: _merged_at_tip(repo_, pipeline)
+    )
 
     code, out, _ = _gc(repo, capsys)
 
@@ -831,7 +842,9 @@ def test_gc_delete_removes_squash_merged_branch_without_force(
     merged branch, gate unchanged) it's a no-force delete candidate."""
     branch = "auto/fix-thing-20260901T000000Z"
     _squash_merge(repo, branch, "thing.txt")
-    monkeypatch.setattr(gc, "fetch_merged_pr_heads", lambda repo_: {branch: None})
+    monkeypatch.setattr(
+        gc, "fetch_merged_pr_heads", lambda repo_: _merged_at_tip(repo_, branch)
+    )
 
     code, out, _ = _gc_delete(repo, capsys)
 
@@ -1550,3 +1563,260 @@ def test_gc_worktrees_root_override_respected(
 
     assert code == 0
     assert "auto-orphan-20260101T000000Z" in out
+
+
+# ---------------------------------------------------------------------------
+# A merged PR only vouches for the commit it merged, not for the branch name
+# ---------------------------------------------------------------------------
+
+_real_fetch_merged_pr_heads = gc.fetch_merged_pr_heads
+
+
+def _fake_gh_merged_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prs: list[dict[str, str | None]]
+) -> None:
+    """Put a `gh` on PATH that answers every call with `prs` and route gc to the real
+    `fetch_merged_pr_heads` (the autouse fixture stubs it), so the JSON parsing and the
+    merged check run for real against canned `gh pr list --state merged` output."""
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir(exist_ok=True)
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!/bin/sh\ncat <<'EOF'\n{json.dumps(prs)}\nEOF\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(gc, "fetch_merged_pr_heads", _real_fetch_merged_pr_heads)
+
+
+def _tip(repo: Path, branch: str) -> str:
+    return _git(repo, "rev-parse", branch).stdout.strip()
+
+
+def _branch_exists(repo: Path, branch: str) -> bool:
+    out = _git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/auto/")
+    return branch in out.stdout.split()
+
+
+def test_gc_delete_keeps_commits_made_after_the_squash_merge(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The PR merged tip A; the local branch has since gained commit B. The branch name
+    still matches a merged PR, but B was never merged — deleting would lose it."""
+    branch = "auto/fix-thing-20260901T000000Z"
+    _squash_merge(repo, branch, "thing.txt")
+    merged_oid = _tip(repo, branch)
+    _git(repo, "checkout", branch)
+    (repo / "later.txt").write_text("work after the merge\n")
+    _git(repo, "add", "later.txt")
+    _git(repo, "commit", "-m", "work after the merge")
+    _git(repo, "checkout", "main")
+    _fake_gh_merged_prs(
+        tmp_path,
+        monkeypatch,
+        [{"headRefName": branch, "headRefOid": merged_oid, "mergedAt": None}],
+    )
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" not in out
+    assert _branch_exists(repo, branch)
+
+
+def test_gc_delete_keeps_a_branch_name_reused_after_its_pr_merged(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An old PR merged under this name; the name now points at unrelated, unmerged
+    work. The old PR's head says nothing about the new tip."""
+    branch = "auto/fix-thing-20260901T000000Z"
+    seed = _tip(repo, "main")
+    _squash_merge(repo, branch, "thing.txt")
+    old_pr_oid = _tip(repo, branch)
+    _git(repo, "checkout", "-B", branch, seed)
+    (repo / "new.txt").write_text("a new, unmerged attempt\n")
+    _git(repo, "add", "new.txt")
+    _git(repo, "commit", "-m", "new attempt")
+    _git(repo, "checkout", "main")
+    _fake_gh_merged_prs(
+        tmp_path,
+        monkeypatch,
+        [{"headRefName": branch, "headRefOid": old_pr_oid, "mergedAt": None}],
+    )
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" not in out
+    assert _branch_exists(repo, branch)
+
+
+def test_gc_delete_ignores_a_same_named_pr_head_that_is_not_ours(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A fork's PR with the same head ref name merged; its head SHA is unknown here."""
+    branch = "auto/fix-thing-20260901T000000Z"
+    _squash_merge(repo, branch, "thing.txt")
+    _fake_gh_merged_prs(
+        tmp_path,
+        monkeypatch,
+        [{"headRefName": branch, "headRefOid": "0" * 40, "mergedAt": None}],
+    )
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" not in out
+    assert _branch_exists(repo, branch)
+
+
+def test_gc_delete_removes_branch_whose_tip_is_the_merged_pr_head(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Control: the squash-merge case issue 042 added still deletes, and a same-named PR
+    from elsewhere listed alongside does not hide the genuine one."""
+    branch = "auto/fix-thing-20260901T000000Z"
+    _squash_merge(repo, branch, "thing.txt")
+    _fake_gh_merged_prs(
+        tmp_path,
+        monkeypatch,
+        [
+            {"headRefName": branch, "headRefOid": "0" * 40, "mergedAt": None},
+            {
+                "headRefName": branch,
+                "headRefOid": _tip(repo, branch),
+                "mergedAt": "2026-09-01T00:00:00Z",
+            },
+        ],
+    )
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" in out
+    assert not _branch_exists(repo, branch)
+
+
+def test_fetch_merged_pr_heads_parses_canned_gh_output(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_gh_merged_prs(
+        tmp_path,
+        monkeypatch,
+        [
+            {"headRefName": "auto/a", "headRefOid": "a" * 40, "mergedAt": "2026-09-01"},
+            {"headRefName": "auto/a", "headRefOid": "b" * 40},
+            {"headRefName": "auto/no-oid"},
+            {"headRefOid": "c" * 40},
+        ],
+    )
+
+    assert gc.fetch_merged_pr_heads(repo) == {
+        "auto/a": [
+            gc.MergedPr(head_oid="a" * 40, merged_at="2026-09-01"),
+            gc.MergedPr(head_oid="b" * 40, merged_at=None),
+        ],
+        "auto/no-oid": [gc.MergedPr(head_oid=None, merged_at=None)],
+    }
+
+
+@pytest.mark.parametrize("stdout", ["not json", '{"headRefName": "auto/a"}', "null"])
+def test_fetch_merged_pr_heads_tolerates_a_malformed_payload(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!/bin/sh\necho '{stdout}'\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    assert gc.fetch_merged_pr_heads(repo) == {}
+
+
+def test_merged_pr_without_a_head_commit_vouches_for_nothing(repo: Path) -> None:
+    branch = "auto/fix-thing-20260901T000000Z"
+    _git(repo, "branch", branch, "main")
+    prs = {branch: [gc.MergedPr(head_oid=None, merged_at=None)]}
+
+    assert gc.merged_pr_for(branch, repo, prs) is None
+
+
+# ---------------------------------------------------------------------------
+# A worktree holding uncommitted work is never force-removed
+# ---------------------------------------------------------------------------
+
+
+def _merged_branch_with_worktree(repo: Path, tmp_path: Path) -> tuple[str, Path]:
+    branch = "auto/fix-thing-20260901T000000Z"
+    worktree = tmp_path / "wt" / "auto-fix-thing"
+    _git(repo, "worktree", "add", str(worktree), "-b", branch, "main")
+    return branch, worktree
+
+
+@pytest.mark.parametrize("extra_args", [(), ("--force",)])
+@pytest.mark.parametrize("dirt", ["modified", "untracked"])
+def test_gc_delete_skips_a_dirty_worktree(
+    repo: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    dirt: str,
+    extra_args: tuple[str, ...],
+) -> None:
+    branch, worktree = _merged_branch_with_worktree(repo, tmp_path)
+    if dirt == "modified":
+        (worktree / "README.md").write_text("edited, never committed\n")
+    else:
+        (worktree / "scratch.txt").write_text("never added\n")
+
+    code, out, _ = _gc_delete(repo, capsys, *extra_args)
+
+    assert code == 0
+    assert f"skipped (dirty worktree): {branch}" in out
+    assert f"deleted: {branch}" not in out
+    assert worktree.exists()
+    assert _branch_exists(repo, branch)
+
+
+def test_gc_delete_removes_a_clean_merged_worktree_despite_ignored_files(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ignored files (pipeline `state.json`) don't count as dirty, so a finished
+    pipeline worktree is still collected."""
+    (repo / ".gitignore").write_text("state.json\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore state.json")
+    branch, worktree = _merged_branch_with_worktree(repo, tmp_path)
+    (worktree / "state.json").write_text("{}\n")
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" in out
+    assert not worktree.exists()
+    assert not _branch_exists(repo, branch)
+
+
+def test_gc_delete_removes_a_merged_branch_whose_worktree_dir_is_gone(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Registered but deleted from disk: nothing there to lose, and `git status` can't
+    run in it, so the dirty check must not treat that as a reason to keep the branch."""
+    branch, worktree = _merged_branch_with_worktree(repo, tmp_path)
+    shutil.rmtree(worktree)
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" in out
+    assert not _branch_exists(repo, branch)
