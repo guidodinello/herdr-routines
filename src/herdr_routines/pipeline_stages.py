@@ -79,6 +79,9 @@ TEST_AUTHOR_STAGE = 3
 IMPLEMENT_STAGE = 4
 # The stage with no agent: bookkeeping, then the PR.
 PR_STAGE = 5
+# The stage that acts on review feedback, which code fetches and filters to trusted
+# authors before the prompt is built (`pipeline_run._review_feedback`).
+ADDRESS_COMMENTS_STAGE = 7
 
 STAGES: tuple[StageSpec, ...] = (
     StageSpec(

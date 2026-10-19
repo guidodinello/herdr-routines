@@ -511,3 +511,26 @@ def test_gates_3_and_4_are_not_cli_stages() -> None:
     assert "3" not in GATE_STAGE_CHOICES
     assert "4" not in GATE_STAGE_CHOICES
     assert set(GATE_STAGE_CHOICES) == {"1", "2", "5", "6", "7", "ci"}
+
+
+def test_evaluate_gate7_scopes_to_trusted_authors_when_given() -> None:
+    threads = [
+        ReviewThread(
+            is_resolved=False,
+            comment_count=1,
+            first_comment_body="[blocking] unanswered",
+            first_comment_author="drive-by",
+        ),
+        ReviewThread(
+            is_resolved=False,
+            comment_count=2,
+            first_comment_body="answered",
+            first_comment_author="Owner",
+        ),
+    ]
+    # Without a trusted set every thread counts (the standalone `gate 7` CLI).
+    assert evaluate_gate7(threads).passed is False
+    assert evaluate_gate7(threads, trusted_authors=frozenset({"owner"})).passed is True
+    # A thread whose author is unknown is never in scope of a trusted-only check.
+    ghost = [ReviewThread(is_resolved=False, comment_count=1, first_comment_body="x")]
+    assert evaluate_gate7(ghost, trusted_authors=frozenset({"owner"})).passed is True

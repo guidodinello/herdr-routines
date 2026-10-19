@@ -33,6 +33,16 @@ defaults:
 # always explicit: `herdr-routines prune reports --dry-run` to see, `--yes` to do it. In a
 # jobs.d/ layout this lives in its own retention.yaml instead (never treated as a job).
 
+# trusted_review_authors: # optional: the GitHub logins whose PRs and review feedback
+#   # unattended agents act on (the pr_health auto-fix and pipeline stage 7). The
+#   # authenticated `gh` user is always trusted on top of this list, so it is not listed.
+#   # Absent = [copilot-pull-request-reviewer]; a list here replaces that default, and
+#   # [] means "only the gh user". Matching is by login, case-insensitive.
+#   - copilot-pull-request-reviewer
+#
+# In a jobs.d/ layout this lives in its own trusted_review_authors.yaml, whose whole
+# document is the list (never treated as a job).
+
 jobs:
   - name: nightly-dep-audit
     enabled: true

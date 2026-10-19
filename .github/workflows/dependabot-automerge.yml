@@ -21,7 +21,7 @@ permissions:
 jobs:
   auto-merge:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     # Surfaced as env rather than read inline so the steps below can branch on whether the
     # App is configured: the `secrets` context is not available in a step `if`, but `env` is.
     env:
@@ -29,7 +29,7 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
-        uses: dependabot/fetch-metadata@v3
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
       # A merge made with GITHUB_TOKEN triggers no further workflow runs — GitHub
       # suppresses that to prevent a workflow from triggering itself in an infinite loop.
@@ -43,10 +43,14 @@ jobs:
       - name: Mint a GitHub App token
         id: app-token
         if: env.APP_ID != ''
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ env.APP_ID }}
           private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+          # Only what `gh pr merge --auto` needs. No `workflows` permission, so Dependabot
+          # bumps that edit workflow files (github-actions) need a manual merge.
+          permission-contents: write
+          permission-pull-requests: write
 
       # `--auto` queues the merge behind the required CI check rather than merging
       # immediately, so the branch ruleset still decides whether it lands.

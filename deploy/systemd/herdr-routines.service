@@ -13,7 +13,7 @@ WorkingDirectory=%h/projects/herdr-routines
 # full path below) starts fine. %h/.local/bin covers the common `uv tool install`/pipx location
 # for `herdr`; adjust if yours lives elsewhere (check with `command -v herdr` in your login shell).
 Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=%h/.local/bin/uv run herdr-routines tick
+ExecStart=%h/.local/bin/uv run --locked herdr-routines tick
 
 # NOT infinity. A tick blocks for the length of whatever job it runs (agent prompt --wait), so
 # the naive choice is TimeoutStartSec=infinity — but that's a trap: if the herdr server dies or

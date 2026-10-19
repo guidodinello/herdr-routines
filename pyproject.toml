@@ -7,7 +7,8 @@ requires-python = ">=3.13"
 dependencies = [
     "pyyaml==6.0.3",
     "croniter==6.2.4",
-    "logger @ git+https://github.com/guidodinello/logger.git@main",
+    # Pinned to a commit. To bump: change the SHA, run `uv lock`, commit both files.
+    "logger @ git+https://github.com/guidodinello/logger.git@7dbd2f616040a32fc5bbf458d661e7cd2d2385aa",
 ]
 
 [project.scripts]
