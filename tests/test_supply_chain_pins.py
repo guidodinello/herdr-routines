@@ -6,6 +6,8 @@ rather than silently re-resolving. Text checks over the committed files, so a re
 import re
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
 
@@ -61,3 +63,15 @@ def test_systemd_units_run_uv_locked() -> None:
     ]
     assert execs, "no `uv run` ExecStart found; the guard would pass vacuously"
     assert [e for e in execs if "uv run --locked " not in e[1]] == []
+
+
+def test_dependabot_has_cooldown_and_tracks_uv_lock() -> None:
+    config = yaml.safe_load(
+        (REPO_ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+    )
+    updates = config["updates"]
+    assert all("cooldown" in u for u in updates)
+    ecosystems = {u["package-ecosystem"] for u in updates}
+    # `pip` bumps edit only pyproject.toml, which `uv sync --locked` then rejects.
+    assert "uv" in ecosystems
+    assert "pip" not in ecosystems
