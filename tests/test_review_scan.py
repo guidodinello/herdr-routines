@@ -21,6 +21,7 @@ import yaml
 from herdr_routines import tick
 from herdr_routines.auto_fix import (
     REVIEW_SEARCH_QUALIFIERS,
+    PostedBody,
     ReviewPR,
     ReviewSearch,
     attempt_count_for_target,
@@ -152,7 +153,7 @@ class ReviewGh:
         user: str = "me",
         prs: tuple[ReviewPR, ...] = (),
         repo_infos: dict[tuple[str, str], dict[str, object] | None] | None = None,
-        raw_bodies: dict[str, list[str]] | None = None,
+        raw_bodies: dict[str, list[PostedBody]] | None = None,
         search_fail: bool = False,
         bodies_fail: bool = False,
     ) -> None:
@@ -204,14 +205,16 @@ class ReviewGh:
 
     def pr_review_bodies(
         self, *, owner: str, repo: str, number: int
-    ) -> list[str] | None:
+    ) -> list[PostedBody] | None:
         self.bodies_calls.append((owner, repo, number))
         if self.bodies_fail:
             return None
         key = f"{owner}/{repo}#{number}"
         if key in self.raw_bodies:
             return list(self.raw_bodies[key])
-        return [review_marker("review-my-prs", key)] if key in self.posted else []
+        # The review worker posts with the owner's gh account, i.e. `user`.
+        marker = review_marker("review-my-prs", key)
+        return [PostedBody(author=self.user, body=marker)] if key in self.posted else []
 
     def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
         self.repo_info_calls.append((owner, repo))
@@ -529,7 +532,10 @@ def test_review_scan_marker_guard_and_search_fail_closed(
 
     posted = ReviewGh()
     posted.posted.add("acme/widgets#1")
-    dispatchable, skipped = apply_marker_guard(posted, "review-my-prs", [cand])
+    trusted = frozenset({"me"})
+    dispatchable, skipped = apply_marker_guard(
+        posted, "review-my-prs", [cand], trusted_authors=trusted
+    )
     assert dispatchable == []
     assert skipped[0].skip_reason == "review_already_posted"
 
@@ -537,17 +543,23 @@ def test_review_scan_marker_guard_and_search_fail_closed(
     other = ReviewGh(
         raw_bodies={
             "acme/widgets#1": [
-                review_marker("some-other-job", "acme/widgets#1"),
+                PostedBody(
+                    author="me", body=review_marker("some-other-job", "acme/widgets#1")
+                ),
             ]
         }
     )
-    dispatchable2, skipped2 = apply_marker_guard(other, "review-my-prs", [cand])
+    dispatchable2, skipped2 = apply_marker_guard(
+        other, "review-my-prs", [cand], trusted_authors=trusted
+    )
     assert dispatchable2 == [cand]
     assert skipped2 == []
 
     # A body read failure (None) is unverified → still dispatchable.
     failing = ReviewGh(bodies_fail=True)
-    dispatchable3, skipped3 = apply_marker_guard(failing, "review-my-prs", [cand])
+    dispatchable3, skipped3 = apply_marker_guard(
+        failing, "review-my-prs", [cand], trusted_authors=trusted
+    )
     assert dispatchable3 == [cand]
     assert skipped3 == []
 
@@ -774,6 +786,73 @@ def test_review_dispatch_creates_per_repo_checkout(
     # One default-branch lookup per distinct repo, even with two PRs in it.
     assert gh.repo_info_calls == [("acme", "widgets")]
     assert len(gh.search_calls) == 1
+
+
+def test_marker_guard_ignores_a_marker_from_an_untrusted_author() -> None:
+    """The marker is plain text: a copy posted by someone outside the trusted set must
+    not suppress the review, nor may a deleted account's."""
+    cand = Candidate(
+        target_key="acme/widgets#1",
+        repo="acme/widgets",
+        owner="acme",
+        repo_name="widgets",
+        number=1,
+        title="PR 1",
+        url="https://example.invalid/1",
+        created_at="2026-10-01T00:00:00Z",
+        updated_at="2026-10-01T00:00:00Z",
+        head_ref="feature-x",
+        author="me",
+        select_mode="author",
+    )
+    marker = review_marker("review-my-prs", cand.target_key)
+    gh = ReviewGh(
+        raw_bodies={
+            cand.target_key: [
+                PostedBody(author="drive-by", body=marker),
+                PostedBody(author=None, body=marker),
+            ]
+        }
+    )
+    dispatchable, skipped = apply_marker_guard(
+        gh, "review-my-prs", [cand], trusted_authors=frozenset({"me"})
+    )
+    assert dispatchable == [cand]
+    assert skipped == []
+
+
+def test_review_post_condition_ignores_an_untrusted_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR carrying only someone else's copy of the marker still gets its review
+    dispatched, and that copy does not satisfy the post-condition either: the review
+    counts as not posted."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    base = tmp_path / "repos"
+    origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
+    job = _review_job(tmp_path, repo=base)
+    key = "acme/widgets#1"
+    gh = ReviewGh(
+        prs=(_pr(1),),
+        repo_infos={
+            ("acme", "widgets"): {"clone_url": str(origin), "default_branch": "main"}
+        },
+        raw_bodies={
+            key: [
+                PostedBody(author="drive-by", body=review_marker("review-my-prs", key))
+            ]
+        },
+    )
+    client = ReviewHerdrClient()
+    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    history = tmp_path / "state" / "history.jsonl"
+
+    _, failed = _run_cycle(job, history, gh, client, run_id="review-my-prs-r1")
+
+    assert len(client.started) == 1, "an untrusted marker suppressed the review"
+    assert failed is True
+    reasons = [r.extra.get("reason") for r in read_job(history, job.name) if r.extra]
+    assert "review_not_posted" in reasons
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1200,8 @@ def test_review_prompt_is_read_only_and_idempotent() -> None:
     # Idempotence: the exact marker is embedded and the agent must re-check it first.
     assert marker in prompt
     assert "POST NOTHING" in prompt
+    # Only the worker's own earlier review stops it, as in the engine's marker guard.
+    assert "your own gh login" in prompt
     # Read-only by construction: none of the mutating verbs appear as instructions.
     for forbidden in ("git push", "git commit", "resolveReviewThread"):
         assert forbidden not in prompt
@@ -1234,3 +1315,29 @@ def test_ensure_checkout_refactor_preserves_babysit(
     repos.ensure_repo(job2)
     assert clone_calls == []
     assert ff_calls == [(repo2, "main")]
+
+
+def test_real_pr_review_bodies_carry_their_authors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`gh pr view --json comments,reviews` names the author `author.login`; a deleted
+    account comes back as `author: null` and is kept with no author, so it can never be
+    trusted. Empty bodies are dropped as before."""
+    import json
+
+    from herdr_routines.auto_fix import RealGhClient
+
+    payload = {
+        "reviews": [{"author": {"login": "me"}, "body": "review"}],
+        "comments": [
+            {"author": None, "body": "ghost"},
+            {"author": {"login": "you"}, "body": ""},
+        ],
+    }
+    monkeypatch.setattr(
+        RealGhClient, "_run", lambda self, argv: (0, json.dumps(payload), "")
+    )
+    assert RealGhClient().pr_review_bodies(owner="o", repo="r", number=1) == [
+        PostedBody(author="me", body="review"),
+        PostedBody(author=None, body="ghost"),
+    ]

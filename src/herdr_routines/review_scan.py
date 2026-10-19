@@ -22,6 +22,7 @@ from herdr_routines.auto_fix import (
     GhClient,
     ReviewPR,
     attempt_count_for_target,
+    has_trusted_marker,
     review_marker,
 )
 from herdr_routines.config import Job
@@ -152,14 +153,20 @@ def scan_review_targets(
 
 
 def apply_marker_guard(
-    gh: GhClient, job_name: str, candidates: Sequence[Candidate]
+    gh: GhClient,
+    job_name: str,
+    candidates: Sequence[Candidate],
+    *,
+    trusted_authors: frozenset[str],
 ) -> tuple[list[Candidate], list[Candidate]]:
     """Split *candidates* into (dispatchable, skipped-by-marker).
 
-    Guard 1: a candidate whose PR already carries **this job's** marker for its target
-    is ``review_already_posted``. Another job's marker is not a match (the job name is in
-    the marker). A body read that fails (``None``) is *unverified* — the candidate stays
-    dispatchable, since the attempt budget, not this guard, bounds a missed marker."""
+    Guard 1: a candidate whose PR already carries **this job's** marker for its target,
+    posted by a trusted author (`has_trusted_marker`), is ``review_already_posted``.
+    Another job's marker is not a match (the job name is in the marker), and neither is
+    a copy posted by anyone else. A body read that fails (``None``) is *unverified* — the
+    candidate stays dispatchable, since the attempt budget, not this guard, bounds a
+    missed marker."""
     dispatchable: list[Candidate] = []
     skipped: list[Candidate] = []
     for cand in candidates:
@@ -170,7 +177,7 @@ def apply_marker_guard(
             dispatchable.append(cand)
             continue
         marker = review_marker(job_name, cand.target_key)
-        if any(marker in body for body in bodies):
+        if has_trusted_marker(bodies, marker, trusted_authors):
             skipped.append(replace(cand, skip_reason="review_already_posted"))
         else:
             dispatchable.append(cand)

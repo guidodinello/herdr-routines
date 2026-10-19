@@ -35,6 +35,7 @@ import pytest
 import yaml
 
 from herdr_routines.auto_fix import (
+    PostedBody,
     ReviewSearch,
     build_event_fix_prompt,
     enrich_event_detail,
@@ -190,6 +191,7 @@ class EventGhClient:
                 "author": {"login": self.user, "is_bot": False},
                 "url": f"https://github.com/{owner}/{repo}/pull/{EVENT_NUMBER}",
                 "labels": [{"name": EVENT_LABEL}],
+                "isCrossRepository": False,
             }
         ]
 
@@ -214,6 +216,8 @@ class EventGhClient:
             "title": EVENT_TITLE,
             "labels": [EVENT_LABEL],
             "headRefName": EVENT_BRANCH,
+            "author": {"login": self.user},
+            "isCrossRepository": False,
         }
         nodes = [node] if self.events else []
         return {
@@ -248,7 +252,7 @@ class EventGhClient:
 
     def pr_review_bodies(
         self, *, owner: str, repo: str, number: int
-    ) -> list[str] | None:
+    ) -> list[PostedBody] | None:
         return []
 
     def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
@@ -275,6 +279,7 @@ class CiGhClient(EventGhClient):
                                 "title": EVENT_TITLE,
                                 "headRefName": EVENT_BRANCH,
                                 "author": {"login": self.user},
+                                "isCrossRepository": False,
                                 "labels": {"nodes": [{"name": EVENT_LABEL}]},
                                 "statusCheckRollup": {"state": self.ci_state},
                             }
@@ -1042,6 +1047,7 @@ class ScriptedEventGh(EventGhClient):
                 "author": {"login": self.user},
                 "url": f"https://github.com/{owner}/{repo}/pull/{n}",
                 "labels": [{"name": EVENT_LABEL}],
+                "isCrossRepository": False,
             }
             for n in self.numbers
         ]
@@ -1187,7 +1193,13 @@ class ScriptedIssueGh(EventGhClient):
         if self.fail:
             raise RuntimeError("gh api graphql failed: rate limit exceeded")
         nodes = [
-            {"id": f"I_{n}", "number": n, "title": f"Issue {n}", "labels": []}
+            {
+                "id": f"I_{n}",
+                "number": n,
+                "title": f"Issue {n}",
+                "author": {"login": self.user},
+                "labels": [],
+            }
             for n in self.numbers
         ]
         return {"data": {"search": {"nodes": nodes}}}
@@ -1257,3 +1269,266 @@ def test_issues_opened_empty_baseline_still_counts_as_polled(
     gh.numbers = [9]
     tick(2)
     assert _dispatched_numbers(client) == [9]
+
+
+# -- Same-repo PRs, trusted issue authors, head ref validation --------------------
+
+
+class _PrPollGh(EventGhClient):
+    """Serves `prs` on both PR read seams: `pr_list` (prs:labels) and the batched
+    `ci:failed` GraphQL read."""
+
+    def __init__(self, prs: list[dict[str, object]]) -> None:
+        super().__init__(events=True)
+        self.prs = prs
+
+    def pr_list(
+        self, *, owner: str, repo: str, state: str, limit: int
+    ) -> list[dict[str, object]]:
+        self._maybe_raise("pr_list")
+        return self.prs
+
+    def graphql(self, query: str, **variables: str) -> dict[str, object]:
+        self._maybe_raise("graphql")
+        return {"data": {"repository": {"pullRequests": {"nodes": self.prs}}}}
+
+
+def _poll_pr(number: int, **fields: object) -> dict[str, object]:
+    pr: dict[str, object] = {
+        "number": number,
+        "title": f"PR {number}",
+        "headRefName": f"feature-{number}",
+        "author": {"login": "testuser"},
+        "labels": [{"name": EVENT_LABEL}],
+        "statusCheckRollup": {"state": "FAILURE"},
+    }
+    pr.update(fields)
+    return pr
+
+
+@pytest.mark.parametrize("query", ["prs:labels", "ci:failed"])
+def test_pr_events_only_come_from_same_repo_prs(query: str) -> None:
+    """A fork PR's head branch would be checked out in our clone under a name the fork
+    chose, so PR events only fire for PRs that say their branch is in this repo. A
+    payload that does not say is treated as a fork."""
+    gh = _PrPollGh(
+        [
+            _poll_pr(1, isCrossRepository=False),
+            _poll_pr(2, isCrossRepository=True),
+            _poll_pr(3),  # field missing
+            _poll_pr(4, isCrossRepository=None),
+        ]
+    )
+    check = GateCheck(kind="github_event", query=query, match={})
+    events = poll_github_event(gh, owner="o", repo="r", check=check)
+    assert [e.number for e in events] == [1]
+
+
+def test_ci_failed_query_requests_is_cross_repository() -> None:
+    gh = _PrPollGh([])
+    seen: list[str] = []
+    real_graphql = gh.graphql
+
+    def _graphql(query: str, **variables: str) -> dict[str, object]:
+        seen.append(query)
+        return real_graphql(query, **variables)
+
+    gh.graphql = _graphql  # type: ignore[method-assign]
+    check = GateCheck(kind="github_event", query="ci:failed", match={})
+    poll_github_event(gh, owner="o", repo="r", check=check)
+    assert "isCrossRepository" in seen[0]
+
+
+class _IssueAuthorsGh(EventGhClient):
+    """`issues:opened` search whose issue N is authored by `authors[N]` (a login, None
+    for a deleted account, or absent for a node with no `author` key at all)."""
+
+    def __init__(self, authors: dict[int, str | None], **kwargs: Any) -> None:
+        super().__init__(user="owner", **kwargs)
+        self.authors = authors
+        self.missing: set[int] = set()
+
+    def graphql(self, query: str, **variables: str) -> dict[str, object]:
+        self._maybe_raise("graphql")
+        nodes: list[dict[str, object]] = []
+        for n, login in self.authors.items():
+            node: dict[str, object] = {"number": n, "title": f"Issue {n}"}
+            if n not in self.missing:
+                node["author"] = None if login is None else {"login": login}
+            nodes.append(node)
+        return {"data": {"search": {"nodes": nodes}}}
+
+
+def test_issues_opened_without_author_match_only_fires_for_trusted_authors() -> None:
+    """Without `match.author`, only issues from the trusted set fire: the configured
+    logins (case-insensitive) plus the gh user. Anyone else, a deleted account and a
+    node with no author are all dropped."""
+    gh = _IssueAuthorsGh({1: "owner", 2: "Alice", 3: "stranger", 4: None, 5: "alice"})
+    gh.missing = {5}
+    check = GateCheck(kind="github_event", query="issues:opened", match={})
+    events = poll_github_event(
+        gh, owner="o", repo="r", check=check, trusted_review_authors=("alice",)
+    )
+    assert [e.number for e in events] == [1, 2]
+    assert "api_user" in gh.calls
+
+
+def test_issues_opened_explicit_author_match_stays_exact() -> None:
+    """An explicit `match.author` keeps its exact-match meaning, trusted or not, and
+    needs no gh user lookup."""
+    gh = _IssueAuthorsGh({1: "owner", 3: "stranger"})
+    check = GateCheck(
+        kind="github_event", query="issues:opened", match={"author": "stranger"}
+    )
+    events = poll_github_event(gh, owner="o", repo="r", check=check)
+    assert [e.number for e in events] == [3]
+    assert "api_user" not in gh.calls
+
+
+def test_issues_opened_fails_closed_when_the_gh_user_is_unknown() -> None:
+    gh = _IssueAuthorsGh({1: "owner"}, raise_on={"api_user"})
+    check = GateCheck(kind="github_event", query="issues:opened", match={})
+    with pytest.raises(RuntimeError):
+        poll_github_event(gh, owner="o", repo="r", check=check)
+
+
+def test_issues_opened_tick_uses_configured_trusted_authors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_tick` hands the config's `trusted_review_authors` to the poll."""
+    repo = _init_repo(tmp_path)
+    job = _issue_job(repo)
+    gh = _IssueAuthorsGh({})
+    client = RecordingHerdrClient()
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(jobs=(job,), trusted_review_authors=("alice",))
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
+
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    run_tick(  # first poll: empty baseline
+        config,
+        history_path,
+        client=client,  # type: ignore[arg-type]
+        now=t0 + timedelta(minutes=1),
+    )
+    gh.authors = {7: "alice", 8: "stranger"}
+    run_tick(
+        config,
+        history_path,
+        client=client,  # type: ignore[arg-type]
+        now=t0 + timedelta(minutes=2),
+    )
+    assert _dispatched_numbers(client) == [7]
+
+
+class _RecordingGitSubprocess:
+    """Tick's subprocess seam: `git check-ref-format` runs for real, every other call is
+    recorded and succeeds like `MockSubprocess`."""
+
+    TimeoutExpired = _sp.TimeoutExpired
+
+    def __init__(self) -> None:
+        self.argvs: list[list[str]] = []
+
+    def run(self, argv: list[str], *args: Any, **kwargs: Any) -> Any:
+        if argv[:2] == ["git", "check-ref-format"]:
+            return _sp.run(
+                argv, capture_output=True, text=True, timeout=10, check=False
+            )
+        self.argvs.append(list(argv))
+        return MockSubprocess.Result()
+
+    def worktree_adds(self) -> list[list[str]]:
+        return [a for a in self.argvs if "worktree" in a and "add" in a]
+
+
+@pytest.mark.parametrize("head_ref", ["-b", "bad..ref", "@{-1}", "has space"])
+def test_invalid_head_ref_is_skipped_without_a_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, head_ref: str
+) -> None:
+    """A head ref git would not accept as a branch name never reaches `git worktree
+    add`: the event is recorded as skipped (`invalid_head_ref`), marked seen, and not
+    retried on the next tick."""
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo)
+    gh = _PrPollGh([_poll_pr(7, headRefName=head_ref, isCrossRepository=False)])
+    client = RecordingHerdrClient()
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+    git = _RecordingGitSubprocess()
+    monkeypatch.setattr("herdr_routines.tick.subprocess", git)
+
+    tick(1)
+    tick(2)
+
+    assert git.worktree_adds() == []
+    assert client.tab_creates == []
+    history_path = tmp_path / "state" / "history.jsonl"
+    skipped = [
+        r
+        for r in read_job(history_path, job.name)
+        if r.extra and r.extra.get("reason") == "invalid_head_ref"
+    ]
+    assert len(skipped) == 1, "an invalid ref is skipped once, then seen"
+    assert skipped[0].state == "skipped"
+    assert skipped[0].extra is not None
+    assert skipped[0].extra.get("event_id") == f"evt-pr-7-{EVENT_LABEL}"
+
+
+def test_valid_head_ref_dispatches_with_option_terminator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A well-formed head ref still dispatches, and `--` ends git's options before the
+    worktree path and the ref."""
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo)
+    gh = _PrPollGh([_poll_pr(7, headRefName="feature/ok-7", isCrossRepository=False)])
+    client = RecordingHerdrClient()
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+    git = _RecordingGitSubprocess()
+    monkeypatch.setattr("herdr_routines.tick.subprocess", git)
+
+    tick(1)
+
+    assert len(client.tab_creates) == 1
+    (add,) = git.worktree_adds()
+    assert add[-3:-2] == ["--"]
+    assert add[-1] == "feature/ok-7"
+
+
+def test_head_ref_check_that_cannot_run_is_a_retried_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the branch-name check itself cannot run, the event is neither dispatched nor
+    written off as invalid: it is a failed attempt, retried on later ticks within the
+    event's budget."""
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo, max_attempts_per_target=2)
+    gh = _PrPollGh([_poll_pr(7, isCrossRepository=False)])
+    client = RecordingHerdrClient()
+    tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    class _NoGit(_RecordingGitSubprocess):
+        def run(self, argv: list[str], *args: Any, **kwargs: Any) -> Any:
+            if argv[:2] == ["git", "check-ref-format"]:
+                raise OSError("git: not found")
+            return super().run(argv, *args, **kwargs)
+
+    git = _NoGit()
+    monkeypatch.setattr("herdr_routines.tick.subprocess", git)
+
+    for minute in (1, 2, 3):
+        tick(minute)
+
+    assert git.worktree_adds() == []
+    assert client.tab_creates == []
+    history_path = tmp_path / "state" / "history.jsonl"
+    reasons = [
+        r.extra.get("reason") for r in read_job(history_path, job.name) if r.extra
+    ]
+    assert reasons.count("head_ref_check_failed") == 2, "retried up to the budget"
+    assert "invalid_head_ref" not in reasons
+    assert "max_attempts_exceeded" in reasons
