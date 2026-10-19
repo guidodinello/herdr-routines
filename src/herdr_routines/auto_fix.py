@@ -990,7 +990,7 @@ def run_checks(
                     CheckResult(
                         kind=kind,
                         passed=False,
-                        error=f"unknown check kind: {kind}",
+                        error="command check has no command",
                     )
                 )
                 continue
@@ -1020,7 +1020,7 @@ def run_checks(
                 CheckResult(
                     kind=kind,
                     passed=False,
-                    error=f"unknown check kind: {kind}",
+                    error="github_event checks are polled by the tick, not run by run_checks",
                 )
             )
         else:

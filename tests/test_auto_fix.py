@@ -1336,3 +1336,24 @@ def test_run_checks_keeps_partial_output_on_timeout(tmp_path: Path) -> None:
     assert result.timed_out is True
     assert "partial" in result.output
     assert "oops" in result.output
+
+
+def test_run_checks_reports_specific_errors_for_non_runnable_checks(
+    tmp_path: Path,
+) -> None:
+    from herdr_routines.auto_fix import run_checks
+    from herdr_routines.config import GateCheck
+
+    outcome = run_checks(
+        (GateCheck(kind="command"), GateCheck(kind="github_event")),
+        cwd=str(tmp_path),
+    )
+    no_command, event = outcome.results
+    assert outcome.passed is False
+    assert no_command.passed is False
+    assert no_command.error == "command check has no command"
+    assert event.passed is False
+    assert (
+        event.error
+        == "github_event checks are polled by the tick, not run by run_checks"
+    )
