@@ -22,7 +22,12 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 
-from herdr_routines.herdr import HerdrClient, HerdrCliError, PromptWatchdogKilled
+from herdr_routines.herdr import (
+    AgentStatus,
+    HerdrClient,
+    HerdrCliError,
+    PromptWatchdogKilled,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +103,7 @@ def prompt_with_watchdog(
     prompt_text: str,
     on_poll_hook: Callable[[], None] | None = None,
     retry_delays_s: Sequence[float] = PROMPT_RETRY_DELAYS_S,
-) -> str:
+) -> AgentStatus | None:
     """agent_prompt_wait_with_watchdog with bounded retries over provably-early
     session-not-ready failures — the same whitelist phase 1's retry enforced (see
     is_retryable_prompt_error): settle timeouts, wrapper subprocess timeouts and shape
@@ -110,7 +115,8 @@ def prompt_with_watchdog(
     and never retried — one delivery, one terminal record — so it propagates immediately as
     PromptWatchdogKilled for the caller's fast-fail classification. Poll reads that fail are
     inert (the callback sees "", which matches nothing). Raises the last error if every
-    attempt fails. `target` is the agent name; `job_name` only labels log lines.
+    attempt fails. Returns the settled agent_status, or None when herdr reports a value
+    outside its schema. `target` is the agent name; `job_name` only labels log lines.
 
     `on_poll_hook` (a no-arg callback) fires inside the same `scan` closure that scans
     for markers, once per poll. `pipeline_run` uses it to write its liveness heartbeat —

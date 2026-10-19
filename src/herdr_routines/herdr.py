@@ -14,7 +14,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Final, Literal, Protocol, cast, get_args
 
 from herdr_routines.config import AGENT_MODEL_FLAGS
 
@@ -39,11 +39,15 @@ WATCHDOG_KILL_GRACE_S = 5.0
 # Settle states `agent get`/`agent prompt --wait` can report. Confirmed empirically against
 # herdr 0.8.2 (see docs/plan-v1.md step 5): a never-focused pane settles to "idle", not the
 # "done" that SKILL.md's seen/unseen distinction predicted — so both map to success below.
-AGENT_STATUS_IDLE = "idle"
-AGENT_STATUS_DONE = "done"
-AGENT_STATUS_WORKING = "working"
-AGENT_STATUS_BLOCKED = "blocked"
-AGENT_STATUS_UNKNOWN = "unknown"
+# Mirrors the closed `AgentStatus` enum in tests/fixtures/api-schema.json; `_extract_status`
+# derives its membership check from this Literal, so it stays the one definition.
+AgentStatus = Literal["idle", "done", "working", "blocked", "unknown"]
+
+AGENT_STATUS_IDLE: Final[AgentStatus] = "idle"
+AGENT_STATUS_DONE: Final[AgentStatus] = "done"
+AGENT_STATUS_WORKING: Final[AgentStatus] = "working"
+AGENT_STATUS_BLOCKED: Final[AgentStatus] = "blocked"
+AGENT_STATUS_UNKNOWN: Final[AgentStatus] = "unknown"
 
 # The only status that self-clears without outside intervention: an actively-working agent
 # will transition on its own once it settles. idle/done are already settled. "blocked" and
@@ -51,19 +55,23 @@ AGENT_STATUS_UNKNOWN = "unknown"
 # blocked agent's prompt or resolves an unknown state — so treating them as "live" would just
 # move the skip-forever bug (permanently registered, never re-evaluated) rather than fix it.
 # See tick.py's _live_agent_exists.
-LIVE_AGENT_STATUSES = frozenset({AGENT_STATUS_WORKING})
+LIVE_AGENT_STATUSES: Final[frozenset[AgentStatus]] = frozenset({AGENT_STATUS_WORKING})
 
 # Statuses safe to reap when reusing a recurring job's agent name. Only idle/done are
 # provably settled and will never need human follow-up; blocked (waiting on approval,
 # answerable from bed via herdr-push per plan-v1 §2) and unknown must never be reaped.
-SETTLED_AGENT_STATUSES = frozenset({AGENT_STATUS_IDLE, AGENT_STATUS_DONE})
+SETTLED_AGENT_STATUSES: Final[frozenset[AgentStatus]] = frozenset(
+    {AGENT_STATUS_IDLE, AGENT_STATUS_DONE}
+)
 
 # The "sticky under cron" statuses (issue 051): a prior run that ended blocked/unknown and
 # whose agent is still registered holds the recurring name hostage — `agent start` then
 # fails `agent_name_taken` every subsequent run. The pre-start reap deliberately leaves
 # these alone (evidence pane, issue 033), so the runner only force-closes one on an actual
 # name collision, when the prior run is already recorded failed and its tail is on disk.
-STICKY_AGENT_STATUSES = frozenset({AGENT_STATUS_BLOCKED, AGENT_STATUS_UNKNOWN})
+STICKY_AGENT_STATUSES: Final[frozenset[AgentStatus]] = frozenset(
+    {AGENT_STATUS_BLOCKED, AGENT_STATUS_UNKNOWN}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,8 +389,11 @@ class HerdrClient:
         )
         self._call(args, timeout_s=start_timeout_ms / 1000 + 10)
 
-    def agent_prompt_wait(self, *, target: str, text: str, timeout_ms: int) -> str:
-        """Sends the prompt, waits for settle, and returns the settled agent_status."""
+    def agent_prompt_wait(
+        self, *, target: str, text: str, timeout_ms: int
+    ) -> AgentStatus | None:
+        """Sends the prompt, waits for settle, and returns the settled agent_status (None
+        when herdr reports a value outside its schema)."""
         args = ["agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)]
         body = self._call(args, timeout_s=timeout_ms / 1000 + 30)
         return _extract_status(body)
@@ -395,7 +406,7 @@ class HerdrClient:
         timeout_ms: int,
         poll_interval_s: float = PROMPT_WATCHDOG_POLL_S,
         on_poll: Callable[[str], str | None] | None = None,
-    ) -> str:
+    ) -> AgentStatus | None:
         """agent_prompt_wait with a mid-run fast-fail watchdog (phase 2,
         docs/pipeline/runs/<run_id>/spec.md). Runs `herdr agent prompt --wait` under Popen
         and, every poll_interval_s while the child is still running, feeds
@@ -407,7 +418,8 @@ class HerdrClient:
         never an exception — an unreachable server degrades to today's timeout path. With no
         marker ever confirmed this is behavior-identical to agent_prompt_wait: child exits
         parse through _parse_result (including the exit-124 wrapper timeout at
-        timeout_ms + PROMPT_WAIT_GRACE_S) and the settled status string comes back."""
+        timeout_ms + PROMPT_WAIT_GRACE_S) and the settled agent_status comes back (None when herdr reports a value outside its
+        schema)."""
         args = ["agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)]
         proc = self.popen_factory([self.bin_path, *args])
         deadline = time.monotonic() + timeout_ms / 1000 + PROMPT_WAIT_GRACE_S
@@ -441,7 +453,7 @@ class HerdrClient:
             remaining = deadline - time.monotonic()
             time.sleep(min(max(poll_interval_s, 0.0), max(remaining, 0.0)))
 
-    def agent_get(self, target: str) -> str:
+    def agent_get(self, target: str) -> AgentStatus | None:
         body = self._call(["agent", "get", target])
         return _extract_status(body)
 
@@ -837,7 +849,7 @@ def _extract_str(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
     return node
 
 
-def _extract_status(body: dict[str, Any]) -> str:
+def _extract_status(body: dict[str, Any]) -> AgentStatus | None:
     try:
         status = body["result"]["agent"]["agent_status"]
     except (KeyError, TypeError) as e:
@@ -846,4 +858,7 @@ def _extract_status(body: dict[str, Any]) -> str:
         ) from e
     if not isinstance(status, str):
         raise HerdrCliError(f"unexpected agent_status type in: {body!r}", exit_code=0)
-    return status
+    if status not in get_args(AgentStatus):
+        log.warning("herdr reported unrecognized agent_status %r", status)
+        return None
+    return cast(AgentStatus, status)

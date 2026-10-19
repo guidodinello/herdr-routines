@@ -57,7 +57,7 @@ class ScriptedClient:
         self,
         *,
         pane_id: str = "w1:p1",
-        agent_status: str = "idle",
+        agent_status: str | None = "idle",
         interactive_ready: bool = True,
         stale_workspace: str | None = None,
         stale_pane: str | None = None,
@@ -1102,6 +1102,18 @@ def test_defensive_unsettled_status_reaps_pane(tmp_path: Path) -> None:
     assert outcome.state == "failed"
     assert outcome.reason == "unsettled_status_working"
     assert client.calls.index("agent_read_visible") < client.calls.index("pane_close")
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_unrecognized_status_reaps_pane_with_distinct_reason(tmp_path: Path) -> None:
+    """None is a status outside herdr's schema: same reap path as a defensive 'working',
+    but the reason must not read 'unsettled_status_None'."""
+    job = make_job(tmp_path)
+    client = ScriptedClient(agent_status=None, visible_screen="who knows")
+    outcome = execute_run(job, client, run_id="a-unrecognized")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "unsettled_status_unrecognized"
+    assert outcome.final_agent_status is None
     assert client.closed_panes == ["w1:p1"]
 
 

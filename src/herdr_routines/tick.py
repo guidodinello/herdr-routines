@@ -69,7 +69,12 @@ from herdr_routines.findings import (
     prune_ledger,
     save_ledger,
 )
-from herdr_routines.herdr import LIVE_AGENT_STATUSES, HerdrClient, HerdrCliError
+from herdr_routines.herdr import (
+    LIVE_AGENT_STATUSES,
+    SETTLED_AGENT_STATUSES,
+    HerdrClient,
+    HerdrCliError,
+)
 from herdr_routines.history import (
     TERMINAL_STATES,
     HistoryRecord,
@@ -583,7 +588,9 @@ def _run_agent_in_worktree(
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
 
     return _AgentRun(
-        reason=None if settled_status in ("idle", "done") else "agent_prompt_failed",
+        reason=None
+        if settled_status in SETTLED_AGENT_STATUSES
+        else "agent_prompt_failed",
         pane_id=pane_id,
         final_agent_status=settled_status,
         session_id=session_id,
@@ -1745,7 +1752,7 @@ def _dispatch_event_worker(
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
 
     return {
-        "state": "done" if settled_status in ("idle", "done") else "failed",
+        "state": "done" if settled_status in SETTLED_AGENT_STATUSES else "failed",
         "pane_id": pane_id,
         "report_path": str(report_path) if report_written else None,
         "report_written": report_written,
@@ -2389,7 +2396,7 @@ def _process_base_target(
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
     _cleanup_worktree(job.repo, fix_wt_path)
 
-    state = "done" if settled_status in ("idle", "done") else "failed"
+    state = "done" if settled_status in SETTLED_AGENT_STATUSES else "failed"
     append(
         history_path,
         HistoryRecord(
@@ -2697,7 +2704,7 @@ def _dispatch_fix_worker(
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
 
     return {
-        "state": "done" if settled_status in ("idle", "done") else "failed",
+        "state": "done" if settled_status in SETTLED_AGENT_STATUSES else "failed",
         "pane_id": pane_id,
         "report_path": str(report_path) if report_written else None,
         "report_written": report_written,

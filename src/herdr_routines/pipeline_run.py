@@ -48,7 +48,7 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 from logger import get_logger
 
@@ -61,6 +61,8 @@ from herdr_routines.gates import (
     run_stage_gate,
 )
 from herdr_routines.herdr import (
+    AGENT_STATUS_BLOCKED,
+    AgentStatus,
     HerdrClient,
     HerdrCliError,
     PromptWatchdogKilled,
@@ -522,10 +524,14 @@ def _run_bounded(argv: Sequence[str], *, timeout_s: float) -> tuple[int, str, st
 # Not a herdr agent status: what `_start_and_prompt` returns when the failure-marker
 # watchdog killed the prompt, so the quota wedge flows through the same fallback check
 # and settle mapping as a real settle.
-QUOTA_KILLED_STATUS = "quota_exhausted"
+QUOTA_KILLED_STATUS: Final = "quota_exhausted"
+
+# A stage's settled status: a herdr status, None for a value outside its schema, or the
+# watchdog sentinel above.
+_StageStatus = AgentStatus | None | Literal["quota_exhausted"]
 
 
-def _settle_outcome(status: str) -> tuple[bool, str | None]:
+def _settle_outcome(status: _StageStatus) -> tuple[bool, str | None]:
     """Map a settled agent status onto (continue?, reason).
 
     `idle`/`done` is `runner.SUCCESS_AGENT_STATUSES`, the same set the routine-job path
@@ -539,7 +545,7 @@ def _settle_outcome(status: str) -> tuple[bool, str | None]:
     indistinguishable from a crash in the morning history."""
     if status in SUCCESS_AGENT_STATUSES:
         return True, None
-    if status == "blocked":
+    if status == AGENT_STATUS_BLOCKED:
         return False, "stage_blocked"
     if status == QUOTA_KILLED_STATUS:
         return False, "quota_exhausted"
@@ -1142,7 +1148,7 @@ def _prompt_with_fallback(
     heartbeat: Path,
     session_export: Callable[[str], str | None],
     clock: Callable[[], float],
-) -> tuple[str, str, str | None]:
+) -> tuple[str, _StageStatus, str | None]:
     """Prompt `spec`'s agent (resuming `session_id` if given) and, when its model failed
     mid-call, resume the same session once on `spec.fallback_model`. Returns (pane id,
     settled status, report line when the fallback ran).
@@ -1155,7 +1161,7 @@ def _prompt_with_fallback(
 
     def attempt(
         *, model: str, session_id: str | None, text: str, markers: Sequence[str]
-    ) -> tuple[str, str]:
+    ) -> tuple[str, _StageStatus]:
         return _start_and_prompt(
             spec,
             state,
@@ -1326,7 +1332,7 @@ def _start_and_prompt(
     failure_markers: Sequence[str],
     heartbeat: Path,
     clock: Callable[[], float],
-) -> tuple[str, str]:
+) -> tuple[str, _StageStatus]:
     """Open a pane, start `agent_name` on `model` (resuming `session_id` if given), send
     `text`, and return (pane id, settled status). Closes the pane before any `_Abort`.
 
@@ -1417,7 +1423,7 @@ def _session_api_error(export_json: str) -> str | None:
 def _fallback_cause(
     client: HerdrClient,
     agent_name: str,
-    status: str,
+    status: _StageStatus,
     session_export: Callable[[str], str | None],
 ) -> tuple[str | None, str | None]:
     """(session id, why the stage's model failed) for a settled stage agent; the cause is

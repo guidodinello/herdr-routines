@@ -12,10 +12,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TypedDict
+from typing import Final, TypedDict
 
 from herdr_routines.config import Job
 from herdr_routines.herdr import (
+    AGENT_STATUS_BLOCKED,
+    AGENT_STATUS_UNKNOWN,
+    SETTLED_AGENT_STATUSES,
+    AgentStatus,
     HerdrClient,
     HerdrCliError,
     PromptWatchdogKilled,
@@ -55,7 +59,7 @@ log = logging.getLogger(__name__)
 # because "idle" is what was empirically observed on herdr 0.8.2 for a never-focused pane, and
 # "done" is kept in case SKILL.md's seen/unseen distinction applies under some other condition
 # not exercised by the step-5 probe. See docs/plan-v1.md.
-SUCCESS_AGENT_STATUSES = frozenset({"idle", "done"})
+SUCCESS_AGENT_STATUSES: Final[frozenset[AgentStatus]] = SETTLED_AGENT_STATUSES
 
 # How often _wait_for_agent_ready re-checks `agent get` while waiting for the agent's TUI to
 # accept typed input. Module-level so tests can zero it out.
@@ -149,7 +153,7 @@ def _prompt_with_watchdog(
     timeout_ms: int,
     markers: tuple[str, ...],
     prompt_text: str,
-) -> str:
+) -> AgentStatus | None:
     """Thin wrapper over `wait_loop.prompt_with_watchdog` (issue 056 §4: the loop moved
     out of this module so `pipeline_run` shares exactly one copy, and `runner`'s
     behaviour is unchanged). Retained as a named seam for the routine-job tests.
@@ -758,7 +762,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         "reaped_stale_agent": reaped_stale_agent,
     }
 
-    if settled_status == "blocked":
+    if settled_status == AGENT_STATUS_BLOCKED:
         # Leave the pane open (no _close_run_pane/_capture_session_id) so a human can
         # resume and see what it's stuck on — but still capture a diagnostic tail, since
         # the pane may not survive until then (manual close, host reboot). Uses
@@ -768,7 +772,7 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
         )
         return RunOutcome(state="failed", reason="blocked", visible_tail=tail, **common)
 
-    if settled_status == "unknown":
+    if settled_status == AGENT_STATUS_UNKNOWN:
         # An unresolvable settle status maps to the same terminal state as a crashed/killed
         # tick (docs/plan-v1.md §4's state machine), not a plain "failed" — stale-run recovery
         # already treats interrupted_unknown as the "we don't know what happened" bucket.
@@ -786,9 +790,14 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
         )
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)
-        return RunOutcome(
-            state="failed", reason=f"unsettled_status_{settled_status}", **common
+        # None is a status outside herdr's schema (the raw value went to the boundary
+        # warning log in herdr._extract_status).
+        reason = (
+            "unsettled_status_unrecognized"
+            if settled_status is None
+            else f"unsettled_status_{settled_status}"
         )
+        return RunOutcome(state="failed", reason=reason, **common)
 
     # Both remaining outcomes are a settled idle/done agent. Before closing our pane (issue
     # 032): a settle with no report, or an empty one, gets exactly one bounded follow-up

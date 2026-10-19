@@ -82,6 +82,7 @@ except the two preserved states:
 | settled `blocked`                    | blocked                                        | **no** | answerable from bed via herdr-push (ROADMAP Next)                                            |
 | settled `unknown`                    | unsettled_status_unknown → interrupted_unknown | **no** | evidence preservation (plan-v1 §4 bucket)                                                    |
 | settled other (defensive)            | unsettled_status_<status>                      | yes   | herdr claims it is still working → would wedge                                               |
+| settled off-schema value             | unsettled_status_unrecognized                  | yes   | herdr emitted a status outside its schema; raw value is in the boundary warning log          |
 | `no_report` / `done`                 | —                                              | no    | existing retention policy unchanged (ROADMAP Next: retention policy)                         |
 
 Ordering: tail capture (§3.3) happens *before* the close, obviously; the close happens before
