@@ -680,6 +680,20 @@ def run_gc(
     return 0
 
 
+def _worktree_dirty(path: Path | None) -> bool:
+    """True when the worktree at ``path`` has uncommitted or untracked changes.
+
+    ``worktree remove --force`` discards them, so delete mode must look first. Ignored
+    files (pipeline ``state.json``) don't show in ``status --porcelain`` and don't count.
+    A registered worktree whose directory is gone has nothing to lose; any other
+    ``git status`` failure reads as dirty (fail closed on a destructive step).
+    """
+    if path is None or not path.exists():
+        return False
+    proc = run_git(path, "status", "--porcelain")
+    return proc.returncode != 0 or bool(proc.stdout.strip())
+
+
 def _remove_worktree(repo: Path, row: Row, worktrees: dict[str, Path]) -> bool:
     path = worktrees.get(row.branch)
     if path is None:
@@ -861,9 +875,16 @@ def run_gc_delete(
 
         deleted: list[str] = []
         failed: list[str] = []
+        dirty: list[str] = []
         removed_worktree_paths: set[Path] = set()
 
         for row in to_delete:
+            # Never overridable by --force: that flag widens *which branches* are
+            # candidates, not whether uncommitted work may be thrown away.
+            if _worktree_dirty(worktrees.get(row.branch)):
+                dirty.append(row.branch)
+                out.write(f"skipped (dirty worktree): {row.branch}\n")
+                continue
             if not _remove_worktree(root, row, worktrees):
                 failed.append(f"{row.branch} (worktree remove)")
                 continue
@@ -886,7 +907,8 @@ def run_gc_delete(
         summary = (
             f"deleted: {len(deleted)}, "
             f"skipped (unmerged): {len(skipped)}, "
-            f"failed: {len(failed)}"
+            f"failed: {len(failed)}, "
+            f"skipped (dirty): {len(dirty)}"
         )
         out.write(f"{summary}\n")
 

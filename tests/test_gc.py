@@ -1750,3 +1750,73 @@ def test_merged_pr_without_a_head_commit_vouches_for_nothing(repo: Path) -> None
     prs = {branch: [gc.MergedPr(head_oid=None, merged_at=None)]}
 
     assert gc.merged_pr_for(branch, repo, prs) is None
+
+
+# ---------------------------------------------------------------------------
+# A worktree holding uncommitted work is never force-removed
+# ---------------------------------------------------------------------------
+
+
+def _merged_branch_with_worktree(repo: Path, tmp_path: Path) -> tuple[str, Path]:
+    branch = "auto/fix-thing-20260901T000000Z"
+    worktree = tmp_path / "wt" / "auto-fix-thing"
+    _git(repo, "worktree", "add", str(worktree), "-b", branch, "main")
+    return branch, worktree
+
+
+@pytest.mark.parametrize("extra_args", [(), ("--force",)])
+@pytest.mark.parametrize("dirt", ["modified", "untracked"])
+def test_gc_delete_skips_a_dirty_worktree(
+    repo: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    dirt: str,
+    extra_args: tuple[str, ...],
+) -> None:
+    branch, worktree = _merged_branch_with_worktree(repo, tmp_path)
+    if dirt == "modified":
+        (worktree / "README.md").write_text("edited, never committed\n")
+    else:
+        (worktree / "scratch.txt").write_text("never added\n")
+
+    code, out, _ = _gc_delete(repo, capsys, *extra_args)
+
+    assert code == 0
+    assert f"skipped (dirty worktree): {branch}" in out
+    assert f"deleted: {branch}" not in out
+    assert worktree.exists()
+    assert _branch_exists(repo, branch)
+
+
+def test_gc_delete_removes_a_clean_merged_worktree_despite_ignored_files(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ignored files (pipeline `state.json`) don't count as dirty, so a finished
+    pipeline worktree is still collected."""
+    (repo / ".gitignore").write_text("state.json\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-m", "ignore state.json")
+    branch, worktree = _merged_branch_with_worktree(repo, tmp_path)
+    (worktree / "state.json").write_text("{}\n")
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" in out
+    assert not worktree.exists()
+    assert not _branch_exists(repo, branch)
+
+
+def test_gc_delete_removes_a_merged_branch_whose_worktree_dir_is_gone(
+    repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Registered but deleted from disk: nothing there to lose, and `git status` can't
+    run in it, so the dirty check must not treat that as a reason to keep the branch."""
+    branch, worktree = _merged_branch_with_worktree(repo, tmp_path)
+    shutil.rmtree(worktree)
+
+    code, out, _ = _gc_delete(repo, capsys)
+
+    assert code == 0
+    assert f"deleted: {branch}" in out
+    assert not _branch_exists(repo, branch)
