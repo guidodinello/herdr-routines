@@ -10,7 +10,8 @@ reusing the fakes of `test_review_scan` and `test_audit_dispatch`.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,13 +22,16 @@ import pytest
 from herdr_routines import runner, tick
 from herdr_routines.auto_fix import (
     build_audit_agent_name,
+    build_gate_worker_agent_name,
     build_review_agent_name,
     build_review_agent_prefix,
     review_target_hash,
 )
 from herdr_routines.config import Job
+from herdr_routines.findings import ledger_path, load_ledger
 from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import STALE_MARGIN, HistoryRecord, append, read_job
+from tests.test_audit_dispatch import _FakeHerdr, _finding, _git
 from tests.test_audit_dispatch import _job as _audit_job
 from tests.test_review_scan import (
     ReviewGh,
@@ -759,3 +763,352 @@ def test_review_job_prompt_replaces_the_engine_prompt_with_placeholders_resolved
     assert env.client.prompt_texts == [
         f"Review review-my-prs run {run_id}, write {report}"
     ]
+
+
+# -- audit run and fix dispatch ---------------------------------------------------------
+
+AUDIT_RUN_ID = "audit-type-health-20261012T083000Z"
+AUDIT_JOB = "audit-type-health"
+AUDIT_AGENT = build_audit_agent_name(AUDIT_JOB, AUDIT_RUN_ID)
+FIX_AGENT = build_gate_worker_agent_name(AUDIT_JOB, AUDIT_RUN_ID)
+
+
+@pytest.fixture
+def state_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    state = tmp_path / "state"
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(state))
+    return state
+
+
+@pytest.fixture
+def audit_repo(
+    tmp_path: Path, state_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """A real one-commit git repo on `main`. `ensure_repo` is stubbed (there is no
+    remote); the tests that need it to fail replace the stub."""
+    path = tmp_path / "repo"
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    (path / "a.php").write_text("<?php\n")
+    _git(path, "add", ".")
+    _git(
+        path,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "init",
+    )
+    monkeypatch.setattr(tick, "ensure_repo", lambda job: job.repo)
+    return path
+
+
+def _due_audit_job(repo: Path, history: Path, **over: Any) -> Job:
+    job = _audit_job(repo, **{"cron": "30 8 * * *", **over})
+    append(history, HistoryRecord(ts=REGISTERED, job=job.name, state="registered"))
+    return job
+
+
+def _run_audit_job(job: Job, history: Path, client: _FakeHerdr) -> tuple[str, bool]:
+    return tick._process_audit_job(
+        job,
+        history,
+        client=client,  # type: ignore[arg-type]
+        now=NOW,
+    )
+
+
+def _auditor(
+    findings: list[dict[str, str]], *, fix_status: str = "idle"
+) -> Callable[[Any], str]:
+    """The audit agent writes its manifest; the fix worker settles with `fix_status`."""
+
+    def on_prompt(agent: Any) -> str:
+        if agent.name != AUDIT_AGENT:
+            return fix_status
+        manifest = tick.default_reports_dir() / f"{AUDIT_RUN_ID}-findings.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"version": 1, "check": "type-health", "findings": findings})
+        )
+        return "idle"
+
+    return on_prompt
+
+
+def _last_audit(history: Path) -> tuple[HistoryRecord, Mapping[str, Any]]:
+    record = read_job(history, AUDIT_JOB)[-1]
+    return record, record.extra or {}
+
+
+def _worktree(repo: Path, prefix: str) -> Path:
+    return repo / ".worktrees" / f"{prefix}-{AUDIT_RUN_ID}"
+
+
+class _NotReady(_FakeHerdr):
+    """Every agent starts but never reports interactive."""
+
+    def agent_interactive_ready(self, target: str) -> bool:
+        return False
+
+
+class _FixNotReady(_FakeHerdr):
+    """Only the fix worker never reports interactive."""
+
+    def agent_interactive_ready(self, target: str) -> bool:
+        return target != FIX_AGENT
+
+
+@pytest.fixture
+def fast_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse the ready-poll sleep and the prompt retry backoff."""
+    monkeypatch.setattr(runner, "READY_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(runner, "PROMPT_RETRY_DELAYS_S", ())
+
+
+def test_audit_flow_runs_the_audit_then_one_fix_worker_in_their_own_worktrees(
+    audit_repo: Path, history: Path
+) -> None:
+    job = _due_audit_job(audit_repo, history)
+    client = _FakeHerdr(_auditor([_finding(1), _finding(2)]))
+
+    summary, failed = _run_audit_job(job, history, client)
+
+    assert (summary, failed) == ("audit-type-health: done (fix_dispatched)", False)
+    records = read_job(history, AUDIT_JOB)
+    assert [r.state for r in records] == ["registered", "running", "done"]
+    assert records[1].run_id == AUDIT_RUN_ID
+    assert records[1].extra is not None
+    assert records[1].extra["scheduled_for"] == "2026-10-12T08:30:00+00:00"
+    extra = records[2].extra
+    assert extra is not None
+    branch = tick.build_branch_name(AUDIT_JOB, AUDIT_RUN_ID)
+    assert extra["gate"] == "fix_dispatched"
+    assert extra["target"] == "base"
+    assert (extra["findings_total"], extra["new"], extra["dispatched"]) == (2, 2, 2)
+    assert isinstance(ids := extra["dispatched_ids"], list)
+    assert len(ids) == 2
+    assert extra["branch"] == extra["gate_branch"] == branch
+    assert extra["agent_name"] == FIX_AGENT
+    assert extra["final_agent_status"] == "idle"
+    assert extra["session_id"] == f"ses-{FIX_AGENT}"
+    assert extra["report_path"] == str(
+        tick.default_reports_dir() / f"{AUDIT_RUN_ID}.md"
+    )
+    # The audit and the fix worker each ran in a worktree of their own, both gone now.
+    audit, fix = client.agents
+    assert (audit.name, audit.cwd) == (AUDIT_AGENT, _worktree(audit_repo, "audit"))
+    assert (fix.name, fix.cwd) == (FIX_AGENT, _worktree(audit_repo, "audit-fix"))
+    assert not _worktree(audit_repo, "audit").exists()
+    assert not _worktree(audit_repo, "audit-fix").exists()
+    # The worker settled, so its findings are handed off, not owed another dispatch.
+    ledger = load_ledger(ledger_path(AUDIT_JOB))
+    assert ledger is not None
+    assert {(e.attempts, e.queued) for e in ledger.entries.values()} == {(1, False)}
+    assert client.notifications == ["herdr-routines: audit-type-health fix_dispatched"]
+
+
+@pytest.mark.parametrize(
+    ("has_git_dir", "reason"),
+    [(False, "clone_failed"), (True, "repo_sync_failed")],
+)
+def test_audit_repo_that_cannot_be_prepared_fails_before_any_agent_starts(
+    tmp_path: Path,
+    state_env: Path,
+    history: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    has_git_dir: bool,
+    reason: str,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if has_git_dir:
+        (repo / ".git").mkdir()
+    monkeypatch.setattr(tick, "ensure_repo", _raises(RuntimeError("sync exploded")))
+    job = _due_audit_job(repo, history)
+    client = _FakeHerdr()
+
+    summary, failed = _run_audit_job(job, history, client)
+
+    assert (summary, failed) == (f"audit-type-health: failed ({reason})", True)
+    record, extra = _last_audit(history)
+    assert record.state == "failed"
+    assert extra["reason"] == reason
+    assert extra["error"] == "sync exploded"
+    assert extra["gate"] == "failed"
+    assert extra["target"] == "base"
+    assert extra["report_written"] is False
+    assert extra["report_path"] == str(
+        tick.default_reports_dir() / f"{AUDIT_RUN_ID}.md"
+    )
+    assert client.agents == []
+    assert client.notifications == ["herdr-routines: audit-type-health failed"]
+
+
+def test_audit_whose_base_cannot_be_checked_out_fails_with_worktree_creation_failed(
+    audit_repo: Path, history: Path
+) -> None:
+    job = _due_audit_job(audit_repo, history, base="no-such-ref")
+    client = _FakeHerdr()
+
+    summary, failed = _run_audit_job(job, history, client)
+
+    assert (summary, failed) == (
+        "audit-type-health: failed (worktree_creation_failed)",
+        True,
+    )
+    _record, extra = _last_audit(history)
+    assert extra["reason"] == "worktree_creation_failed"
+    assert "git worktree add failed" in extra["error"]
+    assert client.agents == []
+
+
+@pytest.mark.parametrize(
+    ("client_factory", "reason", "final_status", "error"),
+    [
+        pytest.param(
+            lambda: _FakeHerdr(fail_start=lambda name: True),
+            "agent_start_failed",
+            None,
+            "could not start",
+            id="start_raises",
+        ),
+        pytest.param(
+            lambda: _NotReady(),
+            "agent_not_interactive",
+            None,
+            None,
+            id="never_interactive",
+        ),
+        pytest.param(
+            lambda: _FakeHerdr(_raises(RuntimeError("agent crashed"))),
+            "agent_prompt_failed",
+            None,
+            "agent crashed",
+            id="prompt_raises",
+        ),
+        pytest.param(
+            lambda: _FakeHerdr(lambda agent: "blocked"),
+            "agent_prompt_failed",
+            "blocked",
+            None,
+            id="settles_blocked",
+        ),
+    ],
+)
+def test_audit_agent_that_fails_ends_the_run_without_a_fix_worker(
+    audit_repo: Path,
+    history: Path,
+    fast_waits: None,
+    client_factory: Callable[[], _FakeHerdr],
+    reason: str,
+    final_status: str | None,
+    error: str | None,
+) -> None:
+    job = _due_audit_job(audit_repo, history, start_timeout_ms=10)
+    client = client_factory()
+
+    summary, failed = _run_audit_job(job, history, client)
+
+    assert (summary, failed) == (f"audit-type-health: failed ({reason})", True)
+    record, extra = _last_audit(history)
+    assert record.state == "failed"
+    assert extra["reason"] == reason
+    assert extra["phase"] == "audit"
+    assert extra["agent_name"] == AUDIT_AGENT
+    assert extra["pane_id"] == "w1:p1"
+    assert extra["final_agent_status"] == final_status
+    if error is None:
+        assert extra["error"] is None
+    else:
+        assert error in extra["error"]
+    assert extra["report_written"] is False
+    assert FIX_AGENT not in [a.name for a in client.agents]
+    assert not _worktree(audit_repo, "audit").exists()
+    assert client.notifications == ["herdr-routines: audit-type-health failed"]
+
+
+def test_audit_fix_that_cannot_get_a_worktree_still_spends_the_attempt(
+    audit_repo: Path, history: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_add = tick._add_worktree
+
+    def add_worktree(repo: Path, wt_path: Path, base: str) -> None:
+        if wt_path.name.startswith("audit-fix-"):
+            raise RuntimeError("git worktree add failed: simulated")
+        real_add(repo, wt_path, base)
+
+    monkeypatch.setattr(tick, "_add_worktree", add_worktree)
+    job = _due_audit_job(audit_repo, history)
+    client = _FakeHerdr(_auditor([_finding(1)]))
+
+    summary, failed = _run_audit_job(job, history, client)
+
+    assert (summary, failed) == (
+        "audit-type-health: failed (worktree_creation_failed)",
+        True,
+    )
+    _record, extra = _last_audit(history)
+    assert extra["gate"] == "fix_dispatched"
+    assert extra["reason"] == "worktree_creation_failed"
+    assert "simulated" in extra["error"]
+    assert extra["pane_id"] is None
+    assert extra["fix_report_written"] is False
+    (fid,) = extra["dispatched_ids"]
+    # The ledger is written before the dispatch, so the finding is spent an attempt and
+    # stays queued for the next cycle.
+    ledger = load_ledger(ledger_path(AUDIT_JOB))
+    assert ledger is not None
+    assert ledger.entries[fid].attempts == 1
+    assert ledger.entries[fid].queued
+    assert [a.name for a in client.agents] == [AUDIT_AGENT]
+
+
+@pytest.mark.parametrize(
+    ("client_factory", "reason", "final_status"),
+    [
+        pytest.param(
+            lambda: _FixNotReady(_auditor([_finding(1)])),
+            "agent_not_interactive",
+            None,
+            id="never_interactive",
+        ),
+        pytest.param(
+            lambda: _FakeHerdr(_auditor([_finding(1)], fix_status="blocked")),
+            "agent_prompt_failed",
+            "blocked",
+            id="settles_blocked",
+        ),
+    ],
+)
+def test_audit_fix_worker_that_does_not_settle_keeps_its_findings_queued(
+    audit_repo: Path,
+    history: Path,
+    fast_waits: None,
+    client_factory: Callable[[], _FakeHerdr],
+    reason: str,
+    final_status: str | None,
+) -> None:
+    job = _due_audit_job(audit_repo, history, start_timeout_ms=10)
+    client = client_factory()
+
+    summary, failed = _run_audit_job(job, history, client)
+
+    assert (summary, failed) == (f"audit-type-health: failed ({reason})", True)
+    record, extra = _last_audit(history)
+    assert record.state == "failed"
+    assert extra["gate"] == "fix_dispatched"
+    assert extra["reason"] == reason
+    assert extra["agent_name"] == FIX_AGENT
+    assert extra["pane_id"] == "w1:p2"
+    assert extra["final_agent_status"] == final_status
+    assert extra["fix_report_written"] is False
+    (fid,) = extra["dispatched_ids"]
+    ledger = load_ledger(ledger_path(AUDIT_JOB))
+    assert ledger is not None
+    assert (ledger.entries[fid].attempts, ledger.entries[fid].queued) == (1, True)
+    assert not _worktree(audit_repo, "audit-fix").exists()
+    assert client.notifications == ["herdr-routines: audit-type-health failed"]
