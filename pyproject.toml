@@ -47,5 +47,23 @@ mypy_path = "src"
 module = ["logger", "logger.*"]
 ignore_missing_imports = true
 
+# `strict = true` is global-only in mypy, and tests carry ~200 strict errors, so src
+# gets the per-module flags `--strict` implies instead. `warn_redundant_casts` is
+# global-only and left out; `no_implicit_reexport` is left out because it applies to the
+# exporting module, so tests importing names re-exported from src modules would fail.
+[[tool.mypy.overrides]]
+module = ["herdr_routines", "herdr_routines.*"]
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+warn_unused_ignores = true
+warn_return_any = true
+strict_equality = true
+extra_checks = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1190,3 +1190,16 @@ def test_build_agent_start_args_never_emits_skip_permissions() -> None:
             assert token not in args_lower, (
                 f"build_agent_start_args(kind={kind!r}) must not contain {token!r}"
             )
+
+
+def test_subprocess_runner_keeps_partial_output_on_timeout() -> None:
+    """On POSIX `TimeoutExpired.stdout/.stderr` are raw bytes, not str; the partial
+    output must survive the timeout instead of collapsing to ''."""
+    from herdr_routines.herdr import _subprocess_runner
+
+    exit_code, stdout, stderr = _subprocess_runner(
+        ["sh", "-c", "echo partial; echo oops >&2; sleep 5"], timeout_s=0.5
+    )
+    assert exit_code == 124
+    assert stdout == "partial\n"
+    assert stderr == "oops\n"

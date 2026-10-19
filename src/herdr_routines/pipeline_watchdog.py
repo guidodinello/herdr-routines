@@ -233,7 +233,7 @@ def heartbeat_log_path(heartbeat_dir: Path, run_id: str) -> Path:
 
 
 def _candidate_report_paths(
-    reports_dir: Path, run_id: str, raw_state: dict
+    reports_dir: Path, run_id: str, raw_state: Mapping[str, object]
 ) -> list[Path]:
     """Every path this run's terminal report could plausibly live at. The orchestrator
     records the exact path under `artifact_paths.report` (same field `ps.py`'s
@@ -252,7 +252,9 @@ def _candidate_report_paths(
     return paths
 
 
-def _has_terminal_report(reports_dir: Path, run_id: str, raw_state: dict) -> bool:
+def _has_terminal_report(
+    reports_dir: Path, run_id: str, raw_state: Mapping[str, object]
+) -> bool:
     return any(
         p.exists() for p in _candidate_report_paths(reports_dir, run_id, raw_state)
     )

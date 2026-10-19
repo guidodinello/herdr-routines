@@ -114,6 +114,14 @@ class CommandRunner(Protocol):
     ) -> tuple[int, str, str]: ...
 
 
+def _timeout_text(value: bytes | str | None) -> str:
+    """`TimeoutExpired.stdout/.stderr` are raw bytes on POSIX even under `text=True`
+    (they come from `communicate()` before decoding); keep them rather than dropping."""
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else value.decode(errors="replace")
+
+
 def _subprocess_runner(
     argv: list[str], *, timeout_s: float | None
 ) -> tuple[int, str, str]:
@@ -122,12 +130,10 @@ def _subprocess_runner(
             argv, capture_output=True, text=True, timeout=timeout_s, check=False
         )
     except subprocess.TimeoutExpired as e:
-        stdout = e.stdout if isinstance(e.stdout, str) else ""
-        stderr = e.stderr if isinstance(e.stderr, str) else ""
         return (
             124,
-            stdout,
-            stderr,
+            _timeout_text(e.stdout),
+            _timeout_text(e.stderr),
         )  # conventional timeout exit code; not one `herdr` itself uses
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -800,7 +806,7 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 
 
 def _extract_pane_id(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
-    node: Any = body
+    node: object = body
     for key in path:
         if not isinstance(node, dict) or key not in node:
             raise HerdrCliError(
@@ -816,7 +822,7 @@ def _extract_pane_id(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
 
 
 def _extract_str(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
-    node: Any = body
+    node: object = body
     for key in path:
         if not isinstance(node, dict) or key not in node:
             raise HerdrCliError(

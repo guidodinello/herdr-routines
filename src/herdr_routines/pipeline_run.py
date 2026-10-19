@@ -304,6 +304,7 @@ class _State:
     def commit(self, state_json: Path, **changes: object) -> _State:
         """Atomically write the changed state and return it. The write is the resume
         point, so it happens only after a gate has passed or a session id is real."""
+        # `**changes: object` cannot match replace()'s per-field types.
         updated = replace(self, **changes)  # type: ignore[arg-type]
         write_state_json(state_json, updated.payload())
         return updated

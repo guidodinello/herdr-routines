@@ -16,7 +16,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO
+
+OrphanKind = Literal["dangling-symlink", "nonempty-dir", "empty-dir"]
 
 BRANCH_PATTERN = "refs/heads/auto/*"
 PIPELINE_PREFIX = "auto/pipeline-"
@@ -83,7 +85,7 @@ class Orphan:
     """
 
     path: Path
-    kind: str
+    kind: OrphanKind
 
     @property
     def collectible(self) -> bool:

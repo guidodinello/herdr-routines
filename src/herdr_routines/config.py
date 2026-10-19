@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -627,7 +628,7 @@ def load_config_dir(path: Path) -> RoutinesConfig:
 
     # --- load defaults.yaml (optional) -------------------------------------------
     defaults_path = path / "defaults.yaml"
-    raw_defaults: dict = {}
+    raw_defaults: dict[str, Any] = {}
     if defaults_path.exists():
         raw_defaults = _load_yaml_or_error(defaults_path, kind="defaults")
         _validate_defaults_keys(raw_defaults, defaults_path)
@@ -718,7 +719,7 @@ def load_config_dir(path: Path) -> RoutinesConfig:
     )
 
 
-def _load_yaml_or_error(path: Path, *, kind: str) -> dict:
+def _load_yaml_or_error(path: Path, *, kind: str) -> dict[str, Any]:
     """Read and parse a single YAML file.  Raises :class:`ConfigError` with the file
     name embedded for clear diagnostics.  *kind* ("defaults" | "retention" | "job") only
     shapes the error message."""
@@ -739,7 +740,7 @@ def _load_yaml_or_error(path: Path, *, kind: str) -> dict:
     return raw
 
 
-def _validate_defaults_keys(raw: dict, path: Path) -> None:
+def _validate_defaults_keys(raw: Mapping[str, object], path: Path) -> None:
     """Reject unknown keys in ``defaults.yaml`` (same contract as the legacy top-level
     ``defaults:`` block)."""
     unknown = set(raw) - _DEFAULTS_ALLOWED_KEYS
@@ -747,7 +748,7 @@ def _validate_defaults_keys(raw: dict, path: Path) -> None:
         raise ConfigError(f"{path}: unknown key(s): {sorted(unknown)}")
 
 
-def _validate_retention_keys(raw: dict, label: str) -> None:
+def _validate_retention_keys(raw: Mapping[str, object], label: str) -> None:
     """Reject unknown keys under `retention` (same contract for the top-level block and for
     ``retention.yaml``). *label* is the file path, or "retention" for the inline block."""
     unknown = set(raw) - _RETENTION_ALLOWED_KEYS
@@ -755,7 +756,7 @@ def _validate_retention_keys(raw: dict, label: str) -> None:
         raise ConfigError(f"{label}: unknown key(s): {sorted(unknown)}")
 
 
-def _build_retention(raw: dict, label: str) -> Retention:
+def _build_retention(raw: Mapping[str, object], label: str) -> Retention:
     """Build a :class:`Retention` from a parsed retention mapping. Validates the unknown key
     set first, so a typo is reported as a typo rather than as a type error on `None`."""
     _validate_retention_keys(raw, label)
@@ -883,7 +884,11 @@ def _is_valid_repo_url(value: str) -> bool:
 
 
 def _build_job(
-    raw_job: dict, defaults: dict, *, index: int, label_prefix: str | None = None
+    raw_job: dict[str, Any],
+    defaults: dict[str, Any],
+    *,
+    index: int,
+    label_prefix: str | None = None,
 ) -> Job:
     unknown = set(raw_job) - _JOB_ALLOWED_KEYS
     if unknown:
@@ -1400,7 +1405,7 @@ def _build_job(
             )
         target = "pr"
 
-    if target == "base" and kind == "gated" and (not isinstance(base, str) or not base):
+    if target == "base" and kind == "gated" and not base:
         raise ConfigError(
             f"{label}: 'base' must be a non-empty string when target is 'base'"
         )
