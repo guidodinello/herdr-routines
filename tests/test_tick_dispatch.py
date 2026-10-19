@@ -18,12 +18,25 @@ from typing import Any
 
 import pytest
 
-from herdr_routines import tick
-from herdr_routines.auto_fix import build_audit_agent_name
+from herdr_routines import runner, tick
+from herdr_routines.auto_fix import (
+    build_audit_agent_name,
+    build_review_agent_name,
+    build_review_agent_prefix,
+    review_target_hash,
+)
 from herdr_routines.config import Job
+from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import STALE_MARGIN, HistoryRecord, append, read_job
 from tests.test_audit_dispatch import _job as _audit_job
-from tests.test_review_scan import _review_job
+from tests.test_review_scan import (
+    ReviewGh,
+    ReviewHerdrClient,
+    _mark_posted,
+    _pr,
+    _review_job,
+    _setup_repo,
+)
 
 NOW = datetime(2026, 10, 12, 9, 0, 0, tzinfo=UTC)
 # One cron fire (08:30 UTC) lies between REGISTERED and NOW, 30 minutes late.
@@ -353,3 +366,396 @@ def test_process_job_routes_kind_review_to_the_review_flow(
     # First sight is `_process_review_job`'s own answer; no other kind registers a review job.
     assert (summary, failed) == (f"{job.name}: registered", False)
     assert _states(history, job) == ["registered"]
+
+
+# -- review cycle and per-target dispatch ----------------------------------------------
+
+
+@dataclass(slots=True)
+class ReviewEnv:
+    job: Job
+    gh: ReviewGh
+    client: ReviewHerdrClient
+    history: Path
+    checkout: Path
+
+    def run(self) -> tuple[str, bool]:
+        return tick._process_review_job(
+            self.job,
+            self.history,
+            client=self.client,  # type: ignore[arg-type]
+            now=NOW,
+        )
+
+    @property
+    def worktree_root(self) -> Path:
+        return self.checkout / ".worktrees"
+
+    def target_records(self) -> list[HistoryRecord]:
+        return [
+            r
+            for r in read_job(self.history, self.job.name)
+            if r.extra and "target_key" in r.extra
+        ]
+
+    def run_id(self) -> str:
+        running = [
+            r for r in read_job(self.history, self.job.name) if r.state == "running"
+        ]
+        assert running[-1].run_id is not None
+        return running[-1].run_id
+
+
+def _review_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prs: tuple[Any, ...],
+    client: Callable[[ReviewGh], ReviewHerdrClient] | None = None,
+    head_branch: str = "feature-x",
+    **job_over: Any,
+) -> ReviewEnv:
+    """A due review job over a real `acme/widgets` clone, with gh and herdr faked.
+    The default herdr fake plays a worker that posts its review."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    base = tmp_path / "repos"
+    origin, checkout = _setup_repo(tmp_path, "acme", "widgets", head_branch, base)
+    job = _review_job(tmp_path, repo=base, **job_over)
+    gh = ReviewGh(
+        prs=prs,
+        repo_infos={
+            ("acme", "widgets"): {"clone_url": str(origin), "default_branch": "main"}
+        },
+    )
+    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    history = tmp_path / "history.jsonl"
+    append(history, HistoryRecord(ts=REGISTERED, job=job.name, state="registered"))
+    return ReviewEnv(
+        job=job,
+        gh=gh,
+        client=client(gh) if client else ReviewHerdrClient(on_prompt=_mark_posted(gh)),
+        history=history,
+        checkout=checkout,
+    )
+
+
+def _raises(exc: Exception) -> Callable[..., Any]:
+    def _raise(*_a: Any, **_kw: Any) -> Any:
+        raise exc
+
+    return _raise
+
+
+def test_review_flow_dispatches_the_oldest_target_and_reports_every_skip_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Oldest first: #1 is at its attempt budget, #2 already carries a trusted review
+    # marker, #3 is dispatched, #4 is over the one-worker cap.
+    env = _review_env(
+        tmp_path,
+        monkeypatch,
+        prs=tuple(_pr(n, created_at=f"2026-10-0{n}T00:00:00Z") for n in (1, 2, 3, 4)),
+        max_workers_per_tick=1,
+    )
+    env.gh.posted.add("acme/widgets#2")
+    append(
+        env.history,
+        HistoryRecord(
+            ts=REGISTERED,
+            job=env.job.name,
+            state="done",
+            run_id="review-my-prs-20261011T083000Z",
+            extra={"target_key": "acme/widgets#1"},
+        ),
+    )
+
+    summary, failed = env.run()
+
+    assert failed is False
+    assert summary == (
+        "review-my-prs: done (enumerated=4, candidates=4, dispatched=1, "
+        "skipped=3, failed=0, repos_failed=0)"
+    )
+    run_id = env.run_id()
+    target_done = [r for r in env.target_records() if r.run_id == run_id]
+    assert len(target_done) == 1
+    record = target_done[0]
+    assert record.state == "done"
+    assert record.extra is not None
+    h6 = review_target_hash(env.job.name, "acme/widgets#3")
+    assert record.extra["target_key"] == "acme/widgets#3"
+    assert record.extra["pr_number"] == 3
+    assert record.extra["select_mode"] == "author"
+    assert record.extra["headRefName"] == "feature-x"
+    assert record.extra["attempt"] == 0
+    assert record.extra["verified"] is True
+    assert record.extra["agent"] == build_review_agent_name(
+        env.job.name, "acme/widgets#3", run_id
+    )
+    assert record.extra["pane_id"] == "w1:p1"
+    assert record.extra["report_path"] == str(
+        tick.default_reports_dir() / f"auto-review-{run_id}-{h6}.md"
+    )
+    aggregate = read_job(env.history, env.job.name)[-1]
+    assert aggregate.state == "done"
+    assert aggregate.extra is not None
+    assert aggregate.extra["gate"] == "passed"
+    assert aggregate.extra["target"] == "pr"
+    assert (
+        aggregate.extra["enumerated"],
+        aggregate.extra["candidates"],
+        aggregate.extra["dispatched"],
+        aggregate.extra["skipped"],
+        aggregate.extra["failed"],
+        aggregate.extra["repos_failed"],
+    ) == (4, 4, 1, 3, 0, 0)
+    report = (tick.default_reports_dir() / f"review-{run_id}.md").read_text()
+    for reason in ("max_attempts_exceeded", "review_already_posted", "over_cap"):
+        assert reason in report
+    assert env.client.started == [record.extra["agent"]]
+    assert env.client.notifications == [
+        ("herdr-routines: review-my-prs done", None, "done")
+    ]
+
+
+def test_review_flow_fails_closed_when_gh_has_no_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _review_env(tmp_path, monkeypatch, prs=(_pr(1),))
+    monkeypatch.setattr(env.gh, "api_user", _raises(RuntimeError("gh: not logged in")))
+
+    summary, failed = env.run()
+
+    assert (summary, failed) == ("review-my-prs: failed (gh_auth_missing)", True)
+    record = read_job(env.history, env.job.name)[-1]
+    assert record.state == "failed"
+    assert record.extra is not None
+    assert record.extra["reason"] == "gh_auth_missing"
+    assert record.extra["error"] == "gh: not logged in"
+    assert record.extra["gate"] == "failed"
+    assert record.extra["dispatched"] == 0
+    assert env.gh.search_calls == []
+    assert env.client.notifications == [
+        ("herdr-routines: review-my-prs failed", "gh_auth_missing", "request")
+    ]
+
+
+def test_review_flow_isolates_a_repo_whose_info_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `acme/gadgets` has no repo_info entry, so gh answers None for it.
+    env = _review_env(
+        tmp_path,
+        monkeypatch,
+        prs=(
+            _pr(1, repo="acme/gadgets", created_at="2026-10-01T00:00:00Z"),
+            _pr(2, created_at="2026-10-02T00:00:00Z"),
+        ),
+    )
+
+    summary, failed = env.run()
+
+    assert failed is True
+    assert summary == (
+        "review-my-prs: done (enumerated=2, candidates=2, dispatched=1, "
+        "skipped=0, failed=1, repos_failed=1)"
+    )
+    # Only the readable repo's target got a per-target record.
+    assert [r.extra["target_key"] for r in env.target_records() if r.extra] == [
+        "acme/widgets#2"
+    ]
+    aggregate = read_job(env.history, env.job.name)[-1]
+    assert aggregate.state == "failed"
+    assert aggregate.extra is not None
+    assert aggregate.extra["gate"] == "failed"
+    assert aggregate.extra["repos_failed"] == 1
+    report = (tick.default_reports_dir() / f"review-{env.run_id()}.md").read_text()
+    assert "repo_info_failed" in report
+    assert env.client.notifications == [
+        (
+            "herdr-routines: review-my-prs failed",
+            "1 dispatched, 1 failed, 0 skipped",
+            "request",
+        )
+    ]
+
+
+def test_review_target_with_a_live_agent_is_skipped_not_redispatched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live = build_review_agent_prefix("review-my-prs", "acme/widgets#1") + "-earlier"
+    env = _review_env(
+        tmp_path,
+        monkeypatch,
+        prs=(_pr(1),),
+        client=lambda gh: ReviewHerdrClient(statuses={live: "working"}),
+    )
+
+    summary, failed = env.run()
+
+    assert failed is False
+    assert "dispatched=0, skipped=1, failed=0" in summary
+    (record,) = env.target_records()
+    assert record.state == "skipped"
+    assert record.extra is not None
+    assert record.extra["reason"] == "agent_live"
+    assert record.extra["attempt"] == 0
+    assert record.extra["pane_id"] is None
+    assert record.extra["verified"] is None
+    assert env.client.tabs == []
+    assert env.client.started == []
+
+
+def test_review_target_whose_head_ref_cannot_be_fetched_is_worktree_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _review_env(tmp_path, monkeypatch, prs=(_pr(1, head_ref="gone-branch"),))
+
+    _summary, failed = env.run()
+
+    assert failed is True
+    (record,) = env.target_records()
+    assert record.state == "failed"
+    assert record.extra is not None
+    assert record.extra["reason"] == "worktree_failed"
+    assert str(record.extra["error"]).startswith("git fetch failed")
+    assert record.extra["verified"] is False
+    assert record.extra["agent"] is None
+    assert env.client.tabs == []
+    assert not (env.worktree_root / "review-pr1").exists()
+
+
+def test_review_target_whose_worktree_cannot_be_added_is_worktree_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _review_env(tmp_path, monkeypatch, prs=(_pr(1),))
+    # A regular file where the `.worktrees` directory belongs: the fetch succeeds,
+    # `git worktree add` cannot create its target.
+    env.worktree_root.write_text("not a directory\n")
+
+    _summary, failed = env.run()
+
+    assert failed is True
+    (record,) = env.target_records()
+    assert record.extra is not None
+    assert record.extra["reason"] == "worktree_failed"
+    assert str(record.extra["error"]).startswith("git worktree add failed")
+    assert env.client.tabs == []
+
+
+class _TabCreateFails(ReviewHerdrClient):
+    def tab_create(self, *, cwd: Any, label: Any = None) -> str:
+        raise HerdrCliError("tab_create refused", exit_code=1)
+
+
+class _AgentStartFails(ReviewHerdrClient):
+    def agent_start(self, **_kw: Any) -> None:
+        raise HerdrCliError("agent_start refused", exit_code=1)
+
+
+@pytest.mark.parametrize(
+    ("client_cls", "pane_id", "error"),
+    [
+        (_TabCreateFails, None, "tab_create refused"),
+        (_AgentStartFails, "w1:p1", "agent_start refused"),
+    ],
+)
+def test_review_agent_that_cannot_be_started_fails_and_closes_its_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type[ReviewHerdrClient],
+    pane_id: str | None,
+    error: str,
+) -> None:
+    env = _review_env(
+        tmp_path,
+        monkeypatch,
+        prs=(_pr(1),),
+        client=lambda gh: client_cls(on_prompt=_mark_posted(gh)),
+    )
+
+    _summary, failed = env.run()
+
+    assert failed is True
+    (record,) = env.target_records()
+    assert record.state == "failed"
+    assert record.extra is not None
+    assert record.extra["reason"] == "agent_start_failed"
+    assert error in str(record.extra["error"])
+    assert record.extra["pane_id"] == pane_id
+    assert record.extra["verified"] is False
+    assert env.client.closed == ([pane_id] if pane_id else [])
+    assert env.client.prompt_texts == []
+    assert not (env.worktree_root / "review-pr1").exists()
+
+
+def test_review_agent_that_never_gets_ready_is_recorded_as_agent_start_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The audit flow records `agent_not_interactive` for the same situation.
+    monkeypatch.setattr(runner, "READY_POLL_INTERVAL_S", 0.0)
+    env = _review_env(
+        tmp_path,
+        monkeypatch,
+        prs=(_pr(1),),
+        client=lambda gh: ReviewHerdrClient(ready=False),
+        start_timeout_ms=10,
+    )
+
+    _summary, failed = env.run()
+
+    assert failed is True
+    (record,) = env.target_records()
+    assert record.extra is not None
+    assert record.extra["reason"] == "agent_start_failed"
+    assert record.extra["pane_id"] == "w1:p1"
+    assert env.client.closed == ["w1:p1"]
+    assert env.client.prompt_texts == []
+    assert not (env.worktree_root / "review-pr1").exists()
+
+
+def test_review_agent_whose_prompt_fails_is_recorded_as_agent_prompt_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "PROMPT_RETRY_DELAYS_S", ())
+    env = _review_env(
+        tmp_path,
+        monkeypatch,
+        prs=(_pr(1),),
+        client=lambda gh: ReviewHerdrClient(
+            on_prompt=_raises(RuntimeError("agent crashed"))
+        ),
+    )
+
+    _summary, failed = env.run()
+
+    assert failed is True
+    (record,) = env.target_records()
+    assert record.state == "failed"
+    assert record.extra is not None
+    assert record.extra["reason"] == "agent_prompt_failed"
+    assert "agent crashed" in str(record.extra["error"])
+    assert record.extra["pane_id"] == "w1:p1"
+    assert env.client.closed == ["w1:p1"]
+    assert not (env.worktree_root / "review-pr1").exists()
+
+
+def test_review_job_prompt_replaces_the_engine_prompt_with_placeholders_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _review_env(
+        tmp_path,
+        monkeypatch,
+        prs=(_pr(1),),
+        prompt="Review $ROUTINE_JOB run $ROUTINE_RUN_ID, write $ROUTINE_REPORT",
+    )
+
+    env.run()
+
+    run_id = env.run_id()
+    report = tick.default_reports_dir() / (
+        f"auto-review-{run_id}-{review_target_hash(env.job.name, 'acme/widgets#1')}.md"
+    )
+    assert env.client.prompt_texts == [
+        f"Review review-my-prs run {run_id}, write {report}"
+    ]
