@@ -1,7 +1,7 @@
 ---
 id: "061"
 title: "Tick's pipeline in-flight guard should check systemd unit liveness"
-status: blocked
+status: done
 priority: medium
 area: pipeline
 gate: the type-gaps refactor PRs that edit tick.py are merged (same as 060)
@@ -37,3 +37,6 @@ drifts, the liveness check matches no unit and reads "inactive".
 
 - **2026-10-19**: found while fixing the watchdog (PR #187); deferred because
   `tick.py` was owned by the concurrent type-gaps run.
+- **2026-10-19**: fixed in this PR: tick's guard now keeps a stalled run in flight
+  while its unit is active or unknown, and the `herdr-pipeline-` prefix is one shared
+  constant (`pipeline_watchdog.PIPELINE_UNIT_PREFIX`).
