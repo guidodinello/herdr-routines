@@ -269,6 +269,24 @@ files 2026-08-27.
   orchestrator prompt. First slice landed 2026-09-07 (PR #109): `tick`
   reconcile enforces the G-17 stage-independence gate
   (`validate_stage_sessions`). 2026-08-30 brainstorm.
+- **Inspect-only CLI for review candidates** — a read-only subcommand that runs
+  the `kind: review` job's candidate scan and prints every PR it found with the
+  reason it would or would not be dispatched, without spawning anything.
+  Answers "why didn't it review PR X?". Deferred in issue 055.
+- **Close issue 057's two open review notes** — layer the write-ahead ledger
+  ordering test (criterion 9) between the pure `apply_diff` test and a
+  tick-level one, and add a criterion plus test asserting the shape of the
+  `gate` values and the history `extra` fields. Left open when 057's refine
+  loop hit its cap.
+- **Stable finding `id` from the audit skills** — without it, same-kind
+  findings in one file collapse into one fix dispatch (issues 057, 058). The
+  skills live in the target repo. Gate: the audit ledger holds real findings
+  that collide.
+- **Quota fallback chain and `agent_kind` override** — more than one
+  `fallback_model`, tried in order (issue 022). Gate: a single fallback model
+  proves insufficient.
+- **`pick-feature --check`** — a read-only mode that also reclaims stale
+  claims (issue 052). Gate: the current behaviour gets annoying in practice.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives

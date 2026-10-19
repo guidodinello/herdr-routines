@@ -313,6 +313,10 @@ checks — recommendation 2 above preempts most of its value. **Option C —
 `src/herdr_routines/pipeline.py` typed `Gate` objects** only if we want `tick`
 to own the pipeline as a scheduled job — explicitly out of scope for POC.
 
+> **2026-10-19: Option B closed, superseded.** Issues 054, 056 and 059 moved the
+> stage loop, gates and bookkeeping into `pipeline-run`, so gates already run in
+> code and a separate `verify-gate.sh` oracle has nothing left to check.
+
 ## Launcher (one-shot, not cron — audit gap 11)
 
 `herdr-routines` cron is not used for the pipeline (`roadmap.md:32`). Two
