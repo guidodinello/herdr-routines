@@ -24,7 +24,7 @@ from herdr_routines.auto_fix import (
     repo_owner_and_name,
 )
 from herdr_routines.config import GateCheck, Job, RoutinesConfig
-from herdr_routines.history import HistoryRecord, append, read_job
+from herdr_routines.history import HistoryRecord, HistoryState, append, read_job
 from herdr_routines.tick import run_tick
 
 
@@ -1361,7 +1361,7 @@ def _base_gate_record(
     i: int,
     *,
     gate: str,
-    state: str = "done",
+    state: HistoryState = "done",
     gate_branch: str | None = "auto/repo-hygiene",
 ) -> None:
     extra: dict[str, Any] = {"gate": gate, "target": "base"}
