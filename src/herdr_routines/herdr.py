@@ -12,9 +12,9 @@ import json
 import logging
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Final, Literal, Protocol, cast, get_args
+from typing import Final, Literal, Protocol, TypedDict, TypeIs, get_args
 
 from herdr_routines.config import AGENT_MODEL_FLAGS
 
@@ -39,9 +39,10 @@ WATCHDOG_KILL_GRACE_S = 5.0
 # Settle states `agent get`/`agent prompt --wait` can report. Confirmed empirically against
 # herdr 0.8.2 (see docs/plan-v1.md step 5): a never-focused pane settles to "idle", not the
 # "done" that SKILL.md's seen/unseen distinction predicted — so both map to success below.
-# Mirrors the closed `AgentStatus` enum in tests/fixtures/api-schema.json; `_extract_status`
-# derives its membership check from this Literal, so it stays the one definition.
+# Mirrors the closed `AgentStatus` enum in tests/fixtures/api-schema.json; `AGENT_STATUSES`
+# derives the membership check from this Literal, so it stays the one definition.
 AgentStatus = Literal["idle", "done", "working", "blocked", "unknown"]
+AGENT_STATUSES: Final[frozenset[AgentStatus]] = frozenset(get_args(AgentStatus))
 
 AGENT_STATUS_IDLE: Final[AgentStatus] = "idle"
 AGENT_STATUS_DONE: Final[AgentStatus] = "done"
@@ -87,12 +88,40 @@ class WorktreeInfo:
     root_pane_id: str
 
 
+class AgentEntry(TypedDict, total=False):
+    """One `herdr agent list` entry, reduced to the keys this module reads. A key is present
+    only when herdr sent it with the expected type; `agent_status` is None when herdr sent a
+    string outside its schema (see `_parse_status`)."""
+
+    name: str
+    agent_status: AgentStatus | None
+    pane_id: str
+    workspace_id: str
+
+
+class WorkspaceWorktree(TypedDict, total=False):
+    checkout_path: str
+
+
+class WorkspaceEntry(TypedDict, total=False):
+    """One `herdr workspace list` entry, reduced to the keys the locate-or-create lookup
+    reads. `worktree` is absent for a workspace whose cwd is not a checkout."""
+
+    workspace_id: str
+    label: str
+    worktree: WorkspaceWorktree
+
+
 class HerdrCliError(Exception):
     """A `herdr` invocation exited non-zero. Carries the parsed JSON error body when there was
     one (exit 1, server error) vs. plain stderr text (exit 2, syntax error)."""
 
     def __init__(
-        self, message: str, *, exit_code: int, error_body: dict[str, Any] | None = None
+        self,
+        message: str,
+        *,
+        exit_code: int,
+        error_body: dict[str, object] | None = None,
     ):
         super().__init__(message)
         self.exit_code = exit_code
@@ -238,7 +267,7 @@ class HerdrClient:
 
     def _call(
         self, args: list[str], *, timeout_s: float | None = None
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         argv = [self.bin_path, *args]
         exit_code, stdout, stderr = self.runner(argv, timeout_s=timeout_s)
         return self._parse_result(
@@ -252,7 +281,7 @@ class HerdrClient:
         exit_code: int,
         stdout: str,
         stderr: str,
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         """Maps one completed herdr invocation's (exit_code, stdout, stderr) onto _call's
         return-or-raise contract. Shared by `_call` and the watchdog's Popen path so child
         exits parse identically no matter how the process was waited on."""
@@ -334,10 +363,10 @@ class HerdrClient:
         body = self._call(args)
         return _extract_str(body, path=("result", "workspace", "workspace_id"))
 
-    def workspace_list(self) -> list[dict[str, Any]]:
+    def workspace_list(self) -> list[WorkspaceEntry]:
         """Every known workspace as herdr reports it, for locate-or-create lookups.
-        Returns the raw entries so a caller is not boxed into this module's idea of the
-        shape; an empty list when the server reports none.
+        Returns the entries reduced to the keys callers read; an empty list when the
+        server reports none.
 
         There is **no `cwd` key** — live `herdr 0.8.2` `workspace list` entries are
         `workspace_id, label, number, focused, pane_count, tab_count, active_tab_id,
@@ -347,17 +376,7 @@ class HerdrClient:
         is therefore the only way to tell two same-labelled workspaces apart, and
         `_ensure_shared_workspace` (pipeline_prepare) relies on it."""
         body = self._call(["workspace", "list"], timeout_s=10)
-        result = body.get("result")
-        if not isinstance(result, dict):
-            raise HerdrCliError(
-                f"unexpected herdr workspace response shape: {body!r}", exit_code=0
-            )
-        workspaces = result.get("workspaces")
-        if not isinstance(workspaces, list):
-            raise HerdrCliError(
-                f"unexpected herdr workspace response shape: {body!r}", exit_code=0
-            )
-        return [w for w in workspaces if isinstance(w, dict)]
+        return _parse_workspace_list(body)
 
     def tab_create(self, *, cwd: str, label: str | None = None) -> str:
         """Returns the new tab's root pane id. Used for `workspace: root` jobs."""
@@ -471,13 +490,15 @@ class HerdrClient:
         if exit_code != 0:
             return None
         body = _try_parse_json(stdout)
-        if not isinstance(body, dict):
+        if body is None:
             return None
         try:
-            value = body["result"]["agent"]["agent_session"]["value"]
-        except (KeyError, TypeError):
+            value = _extract_str(
+                body, path=("result", "agent", "agent_session", "value")
+            )
+        except HerdrCliError:
             return None
-        return value if isinstance(value, str) and value else None
+        return value or None
 
     def agent_read(self, target: str, *, lines: int = 200) -> str:
         args = [
@@ -528,27 +549,19 @@ class HerdrClient:
         ready = agent.get("interactive_ready")
         return ready if isinstance(ready, bool) else True
 
-    def agent_statuses(self) -> dict[str, str]:
+    def agent_statuses(self) -> dict[str, AgentStatus]:
         """Maps every currently-registered agent name to its `agent_status`. A name stays
         registered (and shows up here) long after its run has settled to idle/done, until the
         tab is closed — callers that want "still actively running" must filter by status
-        against LIVE_AGENT_STATUSES, not just check for name presence."""
-        body = self._call(["agent", "list"], timeout_s=10)
-        result = body.get("result")
-        if not isinstance(result, dict):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        agents = result.get("agents")
-        if not isinstance(agents, list):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        return {
-            a["name"]: a["agent_status"]
-            for a in agents
-            if isinstance(a, dict) and a.get("name") and a.get("agent_status")
-        }
+        against LIVE_AGENT_STATUSES, not just check for name presence. An entry whose status
+        is outside herdr's schema is dropped: it is never live, so no caller can act on it."""
+        statuses: dict[str, AgentStatus] = {}
+        for agent in self._agent_list():
+            name = agent.get("name")
+            status = agent.get("agent_status")
+            if name and status:
+                statuses[name] = status
+        return statuses
 
     def settled_agent_workspace(self, name: str) -> str | None:
         """The workspace_id hosting registered agent `name`, if its status is settled
@@ -556,66 +569,32 @@ class HerdrClient:
         unreadable — callers must never close a busy or human-blocked pane. Only
         idle/done are considered settled (see SETTLED_AGENT_STATUSES); blocked/unknown
         are sticky under cron and must not be reaped."""
-        body = self._call(["agent", "list"], timeout_s=10)
-        result = body.get("result")
-        if not isinstance(result, dict):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        agents = result.get("agents")
-        if not isinstance(agents, list):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
         # Names are unique only among live agents (plan-v1 empirical notes), so scan
         # all entries: if any matching agent is live, blocked, unknown, or has an
         # unreadable status, treat the whole name as not-settled and return None.
-        matched: list[dict[str, object]] = []
-        for agent in agents:
-            if not isinstance(agent, dict) or agent.get("name") != name:
-                continue
-            matched.append(agent)
+        matched = [a for a in self._agent_list() if a.get("name") == name]
         if not matched:
             return None
         for agent in matched:
-            status = agent.get("agent_status")
-            if not isinstance(status, str) or status not in SETTLED_AGENT_STATUSES:
+            if agent.get("agent_status") not in SETTLED_AGENT_STATUSES:
                 return None
         # All matched entries are settled — return the first one's workspace.
-        workspace_id = matched[0].get("workspace_id")
-        return workspace_id if isinstance(workspace_id, str) and workspace_id else None
+        return matched[0].get("workspace_id") or None
 
     def settled_agent_pane(self, name: str) -> str | None:
         """The pane_id hosting registered agent `name`, if its status is settled
         (idle/done). None when absent, still working, blocked, unknown, or status
         unreadable. Narrower than settled_agent_workspace — reaping a single pane
         preserves sibling tabs/panes the user may have opened to inspect the last run."""
-        body = self._call(["agent", "list"], timeout_s=10)
-        result = body.get("result")
-        if not isinstance(result, dict):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        agents = result.get("agents")
-        if not isinstance(agents, list):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        matched: list[dict[str, object]] = []
-        for agent in agents:
-            if not isinstance(agent, dict) or agent.get("name") != name:
-                continue
-            matched.append(agent)
+        matched = [a for a in self._agent_list() if a.get("name") == name]
         if not matched:
             return None
         for agent in matched:
-            status = agent.get("agent_status")
-            if not isinstance(status, str) or status not in SETTLED_AGENT_STATUSES:
+            if agent.get("agent_status") not in SETTLED_AGENT_STATUSES:
                 return None
-        pane_id = matched[0].get("pane_id")
-        return pane_id if isinstance(pane_id, str) and pane_id else None
+        return matched[0].get("pane_id") or None
 
-    def sticky_agent_pane(self, name: str) -> tuple[str, str] | None:
+    def sticky_agent_pane(self, name: str) -> tuple[str, AgentStatus] | None:
         """`(pane_id, status)` for a registered agent `name` whose status is blocked or
         unknown — the "sticky under cron" states `settled_agent_pane` deliberately refuses
         to reap. None when the name is absent, still working, settled (idle/done), or its
@@ -624,28 +603,12 @@ class HerdrClient:
         prior run's parked agent that would otherwise wedge every future run (issue 051).
         Raises HerdrCliError on an unexpected response shape, like its `settled_agent_*`
         siblings."""
-        body = self._call(["agent", "list"], timeout_s=10)
-        result = body.get("result")
-        if not isinstance(result, dict):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        agents = result.get("agents")
-        if not isinstance(agents, list):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        for agent in agents:
-            if not isinstance(agent, dict) or agent.get("name") != name:
+        for agent in self._agent_list():
+            if agent.get("name") != name:
                 continue
             status = agent.get("agent_status")
             pane_id = agent.get("pane_id")
-            if (
-                isinstance(status, str)
-                and status in STICKY_AGENT_STATUSES
-                and isinstance(pane_id, str)
-                and pane_id
-            ):
+            if status in STICKY_AGENT_STATUSES and status is not None and pane_id:
                 return pane_id, status
         return None
 
@@ -679,7 +642,9 @@ class HerdrClient:
             ).items()
         }
 
-    def pipeline_agent_panes_by_status(self, run_id: str) -> dict[str, tuple[str, str]]:
+    def pipeline_agent_panes_by_status(
+        self, run_id: str
+    ) -> dict[str, tuple[AgentStatus | None, str]]:
         """`pl-<N>-<run_id>` agent name -> (agent_status, pane_id)."""
         lowered_run_id = run_id.lower()
         return {
@@ -688,35 +653,22 @@ class HerdrClient:
             if name.lower().startswith("pl-") and lowered_run_id in name.lower()
         }
 
-    def agent_panes_by_status(self) -> dict[str, tuple[str, str]]:
-        """Every registered agent name -> (agent_status, pane_id). Raises HerdrCliError on
-        an unexpected response shape like its settled_agent_* siblings."""
-        body = self._call(["agent", "list"], timeout_s=10)
-        result = body.get("result")
-        if not isinstance(result, dict):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        agents = result.get("agents")
-        if not isinstance(agents, list):
-            raise HerdrCliError(
-                f"unexpected herdr agent response shape: {body!r}", exit_code=0
-            )
-        panes: dict[str, tuple[str, str]] = {}
-        for agent in agents:
-            if not isinstance(agent, dict):
-                continue
+    def agent_panes_by_status(self) -> dict[str, tuple[AgentStatus | None, str]]:
+        """Every registered agent name -> (agent_status, pane_id). The status is None when
+        herdr reported a value outside its schema: callers close these panes whatever the
+        status, so such an agent is kept rather than dropped. Raises HerdrCliError on an
+        unexpected response shape like its settled_agent_* siblings."""
+        panes: dict[str, tuple[AgentStatus | None, str]] = {}
+        for agent in self._agent_list():
             name = agent.get("name")
-            status = agent.get("agent_status")
             pane_id = agent.get("pane_id")
-            if (
-                isinstance(name, str)
-                and isinstance(status, str)
-                and isinstance(pane_id, str)
-                and pane_id
-            ):
-                panes[name] = (status, pane_id)
+            if name is not None and "agent_status" in agent and pane_id:
+                panes[name] = (agent["agent_status"], pane_id)
         return panes
+
+    def _agent_list(self) -> list[AgentEntry]:
+        body = self._call(["agent", "list"], timeout_s=10)
+        return _parse_agent_list(body)
 
     def workspace_close(self, workspace_id: str) -> None:
         self._call(["workspace", "close", workspace_id], timeout_s=10)
@@ -806,18 +758,73 @@ def _worktree_create_argv(
     return args
 
 
-def _try_parse_json(text: str) -> dict[str, Any] | None:
+def _try_parse_json(text: str) -> dict[str, object] | None:
     text = text.strip()
     if not text:
         return None
     try:
-        parsed = json.loads(text)
+        parsed: object = json.loads(text)
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
 
 
-def _extract_pane_id(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
+def _result_list(
+    body: Mapping[str, object], key: str, *, kind: str
+) -> list[Mapping[str, object]]:
+    """`body.result.<key>` as a list of its dict entries (non-dict entries skipped), raising
+    the shared shape error when `result` is not an object or `<key>` is not a list."""
+    result = body.get("result")
+    entries = result.get(key) if isinstance(result, dict) else None
+    if not isinstance(entries, list):
+        raise HerdrCliError(
+            f"unexpected herdr {kind} response shape: {body!r}", exit_code=0
+        )
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def _str_key(entry: Mapping[str, object], key: str) -> str | None:
+    value = entry.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _parse_agent_list(body: Mapping[str, object]) -> list[AgentEntry]:
+    """Narrows an `agent list` response. Keys of the wrong type are omitted; a string
+    `agent_status` is kept, as None when it is outside the schema."""
+    agents: list[AgentEntry] = []
+    for raw in _result_list(body, "agents", kind="agent"):
+        agent: AgentEntry = {}
+        if (name := _str_key(raw, "name")) is not None:
+            agent["name"] = name
+        if (status := _str_key(raw, "agent_status")) is not None:
+            agent["agent_status"] = _parse_status(status)
+        if (pane_id := _str_key(raw, "pane_id")) is not None:
+            agent["pane_id"] = pane_id
+        if (workspace_id := _str_key(raw, "workspace_id")) is not None:
+            agent["workspace_id"] = workspace_id
+        agents.append(agent)
+    return agents
+
+
+def _parse_workspace_list(body: Mapping[str, object]) -> list[WorkspaceEntry]:
+    workspaces: list[WorkspaceEntry] = []
+    for raw in _result_list(body, "workspaces", kind="workspace"):
+        workspace: WorkspaceEntry = {}
+        if (workspace_id := _str_key(raw, "workspace_id")) is not None:
+            workspace["workspace_id"] = workspace_id
+        if (label := _str_key(raw, "label")) is not None:
+            workspace["label"] = label
+        raw_worktree = raw.get("worktree")
+        if isinstance(raw_worktree, dict):
+            worktree: WorkspaceWorktree = {}
+            if (checkout := _str_key(raw_worktree, "checkout_path")) is not None:
+                worktree["checkout_path"] = checkout
+            workspace["worktree"] = worktree
+        workspaces.append(workspace)
+    return workspaces
+
+
+def _extract_pane_id(body: Mapping[str, object], *, path: tuple[str, ...]) -> str:
     node: object = body
     for key in path:
         if not isinstance(node, dict) or key not in node:
@@ -833,7 +840,7 @@ def _extract_pane_id(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
     return node
 
 
-def _extract_str(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
+def _extract_str(body: Mapping[str, object], *, path: tuple[str, ...]) -> str:
     node: object = body
     for key in path:
         if not isinstance(node, dict) or key not in node:
@@ -849,16 +856,27 @@ def _extract_str(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
     return node
 
 
-def _extract_status(body: dict[str, Any]) -> AgentStatus | None:
-    try:
-        status = body["result"]["agent"]["agent_status"]
-    except (KeyError, TypeError) as e:
-        raise HerdrCliError(
-            f"unexpected herdr agent response shape: {body!r}", exit_code=0
-        ) from e
-    if not isinstance(status, str):
-        raise HerdrCliError(f"unexpected agent_status type in: {body!r}", exit_code=0)
-    if status not in get_args(AgentStatus):
+def _is_agent_status(value: str) -> TypeIs[AgentStatus]:
+    return value in AGENT_STATUSES
+
+
+def _parse_status(status: str) -> AgentStatus | None:
+    """`status` as an `AgentStatus`, or None (with a warning) when herdr reported a value
+    outside its schema."""
+    if not _is_agent_status(status):
         log.warning("herdr reported unrecognized agent_status %r", status)
         return None
-    return cast(AgentStatus, status)
+    return status
+
+
+def _extract_status(body: Mapping[str, object]) -> AgentStatus | None:
+    result = body.get("result")
+    agent = result.get("agent") if isinstance(result, dict) else None
+    if not isinstance(agent, dict) or "agent_status" not in agent:
+        raise HerdrCliError(
+            f"unexpected herdr agent response shape: {body!r}", exit_code=0
+        )
+    status = agent["agent_status"]
+    if not isinstance(status, str):
+        raise HerdrCliError(f"unexpected agent_status type in: {body!r}", exit_code=0)
+    return _parse_status(status)

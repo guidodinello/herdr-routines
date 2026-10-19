@@ -364,13 +364,10 @@ def _ensure_shared_workspace(client: HerdrClient, *, cwd: str, label: str) -> st
     for entry in client.workspace_list():
         if entry.get("label") != label:
             continue
-        entry_worktree = entry.get("worktree")
-        if not isinstance(entry_worktree, dict):
-            continue
-        if entry_worktree.get("checkout_path") != cwd:
+        if entry.get("worktree", {}).get("checkout_path") != cwd:
             continue
         workspace_id = entry.get("workspace_id")
-        if isinstance(workspace_id, str) and workspace_id:
+        if workspace_id:
             return workspace_id
     return client.workspace_create(cwd=cwd, label=label, env=SHARED_WORKSPACE_ENV)
 
