@@ -11,6 +11,8 @@ import subprocess
 import pytest
 
 from herdr_routines.herdr import (
+    DEFAULT_CALL_TIMEOUT_S,
+    WORKTREE_CREATE_TIMEOUT_S,
     HerdrClient,
     HerdrCliError,
     PromptWatchdogKilled,
@@ -1380,3 +1382,72 @@ def test_subprocess_runner_keeps_partial_output_on_timeout() -> None:
     assert exit_code == 124
     assert stdout == "partial\n"
     assert stderr == "oops\n"
+
+
+class TimeoutRecordingRunner:
+    """Answers every call with `body` and records the `timeout_s` each one was given."""
+
+    def __init__(self, body: dict) -> None:
+        self._body = body
+        self.timeouts: list[float | None] = []
+
+    def __call__(
+        self, argv: list[str], *, timeout_s: float | None
+    ) -> tuple[int, str, str]:
+        self.timeouts.append(timeout_s)
+        return ok(self._body)
+
+
+PANE_BODY = {"result": {"root_pane": {"pane_id": "w1:p1"}}}
+WORKSPACE_BODY = {"result": {"workspace": {"workspace_id": "w1"}}}
+EMPTY_BODY: dict = {"result": {}}
+
+
+@pytest.mark.parametrize(
+    ("body", "call"),
+    [
+        (PANE_BODY, lambda c: c.tab_create(cwd="/repo")),
+        (WORKSPACE_BODY, lambda c: c.workspace_create(cwd="/repo")),
+        (agent_response("idle"), lambda c: c.agent_get("rt-a")),
+        (agent_response("idle"), lambda c: c.agent_interactive_ready("rt-a")),
+        (EMPTY_BODY, lambda c: c.notification_show("title")),
+    ],
+    ids=[
+        "tab_create",
+        "workspace_create",
+        "agent_get",
+        "agent_interactive_ready",
+        "notification_show",
+    ],
+)
+def test_plain_calls_get_the_default_timeout(body: dict, call) -> None:
+    runner = TimeoutRecordingRunner(body)
+    call(HerdrClient(runner=runner))
+    assert runner.timeouts == [DEFAULT_CALL_TIMEOUT_S]
+
+
+def test_worktree_create_gets_the_longer_timeout() -> None:
+    runner = TimeoutRecordingRunner(
+        worktree_created_body(path="/wt", branch="b", pane_id="w1:p1")
+    )
+    client = HerdrClient(runner=runner)
+    client.worktree_create(cwd="/repo", branch="b", base="main")
+    client.worktree_create_full(cwd="/repo", branch="b", base="main")
+    assert runner.timeouts == [WORKTREE_CREATE_TIMEOUT_S] * 2
+    assert WORKTREE_CREATE_TIMEOUT_S > DEFAULT_CALL_TIMEOUT_S
+
+
+def test_hung_server_surfaces_as_cli_error_instead_of_blocking() -> None:
+    """A runner that only returns when handed a bound (as `_subprocess_runner` does on
+    TimeoutExpired); an unbounded call would hang forever, so it fails the test instead."""
+
+    def hung_runner(
+        argv: list[str], *, timeout_s: float | None
+    ) -> tuple[int, str, str]:
+        assert timeout_s is not None, "call would block forever on a hung herdr server"
+        return 124, "", ""
+
+    client = HerdrClient(runner=hung_runner)
+    with pytest.raises(HerdrCliError) as exc_info:
+        client.tab_create(cwd="/repo")
+    assert exc_info.value.exit_code == 124

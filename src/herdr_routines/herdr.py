@@ -33,6 +33,16 @@ PROMPT_WATCHDOG_POLL_S = 30.0
 # the no-marker worst case is bit-for-bit today's behavior.
 PROMPT_WAIT_GRACE_S = 30.0
 
+# Budget for a plain request/response herdr call (create a tab/workspace, `agent get`,
+# notification). A healthy server answers in well under a second; this only has to turn a
+# wedged one (socket accepted, never answered) into a HerdrCliError instead of a tick that
+# holds tick.lock until the systemd unit's TimeoutStartSec — hours of silently skipped ticks.
+DEFAULT_CALL_TIMEOUT_S = 30.0
+
+# `worktree create` runs a `git worktree add` plus a full checkout, which can take minutes on
+# a big repo; still far below the unit timeout.
+WORKTREE_CREATE_TIMEOUT_S = 300.0
+
 # TERM → wait this long → KILL, when terminating a wedged prompt child.
 WATCHDOG_KILL_GRACE_S = 5.0
 
@@ -266,8 +276,10 @@ class HerdrClient:
     popen_factory: PopenFactory = _popen_process
 
     def _call(
-        self, args: list[str], *, timeout_s: float | None = None
+        self, args: list[str], *, timeout_s: float = DEFAULT_CALL_TIMEOUT_S
     ) -> dict[str, object]:
+        """Runs one herdr call, always bounded: a call that outlives `timeout_s` raises
+        HerdrCliError (exit_code 124) via `_parse_result`."""
         argv = [self.bin_path, *args]
         exit_code, stdout, stderr = self.runner(argv, timeout_s=timeout_s)
         return self._parse_result(
@@ -321,7 +333,8 @@ class HerdrClient:
         id is read, so a response carrying no `result.worktree.path` still works — use
         `worktree_create_full` when the path/branch are needed too (issue 054 phase A)."""
         body = self._call(
-            _worktree_create_argv(cwd=cwd, branch=branch, base=base, label=label)
+            _worktree_create_argv(cwd=cwd, branch=branch, base=base, label=label),
+            timeout_s=WORKTREE_CREATE_TIMEOUT_S,
         )
         return _extract_pane_id(body, path=("result", "root_pane", "pane_id"))
 
@@ -338,7 +351,8 @@ class HerdrClient:
         has no top-level `branch` at all (tests/fixtures/api-schema.json; live `herdr
         0.8.2` confirms), so reading a sibling `result.branch` raises on every call."""
         body = self._call(
-            _worktree_create_argv(cwd=cwd, branch=branch, base=base, label=label)
+            _worktree_create_argv(cwd=cwd, branch=branch, base=base, label=label),
+            timeout_s=WORKTREE_CREATE_TIMEOUT_S,
         )
         return WorktreeInfo(
             path=_extract_str(body, path=("result", "worktree", "path")),
