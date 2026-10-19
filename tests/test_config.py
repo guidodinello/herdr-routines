@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1794,22 +1795,57 @@ def test_require_accessors_return_the_validated_fields(tmp_config_path: Path) ->
 
 
 @pytest.mark.parametrize(
-    ("text", "name", "field", "accessor"),
+    ("text", "name", "field", "unset", "call"),
     [
-        (AUDIT_JOB, "nightly-type-audit", "audit", "require_audit"),
-        (GATED_JOB, "babysit-prs", "checks", "require_checks"),
-        (GATED_JOB, "babysit-prs", "target", "require_target"),
-        (PIPELINE_MINIMAL, "nightly-pipeline", "deadline_ms", "require_deadline_ms"),
-        (PIPELINE_MINIMAL, "nightly-pipeline", "prompt_file", "require_prompt_file"),
+        (
+            AUDIT_JOB,
+            "nightly-type-audit",
+            "audit",
+            lambda j: dataclasses.replace(j, audit=None),
+            lambda j: j.require_audit(),
+        ),
+        (
+            GATED_JOB,
+            "babysit-prs",
+            "checks",
+            lambda j: dataclasses.replace(j, checks=None),
+            lambda j: j.require_checks(),
+        ),
+        (
+            GATED_JOB,
+            "babysit-prs",
+            "target",
+            lambda j: dataclasses.replace(j, target=None),
+            lambda j: j.require_target(),
+        ),
+        (
+            PIPELINE_MINIMAL,
+            "nightly-pipeline",
+            "deadline_ms",
+            lambda j: dataclasses.replace(j, deadline_ms=None),
+            lambda j: j.require_deadline_ms(),
+        ),
+        (
+            PIPELINE_MINIMAL,
+            "nightly-pipeline",
+            "prompt_file",
+            lambda j: dataclasses.replace(j, prompt_file=None),
+            lambda j: j.require_prompt_file(),
+        ),
     ],
 )
 def test_require_accessor_raises_naming_job_and_field(
-    tmp_config_path: Path, text: str, name: str, field: str, accessor: str
+    tmp_config_path: Path,
+    text: str,
+    name: str,
+    field: str,
+    unset: Callable[[Job], Job],
+    call: Callable[[Job], object],
 ) -> None:
     """A Job that skipped validation raises JobInvariantError, not AssertionError, so the
     check survives `python -O`; it is a RuntimeError, never a ConfigError (not a bad file)."""
-    job = dataclasses.replace(_loaded_job(tmp_config_path, text, name), **{field: None})
+    job = unset(_loaded_job(tmp_config_path, text, name))
     with pytest.raises(JobInvariantError, match=rf"job '{name}'.*requires '{field}'"):
-        getattr(job, accessor)()
+        call(job)
     assert not issubclass(JobInvariantError, ConfigError)
     assert issubclass(JobInvariantError, RuntimeError)
