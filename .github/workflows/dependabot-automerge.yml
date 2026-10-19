@@ -47,6 +47,10 @@ jobs:
         with:
           app-id: ${{ env.APP_ID }}
           private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
+          # Only what `gh pr merge --auto` needs. No `workflows` permission, so Dependabot
+          # bumps that edit workflow files (github-actions) need a manual merge.
+          permission-contents: write
+          permission-pull-requests: write
 
       # `--auto` queues the merge behind the required CI check rather than merging
       # immediately, so the branch ruleset still decides whether it lands.
