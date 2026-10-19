@@ -2947,3 +2947,103 @@ def test_reap_leaves_agents_alone_unless_the_host_rebooted_under_the_run(
 
     assert reaped == []
     assert client.closed == []
+
+
+# -- run_tick per-job catch-all ---------------------------------------------------------
+
+
+def _raising_process_job(*, open_running_for: set[str], raising: set[str]) -> Any:
+    """A `_process_job` stand-in: jobs in `open_running_for` leave a `running` record
+    behind, jobs in `raising` then raise, everything else succeeds."""
+
+    def fake(
+        job: Job, history_path: Path, *, client: Any, now: datetime
+    ) -> tuple[str, bool]:
+        if job.name in open_running_for:
+            append(
+                history_path,
+                HistoryRecord(ts=now, job=job.name, state="running", run_id="run-1"),
+            )
+        if job.name in raising:
+            raise ValueError("boom")
+        return f"{job.name}: done", False
+
+    return fake
+
+
+def test_run_tick_continues_after_job_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One job raising unexpectedly must not skip the rest, and its open `running`
+    record gets a terminal `failed` so it isn't left to go stale."""
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(
+        jobs=(make_job(tmp_path, name="a"), make_job(tmp_path, name="b"))
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick._process_job",
+        _raising_process_job(open_running_for={"a"}, raising={"a"}),
+    )
+    now = datetime.now(UTC)
+
+    outcome = run_tick(config, history_path, client=FakeStatusClient(), now=now)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: failed (unexpected_error)", "b: done")
+    assert outcome.any_job_failed is True
+    last = read_job(history_path, "a")[-1]
+    assert (last.state, last.run_id) == ("failed", "run-1")
+    assert last.extra is not None
+    assert last.extra["reason"] == "unexpected_error"
+
+
+def test_run_tick_job_raising_before_running_record_gets_failed_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(
+        jobs=(make_job(tmp_path, name="a"), make_job(tmp_path, name="b"))
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick._process_job",
+        _raising_process_job(open_running_for=set(), raising={"a"}),
+    )
+
+    outcome = run_tick(
+        config,
+        history_path,
+        client=FakeStatusClient(),  # type: ignore[arg-type]
+        now=datetime.now(UTC),
+    )
+
+    assert outcome.summaries[-1] == "b: done"
+    records = read_job(history_path, "a")
+    assert [(r.state, r.run_id) for r in records] == [("failed", None)]
+
+
+def test_run_tick_pipeline_job_raising_leaves_running_record_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pipeline job's detached unit may still be live and the watchdog owns finalising
+    its `running` record, so the catch-all must not close it."""
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(
+        jobs=(
+            make_job(tmp_path, name="p", kind="pipeline"),
+            make_job(tmp_path, name="b"),
+        )
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick._process_job",
+        _raising_process_job(open_running_for={"p"}, raising={"p"}),
+    )
+
+    outcome = run_tick(
+        config,
+        history_path,
+        client=FakeStatusClient(),  # type: ignore[arg-type]
+        now=datetime.now(UTC),
+    )
+
+    assert outcome.summaries[-1] == "b: done"
+    assert outcome.any_job_failed is True
+    assert [r.state for r in read_job(history_path, "p")] == ["running"]
