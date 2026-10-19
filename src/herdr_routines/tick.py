@@ -99,6 +99,7 @@ from herdr_routines.history import (
     read_job,
 )
 from herdr_routines.pipeline_watchdog import (
+    PIPELINE_UNIT_PREFIX,
     default_heartbeat_dir,
     default_worktrees_root,
     find_inflight_runs,
@@ -3684,7 +3685,7 @@ def _launch_pipeline_run(
     `running_extra` goes into the `running` record's `extra` (scheduled_for/
     late_seconds)."""
     report_path = pipeline_report_path(bare_run_id)
-    unit_name = f"herdr-pipeline-{bare_run_id}"
+    unit_name = f"{PIPELINE_UNIT_PREFIX}{bare_run_id}"
     # Recorded in the `running` record below: the watchdog reads it from history.
     deadline_epoch = pipeline_deadline_epoch(job, now)
 
