@@ -399,7 +399,7 @@ class Job:
     base: str
     agent_kind: str
     model: str | None
-    prompt: str
+    prompt: str | None  # None = no prompt set (engine default, or empty for a routine)
     timeout_ms: int
     start_timeout_ms: int
     catch_up_minutes: int
@@ -459,9 +459,9 @@ class Job:
     # On a cold start (no ledger): adopt the current findings as the baseline and
     # dispatch nothing. False = treat the first report as the first dispatch set.
     adopt_baseline: bool = True
-    # The fix worker's prompt template, seeded with $ROUTINE_FINDINGS. Empty = the
+    # The fix worker's prompt template, seeded with $ROUTINE_FINDINGS. None = the
     # built-in default. NOT inheritable via defaults.yaml.
-    fix_prompt: str = ""
+    fix_prompt: str | None = None
     # -- kind: review (issue 055) --------------------------------------------------
     # Which PR sets to watch: a non-empty, duplicate-free subset of
     # {author, review_requested}. Required for kind: review, None otherwise.
@@ -1070,6 +1070,8 @@ def _build_job(
     prompt = merged["prompt"]
     if not isinstance(prompt, str):
         raise ConfigError(f"{label}: 'prompt' must be a string")
+    # An empty prompt is "not set"; whitespace-only stays a string (readers differ).
+    prompt = prompt or None
 
     timezone = merged["timezone"]
     if not isinstance(timezone, str):
@@ -1270,6 +1272,7 @@ def _build_job(
     fix_prompt = merged.get("fix_prompt", "")
     if not isinstance(fix_prompt, str):
         raise ConfigError(f"{label}: 'fix_prompt' must be a string")
+    fix_prompt = fix_prompt or None
 
     if kind == "audit":
         if merged["workspace"] != "worktree":

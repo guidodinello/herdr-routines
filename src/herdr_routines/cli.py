@@ -862,14 +862,14 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             # empty; an audit's verdict is its manifest and a review's is its posted
             # review marker, neither of which is $ROUTINE_REPORT.
             and job.kind not in ("gated", "audit", "review")
-            and "$ROUTINE_REPORT" not in job.prompt
+            and (job.prompt is None or "$ROUTINE_REPORT" not in job.prompt)
         ):
             # A run only settles as "done" when the report file exists and is non-empty (see
             # runner.execute_run's no_report check); the agent only writes it if the prompt
             # asks. A prompt that never mentions the placeholder can never succeed. Empty
             # prompts are diagnosed separately — they fail earlier as agent_prompt_failed
             # (config.py:87 defaults omitted prompt to ""), not no_report.
-            if not job.prompt.strip():
+            if job.prompt is None or not job.prompt.strip():
                 warnings.append(
                     f"{job.name}: prompt is empty — the run will fail before "
                     f"$ROUTINE_REPORT can be written; set a prompt that tells the "

@@ -423,8 +423,9 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
     + `pane close`) is intentionally omitted from dry-run output — it is a best-effort
     cleanup of our own previous settled pane and not part of the run's core argv."""
     report_path = default_reports_dir() / f"{run_id}.md"
+    # A routine with no prompt still sends an empty one (it fails as agent_prompt_failed).
     prompt = substitute_prompt(
-        job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
+        job.prompt or "", report_path=report_path, job_name=job.name, run_id=run_id
     )
 
     argv: list[list[str]] = []
@@ -588,8 +589,9 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             branch=branch,
         )
 
+    # A routine with no prompt still sends an empty one (it fails as agent_prompt_failed).
     prompt = substitute_prompt(
-        job.prompt, report_path=report_path, job_name=job.name, run_id=run_id
+        job.prompt or "", report_path=report_path, job_name=job.name, run_id=run_id
     )
 
     # A recurring job reuses one agent name, and every settled terminal path below now closes
