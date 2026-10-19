@@ -118,7 +118,11 @@ commented block in [`jobs.example.yaml`](jobs.example.yaml) to set thresholds, a
 trusted authors. The `pr_health` auto-fix only considers PRs opened (from a branch in
 the repo itself, never a fork) and unresolved review threads started by a trusted login,
 and pipeline stage 7 is handed only the review threads and summaries those logins wrote.
-The trusted set is the top-level `trusted_review_authors:` list plus the authenticated
+The same set scopes the rest: a `github_event` `issues:opened` check without
+`match.author` only fires on issues a trusted login opened (`prs:labels` and `ci:failed`
+only fire on PRs from a branch in the repo itself), a `kind: review` job only counts a
+review marker a trusted login posted, and pipeline gate 6 only counts tier labels from
+trusted logins. The trusted set is the top-level `trusted_review_authors:` list plus the authenticated
 `gh` user, resolved at runtime and never written into config. When the key is absent the
 list is `[copilot-pull-request-reviewer]` (Copilot's PR reviewer); a configured list
 replaces that default, and `[]` means "only the gh user". In a `jobs.d/` layout it lives
