@@ -43,7 +43,7 @@ from herdr_routines.auto_fix import (
 )
 from herdr_routines.config import ConfigError, GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append, read_job
-from herdr_routines.tick import run_tick
+from herdr_routines.tick import _WorkerFailed, _WorkerResult, _WorkerSettled, run_tick
 
 SPEC_PATH = (
     Path(__file__).resolve().parent.parent
@@ -483,12 +483,7 @@ _EVENT_RECORD_KEYS = [
     ("worker_result", "state", "extra_values", "trailing_keys"),
     [
         pytest.param(
-            {
-                "state": "failed",
-                "reason": "agent_start_failed",
-                "error": "boom",
-                "pane_id": "p1",
-            },
+            _WorkerFailed(reason="agent_start_failed", error="boom", pane_id="p1"),
             "failed",
             {
                 "pane_id": "p1",
@@ -501,7 +496,7 @@ _EVENT_RECORD_KEYS = [
             id="failure-with-pane",
         ),
         pytest.param(
-            {"state": "failed", "reason": "clone_failed", "error": "nope"},
+            _WorkerFailed(reason="clone_failed", error="nope"),
             "failed",
             {
                 "pane_id": None,
@@ -514,14 +509,13 @@ _EVENT_RECORD_KEYS = [
             id="failure-without-pane",
         ),
         pytest.param(
-            {
-                "state": "done",
-                "pane_id": "p2",
-                "report_path": "/reports/r.md",
-                "report_written": True,
-                "final_agent_status": "idle",
-                "session_id": "sess-9",
-            },
+            _WorkerSettled(
+                state="done",
+                pane_id="p2",
+                report_path="/reports/r.md",
+                final_agent_status="idle",
+                session_id="sess-9",
+            ),
             "done",
             {
                 "pane_id": "p2",
@@ -537,7 +531,7 @@ _EVENT_RECORD_KEYS = [
 def test_github_event_worker_result_history_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    worker_result: dict[str, Any],
+    worker_result: _WorkerResult,
     state: str,
     extra_values: dict[str, Any],
     trailing_keys: list[str],

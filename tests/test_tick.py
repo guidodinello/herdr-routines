@@ -33,6 +33,9 @@ from herdr_routines.tick import (
     _is_job_agent,
     _live_agent_exists,
     _reap_agents_of_rebooted_run,
+    _WorkerFailed,
+    _WorkerResult,
+    _WorkerSettled,
     run_tick,
 )
 
@@ -2147,8 +2150,8 @@ def test_dispatch_reuses_existing_worktree(
         thread_bodies="",
     )
 
-    assert outcome["state"] == "done"
-    assert outcome.get("reason") is None
+    assert isinstance(outcome, _WorkerSettled)
+    assert outcome.state == "done"
     # It must have run the agent in the orchestrator's existing worktree, not tried
     # (and failed) to create a second one at .worktrees/autofix-pr81.
     assert client.tab_create_cwd == str(other_wt)
@@ -2188,11 +2191,9 @@ def test_dispatch_failure_records_reason(
     )
     monkeypatch.setattr(
         "herdr_routines.tick._dispatch_fix_worker",
-        lambda **kwargs: {
-            "state": "failed",
-            "reason": "worktree_creation_failed",
-            "error": "boom: something specific",
-        },
+        lambda **kwargs: _WorkerFailed(
+            reason="worktree_creation_failed", error="boom: something specific"
+        ),
     )
 
     t0 = datetime.now(UTC).replace(microsecond=0)
@@ -2226,12 +2227,7 @@ _PR_RECORD_KEYS = [
     ("worker_result", "state", "extra_values", "trailing_keys"),
     [
         pytest.param(
-            {
-                "state": "failed",
-                "reason": "agent_start_failed",
-                "error": "boom",
-                "pane_id": "p1",
-            },
+            _WorkerFailed(reason="agent_start_failed", error="boom", pane_id="p1"),
             "failed",
             {
                 "pane_id": "p1",
@@ -2245,7 +2241,7 @@ _PR_RECORD_KEYS = [
             id="failure-with-pane",
         ),
         pytest.param(
-            {"state": "failed", "reason": "clone_failed", "error": "nope"},
+            _WorkerFailed(reason="clone_failed", error="nope"),
             "failed",
             {
                 "pane_id": None,
@@ -2259,15 +2255,14 @@ _PR_RECORD_KEYS = [
             id="failure-without-pane",
         ),
         pytest.param(
-            {
-                "state": "done",
-                "pane_id": "p2",
-                "report_path": "/reports/r.md",
-                "report_written": True,
-                "report_bytes": 12,
-                "final_agent_status": "idle",
-                "session_id": "sess-9",
-            },
+            _WorkerSettled(
+                state="done",
+                pane_id="p2",
+                report_path="/reports/r.md",
+                report_bytes=12,
+                final_agent_status="idle",
+                session_id="sess-9",
+            ),
             "done",
             {
                 "pane_id": "p2",
@@ -2283,7 +2278,7 @@ _PR_RECORD_KEYS = [
 def test_dispatch_worker_result_history_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    worker_result: dict[str, Any],
+    worker_result: _WorkerResult,
     state: str,
     extra_values: dict[str, Any],
     trailing_keys: list[str],
@@ -2793,7 +2788,8 @@ def test_pipeline_workers_capture_tail_before_close(
         thread_bodies="",
     )
 
-    assert outcome["state"] == "done"
+    assert isinstance(outcome, _WorkerSettled)
+    assert outcome.state == "done"
     assert client.read_visible_before_close is True
     # Visible source used, not recent-unwrapped.
     assert "agent_read_visible" in client.calls

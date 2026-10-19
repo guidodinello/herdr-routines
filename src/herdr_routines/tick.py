@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, assert_never
+from typing import Literal, assert_never
 
 from logger import get_logger
 
@@ -72,6 +72,7 @@ from herdr_routines.findings import (
 from herdr_routines.herdr import (
     LIVE_AGENT_STATUSES,
     SETTLED_AGENT_STATUSES,
+    AgentStatus,
     HerdrClient,
     HerdrCliError,
 )
@@ -455,6 +456,32 @@ class _AgentRun:
     pane_id: str | None = None
     final_agent_status: str | None = None
     session_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerFailed:
+    """A fix worker that never got an agent to settle: why, and the pane it had already
+    opened, if any."""
+
+    reason: str
+    error: str | None
+    pane_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkerSettled:
+    """A fix worker whose agent settled. `state` is `failed` when the settled status is not
+    one of SETTLED_AGENT_STATUSES; `report_path` is set iff the agent wrote its report."""
+
+    state: Literal["done", "failed"]
+    pane_id: str
+    report_path: str | None
+    final_agent_status: AgentStatus | None
+    session_id: str | None
+    report_bytes: int = 0
+
+
+_WorkerResult = _WorkerFailed | _WorkerSettled
 
 
 def _record_audit_failure(
@@ -1470,33 +1497,44 @@ def _process_event_target(
             client=client,
         )
 
+        outcome_state: Literal["done", "failed"] = "failed"
+        outcome_error: str | None = None
+        outcome_report_path: str | None = None
+        outcome_agent_status: AgentStatus | None = None
+        if isinstance(worker_outcome, _WorkerSettled):
+            outcome_state = worker_outcome.state
+            outcome_report_path = worker_outcome.report_path
+            outcome_agent_status = worker_outcome.final_agent_status
+        else:
+            outcome_error = worker_outcome.error
+
         extra_record = HistoryExtra(
             event_id=event.event_id,
             event_number=event.number,
             attempt=attempt,
             reason="gate_failed",
             fix_worker_agent=agent_name,
-            pane_id=worker_outcome.get("pane_id"),
-            report_path=worker_outcome.get("report_path"),
-            report_written=worker_outcome.get("report_written", False),
-            final_agent_status=worker_outcome.get("final_agent_status"),
+            pane_id=worker_outcome.pane_id,
+            report_path=outcome_report_path,
+            report_written=outcome_report_path is not None,
+            final_agent_status=outcome_agent_status,
             target=event_target,
         )
-        if worker_outcome.get("error") is not None:
-            extra_record["error"] = worker_outcome["error"]
+        if outcome_error is not None:
+            extra_record["error"] = outcome_error
 
         append(
             history_path,
             HistoryRecord(
                 ts=now,
                 job=job.name,
-                state=worker_outcome.get("state", "failed"),
+                state=outcome_state,
                 run_id=run_id,
                 extra=extra_record,
             ),
         )
 
-        if worker_outcome.get("state") in ("failed", "interrupted_unknown"):
+        if outcome_state == "failed":
             any_failed = True
         else:
             handled.add(event.event_id)
@@ -1552,7 +1590,7 @@ def _dispatch_event_worker(
     owner: str,
     repo: str,
     client: HerdrClient,
-) -> dict[str, Any]:
+) -> _WorkerResult:
     """Dispatch one fix worker for a new GitHub event. Mirrors `_dispatch_fix_worker`
     but seeds `build_event_fix_prompt` from the event payload instead of PR CI/threads.
     The worker checks out the event's head branch when the event carries one (a PR
@@ -1576,16 +1614,12 @@ def _dispatch_event_worker(
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
         )
-        return {"state": "failed", "reason": reason, "error": str(e)}
+        return _WorkerFailed(reason=reason, error=str(e))
 
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        return {
-            "state": "failed",
-            "reason": "report_dir_creation_failed",
-            "error": str(e),
-        }
+        return _WorkerFailed(reason="report_dir_creation_failed", error=str(e))
 
     prompt_text = job.prompt or build_event_fix_prompt(
         job_name=job.name,
@@ -1608,11 +1642,10 @@ def _dispatch_event_worker(
     if existing_wt is not None:
         ok, detail = _worktree_reuse_check(existing_wt)
         if not ok:
-            return {
-                "state": "failed",
-                "reason": "worktree_reuse_not_clean",
-                "error": f"existing worktree {existing_wt} for {event.head_ref}: {detail}",
-            }
+            return _WorkerFailed(
+                reason="worktree_reuse_not_clean",
+                error=f"existing worktree {existing_wt} for {event.head_ref}: {detail}",
+            )
         wt_path = existing_wt
     else:
         wt_path = (
@@ -1673,11 +1706,7 @@ def _dispatch_event_worker(
             if proc.returncode != 0:
                 raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
         except Exception as e:  # noqa: BLE001
-            return {
-                "state": "failed",
-                "reason": "worktree_creation_failed",
-                "error": str(e),
-            }
+            return _WorkerFailed(reason="worktree_creation_failed", error=str(e))
 
     pane_id: str | None = None
     try:
@@ -1695,12 +1724,7 @@ def _dispatch_event_worker(
                 client.pane_close(pane_id)
             except Exception as e2:  # noqa: BLE001
                 log.debug("error closing pane %s after start failure: %s", pane_id, e2)
-        return {
-            "state": "failed",
-            "reason": "agent_start_failed",
-            "error": str(e),
-            "pane_id": pane_id,
-        }
+        return _WorkerFailed(reason="agent_start_failed", error=str(e), pane_id=pane_id)
 
     ready, last_error = _wait_for_agent_ready(
         client, agent_name, timeout_s=job.start_timeout_ms / 1000
@@ -1710,12 +1734,9 @@ def _dispatch_event_worker(
             client, agent_name, reports_dir=report_path.parent, run_id=event_run_id
         )
         _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
-        return {
-            "state": "failed",
-            "reason": "agent_not_interactive",
-            "error": last_error,
-            "pane_id": pane_id,
-        }
+        return _WorkerFailed(
+            reason="agent_not_interactive", error=last_error, pane_id=pane_id
+        )
 
     try:
         settled_status = _prompt_with_watchdog(
@@ -1732,12 +1753,9 @@ def _dispatch_event_worker(
             client, agent_name, reports_dir=report_path.parent, run_id=event_run_id
         )
         _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
-        return {
-            "state": "failed",
-            "reason": "agent_prompt_failed",
-            "error": str(e),
-            "pane_id": pane_id,
-        }
+        return _WorkerFailed(
+            reason="agent_prompt_failed", error=str(e), pane_id=pane_id
+        )
 
     _capture_visible_tail(
         client, agent_name, reports_dir=report_path.parent, run_id=event_run_id
@@ -1752,14 +1770,13 @@ def _dispatch_event_worker(
 
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
 
-    return {
-        "state": "done" if settled_status in SETTLED_AGENT_STATUSES else "failed",
-        "pane_id": pane_id,
-        "report_path": str(report_path) if report_written else None,
-        "report_written": report_written,
-        "final_agent_status": settled_status,
-        "session_id": session_id,
-    }
+    return _WorkerSettled(
+        state="done" if settled_status in SETTLED_AGENT_STATUSES else "failed",
+        pane_id=pane_id,
+        report_path=str(report_path) if report_written else None,
+        final_agent_status=settled_status,
+        session_id=session_id,
+    )
 
 
 def _process_pr_target(
@@ -1917,29 +1934,42 @@ def _process_pr_target(
         )
 
         agent_name = build_worker_agent_name(job.name, elig_pr.pr.number, run_id)
+        outcome_state: Literal["done", "failed"] = "failed"
+        outcome_reason: str | None = None
+        outcome_error: str | None = None
+        outcome_report_path: str | None = None
+        outcome_agent_status: AgentStatus | None = None
+        if isinstance(worker_outcome, _WorkerSettled):
+            outcome_state = worker_outcome.state
+            outcome_report_path = worker_outcome.report_path
+            outcome_agent_status = worker_outcome.final_agent_status
+        else:
+            outcome_reason = worker_outcome.reason
+            outcome_error = worker_outcome.error
+
         extra_record = HistoryExtra(
             pr_number=elig_pr.pr.number,
             headRefName=elig_pr.pr.head_ref,
             attempt=attempt,
             eligible_reason=elig_pr.reason,
             fix_worker_agent=agent_name,
-            pane_id=worker_outcome.get("pane_id"),
-            report_path=worker_outcome.get("report_path"),
-            report_written=worker_outcome.get("report_written", False),
-            final_agent_status=worker_outcome.get("final_agent_status"),
+            pane_id=worker_outcome.pane_id,
+            report_path=outcome_report_path,
+            report_written=outcome_report_path is not None,
+            final_agent_status=outcome_agent_status,
             target="pr",
         )
-        if worker_outcome.get("reason") is not None:
-            extra_record["reason"] = worker_outcome["reason"]
-        if worker_outcome.get("error") is not None:
-            extra_record["error"] = worker_outcome["error"]
-        if worker_outcome.get("state") in ("failed", "interrupted_unknown"):
+        if outcome_reason is not None:
+            extra_record["reason"] = outcome_reason
+        if outcome_error is not None:
+            extra_record["error"] = outcome_error
+        if outcome_state == "failed":
             log.warning(
                 "%s: PR #%d dispatch failed: reason=%s error=%s",
                 job.name,
                 elig_pr.pr.number,
-                worker_outcome.get("reason"),
-                worker_outcome.get("error"),
+                outcome_reason,
+                outcome_error,
             )
 
         append(
@@ -1947,13 +1977,13 @@ def _process_pr_target(
             HistoryRecord(
                 ts=now,
                 job=job.name,
-                state=worker_outcome.get("state", "failed"),
+                state=outcome_state,
                 run_id=run_id,
                 extra=extra_record,
             ),
         )
 
-        if worker_outcome.get("state") in ("failed", "interrupted_unknown"):
+        if outcome_state == "failed":
             any_failed = True
         dispatched_count += 1
 
@@ -2516,7 +2546,7 @@ def _dispatch_fix_worker(
     client: HerdrClient,
     failing_checks: str,
     thread_bodies: str,
-) -> dict[str, Any]:
+) -> _WorkerResult:
     """Dispatch a single fix worker for a PR. Uses git worktree add to checkout
     the PR head branch directly (review finding B), not build_branch_name which
     creates a new auto/* branch that the agent would push to instead of the PR
@@ -2541,21 +2571,13 @@ def _dispatch_fix_worker(
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
         )
-        return {
-            "state": "failed",
-            "reason": reason,
-            "error": str(e),
-        }
+        return _WorkerFailed(reason=reason, error=str(e))
 
     # Create report dir
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        return {
-            "state": "failed",
-            "reason": "report_dir_creation_failed",
-            "error": str(e),
-        }
+        return _WorkerFailed(reason="report_dir_creation_failed", error=str(e))
 
     # Build prompt with real data (review finding C) and report path (review finding D)
     prompt_text = job.prompt or build_fix_prompt(
@@ -2577,11 +2599,10 @@ def _dispatch_fix_worker(
     if existing_wt is not None:
         ok, detail = _worktree_reuse_check(existing_wt)
         if not ok:
-            return {
-                "state": "failed",
-                "reason": "worktree_reuse_not_clean",
-                "error": f"existing worktree {existing_wt} for {pr.head_ref}: {detail}",
-            }
+            return _WorkerFailed(
+                reason="worktree_reuse_not_clean",
+                error=f"existing worktree {existing_wt} for {pr.head_ref}: {detail}",
+            )
         wt_path = existing_wt
     else:
         # Create worktree pinned to PR head branch (review finding B)
@@ -2621,11 +2642,7 @@ def _dispatch_fix_worker(
             if proc.returncode != 0:
                 raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
         except Exception as e:  # noqa: BLE001  # noqa: BLE001 — any worktree failure marks the PR failed
-            return {
-                "state": "failed",
-                "reason": "worktree_creation_failed",
-                "error": str(e),
-            }
+            return _WorkerFailed(reason="worktree_creation_failed", error=str(e))
 
     # Start agent in the worktree (review finding B)
     pane_id: str | None = None
@@ -2644,12 +2661,7 @@ def _dispatch_fix_worker(
                 client.pane_close(pane_id)
             except Exception as e2:  # noqa: BLE001 — best-effort close must not mask the real error
                 log.debug("error closing pane %s after start failure: %s", pane_id, e2)
-        return {
-            "state": "failed",
-            "reason": "agent_start_failed",
-            "error": str(e),
-            "pane_id": pane_id,
-        }
+        return _WorkerFailed(reason="agent_start_failed", error=str(e), pane_id=pane_id)
 
     # Wait for agent readiness
     ready, last_error = _wait_for_agent_ready(
@@ -2660,12 +2672,9 @@ def _dispatch_fix_worker(
             client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id
         )
         _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
-        return {
-            "state": "failed",
-            "reason": "agent_not_interactive",
-            "error": last_error,
-            "pane_id": pane_id,
-        }
+        return _WorkerFailed(
+            reason="agent_not_interactive", error=last_error, pane_id=pane_id
+        )
 
     # Deliver prompt with watchdog
     try:
@@ -2683,12 +2692,9 @@ def _dispatch_fix_worker(
             client, agent_name, reports_dir=report_path.parent, run_id=pr_run_id
         )
         _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
-        return {
-            "state": "failed",
-            "reason": "agent_prompt_failed",
-            "error": str(e),
-            "pane_id": pane_id,
-        }
+        return _WorkerFailed(
+            reason="agent_prompt_failed", error=str(e), pane_id=pane_id
+        )
 
     # Capture tail and close pane
     _capture_visible_tail(
@@ -2706,15 +2712,14 @@ def _dispatch_fix_worker(
 
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
 
-    return {
-        "state": "done" if settled_status in SETTLED_AGENT_STATUSES else "failed",
-        "pane_id": pane_id,
-        "report_path": str(report_path) if report_written else None,
-        "report_written": report_written,
-        "report_bytes": report_bytes,
-        "final_agent_status": settled_status,
-        "session_id": session_id,
-    }
+    return _WorkerSettled(
+        state="done" if settled_status in SETTLED_AGENT_STATUSES else "failed",
+        pane_id=pane_id,
+        report_path=str(report_path) if report_written else None,
+        report_bytes=report_bytes,
+        final_agent_status=settled_status,
+        session_id=session_id,
+    )
 
 
 def _outcome_extra(outcome: RunOutcome) -> HistoryExtra:
