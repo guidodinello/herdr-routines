@@ -38,3 +38,8 @@ and notifies on `done` / `blocked` pane transitions.
   show` (the routine's explicit completion signal) instead of pane status.
 - **2026-08-27**: marked done — the decision was made and the transport is
   deployed. Residual items above are follow-ups, not open scope.
+- **2026-10-19**: correction. The bot on the Pi is `relay/herdr_telegram.py`
+  from the `guidodinello/herdr-remote` fork, not `cokekitten/herdr-telegram-bridge`;
+  that plugin is not installed (see issue 024's 2026-10-16 log). The
+  `pane.agent_status_changed` verification item above is about that plugin's
+  hook, so it does not apply to the live bot.
