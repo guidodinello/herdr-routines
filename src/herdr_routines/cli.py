@@ -60,6 +60,7 @@ from herdr_routines.pipeline_prepare import (
 )
 from herdr_routines.pipeline_run import EXIT_PARTIAL_OR_FAILED, run_pipeline
 from herdr_routines.pipeline_watchdog import (
+    PIPELINE_UNIT_PREFIX,
     default_heartbeat_dir,
     default_worktrees_root,
     run_watchdog,
@@ -1104,9 +1105,9 @@ def _cmd_run_pipeline(job: Job, args: argparse.Namespace, *, now: datetime) -> i
     bare_run_id = args.run_id or now.strftime("%Y%m%dT%H%M%SZ")
     report_path = pipeline_report_path(bare_run_id)
     unit_name = (
-        f"herdr-pipeline-{bare_run_id}"
+        f"{PIPELINE_UNIT_PREFIX}{bare_run_id}"
         if not args.run_id
-        else f"herdr-pipeline-{bare_run_id}-r{now:%H%M%S}"
+        else f"{PIPELINE_UNIT_PREFIX}{bare_run_id}-r{now:%H%M%S}"
     )
     argv = _build_pipeline_launch_argv(
         job,

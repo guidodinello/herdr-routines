@@ -74,10 +74,11 @@ DEADLINE_GRACE_SECONDS = 30 * 60
 # only plausible once nothing is polling any more.
 HEARTBEAT_STALE_SECONDS = 20 * 60
 
-# Must match the transient unit names tick and `herdr-routines run` launch with
-# (`herdr-pipeline-<run_id>`, plus an `-r<HHMMSS>` suffix on a resume). A drifted prefix
-# matches no unit, which reads as "not active".
-PIPELINE_UNIT_GLOB = "herdr-pipeline-{run_id}*"
+# Prefix of the transient unit names tick and `herdr-routines run` launch with
+# (`herdr-pipeline-<run_id>`, plus an `-r<HHMMSS>` suffix on a resume). Shared so a
+# drifted copy can't match no unit, which reads as "not active".
+PIPELINE_UNIT_PREFIX = "herdr-pipeline-"
+PIPELINE_UNIT_GLOB = PIPELINE_UNIT_PREFIX + "{run_id}*"
 SYSTEMCTL_TIMEOUT_SECONDS = 10
 
 WORKTREE_GLOB = "auto-pipeline-*"
