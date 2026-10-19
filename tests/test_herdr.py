@@ -1441,7 +1441,9 @@ def test_hung_server_surfaces_as_cli_error_instead_of_blocking() -> None:
     """A runner that only returns when handed a bound (as `_subprocess_runner` does on
     TimeoutExpired); an unbounded call would hang forever, so it fails the test instead."""
 
-    def hung_runner(argv: list[str], *, timeout_s: float | None) -> tuple[int, str, str]:
+    def hung_runner(
+        argv: list[str], *, timeout_s: float | None
+    ) -> tuple[int, str, str]:
         assert timeout_s is not None, "call would block forever on a hung herdr server"
         return 124, "", ""
 
