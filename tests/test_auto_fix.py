@@ -1024,13 +1024,10 @@ def test_auto_fix_gate_respects_max_attempts_per_target(tmp_history_path: Path) 
             ),
         )
 
-    from herdr_routines.auto_fix import attempt_count_for_gate_branch
+    from herdr_routines.auto_fix import consecutive_base_gate_failures
 
-    # Budget keyed on job_name only (stable across runs) — all base records count
-    count = attempt_count_for_gate_branch(
-        tmp_history_path, "repo-hygiene", "auto/repo-hygiene-0"
-    )
-    assert count == 3
+    # Budget keyed on job_name only (stable across runs) — failed base attempts count
+    assert consecutive_base_gate_failures(tmp_history_path, "repo-hygiene") == 3
 
     # PR target: records keyed by pr_number
     for i in range(3):
@@ -1357,3 +1354,126 @@ def test_run_checks_reports_specific_errors_for_non_runnable_checks(
         event.error
         == "github_event checks are polled by the tick, not run by run_checks"
     )
+
+
+def _base_gate_record(
+    history_path: Path,
+    i: int,
+    *,
+    gate: str,
+    state: str = "done",
+    gate_branch: str | None = "auto/repo-hygiene",
+) -> None:
+    extra: dict[str, Any] = {"gate": gate, "target": "base"}
+    if gate_branch is not None:
+        extra["gate_branch"] = gate_branch
+    append(
+        history_path,
+        HistoryRecord(
+            ts=datetime(2026, 8, 30, 6, 0, 0, tzinfo=UTC) + timedelta(minutes=i),
+            job="repo-hygiene",
+            state=state,
+            run_id=f"repo-hygiene-{i}",
+            extra=extra,
+        ),
+    )
+
+
+def test_base_gate_budget_ignores_passing_runs(tmp_history_path: Path) -> None:
+    from herdr_routines.auto_fix import consecutive_base_gate_failures
+
+    for i in range(5):
+        _base_gate_record(tmp_history_path, i, gate="passed")
+
+    assert consecutive_base_gate_failures(tmp_history_path, "repo-hygiene") == 0
+
+
+def test_base_gate_budget_counts_consecutive_failures(tmp_history_path: Path) -> None:
+    from herdr_routines.auto_fix import consecutive_base_gate_failures
+
+    # A fix agent that settles `done` still left the gate failed.
+    _base_gate_record(tmp_history_path, 0, gate="failed", state="done")
+    _base_gate_record(tmp_history_path, 1, gate="failed", state="failed")
+    _base_gate_record(tmp_history_path, 2, gate="failed", state="done")
+
+    assert consecutive_base_gate_failures(tmp_history_path, "repo-hygiene") == 3
+
+
+def test_base_gate_budget_resets_after_a_pass(tmp_history_path: Path) -> None:
+    from herdr_routines.auto_fix import consecutive_base_gate_failures
+
+    _base_gate_record(tmp_history_path, 0, gate="failed")
+    _base_gate_record(tmp_history_path, 1, gate="failed")
+    _base_gate_record(tmp_history_path, 2, gate="passed")
+    _base_gate_record(tmp_history_path, 3, gate="failed")
+
+    assert consecutive_base_gate_failures(tmp_history_path, "repo-hygiene") == 1
+
+
+def test_base_gate_budget_skips_infra_and_skipped_records(
+    tmp_history_path: Path,
+) -> None:
+    from herdr_routines.auto_fix import consecutive_base_gate_failures
+
+    # ensure_repo failure: failed + target=base but no gate_branch.
+    _base_gate_record(
+        tmp_history_path, 0, gate="failed", state="failed", gate_branch=None
+    )
+    # max_attempts_exceeded skip: no target, no gate.
+    append(
+        tmp_history_path,
+        HistoryRecord(
+            ts=datetime(2026, 8, 30, 7, 0, 0, tzinfo=UTC),
+            job="repo-hygiene",
+            state="skipped",
+            run_id="repo-hygiene-skip",
+            extra={"reason": "max_attempts_exceeded", "gate_branch": "auto/x"},
+        ),
+    )
+
+    assert consecutive_base_gate_failures(tmp_history_path, "repo-hygiene") == 0
+
+
+def _bot_pr(number: int, **overrides: object) -> dict[str, object]:
+    pr: dict[str, object] = {
+        "number": number,
+        "headRefName": "auto/bot-fix",
+        "author": {"login": "app/dependabot", "is_bot": True},
+        "url": f"https://github.com/test/repo/pull/{number}",
+        "isCrossRepository": False,
+    }
+    pr.update(overrides)
+    return pr
+
+
+def _listed_numbers(prs: list[dict[str, object]]) -> list[int]:
+    gh = FakeGhClient(user="testuser", prs=prs)
+    return [
+        p.number
+        for p in list_open_prs(
+            gh, owner="test", repo="repo", branch_prefix="auto/", author="testuser"
+        )
+    ]
+
+
+def test_list_open_prs_accepts_same_repo_bot_pr() -> None:
+    assert _listed_numbers([_bot_pr(1)]) == [1]
+
+
+def test_list_open_prs_rejects_cross_repo_bot_pr() -> None:
+    assert _listed_numbers([_bot_pr(2, isCrossRepository=True)]) == []
+
+
+def test_list_open_prs_rejects_bot_pr_without_fork_field() -> None:
+    pr = _bot_pr(3)
+    del pr["isCrossRepository"]
+    assert _listed_numbers([pr]) == []
+
+
+def test_list_open_prs_author_match_is_not_fork_checked() -> None:
+    pr = _bot_pr(
+        4,
+        author={"login": "testuser", "is_bot": False},
+        isCrossRepository=True,
+    )
+    assert _listed_numbers([pr]) == [4]

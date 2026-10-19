@@ -19,9 +19,22 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal, TypeIs, get_args
 
-VALID_SEVERITIES = ("low", "medium", "high")
-SEVERITY_RANK: dict[str, int] = {"low": 0, "medium": 1, "high": 2}
+Severity = Literal["low", "medium", "high"]
+VALID_SEVERITIES: frozenset[Severity] = frozenset(get_args(Severity))
+SEVERITY_RANK: dict[Severity, int] = {"low": 0, "medium": 1, "high": 2}
+LedgerState = Literal["open", "resolved"]
+VALID_LEDGER_STATES: frozenset[LedgerState] = frozenset(get_args(LedgerState))
+
+
+def is_severity(value: object) -> TypeIs[Severity]:
+    return value in VALID_SEVERITIES
+
+
+def is_ledger_state(value: object) -> TypeIs[LedgerState]:
+    return value in VALID_LEDGER_STATES
+
 
 _ID_MAX_LEN = 128
 _SECONDS_PER_DAY = 86_400
@@ -52,7 +65,7 @@ def finding_id(check: str, kind: str, location: str) -> str:
 class Finding:
     id: str
     kind: str
-    severity: str  # "low" | "medium" | "high"
+    severity: Severity
     location: str
     summary: str
 
@@ -79,8 +92,8 @@ class FindingDiff:
 class LedgerEntry:
     kind: str
     location: str
-    severity: str
-    state: str  # "open" | "resolved"
+    severity: Severity
+    state: LedgerState
     first_seen: str
     last_seen: str
     resolved_at: str | None = None
@@ -140,7 +153,7 @@ def _parse_finding(element: object, *, check: str) -> Finding | None:
         and summary
     ):
         return None
-    if severity not in VALID_SEVERITIES:
+    if not is_severity(severity):
         return None
 
     supplied_id = element.get("id")
@@ -434,7 +447,7 @@ def _entry_from_dict(raw: object) -> LedgerEntry | None:
         and last_seen
     ):
         return None
-    if severity not in VALID_SEVERITIES or state not in ("open", "resolved"):
+    if not is_severity(severity) or not is_ledger_state(state):
         return None
     attempts = raw.get("attempts", 0)
     if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
