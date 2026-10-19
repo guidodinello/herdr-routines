@@ -926,3 +926,20 @@ def test_validate_warns_on_tiny_history_max_bytes(
     config_path.write_text("version: 1\nretention: {}\njobs: []\n")
     assert _cmd_validate(args) == 0
     assert "history_max_bytes" not in capsys.readouterr().err
+
+
+def test_pipeline_run_reads_trusted_review_authors_from_config(tmp_path: Path) -> None:
+    jobs_dir = tmp_path / "jobs.d"
+    jobs_dir.mkdir()
+    (jobs_dir / "trusted_review_authors.yaml").write_text("- alice\n")
+    args = argparse.Namespace(config=jobs_dir)
+    assert cli._configured_trusted_review_authors(args) == ("alice",)
+
+
+def test_pipeline_run_trusts_only_the_gh_user_when_config_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """A broken or missing config must not stop `pipeline-run` from writing its report;
+    it falls back to the narrowest set (no configured logins, so only the gh user)."""
+    args = argparse.Namespace(config=tmp_path / "missing.d")
+    assert cli._configured_trusted_review_authors(args) == ()

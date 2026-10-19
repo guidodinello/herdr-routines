@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from herdr_routines.config import (
+    DEFAULT_TRUSTED_REVIEW_AUTHORS,
     PIPELINE_CATCH_UP_MINUTES,
     ConfigError,
     load_config,
@@ -1666,3 +1667,79 @@ jobs:
 """
     with pytest.raises(ConfigError, match="'base' must be a string"):
         load_config(write(tmp_config_path, text))
+
+
+# -- trusted_review_authors ----------------------------------------------------------------
+
+
+def test_trusted_review_authors_defaults_when_absent(tmp_config_path: Path) -> None:
+    cfg = load_config(write(tmp_config_path, VALID_MINIMAL))
+    assert cfg.trusted_review_authors == DEFAULT_TRUSTED_REVIEW_AUTHORS
+    assert cfg.trusted_review_authors == ("copilot-pull-request-reviewer",)
+
+
+def test_trusted_review_authors_valid_list_replaces_default(
+    tmp_config_path: Path,
+) -> None:
+    text = VALID_MINIMAL + "trusted_review_authors: [alice, ' bob ', alice]\n"
+    cfg = load_config(write(tmp_config_path, text))
+    # Stripped and de-duplicated; a configured list replaces the default.
+    assert cfg.trusted_review_authors == ("alice", "bob")
+
+
+def test_trusted_review_authors_empty_list_means_owner_only(
+    tmp_config_path: Path,
+) -> None:
+    text = VALID_MINIMAL + "trusted_review_authors: []\n"
+    assert load_config(write(tmp_config_path, text)).trusted_review_authors == ()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "alice",  # a bare string must not be iterated character by character
+        "{alice: true}",
+        "[alice, 3]",
+        "[alice, '']",
+        "[alice, '   ']",
+        "[alice, null]",
+    ],
+)
+def test_trusted_review_authors_invalid_values_raise(
+    tmp_config_path: Path, value: str
+) -> None:
+    text = VALID_MINIMAL + f"trusted_review_authors: {value}\n"
+    with pytest.raises(ConfigError, match="trusted_review_authors"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_unknown_top_level_key_still_rejected_next_to_trusted_authors(
+    tmp_config_path: Path,
+) -> None:
+    text = VALID_MINIMAL + "trusted_review_authors: [alice]\ntrusted_reviewers: [x]\n"
+    with pytest.raises(ConfigError, match="unknown top-level"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_trusted_review_authors_yaml_in_jobs_d_is_not_a_job(tmp_path: Path) -> None:
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "a.yaml": "cron: '0 3 * * *'\nrepo: /repo/a\n",
+            "trusted_review_authors.yaml": "- alice\n- copilot-pull-request-reviewer\n",
+        },
+    )
+    cfg = load_config_dir(jobs_dir)
+    assert cfg.errors == ()
+    assert [j.name for j in cfg.jobs] == ["a"]
+    assert cfg.trusted_review_authors == ("alice", "copilot-pull-request-reviewer")
+
+
+def test_trusted_review_authors_yaml_in_jobs_d_rejects_a_mapping(
+    tmp_path: Path,
+) -> None:
+    jobs_dir = _make_jobs_d(
+        tmp_path, {"trusted_review_authors.yaml": "trusted_review_authors: [alice]\n"}
+    )
+    with pytest.raises(ConfigError, match="must be a list"):
+        load_config_dir(jobs_dir)
