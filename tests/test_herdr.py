@@ -312,6 +312,21 @@ def test_agent_prompt_wait_returns_unknown() -> None:
     )
 
 
+@pytest.mark.parametrize("status", ["idle", "done", "working", "blocked", "unknown"])
+def test_agent_get_parses_every_schema_status(status: str) -> None:
+    client = HerdrClient(runner=FakeRunner([ok(agent_response(status))]))
+    assert client.agent_get("rt-a") == status
+
+
+def test_agent_get_returns_none_and_logs_for_off_schema_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = HerdrClient(runner=FakeRunner([ok(agent_response("paused"))]))
+    with caplog.at_level(logging.WARNING, logger="herdr_routines.herdr"):
+        assert client.agent_get("rt-a") is None
+    assert "paused" in caplog.text
+
+
 def test_exit_1_with_json_stderr_raises_with_error_body() -> None:
     error_body = {
         "error": {"code": "agent_blocked", "message": "agent is waiting on approval"}

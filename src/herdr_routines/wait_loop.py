@@ -22,7 +22,12 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 
-from herdr_routines.herdr import HerdrClient, HerdrCliError, PromptWatchdogKilled
+from herdr_routines.herdr import (
+    AgentStatus,
+    HerdrClient,
+    HerdrCliError,
+    PromptWatchdogKilled,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,7 +103,7 @@ def prompt_with_watchdog(
     prompt_text: str,
     on_poll_hook: Callable[[], None] | None = None,
     retry_delays_s: Sequence[float] = PROMPT_RETRY_DELAYS_S,
-) -> str:
+) -> AgentStatus | None:
     """agent_prompt_wait_with_watchdog with bounded retries over provably-early
     session-not-ready failures — the same whitelist phase 1's retry enforced (see
     is_retryable_prompt_error): settle timeouts, wrapper subprocess timeouts and shape
