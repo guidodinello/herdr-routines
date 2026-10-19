@@ -428,7 +428,7 @@ def test_review_scan_selects_open_non_draft_prs(tmp_path: Path) -> None:
     # A review_requested PR is someone else's by definition: its author never matches
     # the login, and that must not skip it as author_mismatch.
     gh = ReviewGh(prs=(_pr(1), _pr(2, author="teammate", mode="review_requested")))
-    outcome = scan_review_targets(gh, job, login="me")  # type: ignore[arg-type]
+    outcome = scan_review_targets(gh, job, login="me")
     assert outcome is not None
     assert len(gh.search_calls) == 1  # one batched call, not one per mode
     modes, _limit = gh.search_calls[0]
@@ -445,14 +445,14 @@ def test_review_scan_selects_open_non_draft_prs(tmp_path: Path) -> None:
 def test_review_scan_skips_auto_branches_unless_opted_in(tmp_path: Path) -> None:
     job = _review_job(tmp_path)
     pr = _pr(1, head_ref="auto/pipeline-20261010T080000Z")
-    outcome = scan_review_targets(ReviewGh(prs=(pr,)), job, login="me")  # type: ignore[arg-type]
+    outcome = scan_review_targets(ReviewGh(prs=(pr,)), job, login="me")
     assert outcome is not None
     assert outcome.candidates == ()
     assert len(outcome.skipped) == 1
     assert outcome.skipped[0].skip_reason == "routine_owned_branch"
 
     opted_in = _review_job(tmp_path, include_auto_branches=True)
-    outcome2 = scan_review_targets(ReviewGh(prs=(pr,)), opted_in, login="me")  # type: ignore[arg-type]
+    outcome2 = scan_review_targets(ReviewGh(prs=(pr,)), opted_in, login="me")
     assert outcome2 is not None
     assert len(outcome2.candidates) == 1
     assert outcome2.candidates[0].skip_reason is None
@@ -466,13 +466,13 @@ def test_review_scan_skips_auto_branches_unless_opted_in(tmp_path: Path) -> None
 def test_review_scan_skips_fork_prs(tmp_path: Path) -> None:
     job = _review_job(tmp_path)
     fork = _pr(9, repo="acme/widgets", head_repo="someone/widgets")
-    outcome = scan_review_targets(ReviewGh(prs=(fork,)), job, login="me")  # type: ignore[arg-type]
+    outcome = scan_review_targets(ReviewGh(prs=(fork,)), job, login="me")
     assert outcome is not None
     assert outcome.candidates == ()
     assert outcome.skipped[0].skip_reason == "fork_pr"
     # author_mismatch takes precedence (a stale login) and is a distinct reason.
     stale = _pr(10, author="someone-else")
-    outcome2 = scan_review_targets(ReviewGh(prs=(stale,)), job, login="me")  # type: ignore[arg-type]
+    outcome2 = scan_review_targets(ReviewGh(prs=(stale,)), job, login="me")
     assert outcome2 is not None
     assert outcome2.skipped[0].skip_reason == "author_mismatch"
 
@@ -489,7 +489,7 @@ def test_review_scan_orders_oldest_first_and_caps_newest(tmp_path: Path) -> None
         _pr(1, created_at="2026-10-01T00:00:00Z"),
         _pr(2, created_at="2026-10-02T00:00:00Z"),
     )
-    outcome = scan_review_targets(ReviewGh(prs=prs), job, login="me")  # type: ignore[arg-type]
+    outcome = scan_review_targets(ReviewGh(prs=prs), job, login="me")
     assert outcome is not None
     assert [c.number for c in outcome.candidates] == [1, 2, 3]
 
@@ -529,7 +529,7 @@ def test_review_scan_marker_guard_and_search_fail_closed(
 
     posted = ReviewGh()
     posted.posted.add("acme/widgets#1")
-    dispatchable, skipped = apply_marker_guard(posted, "review-my-prs", [cand])  # type: ignore[arg-type]
+    dispatchable, skipped = apply_marker_guard(posted, "review-my-prs", [cand])
     assert dispatchable == []
     assert skipped[0].skip_reason == "review_already_posted"
 
@@ -541,13 +541,13 @@ def test_review_scan_marker_guard_and_search_fail_closed(
             ]
         }
     )
-    dispatchable2, skipped2 = apply_marker_guard(other, "review-my-prs", [cand])  # type: ignore[arg-type]
+    dispatchable2, skipped2 = apply_marker_guard(other, "review-my-prs", [cand])
     assert dispatchable2 == [cand]
     assert skipped2 == []
 
     # A body read failure (None) is unverified → still dispatchable.
     failing = ReviewGh(bodies_fail=True)
-    dispatchable3, skipped3 = apply_marker_guard(failing, "review-my-prs", [cand])  # type: ignore[arg-type]
+    dispatchable3, skipped3 = apply_marker_guard(failing, "review-my-prs", [cand])
     assert dispatchable3 == [cand]
     assert skipped3 == []
 

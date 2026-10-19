@@ -1421,7 +1421,7 @@ def test_unknown_age_retains_branch(
         )
         assert gc.collectible(row, 14) is False
     finally:
-        gc._tip_committer_date = monkey  # type: ignore[assignment]
+        gc._tip_committer_date = monkey
 
 
 # ---------------------------------------------------------------------------

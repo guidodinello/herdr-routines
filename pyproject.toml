@@ -39,6 +39,8 @@ extend-exclude = ["docs"]
 python_version = "3.13"
 files = ["src", "tests"]
 mypy_path = "src"
+# Applies to tests too, so dead ignores cannot accumulate outside the strict src override.
+warn_unused_ignores = true
 
 # `logger` is a direct git dependency (see [project].dependencies) that ships no py.typed
 # marker, so mypy can't see into it. Nothing to install — types-* stubs don't exist for a
@@ -60,7 +62,6 @@ disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
 disallow_untyped_decorators = true
-warn_unused_ignores = true
 warn_return_any = true
 strict_equality = true
 extra_checks = true

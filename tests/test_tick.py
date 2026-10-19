@@ -1825,7 +1825,7 @@ def test_pipeline_done_report_downgraded_when_stage_sessions_faked(
     )
 
     t = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=2)
-    outcome = run_tick(config, history_path, client=client, now=t)  # type: ignore[arg-type]
+    outcome = run_tick(config, history_path, client=client, now=t)
     assert outcome.summaries == (
         "nightly-pipeline: failed (stage_independence_unverified)",
     )
@@ -1846,7 +1846,7 @@ def test_pipeline_done_report_trusted_when_state_json_absent(
     report.write_text("## Outcome: ok\n")
 
     t = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=2)
-    outcome = run_tick(config, history_path, client=client, now=t)  # type: ignore[arg-type]
+    outcome = run_tick(config, history_path, client=client, now=t)
     assert outcome.summaries == ("nightly-pipeline: done",)
 
 
@@ -1871,7 +1871,7 @@ def test_pipeline_fails_fast_on_host_reboot_before_deadline(
 
     outcome = run_tick(
         config, history_path, client=client, now=now + timedelta(minutes=3)
-    )  # type: ignore[arg-type]
+    )
     assert outcome.summaries == ("nightly-pipeline: failed (host_rebooted)",)
     assert outcome.any_job_failed is True
     last = read_job(history_path, "nightly-pipeline")[-1]
