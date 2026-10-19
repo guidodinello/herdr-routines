@@ -193,7 +193,7 @@ class RealGhClient:
                 "--limit",
                 str(limit),
                 "--json",
-                "number,headRefName,author,url,labels",
+                "number,headRefName,author,url,labels,isCrossRepository",
             ]
         )
         if exit_code != 0:
@@ -445,7 +445,10 @@ def list_open_prs(
 
     Bot/app accounts are accepted when the branch prefix matches provenance
     (review finding J): a PR opened by a bot from an ``auto/*`` branch is
-    treated as herdr-routines-originated regardless of the bot's login.
+    treated as herdr-routines-originated regardless of the bot's login, but only
+    when the head lives in this repository: a fork can name its branch anything.
+    The ``login == author`` path is not fork-checked: that login is the operator's
+    own authenticated account, so provenance is already proven.
     """
     try:
         raw = gh.pr_list(owner=owner, repo=repo, state="open", limit=100)
@@ -472,8 +475,10 @@ def list_open_prs(
             and isinstance(url, str)
         ):
             continue
-        # Human author must match exactly; bot/app accepted on branch-prefix provenance alone.
-        if is_bot or login == author:
+        # Human author must match exactly; a bot/app is accepted on branch-prefix
+        # provenance only from a same-repo head. `is False` fails closed when the field
+        # is missing.
+        if login == author or (is_bot and pr.get("isCrossRepository") is False):
             result.append(PRInfo(number=num, head_ref=head, author=login, url=url))
     return result
 

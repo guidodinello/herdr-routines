@@ -1432,3 +1432,48 @@ def test_base_gate_budget_skips_infra_and_skipped_records(
     )
 
     assert consecutive_base_gate_failures(tmp_history_path, "repo-hygiene") == 0
+
+
+def _bot_pr(number: int, **overrides: object) -> dict[str, object]:
+    pr: dict[str, object] = {
+        "number": number,
+        "headRefName": "auto/bot-fix",
+        "author": {"login": "app/dependabot", "is_bot": True},
+        "url": f"https://github.com/test/repo/pull/{number}",
+        "isCrossRepository": False,
+    }
+    pr.update(overrides)
+    return pr
+
+
+def _listed_numbers(prs: list[dict[str, object]]) -> list[int]:
+    gh = FakeGhClient(user="testuser", prs=prs)
+    return [
+        p.number
+        for p in list_open_prs(
+            gh, owner="test", repo="repo", branch_prefix="auto/", author="testuser"
+        )
+    ]
+
+
+def test_list_open_prs_accepts_same_repo_bot_pr() -> None:
+    assert _listed_numbers([_bot_pr(1)]) == [1]
+
+
+def test_list_open_prs_rejects_cross_repo_bot_pr() -> None:
+    assert _listed_numbers([_bot_pr(2, isCrossRepository=True)]) == []
+
+
+def test_list_open_prs_rejects_bot_pr_without_fork_field() -> None:
+    pr = _bot_pr(3)
+    del pr["isCrossRepository"]
+    assert _listed_numbers([pr]) == []
+
+
+def test_list_open_prs_author_match_is_not_fork_checked() -> None:
+    pr = _bot_pr(
+        4,
+        author={"login": "testuser", "is_bot": False},
+        isCrossRepository=True,
+    )
+    assert _listed_numbers([pr]) == [4]
