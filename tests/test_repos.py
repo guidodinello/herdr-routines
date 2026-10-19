@@ -255,8 +255,36 @@ def test_repo_url_clone_failed_clean(tmp_path: Path) -> None:
     # No partial checkout left behind
     assert not checkout.exists()
     # No tmp dirs left behind
-    tmp_dirs = list(repos_dir.glob("*.tmp.*")) if repos_dir.exists() else []
+    tmp_dirs = list(repos_dir.glob("*.tmp")) if repos_dir.exists() else []
     assert tmp_dirs == []
+
+
+def _raise_timeout(*args: Any, **kwargs: Any) -> None:
+    raise subprocess.TimeoutExpired(cmd="git", timeout=120)
+
+
+def test_fetch_timeout_raises_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A git timeout is a repo sync failure (RuntimeError), not a stray TimeoutExpired
+    that the callers' `except (RuntimeError, OSError)` guards would miss."""
+    monkeypatch.setattr("herdr_routines.repos.subprocess.run", _raise_timeout)
+    job = make_job(tmp_path, repo=tmp_path / "checkout", repository=None)
+    with pytest.raises(RuntimeError, match="timed out"):
+        ensure_repo(job)
+
+
+def test_clone_timeout_raises_runtime_error_and_cleans_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("herdr_routines.repos.subprocess.run", _raise_timeout)
+    repos_dir = tmp_path / "repos"
+    checkout = repos_dir / "a"
+    job = make_job(tmp_path, repository="https://example.com/repo.git", repo=checkout)
+    with pytest.raises(RuntimeError, match="timed out"):
+        ensure_repo(job)
+    assert not checkout.exists()
+    assert list(repos_dir.glob("*.tmp")) == []
 
 
 # --- Acceptance 5: test_repo_url_repo_sync_failed_non_fast_forward ---

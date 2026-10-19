@@ -2947,3 +2947,219 @@ def test_reap_leaves_agents_alone_unless_the_host_rebooted_under_the_run(
 
     assert reaped == []
     assert client.closed == []
+
+
+# -- run_tick per-job catch-all ---------------------------------------------------------
+
+
+def _raising_process_job(*, open_running_for: set[str], raising: set[str]) -> Any:
+    """A `_process_job` stand-in: jobs in `open_running_for` leave a `running` record
+    behind, jobs in `raising` then raise, everything else succeeds."""
+
+    def fake(
+        job: Job, history_path: Path, *, client: Any, now: datetime
+    ) -> tuple[str, bool]:
+        if job.name in open_running_for:
+            append(
+                history_path,
+                HistoryRecord(ts=now, job=job.name, state="running", run_id="run-1"),
+            )
+        if job.name in raising:
+            raise ValueError("boom")
+        return f"{job.name}: done", False
+
+    return fake
+
+
+def test_run_tick_continues_after_job_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One job raising unexpectedly must not skip the rest, and its open `running`
+    record gets a terminal `failed` so it isn't left to go stale."""
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(
+        jobs=(make_job(tmp_path, name="a"), make_job(tmp_path, name="b"))
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick._process_job",
+        _raising_process_job(open_running_for={"a"}, raising={"a"}),
+    )
+    now = datetime.now(UTC)
+
+    outcome = run_tick(config, history_path, client=FakeStatusClient(), now=now)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: failed (unexpected_error)", "b: done")
+    assert outcome.any_job_failed is True
+    last = read_job(history_path, "a")[-1]
+    assert (last.state, last.run_id) == ("failed", "run-1")
+    assert last.extra is not None
+    assert last.extra["reason"] == "unexpected_error"
+
+
+def test_run_tick_job_raising_before_running_record_gets_failed_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(
+        jobs=(make_job(tmp_path, name="a"), make_job(tmp_path, name="b"))
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick._process_job",
+        _raising_process_job(open_running_for=set(), raising={"a"}),
+    )
+
+    outcome = run_tick(
+        config,
+        history_path,
+        client=FakeStatusClient(),  # type: ignore[arg-type]
+        now=datetime.now(UTC),
+    )
+
+    assert outcome.summaries[-1] == "b: done"
+    records = read_job(history_path, "a")
+    assert [(r.state, r.run_id) for r in records] == [("failed", None)]
+
+
+def test_run_tick_pipeline_job_raising_leaves_running_record_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pipeline job's detached unit may still be live and the watchdog owns finalising
+    its `running` record, so the catch-all must not close it."""
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(
+        jobs=(
+            make_job(tmp_path, name="p", kind="pipeline"),
+            make_job(tmp_path, name="b"),
+        )
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick._process_job",
+        _raising_process_job(open_running_for={"p"}, raising={"p"}),
+    )
+
+    outcome = run_tick(
+        config,
+        history_path,
+        client=FakeStatusClient(),  # type: ignore[arg-type]
+        now=datetime.now(UTC),
+    )
+
+    assert outcome.summaries[-1] == "b: done"
+    assert outcome.any_job_failed is True
+    assert [r.state for r in read_job(history_path, "p")] == ["running"]
+
+
+# -- base-target gate budget (limits fix-agent dispatches, not gate runs) ---------------
+
+
+class FakeBaseGateClient:
+    """Records fix-agent dispatches; any pane/agent call means a fix agent was started."""
+
+    def __init__(self) -> None:
+        self.dispatched: list[str] = []
+
+    def tab_create(self, *, cwd, label=None):
+        self.dispatched.append("tab_create")
+        raise AssertionError("fix agent must not be dispatched")
+
+    def notification_show(self, title, *, body=None, sound="none"):
+        pass
+
+
+def _base_gate_job(tmp_path: Path) -> Job:
+    from herdr_routines.config import GateCheck
+
+    return make_job(
+        tmp_path,
+        target="base",
+        checks=(GateCheck(kind="command", command="true"),),
+        max_attempts_per_target=3,
+    )
+
+
+def _exhaust_base_budget(history_path: Path, job_name: str) -> None:
+    for i in range(3):
+        append(
+            history_path,
+            HistoryRecord(
+                ts=datetime(2026, 8, 30, 6, i, tzinfo=UTC),
+                job=job_name,
+                state="done",
+                run_id=f"{job_name}-{i}",
+                extra={
+                    "gate": "failed",
+                    "target": "base",
+                    "gate_branch": f"auto/{job_name}-{i}",
+                },
+            ),
+        )
+
+
+def _run_base_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    history_path: Path,
+    *,
+    checks_pass: bool,
+) -> tuple[str, bool]:
+    from herdr_routines.auto_fix import GateOutcome
+    from herdr_routines.tick import _process_base_target
+
+    monkeypatch.setattr(
+        "herdr_routines.tick.subprocess.run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""),
+    )
+    monkeypatch.setattr(
+        "herdr_routines.tick.run_checks",
+        lambda checks, *, cwd, **kw: GateOutcome(
+            passed=checks_pass,
+            results=(),
+            combined_output="" if checks_pass else "boom",
+        ),
+    )
+    return _process_base_target(
+        _base_gate_job(tmp_path),
+        history_path,
+        client=FakeBaseGateClient(),  # type: ignore[arg-type]
+        now=datetime(2026, 8, 30, 7, 0, tzinfo=UTC),
+        run_id="a-20260830T070000Z",
+    )
+
+
+def test_base_gate_exhausted_budget_still_records_a_passing_run(
+    tmp_path: Path, tmp_history_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from herdr_routines.auto_fix import consecutive_base_gate_failures
+
+    _exhaust_base_budget(tmp_history_path, "a")
+    assert consecutive_base_gate_failures(tmp_history_path, "a") == 3
+
+    summary, failed = _run_base_gate(
+        monkeypatch, tmp_path, tmp_history_path, checks_pass=True
+    )
+
+    assert (summary, failed) == ("a: done (gate passed)", False)
+    last = read_job(tmp_history_path, "a")[-1]
+    assert last.state == "done"
+    assert last.extra is not None and last.extra["gate"] == "passed"
+    assert consecutive_base_gate_failures(tmp_history_path, "a") == 0
+
+
+def test_base_gate_exhausted_budget_skips_fix_agent_when_checks_fail(
+    tmp_path: Path, tmp_history_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from herdr_routines.auto_fix import consecutive_base_gate_failures
+
+    _exhaust_base_budget(tmp_history_path, "a")
+
+    summary, failed = _run_base_gate(
+        monkeypatch, tmp_path, tmp_history_path, checks_pass=False
+    )
+
+    # FakeBaseGateClient.tab_create raises if a fix agent is dispatched.
+    assert (summary, failed) == ("a: skipped (max_attempts_exceeded)", False)
+    last = read_job(tmp_history_path, "a")[-1]
+    assert last.state == "skipped"
+    assert last.extra is not None
+    assert last.extra["reason"] == "max_attempts_exceeded"
+    assert consecutive_base_gate_failures(tmp_history_path, "a") == 3

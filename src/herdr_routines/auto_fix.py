@@ -193,7 +193,7 @@ class RealGhClient:
                 "--limit",
                 str(limit),
                 "--json",
-                "number,headRefName,author,url,labels",
+                "number,headRefName,author,url,labels,isCrossRepository",
             ]
         )
         if exit_code != 0:
@@ -445,7 +445,10 @@ def list_open_prs(
 
     Bot/app accounts are accepted when the branch prefix matches provenance
     (review finding J): a PR opened by a bot from an ``auto/*`` branch is
-    treated as herdr-routines-originated regardless of the bot's login.
+    treated as herdr-routines-originated regardless of the bot's login, but only
+    when the head lives in this repository: a fork can name its branch anything.
+    The ``login == author`` path is not fork-checked: that login is the operator's
+    own authenticated account, so provenance is already proven.
     """
     try:
         raw = gh.pr_list(owner=owner, repo=repo, state="open", limit=100)
@@ -472,8 +475,10 @@ def list_open_prs(
             and isinstance(url, str)
         ):
             continue
-        # Human author must match exactly; bot/app accepted on branch-prefix provenance alone.
-        if is_bot or login == author:
+        # Human author must match exactly; a bot/app is accepted on branch-prefix
+        # provenance only from a same-repo head. `is False` fails closed when the field
+        # is missing.
+        if login == author or (is_bot and pr.get("isCrossRepository") is False):
             result.append(PRInfo(number=num, head_ref=head, author=login, url=url))
     return result
 
@@ -900,8 +905,6 @@ def attempt_count_for_target(history_path: Path, job_name: str, target_key: str)
 # Unified gate model (docs/pipeline/runs/20260830T050021Z/spec.md)
 # ---------------------------------------------------------------------------
 
-# _COUNTABLE_STATES is reused for gate budget (SSOT, no separate _COUNTABLE_STATES_GATE)
-
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
@@ -1215,20 +1218,20 @@ def build_audit_fix_prompt(
     )
 
 
-def attempt_count_for_gate_branch(
-    history_path: Path, job_name: str, gate_branch: str
-) -> int:
-    """Count prior terminal records for this job+gate_branch (base-target retry budget).
-    Keyed on job_name only (stable across runs) so the budget persists per job."""
-    records = read_job(history_path, job_name)
+def consecutive_base_gate_failures(history_path: Path, job_name: str) -> int:
+    """Base-target retry budget: failed gate attempts since the last passing run.
+    Keyed on job_name only (stable across runs); a passing gate resets the count.
+    Reads `gate`, not `state`: a fix agent that settles `done` still left the gate failed."""
     count = 0
-    for r in records:
-        if (
-            r.state in _COUNTABLE_STATES
-            and r.extra
-            and r.extra.get("target") == "base"
-            and r.extra.get("gate_branch") is not None
-        ):
+    for r in read_job(history_path, job_name):
+        if not r.extra or r.extra.get("target") != "base":
+            continue
+        gate = r.extra.get("gate")
+        if gate == "passed":
+            count = 0
+        # Records without a gate_branch (e.g. ensure_repo failures) are infra flakes,
+        # not gate attempts, so they do not spend budget.
+        elif gate == "failed" and r.extra.get("gate_branch") is not None:
             count += 1
     return count
 

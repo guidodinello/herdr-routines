@@ -8,17 +8,23 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import HistoryRecord, append
 from herdr_routines.pipeline_watchdog import (
     DEADLINE_GRACE_SECONDS,
     HEARTBEAT_STALE_SECONDS,
+    InflightRun,
+    _write_report,
     find_inflight_runs,
     is_stalled,
+    pipeline_unit_active,
     recorded_pipeline_deadlines,
     run_watchdog,
     system_boot_epoch,
@@ -27,6 +33,18 @@ from herdr_routines.pipeline_watchdog import (
 
 RUN_ID = "20260903T050016Z"
 NOW = datetime(2026, 9, 3, 12, 0, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def unit_not_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default every sweep to "orchestrator unit is gone", so tests never shell out to the
+    host's real systemctl (absent on macOS, no user bus on CI, which would read as
+    "can't tell" and block every reap). Tests of the liveness gate override it."""
+    monkeypatch.setattr(
+        "herdr_routines.pipeline_watchdog.pipeline_unit_active",
+        lambda run_id: False,
+        raising=False,
+    )
 
 
 @dataclass
@@ -39,10 +57,13 @@ class FakeWatchdogClient:
     panes_by_run: dict[str, dict[str, str]] = field(default_factory=dict)
     blocked_panes_by_run: dict[str, dict[str, str]] = field(default_factory=dict)
     raise_on_list: bool = False
+    raise_os_error_for: set[str] = field(default_factory=set)
     closed_panes: list[str] = field(default_factory=list)
     notifications: list[tuple[str, str | None, str]] = field(default_factory=list)
 
     def live_pipeline_agent_panes(self, run_id: str) -> dict[str, str]:
+        if run_id in self.raise_os_error_for:
+            raise OSError("herdr socket vanished")
         if self.raise_on_list:
             raise HerdrCliError("server unreachable", exit_code=1)
         return self.panes_by_run.get(run_id, {})
@@ -665,3 +686,209 @@ def test_recorded_deadline_covers_a_state_json_without_one(tmp_path: Path) -> No
     )
 
     assert [(r.run_id, r.deadline_epoch) for r in runs] == [(RUN_ID, 1234)]
+
+
+# -- systemd unit liveness ---------------------------------------------------------------
+
+
+def _stalled_run_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "tmp"
+    heartbeat_dir.mkdir()
+    write_state_json(
+        worktrees_root,
+        deadline_epoch=int(NOW.timestamp()) - DEADLINE_GRACE_SECONDS - 3600,
+    )
+    write_heartbeat(
+        heartbeat_dir,
+        RUN_ID,
+        mtime=NOW.timestamp() - HEARTBEAT_STALE_SECONDS - 60,
+        text="stage 5 poll\n",
+    )
+    return worktrees_root, reports_dir, heartbeat_dir
+
+
+@pytest.mark.parametrize("unit_state", [True, None])
+def test_run_watchdog_does_not_reap_when_unit_active_or_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unit_state: bool | None
+) -> None:
+    worktrees_root, reports_dir, heartbeat_dir = _stalled_run_fixture(tmp_path)
+    monkeypatch.setattr(
+        "herdr_routines.pipeline_watchdog.pipeline_unit_active",
+        lambda run_id: unit_state,
+        raising=False,
+    )
+    agent_name = f"pl-6-{RUN_ID}".lower()
+    client = FakeWatchdogClient(panes_by_run={RUN_ID: {agent_name: "w1:p1"}})
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        now=NOW,
+    )
+
+    assert actions == []
+    assert client.closed_panes == []
+    assert client.notifications == []
+    assert not (reports_dir / f"pipeline-{RUN_ID}.md").exists()
+
+
+def test_run_watchdog_reaps_when_unit_inactive(tmp_path: Path) -> None:
+    worktrees_root, reports_dir, heartbeat_dir = _stalled_run_fixture(tmp_path)
+    client = FakeWatchdogClient()
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        now=NOW,
+    )
+
+    assert [a.run_id for a in actions] == [RUN_ID]
+    assert (reports_dir / f"pipeline-{RUN_ID}.md").exists()
+
+
+def _fake_systemctl(
+    monkeypatch: pytest.MonkeyPatch, *, returncode: int = 0, stdout: str = ""
+) -> list[tuple[list[str], float]]:
+    calls: list[tuple[list[str], float]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, (int, float))
+        calls.append((argv, timeout))
+        return subprocess.CompletedProcess(argv, returncode, stdout, "boom")
+
+    monkeypatch.setattr("herdr_routines.pipeline_watchdog.subprocess.run", fake_run)
+    return calls
+
+
+def test_pipeline_unit_active_true_when_a_unit_is_listed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()  # drop the autouse stub; exercise the real function
+    calls = _fake_systemctl(
+        monkeypatch,
+        stdout=f"herdr-pipeline-{RUN_ID}.service loaded active running x\n",
+    )
+
+    assert pipeline_unit_active(RUN_ID) is True
+    argv, timeout = calls[0]
+    assert argv[:3] == ["systemctl", "--user", "list-units"]
+    assert argv[-1] == f"herdr-pipeline-{RUN_ID}*"
+    assert timeout > 0
+
+
+def test_pipeline_unit_active_false_when_nothing_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()
+    _fake_systemctl(monkeypatch, stdout="")
+
+    assert pipeline_unit_active(RUN_ID) is False
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.TimeoutExpired(cmd="systemctl", timeout=10),
+        FileNotFoundError("systemctl"),
+    ],
+)
+def test_pipeline_unit_active_none_when_systemctl_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    monkeypatch.undo()
+
+    def raising_run(*_a: object, **_k: object) -> None:
+        raise failure
+
+    monkeypatch.setattr("herdr_routines.pipeline_watchdog.subprocess.run", raising_run)
+
+    assert pipeline_unit_active(RUN_ID) is None
+
+
+def test_pipeline_unit_active_none_on_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.undo()
+    _fake_systemctl(monkeypatch, returncode=1)
+
+    assert pipeline_unit_active(RUN_ID) is None
+
+
+# -- atomic report write -----------------------------------------------------------------
+
+
+def test_write_report_failure_leaves_no_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A torn report would count as terminal (`_has_terminal_report`) so the run is never
+    rechecked, while tick would fail to parse it. The write must be all-or-nothing."""
+    reports_dir = tmp_path / "reports"
+    run = InflightRun(
+        run_id=RUN_ID,
+        state_path=tmp_path / "state.json",
+        deadline_epoch=0,
+        current_stage=6,
+    )
+
+    def failing_replace(*_a: object, **_k: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("os.replace", failing_replace)
+
+    with pytest.raises(OSError, match="disk full"):
+        _write_report(
+            reports_dir,
+            run,
+            killed_agents={},
+            heartbeat_last_line=None,
+            now=NOW,
+        )
+
+    assert list(reports_dir.iterdir()) == []
+
+
+# -- per-run error isolation -------------------------------------------------------------
+
+
+def test_run_watchdog_continues_after_one_run_raises(tmp_path: Path) -> None:
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "tmp"
+    heartbeat_dir.mkdir()
+    bad_run, good_run = "20260901T050016Z", "20260902T050016Z"
+    for run_id in (bad_run, good_run):
+        write_state_json(
+            worktrees_root,
+            run_id=run_id,
+            deadline_epoch=int(NOW.timestamp()) - DEADLINE_GRACE_SECONDS - 3600,
+        )
+        write_heartbeat(
+            heartbeat_dir,
+            run_id,
+            mtime=NOW.timestamp() - HEARTBEAT_STALE_SECONDS - 60,
+            text="stage 5 poll\n",
+        )
+    client = FakeWatchdogClient(
+        raise_os_error_for={bad_run},
+        panes_by_run={good_run: {f"pl-6-{good_run}".lower(): "w1:p1"}},
+    )
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        now=NOW,
+    )
+
+    assert [a.run_id for a in actions] == [good_run]
+    assert client.closed_panes == ["w1:p1"]
+    assert (reports_dir / f"pipeline-{good_run}.md").exists()
+    assert not (reports_dir / f"pipeline-{bad_run}.md").exists()

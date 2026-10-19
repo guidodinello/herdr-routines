@@ -26,7 +26,6 @@ from herdr_routines.auto_fix import (
     PRInfo,
     RealGhClient,
     attempt_count_for_event,
-    attempt_count_for_gate_branch,
     attempt_count_for_pr,
     attempt_count_for_target,
     build_audit_agent_name,
@@ -41,6 +40,7 @@ from herdr_routines.auto_fix import (
     build_review_agent_prefix,
     build_review_prompt,
     build_worker_agent_name,
+    consecutive_base_gate_failures,
     enrich_event_detail,
     event_worktree_slug,
     fetch_failing_checks,
@@ -78,6 +78,7 @@ from herdr_routines.herdr import (
 from herdr_routines.history import (
     TERMINAL_STATES,
     HistoryRecord,
+    HistoryState,
     append,
     find_stale_running,
     first_seen_at,
@@ -174,6 +175,55 @@ class TickOutcome:
     any_job_failed: bool
 
 
+def _record_unexpected_failure(
+    job: Job, history_path: Path, *, now: datetime, error: Exception
+) -> str:
+    """Give a job whose processing raised unexpectedly a terminal `failed` record.
+
+    Closes the `running` records this tick wrote for the job (every `running` append in
+    this module uses `ts=now`, which is what scopes this to the current tick), or writes a
+    `run_id`-less `failed` when none was open so the occurrence is consumed rather than
+    re-raising every tick. A pipeline job's open records are left alone: its detached unit
+    may still be live and the pipeline watchdog owns finalising them. Best-effort: a
+    history write failing here must not abort the tick either."""
+    extra = {"reason": "unexpected_error", "error": repr(error)}
+    try:
+        records = read_job(history_path, job.name)
+        terminal_run_ids = {
+            r.run_id for r in records if r.state in TERMINAL_STATES and r.run_id
+        }
+        open_run_ids = [
+            r.run_id
+            for r in records
+            if r.state == "running"
+            and r.ts == now
+            and r.run_id
+            and r.run_id not in terminal_run_ids
+        ]
+        if job.kind == "pipeline" and open_run_ids:
+            log.warning(
+                "%s: leaving running record(s) %s open for the pipeline watchdog",
+                job.name,
+                open_run_ids,
+            )
+        else:
+            to_close: list[str | None] = [*open_run_ids] or [None]
+            for run_id in to_close:
+                append(
+                    history_path,
+                    HistoryRecord(
+                        ts=now,
+                        job=job.name,
+                        state="failed",
+                        run_id=run_id,
+                        extra=extra,
+                    ),
+                )
+    except Exception as e:  # noqa: BLE001 — see docstring
+        log.warning("%s: could not record unexpected failure: %s", job.name, e)
+    return f"{job.name}: failed (unexpected_error)"
+
+
 def run_tick(
     config: RoutinesConfig, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> TickOutcome:
@@ -193,7 +243,15 @@ def run_tick(
     for job in config.jobs:
         if not job.enabled:
             continue
-        summary, failed = _process_job(job, history_path, client=client, now=now)
+        try:
+            summary, failed = _process_job(job, history_path, client=client, now=now)
+        except Exception as e:
+            # One job's unexpected error must not skip the rest of the tick.
+            log.exception("%s: unexpected error (continuing)", job.name)
+            summary, failed = (
+                _record_unexpected_failure(job, history_path, now=now, error=e),
+                True,
+            )
         summaries.append(summary)
         any_job_failed = any_job_failed or failed
 
@@ -1501,7 +1559,7 @@ def _process_event_target(
             handled.add(event.event_id)
         dispatched_count += 1
 
-    state = "failed" if any_failed else "done"
+    state: HistoryState = "failed" if any_failed else "done"
     append(
         history_path,
         HistoryRecord(
@@ -2041,30 +2099,7 @@ def _process_base_target(
     assert job.checks is not None
     gate_branch = build_branch_name(job.name, run_id)
 
-    attempt = attempt_count_for_gate_branch(history_path, job.name, gate_branch)
-    if attempt >= job.max_attempts_per_target:
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="skipped",
-                run_id=run_id,
-                extra={
-                    "reason": "max_attempts_exceeded",
-                    "gate_branch": gate_branch,
-                    "attempt": attempt,
-                },
-            ),
-        )
-        if _notify_gate(job, "failure"):
-            _notify(
-                client,
-                f"herdr-routines: {job.name} skipped",
-                body="max_attempts_exceeded",
-                sound="request",
-            )
-        return f"{job.name}: skipped (max_attempts_exceeded)", False
+    attempt = consecutive_base_gate_failures(history_path, job.name)
 
     # Ensure repo checkout before any worktree creation
     try:
@@ -2182,6 +2217,32 @@ def _process_base_target(
         if _notify_gate(job, "success"):
             _notify(client, f"herdr-routines: {job.name} done", sound="done")
         return f"{job.name}: done (gate passed)", False
+
+    # The budget limits fix-agent dispatches, not gate runs: a passing gate above
+    # still records `passed` and resets it, so only a failing gate is skipped here.
+    if attempt >= job.max_attempts_per_target:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                run_id=run_id,
+                extra={
+                    "reason": "max_attempts_exceeded",
+                    "gate_branch": gate_branch,
+                    "attempt": attempt,
+                },
+            ),
+        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} skipped",
+                body="max_attempts_exceeded",
+                sound="request",
+            )
+        return f"{job.name}: skipped (max_attempts_exceeded)", False
 
     gate_output_path = default_reports_dir() / f"{run_id}-gate-output.txt"
     try:
@@ -2396,7 +2457,9 @@ def _process_base_target(
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
     _cleanup_worktree(job.repo, fix_wt_path)
 
-    state = "done" if settled_status in SETTLED_AGENT_STATUSES else "failed"
+    state: HistoryState = (
+        "done" if settled_status in SETTLED_AGENT_STATUSES else "failed"
+    )
     append(
         history_path,
         HistoryRecord(
@@ -3121,7 +3184,7 @@ def _pipeline_host_rebooted_mid_run(bare_run_id: str) -> bool:
     return host_rebooted_after_state_write(state_path, boot_epoch=system_boot_epoch())
 
 
-def _classify_pipeline_outcome(report_text: str) -> tuple[str, str | None]:
+def _classify_pipeline_outcome(report_text: str) -> tuple[HistoryState, str | None]:
     """(history_state, reason) from a terminal report's first `## Outcome:` line.
 
     `partial (deadline exceeded)` is tolerated content-wise (the orchestrator is
@@ -4143,7 +4206,7 @@ def _review_target_record(
     cand: Candidate,
     run_id: str,
     now: datetime,
-    state: str,
+    state: HistoryState,
     attempt: int,
     agent_name: str | None,
     pane_id: str | None,
