@@ -34,7 +34,8 @@ defaults:
 # jobs.d/ layout this lives in its own retention.yaml instead (never treated as a job).
 
 # trusted_review_authors: # optional: the GitHub logins whose PRs and review feedback
-#   # unattended agents act on (the pr_health auto-fix and pipeline stage 7). The
+#   # unattended agents act on (the pr_health auto-fix, `issues:opened` events, review
+#   # markers, and pipeline gates 6/7 and stage 7). The
 #   # authenticated `gh` user is always trusted on top of this list, so it is not listed.
 #   # Absent = [copilot-pull-request-reviewer]; a list here replaces that default, and
 #   # [] means "only the gh user". Matching is by login, case-insensitive.
@@ -98,6 +99,10 @@ jobs:
   # prs:labels | issues:opened | ci:failed; `match` accepts label/branch/author.
   # The first successful `issues:opened` poll adopts the issues already open as a
   # baseline and dispatches nothing; prs:labels and ci:failed fire on the first poll.
+  # prs:labels and ci:failed only fire for PRs whose branch lives in this repo (never a
+  # fork). Without `match.author`, issues:opened only fires for issues opened by a
+  # trusted author (`trusted_review_authors` plus the `gh` user); an explicit
+  # `match.author` matches exactly that login instead.
   - name: on-ready-for-agent-pr
     enabled: true
     cron: "*/10 * * * *" # poll cadence (every 10 min), not the event itself

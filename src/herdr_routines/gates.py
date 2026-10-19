@@ -551,8 +551,18 @@ def run_gate5(
     return GateVerdict(passed=True, reason=f"PR #{pr} on {branch}")
 
 
-def _pr_bodies(view: Mapping[str, object]) -> list[str]:
-    """Every comment and review body `gh pr view --json comments,reviews` returns.
+def _login_at(entry: Mapping[str, object], key: str) -> object:
+    """``entry[key]["login"]``, or None when either hop is missing. `gh pr view` names
+    the author ``author``; the REST inline-comment endpoint names it ``user``."""
+    holder = entry.get(key)
+    return holder.get("login") if isinstance(holder, dict) else None
+
+
+def _pr_bodies(
+    view: Mapping[str, object], *, trusted_authors: frozenset[str] | None = None
+) -> list[str]:
+    """Every comment and review body `gh pr view --json comments,reviews` returns,
+    limited to trusted authors when ``trusted_authors`` is given.
 
     Conversation comments and review summaries only — NOT inline review comments, which
     `gh pr view` omits entirely (its `reviews` rows for them have empty bodies). Those
@@ -563,12 +573,23 @@ def _pr_bodies(view: Mapping[str, object]) -> list[str]:
         if not isinstance(entries, list):
             continue
         for entry in entries:
-            if isinstance(entry, dict) and isinstance(entry.get("body"), str):
+            if not (isinstance(entry, dict) and isinstance(entry.get("body"), str)):
+                continue
+            if trusted_authors is None or is_trusted_author(
+                _login_at(entry, "author"), trusted_authors
+            ):
                 bodies.append(entry["body"])
     return bodies
 
 
-def run_gate6(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
+def run_gate6(
+    gh: GhClient,
+    *,
+    owner: str,
+    repo: str,
+    pr: int,
+    trusted_authors: frozenset[str] | None = None,
+) -> GateVerdict:
     """The review skill's `blocking`/`non-blocking` tier structure is present.
 
     Anchored on the literal bracketed ``[blocking]``, never a substring test. The prompt's
@@ -577,23 +598,34 @@ def run_gate6(gh: GhClient, *, owner: str, repo: str, pr: int) -> GateVerdict:
     a bracketed constant. A review that only ever writes `[non-blocking]` has not labelled
     a blocking tier, so it is not evidence the skill's structure ran.
 
+    With ``trusted_authors``, only bodies a trusted author posted count, the same scope
+    gate 7 takes: a tier label anyone else typed is not evidence the review ran. None
+    counts every author, which is what the standalone `gate 6` CLI checks.
+
     Note this is deliberately *stricter* than the prose it replaces: prose asked for
     "at least one ``[blocking]`` or ``[non-blocking]`` label", which `[non-blocking]`
     alone satisfies, and so keeps the bug. See the spec's note on the prose/acceptance-
     criteria conflict."""
     view = gh.pr_view(owner=owner, repo=repo, number=pr)
-    bodies = _pr_bodies(view)
+    bodies = _pr_bodies(view, trusted_authors=trusted_authors)
     # The `code-review` skill posts every finding as an inline comment prefixed
     # `**[blocking]**`; its review-summary body carries no tier tag at all. Without this
     # fetch the gate fails on every PR that skill reviewed (verified on PR #137).
     for comment in gh.pr_review_comments(owner=owner, repo=repo, number=pr):
         body = comment.get("body")
-        if isinstance(body, str):
+        if isinstance(body, str) and (
+            trusted_authors is None
+            or is_trusted_author(_login_at(comment, "user"), trusted_authors)
+        ):
             bodies.append(body)
     if not bodies:
         return GateVerdict(
             passed=False,
-            reason=f"PR #{pr} has no review or comment to check for tier labels",
+            reason=(
+                f"PR #{pr} has no review or comment"
+                f"{'' if trusted_authors is None else ' from a trusted author'} "
+                "to check for tier labels"
+            ),
         )
     if any(BLOCKING_TAG in body for body in bodies):
         return GateVerdict(passed=True)
@@ -663,7 +695,9 @@ def run_stage_gate(
     if token == "6":
         if pr is None:
             raise ValueError("gate 6 requires a PR number")
-        return run_gate6(gh, owner=owner, repo=repo, pr=pr)
+        return run_gate6(
+            gh, owner=owner, repo=repo, pr=pr, trusted_authors=trusted_authors
+        )
     if token == "7":
         if pr is None:
             raise ValueError("gate 7 requires a PR number")

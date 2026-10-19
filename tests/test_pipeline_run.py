@@ -34,7 +34,7 @@ from typing import Any
 import pytest
 
 from herdr_routines import pipeline_run, tick
-from herdr_routines.auto_fix import GhClient, ReviewSearch
+from herdr_routines.auto_fix import GhClient, PostedBody, ReviewSearch
 from herdr_routines.gates import GATE_STAGE_CHOICES, PR_GATE_STAGES, gate3_test_names
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.pipeline_run import (
@@ -357,12 +357,13 @@ class FakeGh:
         # that structure rather than its absence.
         self.reviews: list[dict[str, Any]] = [
             {
+                "author": {"login": "tester"},
                 "body": (
                     "### blocking\n\n"
                     "[blocking] `pipeline_run` never re-reads state.json between stages\n\n"
                     "### non-blocking\n\n"
                     "[non-blocking] consider naming the heartbeat directory\n"
-                )
+                ),
             }
         ]
         # The shape a PR with no review feedback returns. It answers both gate 7's
@@ -382,12 +383,17 @@ class FakeGh:
         # to return, or an exception to raise. None = `threads`, like every other query.
         self.feedback: dict[str, Any] | Exception | None = None
         self.api_user_error: str | None = None
+        # How many `api_user` calls succeed before `api_user_error` applies: gate 6
+        # resolves the gh user before stage 7 does.
+        self.api_user_ok_calls = 0
         # Set to make gate 5's inline-comment fetch fail the way an expired token does.
         self.inline_comments_error: str | None = None
 
     def api_user(self) -> str:
         if self.api_user_error is not None:
-            raise RuntimeError(self.api_user_error)
+            if self.api_user_ok_calls <= 0:
+                raise RuntimeError(self.api_user_error)
+            self.api_user_ok_calls -= 1
         return "tester"
 
     def pr_create(
@@ -447,7 +453,7 @@ class FakeGh:
 
     def pr_review_bodies(
         self, *, owner: str, repo: str, number: int
-    ) -> list[str] | None:
+    ) -> list[PostedBody] | None:
         return []
 
     def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
@@ -779,6 +785,35 @@ def test_pipeline_run_turns_a_gh_error_in_a_gate_into_a_failed_report(
     report_text = prepared.report.read_text()
     assert "## Outcome: failed" in report_text
     assert "HTTP 401" in report_text
+
+
+def test_gate_6_ignores_tier_labels_from_untrusted_authors(
+    prepared: PipelineFixture,
+) -> None:
+    """Gate 6 counts tier labels only from the trusted set (configured logins plus the
+    gh user): a `[blocking]` review someone else posted is not proof stage 6 ran."""
+    gh = FakeGh()
+    for review in gh.reviews:
+        review["author"] = {"login": "drive-by"}
+
+    outcome, _client, _gh = _run(prepared, gh=gh)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "gate_6_failed"
+    assert outcome.stage == 6
+
+
+def test_gate_6_fails_closed_when_the_gh_user_cannot_be_read(
+    prepared: PipelineFixture,
+) -> None:
+    gh = FakeGh()
+    gh.api_user_error = "gh auth failed"
+
+    outcome, _client, _gh = _run(prepared, gh=gh)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "gate_6_failed"
+    assert "gh auth failed" in prepared.report.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -2100,6 +2135,7 @@ def test_stage_7_fails_closed_when_feedback_cannot_be_read(
     gh = FakeGh()
     if failure == "api_user":
         gh.api_user_error = "gh auth failed"
+        gh.api_user_ok_calls = 1  # gate 6's lookup succeeds; stage 7's fails
     else:
         gh.feedback = failure  # type: ignore[assignment]
 

@@ -46,6 +46,7 @@ from herdr_routines.auto_fix import (
     event_worktree_slug,
     fetch_failing_checks,
     fetch_thread_bodies,
+    has_trusted_marker,
     is_eligible,
     list_open_prs,
     poll_github_event,
@@ -1271,6 +1272,7 @@ def _process_gated_job(
                 now=now,
                 run_id=run_id,
                 check=check,
+                trusted_review_authors=trusted_review_authors,
             )
 
     if job.target == "pr":
@@ -1345,11 +1347,15 @@ def _process_event_target(
     now: datetime,
     run_id: str,
     check: GateCheck,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
 ) -> tuple[str, bool]:
     """Event-triggered gate (issue 014): poll `gh` for matching events, diff the IDs
     against `last_seen_event_ids`, and dispatch one worker per new event (capped by
     `max_workers_per_tick`). No new event → clean pass, no agent, no worktree; a
-    poll failure fails closed as a gate error (never a silent green)."""
+    poll failure fails closed as a gate error (never a silent green).
+
+    ``trusted_review_authors`` scopes an `issues:opened` poll without `match.author`
+    to issues from trusted authors (`poll_github_event`)."""
     gh = RealGhClient()
     event_target = _event_target(check)
 
@@ -1413,7 +1419,13 @@ def _process_event_target(
     # Fail closed: an auth/rate-limit/transient `gh` failure is a gate ERROR, never
     # "no events" — the same rule commit_check_runs follows (unverifiable != green).
     try:
-        events = poll_github_event(gh, owner=owner, repo=repo_name, check=check)
+        events = poll_github_event(
+            gh,
+            owner=owner,
+            repo=repo_name,
+            check=check,
+            trusted_review_authors=trusted_review_authors,
+        )
     except Exception as e:  # noqa: BLE001
         append(
             history_path,
@@ -1539,6 +1551,59 @@ def _process_event_target(
             continue
 
         detailed = enrich_event_detail(gh, event, owner=owner, repo=repo_name)
+        # The head ref is GitHub data that becomes a `git worktree add` argument and a
+        # worktree lookup key, so it must be a well-formed branch name first. Checked
+        # after enrichment, which may replace it. A malformed name stays malformed, so
+        # the event is skipped and marked seen rather than retried every tick; a check
+        # that could not run is a failed attempt, retried within the event's budget.
+        ref_ok = _is_valid_branch_name(detailed.head_ref) if detailed.head_ref else True
+        if ref_ok is None:
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="failed",
+                    run_id=run_id,
+                    extra={
+                        "reason": "head_ref_check_failed",
+                        "event_id": event.event_id,
+                        "event_number": event.number,
+                        "attempt": attempt,
+                        "target": event_target,
+                    },
+                ),
+            )
+            any_failed = True
+            continue
+        if not ref_ok:
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    run_id=run_id,
+                    extra={
+                        "reason": "invalid_head_ref",
+                        "event_id": event.event_id,
+                        "event_number": event.number,
+                        "head_ref": detailed.head_ref,
+                        "target": event_target,
+                    },
+                ),
+            )
+            if _notify_gate(job, "failure"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} skipped",
+                    body=f"invalid_head_ref for {event.event_id}",
+                    sound="request",
+                )
+            skipped_count += 1
+            handled.add(event.event_id)
+            continue
+
         agent_name = build_worker_agent_name(job.name, event.number, run_id)
         worker_outcome = _dispatch_event_worker(
             job=job,
@@ -1724,6 +1789,7 @@ def _dispatch_event_worker(
                         str(job.repo),
                         "worktree",
                         "add",
+                        "--",
                         str(wt_path),
                         target_ref,
                     ],
@@ -1741,6 +1807,7 @@ def _dispatch_event_worker(
                         "worktree",
                         "add",
                         "--detach",
+                        "--",
                         str(wt_path),
                         target_ref,
                     ],
@@ -2548,6 +2615,34 @@ def _process_base_target(
     return f"{job.name}: done", False
 
 
+# Bounds the one `git check-ref-format` call per event head ref; it reads no repo.
+_REF_CHECK_TIMEOUT_S = 10
+
+
+def _is_valid_branch_name(ref: str) -> bool | None:
+    """Whether ``ref`` is a plain branch name git itself accepts
+    (``git check-ref-format --branch``), or None when the check could not run (timeout,
+    no git) — an unknown answer, never a pass and never proof the name is bad.
+
+    Two shapes are refused before git is asked: a leading ``-``, which a positional
+    argument could read as an option, and ``@{``, because ``--branch`` expands the
+    ``@{-N}`` previous-branch syntax instead of rejecting it. The check reads no
+    repository, so it runs the same from any working directory."""
+    if not ref or ref.startswith("-") or "@{" in ref:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "check-ref-format", "--branch", ref],
+            capture_output=True,
+            text=True,
+            timeout=_REF_CHECK_TIMEOUT_S,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return proc.returncode == 0
+
+
 def _find_existing_worktree(repo: Path, branch: str) -> Path | None:
     """Return the path of a worktree that already has *branch* checked out, or None.
     Parses `git worktree list --porcelain` (issue 036: the pipeline orchestrator
@@ -2892,7 +2987,13 @@ def _process_job(
     # per eligible open PR, and verify each posted review with a content marker. Same
     # schedule guards as the gated path.
     if job.kind == "review":
-        return _process_review_job(job, history_path, client=client, now=now)
+        return _process_review_job(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+        )
 
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
@@ -3894,7 +3995,12 @@ def _pr_worker_is_live(client: HerdrClient, job_name: str, pr_number: int) -> bo
 
 
 def _process_review_job(
-    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
 ) -> tuple[str, bool]:
     """Schedule guards for a kind: review job (same shape as _process_gated_job), then
     run one review cycle. A tick dispatches up to `max_workers_per_tick` workers
@@ -4014,7 +4120,14 @@ def _process_review_job(
         ),
     )
 
-    return _review_cycle(job, history_path, client=client, now=now, run_id=run_id)
+    return _review_cycle(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        run_id=run_id,
+        trusted_review_authors=trusted_review_authors,
+    )
 
 
 def _review_terminal_failure(
@@ -4056,10 +4169,20 @@ def _review_terminal_failure(
 
 
 def _review_cycle(
-    job: Job, history_path: Path, *, client: HerdrClient, now: datetime, run_id: str
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    run_id: str,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
 ) -> tuple[str, bool]:
     """Search, apply both re-review guards, cap, dispatch per repo, verify each review,
-    and write the aggregate report + terminal history record."""
+    and write the aggregate report + terminal history record.
+
+    The review marker only counts when a trusted author posted it (the configured
+    ``trusted_review_authors`` plus the authenticated gh user, who is the account the
+    review worker posts with), both in the pre-dispatch guard and the post-condition."""
     gh = RealGhClient()
 
     try:
@@ -4075,6 +4198,7 @@ def _review_cycle(
             error=str(e),
         )
 
+    trusted = effective_trusted_authors(trusted_review_authors, viewer_login=login)
     outcome = scan_review_targets(gh, job, login=login)
     if outcome is None:
         # Fail closed: an unknown search answer must never read as "nothing to review".
@@ -4103,7 +4227,9 @@ def _review_cycle(
         (cand, cand.skip_reason or "max_attempts_exceeded") for cand in budget_skipped
     )
 
-    dispatchable, marker_skipped = apply_marker_guard(gh, job.name, dispatchable)
+    dispatchable, marker_skipped = apply_marker_guard(
+        gh, job.name, dispatchable, trusted_authors=trusted
+    )
     rows.extend(
         (cand, cand.skip_reason or "review_already_posted") for cand in marker_skipped
     )
@@ -4159,6 +4285,7 @@ def _review_cycle(
                 history_path=history_path,
                 now=now,
                 run_id=run_id,
+                trusted_authors=trusted,
             )
             rows.append((cand, disposition))
             if disposition == "dispatched":
@@ -4301,9 +4428,11 @@ def _dispatch_review_target(
     history_path: Path,
     now: datetime,
     run_id: str,
+    trusted_authors: frozenset[str],
 ) -> str:
     """Fetch the PR head ref, create/reuse a read-only worktree, run one review agent,
-    then verify the marker was posted. Always removes the worktree after settle.
+    then verify a trusted author posted the marker. Always removes the worktree after
+    settle.
 
     Returns the disposition string recorded in the aggregate report."""
     from herdr_routines.runner import (
@@ -4533,7 +4662,9 @@ def _dispatch_review_target(
             False,
             "review_verification_failed",
         )
-    elif review_marker(job.name, cand.target_key) in "\n".join(bodies):
+    elif has_trusted_marker(
+        bodies, review_marker(job.name, cand.target_key), trusted_authors
+    ):
         disposition, verified, reason = "dispatched", True, None
     else:
         disposition, verified, reason = "review_not_posted", False, "review_not_posted"

@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from herdr_routines.auto_fix import (
+    PostedBody,
     PRInfo,
     ReviewSearch,
     attempt_count_for_pr,
@@ -139,7 +140,7 @@ class FakeGhClient:
 
     def pr_review_bodies(
         self, *, owner: str, repo: str, number: int
-    ) -> list[str] | None:
+    ) -> list[PostedBody] | None:
         self.calls.append(f"pr_review_bodies:{owner}/{repo}#{number}")
         if self.raise_on == "pr_review_bodies":
             raise RuntimeError("gh pr view bodies failed")

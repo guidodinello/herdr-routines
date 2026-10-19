@@ -19,7 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, assert_never
 
-from herdr_routines.config import GateCheck, GateCheckKind
+from herdr_routines.config import (
+    DEFAULT_TRUSTED_REVIEW_AUTHORS,
+    GateCheck,
+    GateCheckKind,
+)
 from herdr_routines.findings import Finding
 from herdr_routines.history import read_job
 
@@ -94,9 +98,10 @@ class GhClient(Protocol):
 
     def pr_review_bodies(
         self, *, owner: str, repo: str, number: int
-    ) -> list[str] | None:
+    ) -> list[PostedBody] | None:
         """The PR's posted review bodies **and** issue comments, concatenated (one
-        ``gh pr view --json comments,reviews`` call). Returns ``None`` on any failure;
+        ``gh pr view --json comments,reviews`` call), each with its author so callers
+        can count only what a trusted author posted. Returns ``None`` on any failure;
         every caller treats ``None`` as *unverified*, never as "empty"."""
         ...
 
@@ -141,6 +146,16 @@ class ReviewSearch:
 
     prs: tuple[ReviewPR, ...]
     truncated_modes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PostedBody:
+    """One review or comment body posted on a PR, with its author's login (None for a
+    deleted account). The author is what decides whether the body counts: anyone can
+    write any text on a public PR."""
+
+    author: str | None
+    body: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +350,7 @@ class RealGhClient:
 
     def pr_review_bodies(
         self, *, owner: str, repo: str, number: int
-    ) -> list[str] | None:
+    ) -> list[PostedBody] | None:
         exit_code, stdout, _stderr = self._run(
             [
                 "gh",
@@ -356,7 +371,7 @@ class RealGhClient:
             return None
         if not isinstance(payload, dict):
             return None
-        bodies: list[str] = []
+        bodies: list[PostedBody] = []
         for surface in ("reviews", "comments"):
             items = payload.get(surface, [])
             if not isinstance(items, list):
@@ -366,7 +381,13 @@ class RealGhClient:
                     continue
                 body = item.get("body", "")
                 if isinstance(body, str) and body:
-                    bodies.append(body)
+                    login = _author_login(item)
+                    bodies.append(
+                        PostedBody(
+                            author=login if isinstance(login, str) else None,
+                            body=body,
+                        )
+                    )
         return bodies
 
     def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
@@ -469,6 +490,14 @@ def _author_login(node: Mapping[str, object]) -> object:
     return author.get("login") if isinstance(author, dict) else None
 
 
+def is_same_repo_pr(pr: Mapping[str, object]) -> bool:
+    """Whether a PR payload says its head branch lives in this repository. Only an
+    explicit ``isCrossRepository: false`` counts: a fork PR's branch name is chosen by
+    the fork, so it must never be checked out or acted on as if it were one of ours,
+    and a payload that does not say is treated as a fork rather than guessed at."""
+    return pr.get("isCrossRepository") is False
+
+
 def list_open_prs(
     gh: GhClient,
     *,
@@ -508,7 +537,7 @@ def list_open_prs(
             and isinstance(url, str)
         ):
             continue
-        if pr.get("isCrossRepository") is not False:
+        if not is_same_repo_pr(pr):
             continue
         if not isinstance(login, str):
             continue
@@ -839,6 +868,19 @@ def review_marker(job_name: str, target_key: str) -> str:
     return f"<!-- {REVIEW_MARKER_PREFIX} job={job_name} key={target_key} -->"
 
 
+def has_trusted_marker(
+    posted: Iterable[PostedBody], marker: str, trusted_authors: frozenset[str]
+) -> bool:
+    """Whether a trusted author posted ``marker``. The marker is plain text anyone can
+    write on a public PR, so a copy from anyone else neither suppresses a review nor
+    proves one was posted. One function for the pre-dispatch guard and the
+    post-condition, like `review_marker`, so the two can never disagree."""
+    return any(
+        marker in p.body and is_trusted_author(p.author, trusted_authors)
+        for p in posted
+    )
+
+
 def review_target_hash(job_name: str, target_key: str) -> str:
     """``h6 = sha1("job|target_key")[:6]`` — the per-(job, target) discriminator. A bare
     PR number is ambiguous across repos, so the hash keys the agent name *and* the per-PR
@@ -891,8 +933,10 @@ def build_review_prompt(
         Report: {report_path}
 
         Steps:
-        1. First re-read the PR's existing comments and reviews. If it already contains
-           this exact marker, POST NOTHING and stop:
+        1. First re-read the PR's existing comments and reviews. If a review or comment
+           authored by your own gh login (`gh api user --jq .login`) already contains
+           this exact marker, POST NOTHING and stop. The same text from any other
+           author does not count:
                {marker}
         2. Otherwise run the `code-review` skill against {url} in single-session mode.
         3. Post exactly one review as a COMMENT review (`gh pr review --comment`), never
@@ -1334,7 +1378,12 @@ def _event_matches(event: Mapping[str, object], match: Mapping[str, object]) -> 
 
 
 def poll_github_event(
-    gh: GhClient, *, owner: str, repo: str, check: GateCheck
+    gh: GhClient,
+    *,
+    owner: str,
+    repo: str,
+    check: GateCheck,
+    trusted_review_authors: Iterable[str] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
 ) -> list[GithubEvent]:
     """Read-only poll for a `github_event` check (spec v2 §2).
 
@@ -1343,7 +1392,14 @@ def poll_github_event(
     `commit_check_runs` already follows. One list query plus per-event detail only;
     detail (title/head ref) is cheap REST data already present in the list/poll
     shapes. The `title` field may be left empty by queries whose list shape lacks it;
-    the tick enriches new events right before dispatch."""
+    the tick enriches new events right before dispatch.
+
+    PR events come only from same-repository PRs (`is_same_repo_pr`): a PR event's
+    head branch is checked out in our clone, and a fork chooses its own branch names.
+    An `issues:opened` check without `match.author` only fires on issues opened by a
+    trusted author (``trusted_review_authors`` plus the authenticated gh user,
+    `effective_trusted_authors`), because the issue's text seeds the worker; an
+    explicit `match.author` keeps its exact-match meaning."""
     query = check.query or "prs:labels"
     match = check.match or {}
 
@@ -1358,6 +1414,8 @@ def poll_github_event(
                 continue
             number = pr.get("number")
             if not isinstance(number, int) or not _event_matches(pr, match):
+                continue
+            if not is_same_repo_pr(pr):
                 continue
             # The dedup key is the event's *own* label (the matched one when configured,
             # else the first label the PR carries), so `evt-pr-<n>-<label>` is stable
@@ -1394,6 +1452,7 @@ def poll_github_event(
                 number
                 title
                 headRefName
+                isCrossRepository
                 author { login }
                 labels(first: 20) { nodes { name } }
                 statusCheckRollup { state }
@@ -1407,6 +1466,8 @@ def poll_github_event(
         result = []
         for pr in nodes:
             if not isinstance(pr, dict) or not _event_matches(pr, match):
+                continue
+            if not is_same_repo_pr(pr):
                 continue
             number = pr.get("number")
             if not isinstance(number, int):
@@ -1450,6 +1511,16 @@ def poll_github_event(
             searchQuery=f"repo:{owner}/{repo} is:issue is:open",
         )
         nodes = _graphql_nodes(data, "data", "search", "nodes")
+        # Only needed when no explicit `match.author` narrows the poll. `api_user`
+        # raises on failure like every other read here, so an unknown viewer fails the
+        # poll closed instead of trusting nobody's or everybody's issues.
+        trusted = (
+            effective_trusted_authors(
+                trusted_review_authors, viewer_login=gh.api_user()
+            )
+            if match.get("author") is None
+            else None
+        )
         issue_events: list[GithubEvent] = []
         for node in nodes:
             if not isinstance(node, dict):
@@ -1458,6 +1529,10 @@ def poll_github_event(
             if not isinstance(number, int):
                 continue
             if not _event_matches(node, match):
+                continue
+            if trusted is not None and not is_trusted_author(
+                _author_login(node), trusted
+            ):
                 continue
             label = match.get("label") if isinstance(match.get("label"), str) else None
             title = node.get("title")

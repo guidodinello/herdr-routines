@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from herdr_routines.auto_fix import GhClient, RealGhClient, ReviewSearch
+from herdr_routines.auto_fix import GhClient, PostedBody, RealGhClient, ReviewSearch
 from herdr_routines.gates import (
     BLOCKING_TAG,
     GATE3_LINT_TEST_CHECKS,
@@ -96,7 +96,7 @@ class FakeGhClient:
 
     def pr_review_bodies(
         self, *, owner: str, repo: str, number: int
-    ) -> list[str] | None:
+    ) -> list[PostedBody] | None:
         return None
 
     def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
@@ -501,6 +501,50 @@ def test_gate5_reads_blocking_labels_from_inline_review_comments() -> None:
         inline_comments=[{"body": "**[blocking]** this is wrong"}],
     )
     assert run_gate6(gh, owner="o", repo="r", pr=7).passed is True
+
+
+def test_gate6_ignores_tier_labels_from_untrusted_authors() -> None:
+    """With a trusted set, a `[blocking]` label only counts when a trusted author wrote
+    it, on both the `gh pr view` surfaces (``author.login``) and inline comments
+    (REST ``user.login``). A deleted account (no login) is never trusted. Without a set
+    (the standalone CLI), every author still counts, like gate 7."""
+    trusted = frozenset({"owner"})
+    untrusted_only = FakeGhClient(
+        pr_views=[
+            {
+                "reviews": [
+                    {"author": {"login": "drive-by"}, "body": "[blocking] fake tier"},
+                    {"author": None, "body": "[blocking] ghost tier"},
+                ],
+                "comments": [{"author": {"login": "owner"}, "body": "no tier here"}],
+            }
+        ],
+        inline_comments=[{"user": {"login": "drive-by"}, "body": "**[blocking]** x"}],
+    )
+    verdict = run_gate6(
+        untrusted_only, owner="o", repo="r", pr=7, trusted_authors=trusted
+    )
+    assert verdict.passed is False
+    assert run_gate6(untrusted_only, owner="o", repo="r", pr=7).passed is True
+
+    trusted_inline = FakeGhClient(
+        pr_views=[{"reviews": [{"author": {"login": "owner"}, "body": "summary"}]}],
+        inline_comments=[{"user": {"login": "Owner"}, "body": "**[blocking]** x"}],
+    )
+    assert (
+        run_gate6(
+            trusted_inline, owner="o", repo="r", pr=7, trusted_authors=trusted
+        ).passed
+        is True
+    )
+
+    nobody_trusted = FakeGhClient(
+        pr_views=[{"reviews": [{"author": {"login": "drive-by"}, "body": "hi"}]}]
+    )
+    reason = run_gate6(
+        nobody_trusted, owner="o", repo="r", pr=7, trusted_authors=trusted
+    ).reason
+    assert reason is not None and "trusted author" in reason
 
 
 def test_gates_3_and_4_are_not_cli_stages() -> None:

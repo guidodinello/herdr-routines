@@ -77,6 +77,7 @@ from herdr_routines.pipeline_prepare import write_state_json, write_terminal_rep
 from herdr_routines.pipeline_stages import (
     ADDRESS_COMMENTS_STAGE,
     IMPLEMENT_STAGE,
+    PR_REVIEW_STAGE,
     PR_STAGE,
     SPEC_REVIEW_STAGE,
     STAGES,
@@ -1856,7 +1857,8 @@ def run_pipeline(
     """Run `STAGES` in order, gating each, and return what happened.
 
     `trusted_review_authors` is the configured list (`RoutinesConfig`); stage 7 acts
-    only on review feedback from those logins plus the authenticated gh user.
+    only on review feedback from those logins plus the authenticated gh user, and gate 6
+    counts tier labels only from the same set.
 
     Never raises. This is the process `systemd-run` supervises, and an escaped exception
     would leave a night with no report at all — precisely the silent death
@@ -1968,8 +1970,9 @@ def run_pipeline(
                 )
 
         pane_id: str | None = None
-        # Set for stage 7 only: the trusted set its feedback was filtered with, so gate
-        # 7 checks replies on exactly the threads the stage was given.
+        # Set for stages 6 and 7: the trusted set gate 6 counts tier labels from, and
+        # the one stage 7's feedback was filtered with, so gate 7 checks replies on
+        # exactly the threads the stage was given.
         stage_trusted: frozenset[str] | None = None
         try:
             if spec.stage in (TEST_AUTHOR_STAGE, IMPLEMENT_STAGE):
@@ -2059,6 +2062,12 @@ def run_pipeline(
         # would break this function's never-raises contract and skip the terminal report
         # (spec §8) — so an unreachable gate is a failed gate, with the error as reason.
         try:
+            if spec.stage == PR_REVIEW_STAGE:
+                # Inside the try: an unresolvable gh user is a failed gate, never a gate
+                # that counts every author.
+                stage_trusted = effective_trusted_authors(
+                    trusted_review_authors, viewer_login=gh_client.api_user()
+                )
             verdict = _gate_for_stage(
                 spec,
                 state,
