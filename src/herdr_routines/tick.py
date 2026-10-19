@@ -106,6 +106,7 @@ from herdr_routines.pipeline_watchdog import (
     host_rebooted_after_state_write,
     is_stalled,
     pipeline_state_json_path,
+    pipeline_unit_active,
     recorded_pipeline_deadlines,
     system_boot_epoch,
     validate_stage_sessions,
@@ -3910,7 +3911,8 @@ def _pipeline_run_is_live(
     - a `state.json` with no terminal report yet, enumerated by
       `pipeline_watchdog.find_inflight_runs` and *not* stalled per
       `pipeline_watchdog.is_stalled` (host rebooted since the last state write, or past
-      deadline + grace with a quiet heartbeat).
+      deadline + grace with a quiet heartbeat), or, if stalled, still backed by a live
+      systemd unit.
 
     The second is the load-bearing one now. Issue 056 removed the orchestrator agent, and
     that agent's name was what the old check looked up — so with no orchestrator there is
@@ -3926,6 +3928,12 @@ def _pipeline_run_is_live(
     in-flight on every later night. It reuses the watchdog's own staleness rule rather
     than a second one, so "dead" means the same thing to both; the deadline comes from
     tick's recorded history, as the watchdog's does, never from the model-written copy.
+
+    Stalled is only a guess at death, though: a resumed run gets a fresh unit and deadline
+    but keeps the old recorded one, so a live, quiet run reads as stalled. As in the
+    watchdog, a stalled run whose unit is active, or can't be queried, still counts as
+    in flight; only an inactive unit makes it dead. Better to skip a night than to launch
+    one on top of a live run.
 
     Fails open on a HerdrCliError (unreachable server), matching `_live_agent_exists`:
     the history/flock check above remains the primary guard."""
@@ -3944,6 +3952,7 @@ def _pipeline_run_is_live(
             if not is_stalled(
                 run, now=now, heartbeat_dir=heartbeat_dir, boot_epoch=boot_epoch
             )
+            or pipeline_unit_active(run.run_id) is not False
         ]
     except (OSError, HerdrCliError) as e:
         log.warning("%s: could not enumerate in-flight pipeline runs: %s", job.name, e)
