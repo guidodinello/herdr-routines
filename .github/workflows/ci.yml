@@ -1,16 +1,14 @@
 # Baseline CI for a small/single-package Python repo — mirrors the pre-commit
 # baseline (templates/pre-commit/python.yaml) as a required gate, since
 # pre-commit itself only runs locally and CI is the only place a required
-# check can actually enforce it. Deliberately just lint + test: no
-# typecheck (add a "Typecheck Python" job with pyright/mypy once the repo
-# has real type-annotation coverage), no path filtering (add
-# dorny/paths-filter once this repo is a monorepo with independent
-# subprojects — not needed for a single package).
+# check can actually enforce it. Three jobs: lint, typecheck (mypy, strict on
+# src/ via pyproject.toml) and tests, gated by the single "CI" aggregator job
+# below. No path filtering (add dorny/paths-filter once this repo is a monorepo
+# with independent subprojects — not needed for a single package).
 #
 # Adopt: cp to .github/workflows/ci.yml, fill in the two <FIXME> spots,
-# then add "Lint Python" as a required_status_checks context (no test job
-# below yet — see the note under jobs:)
-# contexts for this repo in github-standard.json.
+# then add "CI" as the required_status_checks context for this repo in
+# github-standard.json.
 #
 # Before the first push, check the target repo actually has what this
 # workflow assumes — two gaps found rolling this out the first time:
