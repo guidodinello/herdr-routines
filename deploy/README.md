@@ -142,7 +142,8 @@ sibling in a `jobs.d/` layout — see the commented block in
 
 ```yaml
 telegram_spawn:
-  allowed_chat_id: 123456789   # REQUIRED: the only chat that may spawn. Empty = validate fails.
+  allowed_chat_id: 123456789   # REQUIRED: the only chat that may spawn, a private 1:1 chat.
+                               # Empty or a group/channel id = validate fails.
   aliases:
     - alias: nightly           # the token after /run or /start
       repo: /home/guido/projects/fitted
@@ -166,9 +167,12 @@ The harness must be a known `agent_kind`. A model works only with claude, codex 
 must start with a letter or digit, so it never reads as a flag. A malformed `/run` from the allowed
 chat gets a usage reply listing the aliases; any other chat gets the generic refusal.
 
-`uv run herdr-routines validate` rejects an empty `allowed_chat_id`, a duplicate alias, and an
-alias whose `repo` does not exist or is not a git checkout — at load time, not at spawn time on
-someone's phone.
+`uv run herdr-routines validate` rejects an empty `allowed_chat_id`, a non-private one, a
+duplicate alias, and an alias whose `repo` does not exist or is not a git checkout — at load
+time, not at spawn time on someone's phone. Only the chat id reaches the entrypoint, not the
+sender, so `allowed_chat_id` must be a private 1:1 chat (a positive id): a group, supergroup or
+channel id is negative ([Telegram bot API ids](https://core.telegram.org/api/bots/ids)) and is
+rejected, because every member of that chat could otherwise spawn.
 
 **Wiring the inbound message.** The bot that polls Telegram must call the event entrypoint
 once per `/run` or `/start` message and send back whatever it prints. Telegram allows one
@@ -184,7 +188,8 @@ HERDR_ROUTINES_BIN=/home/guido/projects/herdr-routines/.venv/bin/herdr-routines
 ```
 
 With it set, `/run <alias>` and `/start <alias>` spawn, and a bare `/start` still shows the
-bot's dashboard. Set `allowed_chat_id` to the same chat as the bot's `HERDR_TG_CHAT_ID`. The
+bot's dashboard. Set `allowed_chat_id` to the same chat as the bot's `HERDR_TG_CHAT_ID`, which
+must be your private chat with the bot (not a group). The
 entrypoint and shim, for any other caller:
 
 ```sh

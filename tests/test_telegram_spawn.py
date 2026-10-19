@@ -791,3 +791,68 @@ def test_is_authorized_compares_int_and_str_ids_and_fails_closed(
     from herdr_routines.telegram_spawn import is_authorized
 
     assert is_authorized(chat_id, allowed) is expected
+
+
+# Issue 178: only a private 1:1 chat may be allowlisted (the id is the only identity the
+# bridge passes in, so a group id would authorize every member). ------------------------
+
+
+@pytest.mark.parametrize(
+    ("allowed", "expected"),
+    [
+        (123456789, "123456789"),
+        ("'123456789'", "123456789"),
+        (2**40 - 1, "1099511627775"),
+    ],
+)
+def test_private_chat_id_is_accepted_at_load(
+    tmp_path: Path, allowed: Any, expected: str
+) -> None:
+    from herdr_routines.config import load_config
+
+    repo = _git_repo(tmp_path / "repo")
+    cfg_path = tmp_path / "jobs.yaml"
+    cfg_path.write_text(_spawn_config_text(repo, allowed=allowed))
+    spawn = load_config(cfg_path).telegram_spawn
+    assert spawn is not None
+    assert spawn.allowed_chat_id == expected
+
+
+@pytest.mark.parametrize(
+    "allowed",
+    [-123456789, -1001234567890, "'-1001234567890'", 0, "true", "abc", "'+123'"],
+)
+def test_non_private_chat_id_is_rejected_at_load(tmp_path: Path, allowed: Any) -> None:
+    from herdr_routines.config import ConfigError, load_config
+
+    repo = _git_repo(tmp_path / "repo")
+    cfg_path = tmp_path / "jobs.yaml"
+    cfg_path.write_text(_spawn_config_text(repo, allowed=allowed))
+    with pytest.raises(ConfigError, match="private 1:1 chat"):
+        load_config(cfg_path)
+
+
+@pytest.mark.parametrize("group_id", [-123456789, "-1001234567890"])
+def test_is_authorized_refuses_group_chat_even_when_it_matches(
+    group_id: int | str,
+) -> None:
+    from herdr_routines.telegram_spawn import is_authorized
+
+    assert is_authorized(group_id, group_id) is False
+
+
+def test_spawn_from_group_chat_reaches_no_herdr_call(tmp_path: Path) -> None:
+    mod = _spawn_module()
+    repo = _git_repo(tmp_path / "g")
+    client = FakeSpawnClient()
+    sent: list[str] = []
+    mod.handle_spawn_message(
+        "/run nightly",
+        -1001234567890,
+        allowed_chat_id=-1001234567890,
+        aliases=_aliases(repo),
+        client=client,
+        reply=sent.append,
+    )
+    assert client.workspace_calls == []
+    assert client.agent_calls == []

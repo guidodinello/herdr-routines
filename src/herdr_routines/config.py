@@ -183,6 +183,20 @@ _TELEGRAM_SPAWN_ALLOWED_KEYS = frozenset({"allowed_chat_id", "aliases"})
 _SPAWN_ALIAS_ALLOWED_KEYS = frozenset(
     {"alias", "repo", "agent_kind", "workspace", "base", "model"}
 )
+# A Bot API chat id is positive only for a private 1:1 chat with a user; basic groups are
+# negative and supergroups/channels are negative with a 1000000000000 offset (the "-100"
+# prefix) — https://core.telegram.org/api/bots/ids. The id is the only identity the
+# spawn bridge passes in, so it can only tell "one known person" apart from "everyone
+# in some group" when the allowlisted chat is a private one.
+_PRIVATE_CHAT_ID_RE = re.compile(r"[1-9][0-9]*")
+
+
+def is_private_chat_id(chat_id: int | str) -> bool:
+    """Whether ``chat_id`` is a Telegram private (1:1 user) chat id: a positive decimal
+    integer. Group, supergroup and channel ids are negative, so they never pass."""
+    return _PRIVATE_CHAT_ID_RE.fullmatch(str(chat_id).strip()) is not None
+
+
 _JOB_ALLOWED_KEYS = (
     _JOB_REQUIRED_KEYS
     | _DEFAULTS_ALLOWED_KEYS
@@ -343,8 +357,8 @@ class SpawnAlias:
 
 @dataclass(frozen=True, slots=True)
 class TelegramSpawn:
-    """The ``telegram_spawn:`` block (issue 024): the single allowlisted ``chat_id`` that
-    may cold-start a session, plus the static alias map it may resolve.
+    """The ``telegram_spawn:`` block (issue 024): the single allowlisted private-chat
+    ``chat_id`` that may cold-start a session, plus the static alias map it may resolve.
 
     A missing block (``RoutinesConfig.telegram_spawn is None``) means the feature is not
     configured at all — the bridge simply has no spawn entrypoint. A present block with an
@@ -908,8 +922,9 @@ def _build_trusted_review_authors(raw: object, label: str) -> tuple[str, ...]:
 def _build_telegram_spawn(raw: object, label: str) -> TelegramSpawn:
     """Build a :class:`TelegramSpawn` from a parsed ``telegram_spawn:`` mapping (issue 024).
 
-    Fails closed: a missing/empty ``allowed_chat_id`` is a load error, never "allow all".
-    Each alias resolves to an existing git checkout; a bad repo or a duplicated alias is
+    Fails closed: a missing/empty ``allowed_chat_id`` is a load error, never "allow all",
+    and so is a non-private one (see ``is_private_chat_id``): only a 1:1 chat may be
+    allowlisted, since a group id would let every member of the group spawn. Each alias resolves to an existing git checkout; a bad repo or a duplicated alias is
     rejected here, at load time, rather than at spawn time on someone's phone."""
     if not isinstance(raw, dict):
         raise ConfigError(f"{label}: 'telegram_spawn' must be a mapping")
@@ -925,6 +940,12 @@ def _build_telegram_spawn(raw: object, label: str) -> TelegramSpawn:
     allowed = str(allowed_raw).strip()
     if not allowed:
         raise ConfigError(f"{label}: 'allowed_chat_id' must be non-empty")
+    if isinstance(allowed_raw, bool) or not is_private_chat_id(allowed):
+        raise ConfigError(
+            f"{label}: 'allowed_chat_id' must be a private 1:1 chat id (a positive "
+            f"integer), got {allowed!r}; group, supergroup and channel ids are negative "
+            "and are rejected because every member of such a chat could spawn"
+        )
 
     raw_aliases = raw.get("aliases") or []
     if not isinstance(raw_aliases, list):

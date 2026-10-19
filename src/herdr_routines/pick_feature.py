@@ -59,6 +59,19 @@ PIPELINE_STATE_JSON_NAME = "state.json"
 # as an int so "041" (a claim's issue id) and a differently-padded "41" in prose agree.
 _ISSUE_REF_PATTERN = re.compile(r"issues?\s+(\d+)", re.IGNORECASE)
 
+# Only PRs opened by the authenticated gh account (the one the pipeline opens its own
+# PRs as) are scanned: anyone can open a PR whose title or body says "issue 12", and
+# that must not hold issue 12's claim or keep it from being picked.
+_OWN_OPEN_PRS_ARGV = ("gh", "pr", "list", "--state", "open", "--author", "@me")
+
+
+def _is_same_repo_pr(item: Mapping[str, object]) -> bool:
+    """Same rule as `auto_fix.is_same_repo_pr` (mirrored, not imported — this leaf
+    module shouldn't pull in auto_fix's config/history graph for one comparison): only
+    an explicit ``isCrossRepository: false`` counts, so a fork PR — or a payload that
+    does not say — never vouches for a claim."""
+    return item.get("isCrossRepository") is False
+
 
 class IssueParseError(Exception):
     """Raised when an issue file is missing or has malformed frontmatter."""
@@ -168,7 +181,8 @@ def _default_pipeline_reports_dir() -> Path:
 
 
 def open_pr_issue_ids(repo: Path) -> frozenset[int] | None:
-    """Issue ids referenced by any currently-open PR's title or body, via one batched
+    """Issue ids referenced by the title or body of a currently-open PR this account
+    opened from a branch in this repository (see `_OWN_OPEN_PRS_ARGV`), via one batched
     `gh pr list` call (flat cost regardless of how many claims need checking).
 
     Returns `None` on any `gh` failure — not an empty set. A claim's reclaim check
@@ -179,15 +193,7 @@ def open_pr_issue_ids(repo: Path) -> frozenset[int] | None:
     """
     try:
         proc = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--json",
-                "number,title,body",
-            ],
+            [*_OWN_OPEN_PRS_ARGV, "--json", "number,title,body,isCrossRepository"],
             cwd=repo,
             capture_output=True,
             text=True,
@@ -206,7 +212,7 @@ def open_pr_issue_ids(repo: Path) -> frozenset[int] | None:
         return None
     refs: set[int] = set()
     for item in data:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _is_same_repo_pr(item):
             continue
         text = f"{item.get('title', '')}\n{item.get('body', '')}"
         refs.update(int(m.group(1)) for m in _ISSUE_REF_PATTERN.finditer(text))
@@ -218,8 +224,9 @@ def pipeline_open_pr_issue_ids(
     *,
     worktrees_root: Path | None = None,
 ) -> frozenset[int] | None:
-    """Issue ids referenced by open `auto/pipeline-*` PRs, via a single batched
-    `gh pr list` call (issue 028, re-scoped).
+    """Issue ids referenced by open `auto/pipeline-*` PRs this account opened from a
+    branch in this repository, via a single batched `gh pr list` call (issue 028,
+    re-scoped; author/fork scoping per `_OWN_OPEN_PRS_ARGV`).
 
     The exclusion is unconditional and fail-open: a `gh` failure warns to stderr
     and returns ``None`` so the caller can pick anyway, rather than bricking the
@@ -238,13 +245,9 @@ def pipeline_open_pr_issue_ids(
     try:
         proc = subprocess.run(
             [
-                "gh",
-                "pr",
-                "list",
-                "--state",
-                "open",
+                *_OWN_OPEN_PRS_ARGV,
                 "--json",
-                "headRefName,number,title,body",
+                "headRefName,number,title,body,isCrossRepository",
             ],
             cwd=repo,
             capture_output=True,
@@ -272,7 +275,7 @@ def pipeline_open_pr_issue_ids(
     refs: set[int] = set()
     pipeline_prefix = "auto/pipeline-"
     for item in data:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or not _is_same_repo_pr(item):
             continue
         head = item.get("headRefName")
         if not isinstance(head, str) or not head.startswith(pipeline_prefix):
