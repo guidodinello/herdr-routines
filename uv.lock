@@ -113,7 +113,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "croniter", specifier = "==6.2.4" },
-    { name = "logger", git = "https://github.com/guidodinello/logger.git?rev=main" },
+    { name = "logger", git = "https://github.com/guidodinello/logger.git?rev=7dbd2f616040a32fc5bbf458d661e7cd2d2385aa" },
     { name = "pyyaml", specifier = "==6.0.3" },
 ]
 
@@ -224,7 +224,7 @@ wheels = [
 [[package]]
 name = "logger"
 version = "0.1.0"
-source = { git = "https://github.com/guidodinello/logger.git?rev=main#7dbd2f616040a32fc5bbf458d661e7cd2d2385aa" }
+source = { git = "https://github.com/guidodinello/logger.git?rev=7dbd2f616040a32fc5bbf458d661e7cd2d2385aa#7dbd2f616040a32fc5bbf458d661e7cd2d2385aa" }
 
 [[package]]
 name = "mypy"

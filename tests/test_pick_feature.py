@@ -257,6 +257,22 @@ def test_run_pick_feature_missing_dir_fails(tmp_path: Path) -> None:
     assert out.getvalue() == ""
 
 
+def test_pick_with_corrupt_claims_file_still_picks(
+    issues_dir: Path, tmp_path: Path
+) -> None:
+    """A truncated claims file used to raise out of every pick (and pipeline-prepare)."""
+    _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
+    claims_path = tmp_path / "claims.json"
+    claims_path.write_text("{truncated")
+
+    out = io.StringIO()
+    code = run_pick_feature(issues_dir, mark=True, out=out, claims_path=claims_path)
+    assert code == 0
+    assert "Foo" in out.getvalue()
+    assert load_claims(claims_path).keys() == {"001"}
+    assert len(list(tmp_path.glob("claims.json.corrupt-*"))) == 1
+
+
 # --- Issue 040: stale-lease reclamation --------------------------------------------
 
 

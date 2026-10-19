@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -58,6 +59,7 @@ from logger import get_logger
 
 from herdr_routines.herdr import HerdrClient, HerdrCliError
 from herdr_routines.history import read_all
+from herdr_routines.pipeline_prepare import write_terminal_report
 from herdr_routines.pipeline_stages import STAGES, StageSpec
 
 log = get_logger(__name__)
@@ -71,6 +73,12 @@ DEADLINE_GRACE_SECONDS = 30 * 60
 # (orchestrator-prompt.md Worker spawn template step 2); a gap several times that is
 # only plausible once nothing is polling any more.
 HEARTBEAT_STALE_SECONDS = 20 * 60
+
+# Must match the transient unit names tick and `herdr-routines run` launch with
+# (`herdr-pipeline-<run_id>`, plus an `-r<HHMMSS>` suffix on a resume). A drifted prefix
+# matches no unit, which reads as "not active".
+PIPELINE_UNIT_GLOB = "herdr-pipeline-{run_id}*"
+SYSTEMCTL_TIMEOUT_SECONDS = 10
 
 WORKTREE_GLOB = "auto-pipeline-*"
 STATE_JSON_NAME = "state.json"
@@ -418,6 +426,46 @@ def is_stalled(
     )
 
 
+def pipeline_unit_active(run_id: str) -> bool | None:
+    """Whether a systemd user unit for `run_id` is still running — the orchestrator's
+    own liveness, which heartbeat staleness only guesses at. The glob covers the original
+    unit and a resume's `-r<HHMMSS>` unit (a resumed run keeps tick's old recorded
+    deadline, so it can look long overdue while perfectly alive). `list-units` rather
+    than `is-active` because it exits 0 with no output when nothing matches, keeping "no
+    unit" apart from "systemctl failed". None means can't tell (no systemctl, no user
+    bus, timeout); callers must not reap on it."""
+    argv = [
+        "systemctl",
+        "--user",
+        "list-units",
+        "--all",
+        "--plain",
+        "--no-legend",
+        "--state=active,activating,deactivating,reloading",
+        PIPELINE_UNIT_GLOB.format(run_id=run_id),
+    ]
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("%s: could not query systemd: %s", run_id, e)
+        return None
+    if result.returncode != 0:
+        log.warning(
+            "%s: systemctl exited %d: %s",
+            run_id,
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return None
+    return bool(result.stdout.strip())
+
+
 def _stage_from_agent_name(name: str, run_id: str) -> int | None:
     """Best-effort `N` out of a `pl-<N>-<run_id>` agent name; None if it doesn't parse
     (never fatal — the report still gets written either way)."""
@@ -439,7 +487,6 @@ def _write_report(
     now: datetime,
     host_rebooted: bool = False,
 ) -> Path:
-    reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"pipeline-{run.run_id}.md"
     killed = bool(killed_agents)
     stages_killed = sorted(
@@ -452,16 +499,12 @@ def _write_report(
     # report (docs/pipeline/orchestrator-prompt.md "Final report"). Always "failed" here —
     # a watchdog-authored report is definitionally not a clean completion.
     if host_rebooted:
-        outcome_marker = "## Outcome: failed (watchdog: host rebooted mid-run)"
+        outcome = "failed (watchdog: host rebooted mid-run)"
     elif killed:
-        outcome_marker = "## Outcome: failed (watchdog killed)"
+        outcome = "failed (watchdog killed)"
     else:
-        outcome_marker = "## Outcome: failed (watchdog: no live worker found)"
+        outcome = "failed (watchdog: no live worker found)"
     lines = [
-        f"# Pipeline run {run.run_id} — watchdog report",
-        "",
-        outcome_marker,
-        "",
         f"watchdog_killed: {'true' if killed else 'false'}",
         f"host_rebooted_mid_run: {'true' if host_rebooted else 'false'}",
         f"stage_killed: {stages_killed[0] if stages_killed else 'none'}",
@@ -502,7 +545,15 @@ def _write_report(
             f"Stage-independence gate (design.md G-17): {run.stage_sessions_issue}. "
             "Any PR from this run is single-session work at best — review it as such."
         )
-    report_path.write_text("\n".join(lines) + "\n")
+    # Atomic (tmp + rename), the same writer the orchestrator uses for this file: a torn
+    # report would count as terminal to `_has_terminal_report` yet fail tick's reconcile.
+    write_terminal_report(
+        report_path,
+        run_id=run.run_id,
+        outcome=outcome,
+        lines=lines,
+        title="watchdog report",
+    )
     return report_path
 
 
@@ -512,6 +563,108 @@ def _notify(client: HerdrClient, title: str, *, body: str | None) -> None:
         client.notification_show(title, body=body, sound="request")
     except HerdrCliError as e:
         log.warning("%s: notification failed: %s", title, e)
+
+
+def _reap_stalled_run(
+    client: HerdrClient,
+    run: InflightRun,
+    *,
+    reports_dir: Path,
+    heartbeat_dir: Path,
+    now: datetime,
+    boot_epoch: float | None,
+) -> WatchdogAction | None:
+    """One run's share of the sweep: None when it is healthy, spared, or can't be listed
+    this cycle; otherwise the action taken."""
+    if not is_stalled(run, now=now, heartbeat_dir=heartbeat_dir, boot_epoch=boot_epoch):
+        return None
+    # Stale heartbeat is only a guess at death. A live unit (e.g. a resumed run, or an
+    # orchestrator blocked in a long call) is left alone, quietly: the watchdog fires
+    # every 15 min, so a notification would just repeat, and the unit is bounded by
+    # its own RuntimeMaxSec. "Can't tell" is treated the same — never reap on doubt.
+    unit_active = pipeline_unit_active(run.run_id)
+    if unit_active is not False:
+        log.warning(
+            "%s: looks stalled but %s; not reaping",
+            run.run_id,
+            "its systemd unit is still active"
+            if unit_active
+            else "systemd liveness is unknown",
+        )
+        return None
+    host_rebooted = _host_rebooted_after_last_state_write(run, boot_epoch=boot_epoch)
+    killed_agents: dict[str, str] = {}
+    try:
+        # A worker left running is closed only while `working`: a `blocked` one is
+        # normally left open for a human. Not after a reboot — herdr restores every
+        # pane's agent at boot as `blocked`, so a dead run's pl- agents come back as
+        # resurrected processes holding ~550 MB each (2026-10-01: four of them pinned
+        # 2.2 GB of the Pi's 4 GB), and nobody is coming to inspect them.
+        panes = (
+            client.pipeline_agent_panes(run.run_id)
+            if host_rebooted
+            else client.live_pipeline_agent_panes(run.run_id)
+        )
+    except HerdrCliError as e:
+        log.warning("%s: could not list agents, skipping this cycle: %s", run.run_id, e)
+        return None
+    for name, pane_id in panes.items():
+        try:
+            client.pane_close(pane_id)
+            killed_agents[name] = pane_id
+        except HerdrCliError as e:
+            log.warning(
+                "%s: could not close pane %s for %s: %s",
+                run.run_id,
+                pane_id,
+                name,
+                e,
+            )
+    heartbeat_last_line = _heartbeat_last_line(
+        heartbeat_log_path(heartbeat_dir, run.run_id)
+    )
+    report_path = _write_report(
+        reports_dir,
+        run,
+        killed_agents=killed_agents,
+        heartbeat_last_line=heartbeat_last_line,
+        now=now,
+        host_rebooted=host_rebooted,
+    )
+    stage_killed = next(
+        (
+            s
+            for s in (_stage_from_agent_name(n, run.run_id) for n in killed_agents)
+            if s is not None
+        ),
+        None,
+    )
+    if killed_agents:
+        _notify(
+            client,
+            f"herdr-routines: pipeline {run.run_id} stalled, worker killed",
+            body=f"stage {stage_killed} agent(s) {', '.join(sorted(killed_agents))} "
+            f"killed past deadline; see {report_path}",
+        )
+    elif host_rebooted:
+        _notify(
+            client,
+            f"herdr-routines: pipeline {run.run_id} failed, host rebooted mid-run",
+            body=f"host booted after the orchestrator's last state write; "
+            f"failed early instead of waiting the deadline. See {report_path}",
+        )
+    else:
+        _notify(
+            client,
+            f"herdr-routines: pipeline {run.run_id} stalled, no report",
+            body=f"deadline exceeded, no live worker found; see {report_path}",
+        )
+    return WatchdogAction(
+        run_id=run.run_id,
+        killed_agents=tuple(sorted(killed_agents)),
+        stage_killed=stage_killed,
+        report_path=report_path,
+    )
 
 
 def run_watchdog(
@@ -526,8 +679,8 @@ def run_watchdog(
 ) -> list[WatchdogAction]:
     """One watchdog sweep: find every stalled in-flight run, kill any live worker it
     left running, write its terminal report, and notify. Never raises — a single run's
-    `herdr` failure is logged and the sweep continues with the rest (fail-open, same
-    posture as `ps.py`/`gc.py`)."""
+    failure of any kind (`herdr`, a filesystem error writing its report) is logged and
+    the sweep continues with the rest (fail-open, same posture as `ps.py`/`gc.py`)."""
     now = now or datetime.now(UTC)
     if boot_epoch is None:
         boot_epoch = system_boot_epoch()
@@ -536,87 +689,18 @@ def run_watchdog(
         recorded_pipeline_deadlines(history_path) if history_path is not None else {}
     )
     for run in find_inflight_runs(worktrees_root, reports_dir, recorded_deadlines):
-        if not is_stalled(
-            run, now=now, heartbeat_dir=heartbeat_dir, boot_epoch=boot_epoch
-        ):
-            continue
-        host_rebooted = _host_rebooted_after_last_state_write(
-            run, boot_epoch=boot_epoch
-        )
-        killed_agents: dict[str, str] = {}
         try:
-            # A worker left running is closed only while `working`: a `blocked` one is
-            # normally left open for a human. Not after a reboot — herdr restores every
-            # pane's agent at boot as `blocked`, so a dead run's pl- agents come back as
-            # resurrected processes holding ~550 MB each (2026-10-01: four of them pinned
-            # 2.2 GB of the Pi's 4 GB), and nobody is coming to inspect them.
-            panes = (
-                client.pipeline_agent_panes(run.run_id)
-                if host_rebooted
-                else client.live_pipeline_agent_panes(run.run_id)
+            action = _reap_stalled_run(
+                client,
+                run,
+                reports_dir=reports_dir,
+                heartbeat_dir=heartbeat_dir,
+                now=now,
+                boot_epoch=boot_epoch,
             )
-        except HerdrCliError as e:
-            log.warning(
-                "%s: could not list agents, skipping this cycle: %s", run.run_id, e
-            )
+        except Exception:  # one run's failure, of any kind, must not abort the sweep
+            log.exception("%s: watchdog failed for this run; continuing", run.run_id)
             continue
-        for name, pane_id in panes.items():
-            try:
-                client.pane_close(pane_id)
-                killed_agents[name] = pane_id
-            except HerdrCliError as e:
-                log.warning(
-                    "%s: could not close pane %s for %s: %s",
-                    run.run_id,
-                    pane_id,
-                    name,
-                    e,
-                )
-        heartbeat_last_line = _heartbeat_last_line(
-            heartbeat_log_path(heartbeat_dir, run.run_id)
-        )
-        report_path = _write_report(
-            reports_dir,
-            run,
-            killed_agents=killed_agents,
-            heartbeat_last_line=heartbeat_last_line,
-            now=now,
-            host_rebooted=host_rebooted,
-        )
-        stage_killed = next(
-            (
-                s
-                for s in (_stage_from_agent_name(n, run.run_id) for n in killed_agents)
-                if s is not None
-            ),
-            None,
-        )
-        if killed_agents:
-            _notify(
-                client,
-                f"herdr-routines: pipeline {run.run_id} stalled, worker killed",
-                body=f"stage {stage_killed} agent(s) {', '.join(sorted(killed_agents))} "
-                f"killed past deadline; see {report_path}",
-            )
-        elif host_rebooted:
-            _notify(
-                client,
-                f"herdr-routines: pipeline {run.run_id} failed, host rebooted mid-run",
-                body=f"host booted after the orchestrator's last state write; "
-                f"failed early instead of waiting the deadline. See {report_path}",
-            )
-        else:
-            _notify(
-                client,
-                f"herdr-routines: pipeline {run.run_id} stalled, no report",
-                body=f"deadline exceeded, no live worker found; see {report_path}",
-            )
-        actions.append(
-            WatchdogAction(
-                run_id=run.run_id,
-                killed_agents=tuple(sorted(killed_agents)),
-                stage_killed=stage_killed,
-                report_path=report_path,
-            )
-        )
+        if action is not None:
+            actions.append(action)
     return actions

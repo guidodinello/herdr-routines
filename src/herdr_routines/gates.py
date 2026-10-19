@@ -45,7 +45,6 @@ CI_POLL_INTERVAL_S = 15.0
 # commit StatusContext instead carries `state` directly, with no separate pending
 # marker beyond `state == "PENDING"`.
 FAILING_CI_CONCLUSIONS = frozenset({"FAILURE"})
-TOLERATED_CI_CONCLUSIONS = frozenset({"SKIPPED", "NEUTRAL"})
 
 # The complement for a *commit* self-update is about to deploy (spec
 # 20260929T050000Z). `evaluate_ci_checks` above tolerates everything that is not
@@ -447,10 +446,6 @@ def _frontmatter_field(text: str, field: str) -> str | None:
         if sep and key.strip() == field:
             return value.strip().strip("\"'") or None
     return None
-
-
-def _frontmatter_has(text: str, field: str, value: str) -> bool:
-    return _frontmatter_field(text, field) == value
 
 
 def run_gate2(spec: Path) -> GateVerdict:

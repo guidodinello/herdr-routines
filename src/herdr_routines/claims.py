@@ -21,11 +21,18 @@ and call `release_claim` — no new storage.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
 import os
+import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 
 def default_claims_path() -> Path:
@@ -46,10 +53,8 @@ class Claim:
     claimed_at: datetime
 
 
-def load_claims(path: Path) -> dict[str, Claim]:
-    """All current claims, keyed by issue id. Empty if the store doesn't exist yet."""
-    if not path.exists():
-        return {}
+def _parse_claims(path: Path) -> dict[str, Claim]:
+    """Raises on a missing or malformed store; callers decide how to degrade."""
     data = json.loads(path.read_text())
     return {
         issue_id: Claim(
@@ -59,9 +64,25 @@ def load_claims(path: Path) -> dict[str, Claim]:
     }
 
 
+# A hand-edited or truncated store can fail in any of these ways.
+_CORRUPT_ERRORS = (ValueError, KeyError, TypeError, AttributeError)
+
+
+def load_claims(path: Path) -> dict[str, Claim]:
+    """All current claims, keyed by issue id. Empty if the store doesn't exist yet or
+    is corrupt (warned, left in place: only a locked writer moves it aside)."""
+    try:
+        return _parse_claims(path)
+    except FileNotFoundError:
+        return {}
+    except _CORRUPT_ERRORS as exc:
+        log.warning("claims store %s is corrupt, treating as empty: %s", path, exc)
+        return {}
+
+
 def save_claims(path: Path, claims: dict[str, Claim]) -> None:
-    """Atomic write (tmpfile + rename), same discipline as pick_feature.mark_in_progress
-    used on the tracked file — just aimed at our own out-of-tree store now."""
+    """Atomic write (unique tmpfile in the same dir + rename). Callers that read first
+    must hold `locked_claims`; this alone does not serialise writers."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         issue_id: {
@@ -71,25 +92,66 @@ def save_claims(path: Path, claims: dict[str, Claim]) -> None:
         }
         for issue_id, claim in claims.items()
     }
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, sort_keys=True))
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f"{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(payload, sort_keys=True))
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+def _quarantine(path: Path) -> None:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    aside = path.with_name(f"{path.name}.corrupt-{stamp}")
+    os.replace(path, aside)
+    log.warning(
+        "claims store %s is corrupt, moved to %s and starting empty", path, aside
+    )
+
+
+@contextmanager
+def locked_claims(path: Path) -> Generator[dict[str, Claim]]:
+    """Exclusive read-modify-write of the claims store. Holds a blocking flock on a
+    sibling `.lock` file for the whole block (neither `tick.lock` nor anything else
+    covers the pipeline unit or manual `pick-feature` runs), yields the current claims
+    to mutate in place, and saves only if they changed and the block didn't raise. A
+    corrupt store is moved aside and treated as empty."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(path.with_name(f"{path.name}.lock"), os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            claims = _parse_claims(path)
+        except FileNotFoundError:
+            claims = {}
+        except _CORRUPT_ERRORS:
+            _quarantine(path)
+            claims = {}
+        before = dict(claims)
+        yield claims
+        if claims != before:
+            save_claims(path, claims)
+    finally:
+        os.close(lock_fd)
 
 
 def claim_issue(path: Path, issue_id: str, *, now: datetime | None = None) -> None:
     """Record that `issue_id` has been picked, replacing any prior claim for it."""
-    claims = load_claims(path)
-    claims[issue_id] = Claim(issue_id=issue_id, claimed_at=now or datetime.now(UTC))
-    save_claims(path, claims)
+    with locked_claims(path) as claims:
+        claims[issue_id] = Claim(issue_id=issue_id, claimed_at=now or datetime.now(UTC))
 
 
 def is_claimed(path: Path, issue_id: str) -> bool:
+    """True if any claim is recorded for issue_id, however old. Ignores the lease:
+    pick_feature decides reclaimability against LEASE_HOURS."""
     return issue_id in load_claims(path)
 
 
 def release_claim(path: Path, issue_id: str) -> None:
     """No-op if `issue_id` isn't claimed."""
-    claims = load_claims(path)
-    if issue_id in claims:
-        del claims[issue_id]
-        save_claims(path, claims)
+    with locked_claims(path) as claims:
+        claims.pop(issue_id, None)

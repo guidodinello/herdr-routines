@@ -5,6 +5,9 @@
 # on a schedule, for three ecosystems: your actual dependencies (pip),
 # your CI Actions pins, and your pre-commit hook revs.
 #
+# `uv` (not `pip`) is the Python entry because it is the ecosystem that also updates
+# uv.lock; a pip bump edits only pyproject.toml, which fails CI's `uv sync --locked`.
+#
 # Adopt: cp to .github/dependabot.yml, adjust `directory` if the repo
 # isn't laid out with pyproject.toml at the root (see fitted's
 # .github/dependabot.yml for the monorepo/multi-directory shape).
@@ -14,10 +17,14 @@
 # — this only helps once a dependency is actually pinned/bounded.
 version: 2
 updates:
-  - package-ecosystem: pip
+  - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly
+    # Hold new releases for a week before proposing them, so a freshly published
+    # malicious release is not merged the moment CI goes green.
+    cooldown:
+      default-days: 7
     groups:
       dependencies:
         patterns:
@@ -27,6 +34,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Hold new releases for a week before proposing them, so a freshly published
+    # malicious release is not merged the moment CI goes green.
+    cooldown:
+      default-days: 7
     groups:
       pre-commit-hooks:
         patterns:
@@ -36,6 +47,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Hold new releases for a week before proposing them, so a freshly published
+    # malicious release is not merged the moment CI goes green.
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
