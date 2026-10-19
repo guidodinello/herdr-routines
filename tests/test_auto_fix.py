@@ -931,7 +931,8 @@ def test_auto_fix_gate_pass_no_dispatch(
     """Acceptance 1: checks all pass -> done with extra.gate == "passed",
     no agent spawned, no branch created, base-target worktree removed,
     any_failed false."""
-    from herdr_routines.auto_fix import GateCheck, run_checks
+    from herdr_routines.auto_fix import run_checks
+    from herdr_routines.config import GateCheck
 
     # run_checks with a passing command
     checks = (GateCheck(kind="command", command="true", timeout_ms=5000),)
@@ -955,7 +956,8 @@ def test_auto_fix_gate_fail_dispatches_worker(tmp_path: Path) -> None:
     """Acceptance 2: any check non-zero -> exactly one worker dispatched
     per failing target, prompt contains all failing checks and captured output,
     no short-circuit, per-attempt record reason: gate_failed."""
-    from herdr_routines.auto_fix import GateCheck, run_checks
+    from herdr_routines.auto_fix import run_checks
+    from herdr_routines.config import GateCheck
 
     # Failing command
     checks = (
@@ -979,7 +981,8 @@ def test_auto_fix_gate_fail_dispatches_worker(tmp_path: Path) -> None:
 def test_auto_fix_gate_command_timeout(tmp_path: Path) -> None:
     """Acceptance 3: check exceeding timeout_ms counts as gate-failed and
     dispatches, tick does not crash, timeout noted in output."""
-    from herdr_routines.auto_fix import GateCheck, run_checks
+    from herdr_routines.auto_fix import run_checks
+    from herdr_routines.config import GateCheck
 
     checks = (
         GateCheck(
@@ -1280,7 +1283,8 @@ def test_auto_fix_gate_clean_run_no_gh_activity(
 ) -> None:
     """Acceptance 9: clean runs: base-target passing gate produces zero
     gh/agent/push activity (only git worktree + check subprocesses)."""
-    from herdr_routines.auto_fix import GateCheck, run_checks
+    from herdr_routines.auto_fix import run_checks
+    from herdr_routines.config import GateCheck
 
     # A passing command check produces no gh/agent activity
     checks = (GateCheck(kind="command", command="true", timeout_ms=5000),)
@@ -1317,7 +1321,8 @@ def test_auto_fix_gate_review_tiers_present() -> None:
 def test_run_checks_keeps_partial_output_on_timeout(tmp_path: Path) -> None:
     """The default runner must keep what a timed-out command already printed: on POSIX
     `TimeoutExpired.stdout/.stderr` are raw bytes, which an `isinstance(str)` guard dropped."""
-    from herdr_routines.auto_fix import GateCheck, run_checks
+    from herdr_routines.auto_fix import run_checks
+    from herdr_routines.config import GateCheck
 
     checks = (
         GateCheck(
