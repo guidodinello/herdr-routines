@@ -58,6 +58,11 @@ In progress or ready to build; no real-run evidence required.
   `high`. Phases B and C of 054: the stage loop and stage 4 (push + PR) moved
   out of the orchestrator session into `pipeline-run`. →
   [`056`](docs/process/issues/056-orchestrator-stage-loop-in-code.md)
+- **Pipeline bookkeeping in code, CI gate with a fix loop, test authoring split
+  from implementation** — `done`, `high`. Stage-3 bookkeeping moved into
+  `pipeline-run`; the PR is gated on `scripts/ci-check.sh` with a bounded fix
+  loop. →
+  [`059`](docs/process/issues/059-pipeline-bookkeeping-in-code.md)
 
 Done (kept as `status: done` issue files for history): plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
@@ -69,6 +74,27 @@ autonomous task selection / `pick-feature`
 ([`013`](docs/process/issues/013-autonomous-task-selection.md), PR #46),
 Telegram plugin replacement
 ([`023`](docs/process/issues/023-replace-herdr-push-telegram.md), 2026-08-25).
+
+Bugs found while running real jobs, all `done`: tests reading host disk state
+([`038`](docs/process/issues/038-tests-depend-on-host-disk.md)), a dead run
+orphaning its picked issue ([`040`](docs/process/issues/040-dead-run-orphans-picked-issue.md)),
+pick-feature's flip wedging repo sync ([`041`](docs/process/issues/041-pick-flip-blocks-repo-sync.md)),
+digest listing disabled jobs as failing ([`046`](docs/process/issues/046-digest-reports-disabled-jobs-as-failing.md)),
+the orchestrator wedging on a bare `herdr-routines`
+([`050`](docs/process/issues/050-orchestrator-wedges-on-bare-herdr-routines.md)),
+a blocked agent name wedging its recurring job
+([`051`](docs/process/issues/051-blocked-agent-name-wedges-recurring-job.md)),
+the pipeline launching with nothing to build
+([`052`](docs/process/issues/052-pipeline-launches-with-no-feature-to-build.md)),
+and a run of worktree GC fixes — pipeline exclusion
+([`039`](docs/process/issues/039-gc-pipeline-exclusion-too-coarse.md)), squash-merge
+detection ([`042`](docs/process/issues/042-gc-squash-merge-detection.md)), delete
+matching dry-run ([`043`](docs/process/issues/043-gc-delete-matches-dry-run.md)), age
+threshold ([`044`](docs/process/issues/044-gc-delete-age-threshold.md),
+[`047`](docs/process/issues/047-gc-age-defeated-by-noncommitting-branches.md)),
+orphaned worktree entries ([`045`](docs/process/issues/045-gc-leaves-orphaned-worktree-entries.md))
+and the orphan scan's repo scoping
+([`048`](docs/process/issues/048-gc-orphan-scan-hardcoded-to-herdr-routines.md)).
 
 ## Next
 
@@ -82,18 +108,18 @@ gate is considered met). One-liner index; full detail in the issue file.
   [`006`](docs/process/issues/006-jobs-dir-per-file.md)
 - **Approval path for `blocked` runs** — one actionable notification →
   approve the pending permission prompt from the phone; no auto-approve
-  escape hatch. `low`. →
+  escape hatch. `low`. `done`. →
   [`007`](docs/process/issues/007-approval-path-blocked-runs.md)
 - **Retries on failure** — opt-in, per-job, only for a declared whitelist of
-  transient failure `reason`s; never for non-idempotent jobs. `low`. →
+  transient failure `reason`s; never for non-idempotent jobs. `low`. `done`. →
   [`008`](docs/process/issues/008-retries-on-failure.md)
 - **Notification policy per job** — `always` / `on-failure` / `on-finding`;
-  default to one terminal-state ping, not per-step noise. `low`. →
+  default to one terminal-state ping, not per-step noise. `low`. `done`. →
   [`009`](docs/process/issues/009-notification-policy-per-job.md)
 - **Daily digest** — one morning summary of terminal states + report links.
-  `low`. → [`010`](docs/process/issues/010-daily-digest.md)
+  `low`. `done`. → [`010`](docs/process/issues/010-daily-digest.md)
 - **Pane/session retention policy** — capture the transcript to the history
-  log before closing the pane; document the retention window. `low`. →
+  log before closing the pane; document the retention window. `low`. `done`. →
   [`011`](docs/process/issues/011-pane-session-retention-policy.md)
 - **Worktree GC, delete half** — `done` (PR #49). Human-invoked
   `gc --delete`/`--prune` acting on the dry-run's own output; never
@@ -104,12 +130,12 @@ gate is considered met). One-liner index; full detail in the issue file.
   [`027`](docs/process/issues/027-tmp-hygiene.md)
 - **pick-feature: skip issues with an open pipeline PR** — so a later launch
   never re-picks the feature an in-flight run already has an open PR for
-  (006 collision, 2026-08-31). `medium`. →
+  (006 collision, 2026-08-31). `medium`. `done`. →
   [`028`](docs/process/issues/028-pick-feature-skip-open-prs.md)
 - **Issue refinement job (Parking Lot → PR)** — automate promoting a Parking
   Lot idea into a refined issue via a bounded author→reviewer loop (product
   refinement vs the pipeline's implementation refinement), delivered as an
-  open PR for the human to merge; nightly 22:00, `opencode` only. `medium`. →
+  open PR for the human to merge; nightly 22:00, `opencode` only. `medium`. `done`. →
   [`029`](docs/process/issues/029-issue-refinement-job.md)
 - **Fetch+fast-forward every job's repo before every run** — `done` (PR
   #72). Generalized `ensure_repo` to sync plain `repo:` jobs too, not just
@@ -157,6 +183,9 @@ Curated into issue files 2026-08-27. Time-gated items were promoted to
   `tick` instead of its own detached `systemd-run` launcher; stages stay
   prompt-hardcoded for now. →
   [`026`](docs/process/issues/026-pipeline-as-routine.md)
+- **One gated-workflow engine, `kind` as the single dispatch key** — `done`.
+  Follow-up to 026: routines and the pipeline share one engine. →
+  [`049`](docs/process/issues/049-unify-routines-pipeline-as-one-gated-workflow-engine.md)
 - **Model selection per job beyond claude/opencode** — `done`, `low`. Extend
   `model` to another `agent_kind` + a validate-time existence check. →
   [`018`](docs/process/issues/018-model-selection-per-job.md)
@@ -192,10 +221,11 @@ files 2026-08-27.
   `fallback_model` retried once on a classified `quota_exhausted` settle;
   free-tier OpenCode quota modals are the dominant real failure mode. →
   [`022`](docs/process/issues/022-switch-model-on-quota-exhaustion.md)
-- **Replace the herdr-push Telegram plugin** — `done`. `cokekitten/herdr-telegram-bridge`
-  installed + configured on the Pi (2026-08-25); `herdr.push` removed. Residual
-  follow-ups (laptop `herdr.push` cleanup, the `pane.agent_status_changed`
-  race verification) are logged in the file. →
+- **Replace the herdr-push Telegram plugin** — `done`; `herdr.push` removed. The
+  live bot is `relay/herdr_telegram.py` from the `guidodinello/herdr-remote` fork,
+  not the `cokekitten/herdr-telegram-bridge` plugin first recorded (not installed;
+  see issue 024's 2026-10-16 log). Residual laptop `herdr.push` cleanup is logged
+  in the file. →
   [`023`](docs/process/issues/023-replace-herdr-push-telegram.md)
 - **Spawn a session on the fly from Telegram** — `done` (PR #163, 2026-10-15).
   `/run <alias>` / `/start <alias>` from the one allowlisted chat starts an agent
