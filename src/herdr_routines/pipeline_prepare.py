@@ -189,7 +189,7 @@ def prepare_run(
     # checkout, while the branch-off happens here, later, from a different checkout.
     try:
         _fetch_and_fast_forward(repo_parent, base=base)
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:
         log.error("pipeline-prepare: repo sync failed for %s: %s", repo_parent, e)
         return _failed("sync_failed", "failed (repo_sync_failed)", str(e))
 

@@ -1369,7 +1369,7 @@ def _cmd_sync_repo(args: argparse.Namespace) -> int:
     # path (issue 030: the overnight pipeline launcher's $REPO_PARENT).
     try:
         _fetch_and_fast_forward(args.path, base=args.base)
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:
         log.error("sync-repo failed for %s: %s", args.path, e)
         return 1
     log.info("sync-repo: %s up to date with origin/%s", args.path, args.base)
