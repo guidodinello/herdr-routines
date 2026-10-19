@@ -313,19 +313,19 @@ def validate_subprocess(
     runner: Runner = subprocess.run,
     timeout_s: float = VALIDATE_TIMEOUT_S,
 ) -> ValidateOutcome:
-    """`uv run --frozen herdr-routines validate` in *checkout*, out of process.
+    """`uv run --locked herdr-routines validate` in *checkout*, out of process.
 
     Out of process is the whole point: the parent already has the old code imported,
     so an import error in the new code is data, not a crash — and the new import
     graph, config schema and `uv.lock` are all exercised against the host's live
-    `jobs.d/`. `--frozen` still syncs `.venv` from the committed lock (so the new
+    `jobs.d/`. `--locked` still syncs `.venv` from the committed lock (so the new
     lock really is exercised) while making it impossible for `uv` to rewrite a
     *tracked* `uv.lock` between the fast-forward and a rollback.
 
     A `TimeoutExpired` is a failure, never a pass: an unbounded child is exactly the
     wedge `TimeoutStartSec` exists to prevent.
     """
-    argv = [str(uv), "run", "--frozen", "herdr-routines", "validate"]
+    argv = [str(uv), "run", "--locked", "herdr-routines", "validate"]
     try:
         proc = runner(
             argv,

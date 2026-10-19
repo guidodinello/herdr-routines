@@ -226,7 +226,7 @@ class FakeGh:
 class FakeValidate:
     """The out-of-process `validate` seam. Records every invocation (argv, cwd,
     timeout) so a test can assert the child really is
-    `[uv, run, --frozen, herdr-routines, validate]` run in the checkout — and can
+    `[uv, run, --locked, herdr-routines, validate]` run in the checkout — and can
     never be reached at all (`calls == []`) where the flow must stop earlier."""
 
     def __init__(
@@ -603,7 +603,10 @@ def test_self_update_units_and_docs_are_shipped() -> None:
     assert "After=herdr-server.service" in service_text
     assert "Wants=herdr-server.service" in service_text
     assert "Environment=PATH=%h/.local/bin:" in service_text
-    assert "ExecStart=%h/.local/bin/uv run herdr-routines self-update" in service_text
+    assert (
+        "ExecStart=%h/.local/bin/uv run --locked herdr-routines self-update"
+        in service_text
+    )
     assert "infinity" not in service_text
     timeouts = [
         line
@@ -643,12 +646,12 @@ def test_self_update_units_and_docs_are_shipped() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_self_update_validates_out_of_process_with_frozen_uv(
+def test_self_update_validates_out_of_process_with_locked_uv(
     sandbox: Sandbox,
 ) -> None:
     """Criterion 10. The parent already has the old code imported, so the new import
     graph, config schema and `uv.lock` are only real if a child exercises them.
-    `--frozen` is what makes that safe: it still syncs `.venv` from the committed
+    `--locked` is what makes that safe: it still syncs `.venv` from the committed
     lock, but `uv` can no longer rewrite a *tracked* `uv.lock` between the
     fast-forward and a rollback (spec finding F6)."""
     sandbox.push("NEW.md", "new\n", "add NEW.md")
@@ -661,7 +664,7 @@ def test_self_update_validates_out_of_process_with_frozen_uv(
         assert call["argv"] == [
             "/usr/bin/uv",
             "run",
-            "--frozen",
+            "--locked",
             "herdr-routines",
             "validate",
         ]
@@ -982,7 +985,7 @@ def test_self_update_git_operations_are_real_not_mocked(
 ) -> None:
     """Criterion 21. Every git operation in the flow is a real subprocess against a
     real bare repo: the fetch, the fast-forward and the diff. Only the three injected
-    seams are fake — and the `uv run --frozen` argv is asserted *absent* from the real
+    seams are fake — and the `uv run --locked` argv is asserted *absent* from the real
     process table, because `validate` goes through the injected runner."""
     real_run = subprocess.run
     recorded: list[list[str]] = []
