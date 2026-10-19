@@ -1196,9 +1196,9 @@ def test_path_default_is_the_runner_not_the_cwd(
     # the real cwd *is* the default, which would make the check below vacuous-or-false.
     monkeypatch.chdir(tmp_path)
     assert default != Path.cwd()
-    parser = cli._build_parser()  # type: ignore[attr-defined]
+    parser = cli._build_parser()
     resolved = parser.parse_args(["self-update"])
-    assert resolved.handler is cli._cmd_self_update  # type: ignore[attr-defined]
+    assert resolved.handler is cli._cmd_self_update
     assert resolved.path == default
 
     # And the deploy README says so, rather than crediting `WorkingDirectory`.

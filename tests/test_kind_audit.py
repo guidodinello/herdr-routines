@@ -282,7 +282,7 @@ def test_manifest_validation_fails_closed(
     summary, failed = _diff_step(
         job,
         tmp_path / "history.jsonl",
-        client=client,  # type: ignore[arg-type]
+        client=client,
         now=NOW,
         run_id="audit-type-health-missing",
     )
@@ -327,7 +327,7 @@ def test_cold_start_adopts_baseline_without_dispatch(
     summary, failed = _diff_step(
         job,
         history,
-        client=client,  # type: ignore[arg-type]
+        client=client,
         now=NOW,
         run_id=RUN_ID,
     )
@@ -354,7 +354,7 @@ def test_cold_start_adopts_baseline_without_dispatch(
     _summary2, failed2 = _diff_step(
         job2,
         history,
-        client=client2,  # type: ignore[arg-type]
+        client=client2,
         now=NOW,
         run_id=RUN_ID,
     )
@@ -387,7 +387,7 @@ def test_corrupt_ledger_fails_closed_without_rebaseline(
     summary, failed = _diff_step(
         job,
         history,
-        client=client,  # type: ignore[arg-type]
+        client=client,
         now=NOW,
         run_id=RUN_ID,
     )
@@ -452,7 +452,7 @@ def test_suppressed_finding_stops_redispatch(
     summary, failed = _diff_step(
         job,
         history,
-        client=client,  # type: ignore[arg-type]
+        client=client,
         now=NOW,
         run_id=RUN_ID,
     )
@@ -470,7 +470,7 @@ def test_suppressed_finding_stops_redispatch(
     _summary2, failed2 = _diff_step(
         job,
         history,
-        client=client,  # type: ignore[arg-type]
+        client=client,
         now=NOW,
         run_id=RUN_ID,
     )
@@ -497,7 +497,7 @@ def test_clean_audit_night_is_silent(
     _summary, failed = _diff_step(
         job,
         history,
-        client=client,  # type: ignore[arg-type]
+        client=client,
         now=NOW,
         run_id=RUN_ID,
     )
@@ -605,7 +605,7 @@ def test_report_and_extra_record_the_full_dispatch_set(
     _summary, failed = _diff_step(
         job,
         history,
-        client=client,  # type: ignore[arg-type]
+        client=client,
         now=NOW,
         run_id=RUN_ID,
     )
