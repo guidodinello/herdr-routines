@@ -2306,11 +2306,13 @@ def test_dispatch_worker_result_history_record(
     )
     monkeypatch.setattr(
         "herdr_routines.tick.list_open_prs",
-        lambda gh, *, owner, repo, branch_prefix, author: [pr],
+        lambda gh, *, owner, repo, branch_prefix, author, trusted_authors: [pr],
     )
     monkeypatch.setattr(
         "herdr_routines.tick.is_eligible",
-        lambda gh, *, owner, repo, pr: EligiblePR(pr=pr, reason="unresolved_threads"),
+        lambda gh, *, owner, repo, pr, trusted_authors: EligiblePR(
+            pr=pr, reason="unresolved_threads"
+        ),
     )
     monkeypatch.setattr(
         "herdr_routines.tick._dispatch_fix_worker", lambda **kwargs: worker_result

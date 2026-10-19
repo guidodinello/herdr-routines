@@ -32,7 +32,7 @@ from herdr_routines.config import (
     RoutinesConfig,
 )
 from herdr_routines.history import HistoryRecord, HistoryState, append, read_job
-from herdr_routines.tick import run_tick
+from herdr_routines.tick import _WorkerSettled, run_tick
 
 # The effective trusted set these tests run under: the authenticated user the fakes
 # report plus the default reviewer bot (what `effective_trusted_authors` builds).
@@ -1750,9 +1750,15 @@ def test_tick_uses_the_configured_trusted_review_authors(
     )
     dispatched: list[dict[str, Any]] = []
 
-    def _dispatch(**kwargs: Any) -> dict[str, Any]:
+    def _dispatch(**kwargs: Any) -> _WorkerSettled:
         dispatched.append(kwargs)
-        return {"state": "done"}
+        return _WorkerSettled(
+            state="done",
+            pane_id="p1",
+            report_path=None,
+            final_agent_status="idle",
+            session_id=None,
+        )
 
     monkeypatch.setattr("herdr_routines.tick._dispatch_fix_worker", _dispatch)
 
