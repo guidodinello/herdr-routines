@@ -20,6 +20,8 @@ from herdr_routines.history import HistoryRecord, append
 from herdr_routines.pipeline_watchdog import (
     DEADLINE_GRACE_SECONDS,
     HEARTBEAT_STALE_SECONDS,
+    InflightRun,
+    _write_report,
     find_inflight_runs,
     is_stalled,
     pipeline_unit_active,
@@ -814,3 +816,36 @@ def test_pipeline_unit_active_none_on_nonzero_exit(
     _fake_systemctl(monkeypatch, returncode=1)
 
     assert pipeline_unit_active(RUN_ID) is None
+
+
+# -- atomic report write -----------------------------------------------------------------
+
+
+def test_write_report_failure_leaves_no_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A torn report would count as terminal (`_has_terminal_report`) so the run is never
+    rechecked, while tick would fail to parse it. The write must be all-or-nothing."""
+    reports_dir = tmp_path / "reports"
+    run = InflightRun(
+        run_id=RUN_ID,
+        state_path=tmp_path / "state.json",
+        deadline_epoch=0,
+        current_stage=6,
+    )
+
+    def failing_replace(*_a: object, **_k: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("os.replace", failing_replace)
+
+    with pytest.raises(OSError, match="disk full"):
+        _write_report(
+            reports_dir,
+            run,
+            killed_agents={},
+            heartbeat_last_line=None,
+            now=NOW,
+        )
+
+    assert list(reports_dir.iterdir()) == []

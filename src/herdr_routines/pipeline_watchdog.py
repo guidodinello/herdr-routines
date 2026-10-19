@@ -59,6 +59,7 @@ from logger import get_logger
 
 from herdr_routines.herdr import HerdrClient, HerdrCliError
 from herdr_routines.history import read_all
+from herdr_routines.pipeline_prepare import write_terminal_report
 from herdr_routines.pipeline_stages import STAGES, StageSpec
 
 log = get_logger(__name__)
@@ -486,7 +487,6 @@ def _write_report(
     now: datetime,
     host_rebooted: bool = False,
 ) -> Path:
-    reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"pipeline-{run.run_id}.md"
     killed = bool(killed_agents)
     stages_killed = sorted(
@@ -499,16 +499,12 @@ def _write_report(
     # report (docs/pipeline/orchestrator-prompt.md "Final report"). Always "failed" here —
     # a watchdog-authored report is definitionally not a clean completion.
     if host_rebooted:
-        outcome_marker = "## Outcome: failed (watchdog: host rebooted mid-run)"
+        outcome = "failed (watchdog: host rebooted mid-run)"
     elif killed:
-        outcome_marker = "## Outcome: failed (watchdog killed)"
+        outcome = "failed (watchdog killed)"
     else:
-        outcome_marker = "## Outcome: failed (watchdog: no live worker found)"
+        outcome = "failed (watchdog: no live worker found)"
     lines = [
-        f"# Pipeline run {run.run_id} — watchdog report",
-        "",
-        outcome_marker,
-        "",
         f"watchdog_killed: {'true' if killed else 'false'}",
         f"host_rebooted_mid_run: {'true' if host_rebooted else 'false'}",
         f"stage_killed: {stages_killed[0] if stages_killed else 'none'}",
@@ -549,7 +545,15 @@ def _write_report(
             f"Stage-independence gate (design.md G-17): {run.stage_sessions_issue}. "
             "Any PR from this run is single-session work at best — review it as such."
         )
-    report_path.write_text("\n".join(lines) + "\n")
+    # Atomic (tmp + rename), the same writer the orchestrator uses for this file: a torn
+    # report would count as terminal to `_has_terminal_report` yet fail tick's reconcile.
+    write_terminal_report(
+        report_path,
+        run_id=run.run_id,
+        outcome=outcome,
+        lines=lines,
+        title="watchdog report",
+    )
     return report_path
 
 
