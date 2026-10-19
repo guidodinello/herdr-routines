@@ -384,6 +384,168 @@ def test_agent_statuses_maps_names_to_status() -> None:
     assert client.agent_statuses() == {"rt-a": "working", "rt-b": "idle"}
 
 
+def _agents_ok(*agents: dict) -> tuple[int, str, str]:
+    return ok({"result": {"agents": list(agents)}})
+
+
+def test_agent_statuses_drops_off_schema_status_with_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = HerdrClient(
+        runner=FakeRunner(
+            [
+                _agents_ok(
+                    {"name": "rt-a", "agent_status": "working"},
+                    {"name": "rt-b", "agent_status": "exploding"},
+                    {"name": "rt-c", "agent_status": 7},
+                )
+            ]
+        )
+    )
+    with caplog.at_level(logging.WARNING, logger="herdr_routines.herdr"):
+        assert client.agent_statuses() == {"rt-a": "working"}
+    assert "unrecognized agent_status 'exploding'" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"result": []}, {"result": {"agents": {}}}, {"nope": 1}],
+)
+def test_agent_list_bad_shape_raises(body: dict) -> None:
+    client = HerdrClient(runner=FakeRunner([ok(body)]))
+    with pytest.raises(
+        HerdrCliError, match="unexpected herdr agent response shape"
+    ) as excinfo:
+        client.agent_statuses()
+    assert excinfo.value.exit_code == 0
+
+
+def test_agent_panes_by_status_keeps_off_schema_status_as_none() -> None:
+    client = HerdrClient(
+        runner=FakeRunner(
+            [
+                _agents_ok(
+                    {"name": "a", "agent_status": "idle", "pane_id": "p1"},
+                    {"name": "b", "agent_status": "exploding", "pane_id": "p2"},
+                    {"name": "c", "agent_status": 7, "pane_id": "p3"},
+                    {"name": "d", "agent_status": "idle", "pane_id": ""},
+                )
+            ]
+        )
+    )
+    assert client.agent_panes_by_status() == {"a": ("idle", "p1"), "b": (None, "p2")}
+
+
+def test_settled_and_sticky_lookups_treat_off_schema_status_as_unsettled() -> None:
+    entry = {
+        "name": "rt-a",
+        "agent_status": "exploding",
+        "pane_id": "p1",
+        "workspace_id": "w1",
+    }
+    runner = FakeRunner([_agents_ok(entry)] * 3)
+    client = HerdrClient(runner=runner)
+    assert client.settled_agent_workspace("rt-a") is None
+    assert client.settled_agent_pane("rt-a") is None
+    assert client.sticky_agent_pane("rt-a") is None
+
+
+def test_settled_and_sticky_lookups_in_schema() -> None:
+    idle = {
+        "name": "rt-a",
+        "agent_status": "idle",
+        "pane_id": "p1",
+        "workspace_id": "w1",
+    }
+    blocked = {"name": "rt-b", "agent_status": "blocked", "pane_id": "p2"}
+    client = HerdrClient(runner=FakeRunner([_agents_ok(idle, blocked)] * 3))
+    assert client.settled_agent_workspace("rt-a") == "w1"
+    assert client.settled_agent_pane("rt-a") == "p1"
+    assert client.sticky_agent_pane("rt-b") == ("p2", "blocked")
+
+
+def test_workspace_list_drops_wrong_typed_keys() -> None:
+    client = HerdrClient(
+        runner=FakeRunner(
+            [
+                ok(
+                    {
+                        "result": {
+                            "workspaces": [
+                                {
+                                    "workspace_id": "w1",
+                                    "label": 5,
+                                    "worktree": {"checkout_path": "/wt"},
+                                },
+                                {
+                                    "workspace_id": "w2",
+                                    "worktree": {"checkout_path": 1},
+                                },
+                                {"workspace_id": "w3", "worktree": None},
+                            ]
+                        }
+                    }
+                )
+            ]
+        )
+    )
+    assert client.workspace_list() == [
+        {"workspace_id": "w1", "worktree": {"checkout_path": "/wt"}},
+        {"workspace_id": "w2", "worktree": {}},
+        {"workspace_id": "w3"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "body", [{"result": []}, {"result": {"workspaces": "x"}}, {"nope": 1}]
+)
+def test_workspace_list_bad_shape_raises(body: dict) -> None:
+    client = HerdrClient(runner=FakeRunner([ok(body)]))
+    with pytest.raises(
+        HerdrCliError, match="unexpected herdr workspace response shape"
+    ):
+        client.workspace_list()
+
+
+def test_agent_get_off_schema_status_warns_and_returns_none(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = HerdrClient(runner=FakeRunner([ok(agent_response("exploding"))]))
+    with caplog.at_level(logging.WARNING, logger="herdr_routines.herdr"):
+        assert client.agent_get("rt-a") is None
+    assert "unrecognized agent_status 'exploding'" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ({"result": {}}, "unexpected herdr agent response shape"),
+        ({"result": {"agent": {}}}, "unexpected herdr agent response shape"),
+        ({"result": {"agent": {"agent_status": 3}}}, "unexpected agent_status type"),
+    ],
+)
+def test_agent_get_bad_shape_raises(body: dict, message: str) -> None:
+    client = HerdrClient(runner=FakeRunner([ok(body)]))
+    with pytest.raises(HerdrCliError, match=message):
+        client.agent_get("rt-a")
+
+
+@pytest.mark.parametrize(
+    "agent",
+    [
+        {"agent_session": {"value": "ses_1"}},
+        {"agent_session": {"value": ""}},
+        {"agent_session": {"value": 3}},
+        {"agent_session": None},
+        {},
+    ],
+)
+def test_agent_session_id_is_best_effort(agent: dict) -> None:
+    client = HerdrClient(runner=FakeRunner([ok({"result": {"agent": agent}})]))
+    expected = "ses_1" if agent == {"agent_session": {"value": "ses_1"}} else None
+    assert client.agent_session_id("rt-a") == expected
+
+
 def test_agent_interactive_ready_parses_flag_and_argv() -> None:
     body = {"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}
     runner = FakeRunner([ok(body)])
