@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from herdr_routines import tmp_hygiene
 from herdr_routines.config import (
     load_config,
 )
@@ -48,11 +49,13 @@ def _make_fresh_file(tmp_dir: Path, name: str) -> Path:
 
 
 def _make_old_dir(tmp_dir: Path, name: str) -> Path:
-    """Create a directory with mtime well in the past."""
+    """Create a directory whose whole tree has mtime well in the past."""
     d = tmp_dir / name
     d.mkdir()
-    (d / "child.txt").write_text("inside")
+    child = d / "child.txt"
+    child.write_text("inside")
     old_time = time.time() - 7200
+    os.utime(child, (old_time, old_time))
     os.utime(d, (old_time, old_time))
     return d
 
@@ -219,6 +222,91 @@ def test_tmp_hygiene_narrow_patterns(tmp_path: Path) -> None:
     assert safe_dir.exists(), "unrelated dir must not be removed"
     assert nested_leak.exists(), "nested .3cdc must not be removed (top-level only)"
     assert not old_so.exists()
+
+
+# ---------------------------------------------------------------------------
+# Nested mtime and symlink handling (audit: top-level mtime is a weak liveness signal)
+# ---------------------------------------------------------------------------
+
+
+def test_tmp_hygiene_keeps_old_dir_with_fresh_nested_file(tmp_path: Path) -> None:
+    """Nested writes don't bump the top-level mtime, so a live agent writing deep in
+    /tmp/opencode must still count as fresh."""
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    live = _make_old_dir(tmp_dir, "opencode")
+    deep = live / "a" / "b"
+    deep.mkdir(parents=True)
+    old_time = time.time() - 7200
+    os.utime(live / "a", (old_time, old_time))
+    os.utime(deep, (old_time, old_time))
+    (deep / "state.db").write_text("live")  # fresh mtime; ancestors stay old
+    os.utime(live, (old_time, old_time))
+
+    result = reap_tmp(tmp_dir=tmp_dir, max_age_s=3600)
+
+    assert live.exists()
+    assert result.removed == 0
+    assert result.skipped_fresh == 1
+
+
+def test_tmp_hygiene_reaps_fully_old_nested_tree(tmp_path: Path) -> None:
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    old = _make_old_dir(tmp_dir, "opencode-old")
+    nested = old / "a"
+    nested.mkdir()
+    leaf = nested / "x.log"
+    leaf.write_text("stale")
+    old_time = time.time() - 7200
+    for path in (leaf, nested, old):
+        os.utime(path, (old_time, old_time))
+
+    result = reap_tmp(tmp_dir=tmp_dir, max_age_s=3600)
+
+    assert not old.exists()
+    assert result.removed == 1
+
+
+def test_tmp_hygiene_skips_symlinks(tmp_path: Path) -> None:
+    """A matching symlink is never followed or deleted, and never judged by its
+    target's mtime — a dangling link is skipped, not counted as an error."""
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    outside = _make_old_dir(tmp_path, "precious")
+    (tmp_dir / "opencode-link").symlink_to(outside, target_is_directory=True)
+    (tmp_dir / "pytest-of-dangling").symlink_to(tmp_path / "missing")
+
+    result = reap_tmp(tmp_dir=tmp_dir, max_age_s=3600)
+
+    assert (outside / "child.txt").exists()
+    assert (tmp_dir / "opencode-link").is_symlink()
+    assert (tmp_dir / "pytest-of-dangling").is_symlink()
+    assert result.removed == 0
+    assert result.errors == 0
+
+
+def test_tmp_hygiene_keeps_tree_larger_than_walk_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tree we can't fully inspect is kept (and flagged), never reaped on a partial
+    look."""
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    big = _make_old_dir(tmp_dir, "pytest-of-big")
+    old_time = time.time() - 7200
+    for n in range(3):
+        extra = big / f"f{n}"
+        extra.write_text("x")
+        os.utime(extra, (old_time, old_time))
+    os.utime(big, (old_time, old_time))
+    monkeypatch.setattr(tmp_hygiene, "_MAX_WALK_ENTRIES", 2)
+
+    result = reap_tmp(tmp_dir=tmp_dir, max_age_s=3600)
+
+    assert big.exists()
+    assert result.removed == 0
+    assert result.errors == 1
 
 
 # ---------------------------------------------------------------------------
