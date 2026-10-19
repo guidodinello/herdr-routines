@@ -17,8 +17,9 @@ import textwrap
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, assert_never
 
+from herdr_routines.config import GateCheck, GateCheckKind
 from herdr_routines.findings import Finding
 from herdr_routines.history import read_job
 
@@ -906,7 +907,7 @@ def attempt_count_for_target(history_path: Path, job_name: str, target_key: str)
 class CheckResult:
     """Result of a single check execution."""
 
-    kind: str  # "pr_health" | "command"
+    kind: GateCheckKind
     passed: bool
     output: str = ""
     error: str | None = None
@@ -923,21 +924,6 @@ class GateOutcome:
     passed: bool
     results: tuple[CheckResult, ...]
     combined_output: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class GateCheck:
-    """A single check in the gate model."""
-
-    kind: str  # "pr_health" | "command" | "github_event"
-    command: str | None = None
-    timeout_ms: int = 120_000
-    # -- kind: github_event (issue 014) -----------------------------------------
-    # Mirror of config.GateCheck's event fields so run_checks and the event poll see
-    # the same shape whichever GateCheck type a caller holds.
-    query: str | None = None
-    repo: str | None = None
-    match: dict[str, Any] | None = None
 
 
 def _timeout_text(value: bytes | str | None) -> str:
@@ -993,11 +979,21 @@ def run_checks(
     outputs: list[str] = []
 
     for check in checks:
-        if check.kind == "pr_health":
+        kind = check.kind
+        if kind == "pr_health":
             results.append(CheckResult(kind="pr_health", passed=True))
-            continue
-
-        if check.kind == "command" and check.command is not None:
+        elif kind == "command":
+            if check.command is None:
+                # A command check without a command can't run — treat as failed
+                all_passed = False
+                results.append(
+                    CheckResult(
+                        kind=kind,
+                        passed=False,
+                        error="command check has no command",
+                    )
+                )
+                continue
             timeout_s = check.timeout_ms / 1000
             argv = shlex.split(check.command)
             exit_code, stdout, stderr = runner(argv, timeout_s=timeout_s)
@@ -1017,17 +1013,18 @@ def run_checks(
                     exit_code=exit_code,
                 )
             )
-            continue
-
-        # Unknown check kind — treat as failed
-        all_passed = False
-        results.append(
-            CheckResult(
-                kind=check.kind,
-                passed=False,
-                error=f"unknown check kind: {check.kind}",
+        elif kind == "github_event":
+            # Polled by the tick, never run here — treat as failed
+            all_passed = False
+            results.append(
+                CheckResult(
+                    kind=kind,
+                    passed=False,
+                    error="github_event checks are polled by the tick, not run by run_checks",
+                )
             )
-        )
+        else:
+            assert_never(kind)
 
     return GateOutcome(
         passed=all_passed,

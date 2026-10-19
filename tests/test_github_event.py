@@ -35,9 +35,6 @@ import pytest
 import yaml
 
 from herdr_routines.auto_fix import (
-    GateCheck as AutoFixGateCheck,
-)
-from herdr_routines.auto_fix import (
     ReviewSearch,
     build_event_fix_prompt,
     enrich_event_detail,
@@ -679,6 +676,11 @@ def test_github_event_config_validation(
     with pytest.raises(ConfigError):
         _load(_event_job_yaml(match="{bogus_key: 1}"))
 
+    # A match value must be a non-empty string: a number or "" could never match.
+    for bad in ("{label: 123}", "{label: ''}", "{author: [a]}"):
+        with pytest.raises(ConfigError, match="non-empty string"):
+            _load(_event_job_yaml(match=bad))
+
     # An issue has no branch, so `match.branch` with issues:opened can never match.
     with pytest.raises(ConfigError, match="branch"):
         _load(_event_job_yaml(query="issues:opened", match="{branch: main}"))
@@ -822,7 +824,7 @@ def test_issue_event_enrichment_skips_pr_view() -> None:
     """`issues:opened` events carry issue numbers, so enrichment must not hit the
     PR-only `pr_view` (which would fail and quietly drop the title)."""
     gh = EventGhClient(events=True)
-    check = AutoFixGateCheck(kind="github_event", query="issues:opened", match={})
+    check = GateCheck(kind="github_event", query="issues:opened", match={})
     events = poll_github_event(gh, owner="test", repo="repo", check=check)
     assert len(events) == 1
     event = events[0]
@@ -841,7 +843,7 @@ def test_ci_failed_polls_once_without_per_pr_view() -> None:
     """`ci:failed` batches the status rollup into one GraphQL read instead of a
     `pr_list` + per-PR `pr_view` N+1."""
     gh = CiGhClient(ci_state="FAILURE")
-    check = AutoFixGateCheck(kind="github_event", query="ci:failed", match={})
+    check = GateCheck(kind="github_event", query="ci:failed", match={})
     events = poll_github_event(gh, owner="owner", repo="repo", check=check)
     assert [e.event_id for e in events] == [f"evt-ci-{EVENT_NUMBER}"]
     assert events[0].title == EVENT_TITLE
@@ -872,7 +874,7 @@ def test_build_event_fix_prompt_matches_worktree_checkout() -> None:
         EventGhClient(events=True),
         owner="test",
         repo="repo",
-        check=AutoFixGateCheck(kind="github_event", query="prs:labels", match={}),
+        check=GateCheck(kind="github_event", query="prs:labels", match={}),
     )[0]
     prompt = build_event_fix_prompt(
         job_name="on-label-pr",
@@ -889,7 +891,7 @@ def test_build_event_fix_prompt_matches_worktree_checkout() -> None:
         EventGhClient(events=True),
         owner="test",
         repo="repo",
-        check=AutoFixGateCheck(kind="github_event", query="issues:opened", match={}),
+        check=GateCheck(kind="github_event", query="issues:opened", match={}),
     )[0]
     issue_prompt = build_event_fix_prompt(
         job_name="on-label-pr",
