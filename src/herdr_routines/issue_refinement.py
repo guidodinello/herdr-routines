@@ -44,9 +44,7 @@ MAX_ITERATIONS = 3
 
 # Job constants per spec (asserted by tests against the real job file).
 ISSUE_REFINEMENT_CRON = "0 22 * * *"
-ISSUE_REFINEMENT_AGENT_KIND = "opencode"
 ISSUE_REFINEMENT_HEAD_PREFIX = "auto/issue-refinement-"
-PIPELINE_HEAD_PREFIX = "auto/pipeline-"
 
 # ROADMAP Parking Lot header — bullets under this header are candidates.
 PARKING_LOT_HEADER = "## Parking lot"
@@ -297,14 +295,6 @@ def job_is_opencode_only(job_config: Mapping[str, object]) -> bool:
         return False
     model = str(job_config.get("model") or "")
     return "claude" not in model.lower()
-
-
-def head_is_pipeline(head: str) -> bool:
-    return head.startswith(PIPELINE_HEAD_PREFIX)
-
-
-def head_is_issue_refinement(head: str) -> bool:
-    return head.startswith(ISSUE_REFINEMENT_HEAD_PREFIX)
 
 
 def run_refine_issue(

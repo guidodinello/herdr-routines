@@ -210,7 +210,6 @@ _JOB_ALLOWED_KEYS = (
     )
 )
 
-VALID_CHECK_KINDS = frozenset({"pr_health", "command", "github_event"})
 JobTarget = Literal["pr", "base"]
 VALID_TARGETS: frozenset[JobTarget] = frozenset(get_args(JobTarget))
 
