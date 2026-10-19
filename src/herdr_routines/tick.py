@@ -77,6 +77,7 @@ from herdr_routines.herdr import (
 )
 from herdr_routines.history import (
     TERMINAL_STATES,
+    HistoryExtra,
     HistoryRecord,
     HistoryState,
     append,
@@ -236,7 +237,7 @@ def _process_audit_job(
         history_path, job.name, timeout_ms=run_timeout_ms, now=now
     )
     if stale is not None:
-        stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
+        stale_extra = HistoryExtra(reason="stale_running_record")
         reaped = _reap_agents_of_rebooted_run(
             client, job, stale, boot_epoch=system_boot_epoch()
         )
@@ -263,7 +264,7 @@ def _process_audit_job(
                 ts=now,
                 job=job.name,
                 state="skipped",
-                extra={"reason": "agent_name_live"},
+                extra=HistoryExtra(reason="agent_name_live"),
             ),
         )
         return f"{job.name}: skipped (agent already live)", False
@@ -284,10 +285,9 @@ def _process_audit_job(
 
     if result.decision == Decision.MISSED:
         assert result.occurrence is not None
-        extra: dict[str, Any] = {
-            "reason": "outside_catch_up_window",
-            "occurrence": result.occurrence.isoformat(),
-        }
+        extra = HistoryExtra(
+            reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
+        )
         if result.skipped_occurrences:
             extra["skipped_occurrences"] = result.skipped_occurrences
         append(
@@ -313,16 +313,16 @@ def _process_audit_job(
                 ts=now,
                 job=job.name,
                 state="missed",
-                extra={
-                    "reason": "collapsed_earlier_occurrences",
-                    "skipped_occurrences": result.skipped_occurrences,
-                    "skipped_first": result.skipped_first.isoformat()
+                extra=HistoryExtra(
+                    reason="collapsed_earlier_occurrences",
+                    skipped_occurrences=result.skipped_occurrences,
+                    skipped_first=result.skipped_first.isoformat()
                     if result.skipped_first
                     else None,
-                    "skipped_last": result.skipped_last.isoformat()
+                    skipped_last=result.skipped_last.isoformat()
                     if result.skipped_last
                     else None,
-                },
+                ),
             ),
         )
 
@@ -333,10 +333,10 @@ def _process_audit_job(
             job=job.name,
             state="running",
             run_id=run_id,
-            extra={
-                "scheduled_for": result.occurrence.isoformat(),
-                "late_seconds": result.late_seconds,
-            },
+            extra=HistoryExtra(
+                scheduled_for=result.occurrence.isoformat(),
+                late_seconds=result.late_seconds,
+            ),
         ),
     )
 
@@ -466,10 +466,21 @@ def _record_audit_failure(
     run_id: str,
     paths: _AuditPaths,
     reason: str,
-    extra: dict[str, Any] | None = None,
+    extra: HistoryExtra | None = None,
 ) -> tuple[str, bool]:
     if _notify_gate(job, _AUDIT_GATE_NOTIFY_KIND["failed"]):
         _notify(client, f"herdr-routines: {job.name} failed", body=reason)
+    failure_extra = HistoryExtra(
+        gate="failed",
+        target=job.target or "base",
+        reason=reason,
+        manifest_path=str(paths.manifest),
+        ledger_path=str(paths.ledger),
+        report_path=str(paths.report),
+        report_written=False,
+    )
+    if extra:
+        failure_extra.update(extra)
     append(
         history_path,
         HistoryRecord(
@@ -477,16 +488,7 @@ def _record_audit_failure(
             job=job.name,
             state="failed",
             run_id=run_id,
-            extra={
-                "gate": "failed",
-                "target": job.target or "base",
-                "reason": reason,
-                "manifest_path": str(paths.manifest),
-                "ledger_path": str(paths.ledger),
-                "report_path": str(paths.report),
-                "report_written": False,
-                **(extra or {}),
-            },
+            extra=failure_extra,
         ),
     )
     return f"{job.name}: failed ({reason})", True
@@ -626,7 +628,7 @@ def run_audit_now(
             job=job.name,
             state="running",
             run_id=run_id,
-            extra={"trigger": "manual"},
+            extra=HistoryExtra(trigger="manual"),
         ),
     )
     return _audit_cycle(job, history_path, client=client, now=now, run_id=run_id)
@@ -649,7 +651,7 @@ def _run_audit(
     audit, so only 127 (the binary is missing) is a failure."""
     assert job.audit is not None
 
-    def _fail(reason: str, extra: dict[str, Any]) -> tuple[str, bool]:
+    def _fail(reason: str, extra: HistoryExtra) -> tuple[str, bool]:
         return _record_audit_failure(
             job,
             history_path,
@@ -667,18 +669,18 @@ def _run_audit(
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
         )
-        return _fail(reason, {"error": str(e)})
+        return _fail(reason, HistoryExtra(error=str(e)))
 
     try:
         paths.report.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        return _fail("report_dir_creation_failed", {"error": str(e)})
+        return _fail("report_dir_creation_failed", HistoryExtra(error=str(e)))
 
     wt_path = Path(job.repo) / ".worktrees" / f"audit-{run_id}"
     try:
         _add_worktree(job.repo, wt_path, job.base)
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
-        return _fail("worktree_creation_failed", {"error": str(e)})
+        return _fail("worktree_creation_failed", HistoryExtra(error=str(e)))
 
     try:
         if job.audit.command is not None:
@@ -712,7 +714,9 @@ def _run_audit(
             if exit_code == 127:
                 return _fail(
                     "audit_command_failed",
-                    {"exit_code": exit_code, "audit_output_path": str(output_path)},
+                    HistoryExtra(
+                        exit_code=exit_code, audit_output_path=str(output_path)
+                    ),
                 )
             return None
 
@@ -762,13 +766,13 @@ def _run_audit(
         if run.reason is not None:
             return _fail(
                 run.reason,
-                {
-                    "phase": "audit",
-                    "agent_name": agent_name,
-                    "error": run.error,
-                    "pane_id": run.pane_id,
-                    "final_agent_status": run.final_agent_status,
-                },
+                HistoryExtra(
+                    phase="audit",
+                    agent_name=agent_name,
+                    error=run.error,
+                    pane_id=run.pane_id,
+                    final_agent_status=run.final_agent_status,
+                ),
             )
         return None
     finally:
@@ -950,26 +954,26 @@ def _diff_and_fix(
         )
     )
 
-    extra: dict[str, Any] = {
-        "gate": gate,
-        "target": job.target or "base",
-        "check": check,
-        "manifest_path": str(paths.manifest),
-        "ledger_path": str(paths.ledger),
-        "report_path": str(paths.report),
-        "report_written": True,
-        "duplicate_ids": list(manifest.duplicate_ids),
-        "findings_total": len(manifest.findings),
-        "new": len(diff.new),
-        "regressed": len(diff.regressed),
-        "unchanged": len(diff.unchanged),
-        "resolved": len(diff.resolved),
-        "dispatched": len(dispatched_ids),
-        "suppressed": len(suppressed_ids),
-        "adopted": adopted,
-        "dispatched_ids": list(dispatched_ids),
-        "suppressed_ids": list(suppressed_ids[:_AUDIT_SUPPRESSED_ID_CAP]),
-    }
+    extra = HistoryExtra(
+        gate=gate,
+        target=job.target or "base",
+        check=check,
+        manifest_path=str(paths.manifest),
+        ledger_path=str(paths.ledger),
+        report_path=str(paths.report),
+        report_written=True,
+        duplicate_ids=list(manifest.duplicate_ids),
+        findings_total=len(manifest.findings),
+        new=len(diff.new),
+        regressed=len(diff.regressed),
+        unchanged=len(diff.unchanged),
+        resolved=len(diff.resolved),
+        dispatched=len(dispatched_ids),
+        suppressed=len(suppressed_ids),
+        adopted=adopted,
+        dispatched_ids=list(dispatched_ids),
+        suppressed_ids=list(suppressed_ids[:_AUDIT_SUPPRESSED_ID_CAP]),
+    )
 
     if not dispatched_ids:
         if gate == "baseline":
@@ -1079,7 +1083,7 @@ def _process_gated_job(
         history_path, job.name, timeout_ms=job.timeout_ms, now=now
     )
     if stale is not None:
-        stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
+        stale_extra = HistoryExtra(reason="stale_running_record")
         reaped = _reap_agents_of_rebooted_run(
             client, job, stale, boot_epoch=system_boot_epoch()
         )
@@ -1106,7 +1110,7 @@ def _process_gated_job(
                 ts=now,
                 job=job.name,
                 state="skipped",
-                extra={"reason": "agent_name_live"},
+                extra=HistoryExtra(reason="agent_name_live"),
             ),
         )
         return f"{job.name}: skipped (agent already live)", False
@@ -1127,10 +1131,9 @@ def _process_gated_job(
 
     if result.decision == Decision.MISSED:
         assert result.occurrence is not None
-        extra: dict[str, Any] = {
-            "reason": "outside_catch_up_window",
-            "occurrence": result.occurrence.isoformat(),
-        }
+        extra = HistoryExtra(
+            reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
+        )
         if result.skipped_occurrences:
             extra["skipped_occurrences"] = result.skipped_occurrences
         append(
@@ -1157,16 +1160,16 @@ def _process_gated_job(
                 ts=now,
                 job=job.name,
                 state="missed",
-                extra={
-                    "reason": "collapsed_earlier_occurrences",
-                    "skipped_occurrences": result.skipped_occurrences,
-                    "skipped_first": result.skipped_first.isoformat()
+                extra=HistoryExtra(
+                    reason="collapsed_earlier_occurrences",
+                    skipped_occurrences=result.skipped_occurrences,
+                    skipped_first=result.skipped_first.isoformat()
                     if result.skipped_first
                     else None,
-                    "skipped_last": result.skipped_last.isoformat()
+                    skipped_last=result.skipped_last.isoformat()
                     if result.skipped_last
                     else None,
-                },
+                ),
             ),
         )
 
@@ -1178,10 +1181,10 @@ def _process_gated_job(
             job=job.name,
             state="running",
             run_id=run_id,
-            extra={
-                "scheduled_for": result.occurrence.isoformat(),
-                "late_seconds": result.late_seconds,
-            },
+            extra=HistoryExtra(
+                scheduled_for=result.occurrence.isoformat(),
+                late_seconds=result.late_seconds,
+            ),
         ),
     )
 
@@ -1287,12 +1290,9 @@ def _process_event_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": reason,
-                    "error": str(e),
-                    "target": event_target,
-                },
+                extra=HistoryExtra(
+                    gate="failed", reason=reason, error=str(e), target=event_target
+                ),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -1314,12 +1314,12 @@ def _process_event_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": "repo_detection_failed",
-                    "error": str(e),
-                    "target": event_target,
-                },
+                extra=HistoryExtra(
+                    gate="failed",
+                    reason="repo_detection_failed",
+                    error=str(e),
+                    target=event_target,
+                ),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -1343,13 +1343,13 @@ def _process_event_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": "github_event_poll_failed",
-                    "error": str(e),
-                    "target": event_target,
-                    "query": check.query,
-                },
+                extra=HistoryExtra(
+                    gate="failed",
+                    reason="github_event_poll_failed",
+                    error=str(e),
+                    target=event_target,
+                    query=check.query,
+                ),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -1374,13 +1374,13 @@ def _process_event_target(
                 job=job.name,
                 state="done",
                 run_id=run_id,
-                extra={
-                    "gate": "baseline",
-                    "target": event_target,
-                    "query": check.query,
-                    "polled": len(events),
-                    "last_seen_event_ids": [e.event_id for e in events],
-                },
+                extra=HistoryExtra(
+                    gate="baseline",
+                    target=event_target,
+                    query=check.query,
+                    polled=len(events),
+                    last_seen_event_ids=[e.event_id for e in events],
+                ),
             ),
         )
         if _notify_gate(job, "finding" if events else "success"):
@@ -1410,13 +1410,13 @@ def _process_event_target(
                 job=job.name,
                 state="done",
                 run_id=run_id,
-                extra={
-                    "gate": "passed",
-                    "target": event_target,
-                    "query": check.query,
-                    "polled": len(events),
-                    "last_seen_event_ids": _watermark(),
-                },
+                extra=HistoryExtra(
+                    gate="passed",
+                    target=event_target,
+                    query=check.query,
+                    polled=len(events),
+                    last_seen_event_ids=_watermark(),
+                ),
             ),
         )
         if _notify_gate(job, "success"):
@@ -1439,13 +1439,13 @@ def _process_event_target(
                     job=job.name,
                     state="skipped",
                     run_id=run_id,
-                    extra={
-                        "reason": "max_attempts_exceeded",
-                        "event_id": event.event_id,
-                        "event_number": event.number,
-                        "attempt": attempt,
-                        "target": event_target,
-                    },
+                    extra=HistoryExtra(
+                        reason="max_attempts_exceeded",
+                        event_id=event.event_id,
+                        event_number=event.number,
+                        attempt=attempt,
+                        target=event_target,
+                    ),
                 ),
             )
             if _notify_gate(job, "failure"):
@@ -1470,18 +1470,18 @@ def _process_event_target(
             client=client,
         )
 
-        extra_record: dict[str, Any] = {
-            "event_id": event.event_id,
-            "event_number": event.number,
-            "attempt": attempt,
-            "reason": "gate_failed",
-            "fix_worker_agent": agent_name,
-            "pane_id": worker_outcome.get("pane_id"),
-            "report_path": worker_outcome.get("report_path"),
-            "report_written": worker_outcome.get("report_written", False),
-            "final_agent_status": worker_outcome.get("final_agent_status"),
-            "target": event_target,
-        }
+        extra_record = HistoryExtra(
+            event_id=event.event_id,
+            event_number=event.number,
+            attempt=attempt,
+            reason="gate_failed",
+            fix_worker_agent=agent_name,
+            pane_id=worker_outcome.get("pane_id"),
+            report_path=worker_outcome.get("report_path"),
+            report_written=worker_outcome.get("report_written", False),
+            final_agent_status=worker_outcome.get("final_agent_status"),
+            target=event_target,
+        )
         if worker_outcome.get("error") is not None:
             extra_record["error"] = worker_outcome["error"]
 
@@ -1510,17 +1510,17 @@ def _process_event_target(
             job=job.name,
             state=state,
             run_id=run_id,
-            extra={
-                "gate": "failed" if any_failed else "passed",
-                "target": event_target,
-                "query": check.query,
-                "polled": len(events),
-                "new": len(new_events),
-                "dispatched": dispatched_count,
-                "skipped": skipped_count,
-                "skipped_over_cap": skipped_over_cap,
-                "last_seen_event_ids": _watermark(),
-            },
+            extra=HistoryExtra(
+                gate="failed" if any_failed else "passed",
+                target=event_target,
+                query=check.query,
+                polled=len(events),
+                new=len(new_events),
+                dispatched=dispatched_count,
+                skipped=skipped_count,
+                skipped_over_cap=skipped_over_cap,
+                last_seen_event_ids=_watermark(),
+            ),
         ),
     )
 
@@ -1782,7 +1782,7 @@ def _process_pr_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={"reason": reason, "error": str(e)},
+                extra=HistoryExtra(reason=reason, error=str(e)),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -1813,7 +1813,7 @@ def _process_pr_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={"reason": "repo_detection_failed", "error": str(e)},
+                extra=HistoryExtra(reason="repo_detection_failed", error=str(e)),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -1835,7 +1835,7 @@ def _process_pr_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={"reason": "gh_auth_missing", "error": str(e)},
+                extra=HistoryExtra(reason="gh_auth_missing", error=str(e)),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -1873,11 +1873,11 @@ def _process_pr_target(
                     ts=now,
                     job=job.name,
                     state="skipped",
-                    extra={
-                        "reason": "max_attempts_exceeded",
-                        "pr_number": elig_pr.pr.number,
-                        "attempt": attempt,
-                    },
+                    extra=HistoryExtra(
+                        reason="max_attempts_exceeded",
+                        pr_number=elig_pr.pr.number,
+                        attempt=attempt,
+                    ),
                 ),
             )
             # Per-PR mid-loop skip, not the job's own once-per-tick terminal notify (that
@@ -1917,18 +1917,18 @@ def _process_pr_target(
         )
 
         agent_name = build_worker_agent_name(job.name, elig_pr.pr.number, run_id)
-        extra_record: dict[str, Any] = {
-            "pr_number": elig_pr.pr.number,
-            "headRefName": elig_pr.pr.head_ref,
-            "attempt": attempt,
-            "eligible_reason": elig_pr.reason,
-            "fix_worker_agent": agent_name,
-            "pane_id": worker_outcome.get("pane_id"),
-            "report_path": worker_outcome.get("report_path"),
-            "report_written": worker_outcome.get("report_written", False),
-            "final_agent_status": worker_outcome.get("final_agent_status"),
-            "target": "pr",
-        }
+        extra_record = HistoryExtra(
+            pr_number=elig_pr.pr.number,
+            headRefName=elig_pr.pr.head_ref,
+            attempt=attempt,
+            eligible_reason=elig_pr.reason,
+            fix_worker_agent=agent_name,
+            pane_id=worker_outcome.get("pane_id"),
+            report_path=worker_outcome.get("report_path"),
+            report_written=worker_outcome.get("report_written", False),
+            final_agent_status=worker_outcome.get("final_agent_status"),
+            target="pr",
+        )
         if worker_outcome.get("reason") is not None:
             extra_record["reason"] = worker_outcome["reason"]
         if worker_outcome.get("error") is not None:
@@ -1995,14 +1995,14 @@ def _process_pr_target(
             job=job.name,
             state="done" if not any_failed else "failed",
             run_id=run_id,
-            extra={
-                "gate": "passed" if not any_failed else "failed",
-                "target": "pr",
-                "enumerated": len(open_prs),
-                "eligible": len(eligible),
-                "dispatched": dispatched_count,
-                "skipped": skipped_count,
-            },
+            extra=HistoryExtra(
+                gate="passed" if not any_failed else "failed",
+                target="pr",
+                enumerated=len(open_prs),
+                eligible=len(eligible),
+                dispatched=dispatched_count,
+                skipped=skipped_count,
+            ),
         ),
     )
 
@@ -2058,12 +2058,9 @@ def _process_base_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": reason,
-                    "error": str(e),
-                    "target": "base",
-                },
+                extra=HistoryExtra(
+                    gate="failed", reason=reason, error=str(e), target="base"
+                ),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -2110,13 +2107,13 @@ def _process_base_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": "worktree_creation_failed",
-                    "error": str(e),
-                    "target": "base",
-                    "gate_branch": gate_branch,
-                },
+                extra=HistoryExtra(
+                    gate="failed",
+                    reason="worktree_creation_failed",
+                    error=str(e),
+                    target="base",
+                    gate_branch=gate_branch,
+                ),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -2149,12 +2146,12 @@ def _process_base_target(
                 job=job.name,
                 state="done",
                 run_id=run_id,
-                extra={
-                    "gate": "passed",
-                    "target": "base",
-                    "gate_branch": gate_branch,
-                    "gate_output_path": None,
-                },
+                extra=HistoryExtra(
+                    gate="passed",
+                    target="base",
+                    gate_branch=gate_branch,
+                    gate_output_path=None,
+                ),
             ),
         )
         if _notify_gate(job, "success"):
@@ -2171,11 +2168,11 @@ def _process_base_target(
                 job=job.name,
                 state="skipped",
                 run_id=run_id,
-                extra={
-                    "reason": "max_attempts_exceeded",
-                    "gate_branch": gate_branch,
-                    "attempt": attempt,
-                },
+                extra=HistoryExtra(
+                    reason="max_attempts_exceeded",
+                    gate_branch=gate_branch,
+                    attempt=attempt,
+                ),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -2207,13 +2204,13 @@ def _process_base_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": "report_dir_creation_failed",
-                    "error": str(e),
-                    "target": "base",
-                    "gate_branch": gate_branch,
-                },
+                extra=HistoryExtra(
+                    gate="failed",
+                    reason="report_dir_creation_failed",
+                    error=str(e),
+                    target="base",
+                    gate_branch=gate_branch,
+                ),
             ),
         )
         return f"{job.name}: failed (report_dir_creation_failed)", True
@@ -2272,13 +2269,13 @@ def _process_base_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": "worktree_creation_failed",
-                    "error": str(e),
-                    "target": "base",
-                    "gate_branch": gate_branch,
-                },
+                extra=HistoryExtra(
+                    gate="failed",
+                    reason="worktree_creation_failed",
+                    error=str(e),
+                    target="base",
+                    gate_branch=gate_branch,
+                ),
             ),
         )
         return f"{job.name}: failed (worktree_creation_failed)", True
@@ -2307,14 +2304,14 @@ def _process_base_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": "agent_start_failed",
-                    "error": str(e),
-                    "pane_id": pane_id,
-                    "target": "base",
-                    "gate_branch": gate_branch,
-                },
+                extra=HistoryExtra(
+                    gate="failed",
+                    reason="agent_start_failed",
+                    error=str(e),
+                    pane_id=pane_id,
+                    target="base",
+                    gate_branch=gate_branch,
+                ),
             ),
         )
         return f"{job.name}: failed (agent_start_failed)", True
@@ -2335,14 +2332,14 @@ def _process_base_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": "agent_not_interactive",
-                    "error": last_error,
-                    "pane_id": pane_id,
-                    "target": "base",
-                    "gate_branch": gate_branch,
-                },
+                extra=HistoryExtra(
+                    gate="failed",
+                    reason="agent_not_interactive",
+                    error=last_error,
+                    pane_id=pane_id,
+                    target="base",
+                    gate_branch=gate_branch,
+                ),
             ),
         )
         return f"{job.name}: failed (agent_not_interactive)", True
@@ -2372,14 +2369,14 @@ def _process_base_target(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "gate": "failed",
-                    "reason": "agent_prompt_failed",
-                    "error": str(e),
-                    "pane_id": pane_id,
-                    "target": "base",
-                    "gate_branch": gate_branch,
-                },
+                extra=HistoryExtra(
+                    gate="failed",
+                    reason="agent_prompt_failed",
+                    error=str(e),
+                    pane_id=pane_id,
+                    target="base",
+                    gate_branch=gate_branch,
+                ),
             ),
         )
         return f"{job.name}: failed (agent_prompt_failed)", True
@@ -2410,22 +2407,22 @@ def _process_base_target(
             job=job.name,
             state=state,
             run_id=run_id,
-            extra={
-                "gate": "failed",
-                "target": "base",
-                "gate_branch": gate_branch,
-                "reason": "gate_failed",
-                "failed_checks": gate_outcome.combined_output,
-                "gate_output_path": str(gate_output_path)
+            extra=HistoryExtra(
+                gate="failed",
+                target="base",
+                gate_branch=gate_branch,
+                reason="gate_failed",
+                failed_checks=gate_outcome.combined_output,
+                gate_output_path=str(gate_output_path)
                 if gate_output_path.exists()
                 else None,
-                "branch": gate_branch,
-                "pane_id": pane_id,
-                "report_path": str(report_path) if report_written else None,
-                "report_written": report_written,
-                "final_agent_status": settled_status,
-                "session_id": session_id,
-            },
+                branch=gate_branch,
+                pane_id=pane_id,
+                report_path=str(report_path) if report_written else None,
+                report_written=report_written,
+                final_agent_status=settled_status,
+                session_id=session_id,
+            ),
         ),
     )
 
@@ -2720,18 +2717,18 @@ def _dispatch_fix_worker(
     }
 
 
-def _outcome_extra(outcome: RunOutcome) -> dict[str, Any]:
-    extra: dict[str, Any] = {
-        "agent": outcome.agent_name,
-        "pane_id": outcome.pane_id,
-        "branch": outcome.branch,
-        "final_agent_status": outcome.final_agent_status,
-        "report_written": outcome.report_written,
-        "report_bytes": outcome.report_bytes,
-        "report": outcome.report_path,
-        "duration_seconds": outcome.duration_seconds,
-        "session_id": outcome.session_id,
-    }
+def _outcome_extra(outcome: RunOutcome) -> HistoryExtra:
+    extra = HistoryExtra(
+        agent=outcome.agent_name,
+        pane_id=outcome.pane_id,
+        branch=outcome.branch,
+        final_agent_status=outcome.final_agent_status,
+        report_written=outcome.report_written,
+        report_bytes=outcome.report_bytes,
+        report=outcome.report_path,
+        duration_seconds=outcome.duration_seconds,
+        session_id=outcome.session_id,
+    )
     if outcome.reason:
         extra["reason"] = outcome.reason
     if outcome.error:
@@ -2790,7 +2787,7 @@ def _process_job(
         history_path, job.name, timeout_ms=job.timeout_ms, now=now
     )
     if stale is not None:
-        stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
+        stale_extra = HistoryExtra(reason="stale_running_record")
         reaped = _reap_agents_of_rebooted_run(
             client, job, stale, boot_epoch=system_boot_epoch()
         )
@@ -2817,7 +2814,7 @@ def _process_job(
                 ts=now,
                 job=job.name,
                 state="skipped",
-                extra={"reason": "agent_name_live"},
+                extra=HistoryExtra(reason="agent_name_live"),
             ),
         )
         return f"{job.name}: skipped (agent already live)", False
@@ -2838,10 +2835,9 @@ def _process_job(
 
     if result.decision == Decision.MISSED:
         assert result.occurrence is not None
-        extra: dict[str, Any] = {
-            "reason": "outside_catch_up_window",
-            "occurrence": result.occurrence.isoformat(),
-        }
+        extra = HistoryExtra(
+            reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
+        )
         if result.skipped_occurrences:
             extra["skipped_occurrences"] = result.skipped_occurrences
         append(
@@ -2867,16 +2863,16 @@ def _process_job(
                 ts=now,
                 job=job.name,
                 state="missed",
-                extra={
-                    "reason": "collapsed_earlier_occurrences",
-                    "skipped_occurrences": result.skipped_occurrences,
-                    "skipped_first": result.skipped_first.isoformat()
+                extra=HistoryExtra(
+                    reason="collapsed_earlier_occurrences",
+                    skipped_occurrences=result.skipped_occurrences,
+                    skipped_first=result.skipped_first.isoformat()
                     if result.skipped_first
                     else None,
-                    "skipped_last": result.skipped_last.isoformat()
+                    skipped_last=result.skipped_last.isoformat()
                     if result.skipped_last
                     else None,
-                },
+                ),
             ),
         )
 
@@ -2887,10 +2883,10 @@ def _process_job(
             job=job.name,
             state="running",
             run_id=run_id,
-            extra={
-                "scheduled_for": result.occurrence.isoformat(),
-                "late_seconds": result.late_seconds,
-            },
+            extra=HistoryExtra(
+                scheduled_for=result.occurrence.isoformat(),
+                late_seconds=result.late_seconds,
+            ),
         ),
     )
 
@@ -2935,7 +2931,7 @@ def _process_job(
                     job=job.name,
                     state="running",
                     run_id=fallback_run_id,
-                    extra={"reason": "fallback_retry", "primary_run_id": run_id},
+                    extra=HistoryExtra(reason="fallback_retry", primary_run_id=run_id),
                 ),
             )
             run_id = fallback_run_id
@@ -2981,13 +2977,13 @@ def _process_job(
                 job=job.name,
                 state="running",
                 run_id=run_id,
-                extra={
-                    "attempt": attempt,
-                    "max_retries": job.retry_attempts,
-                    "retried_from_run_id": base_run_id
+                extra=HistoryExtra(
+                    attempt=attempt,
+                    max_retries=job.retry_attempts,
+                    retried_from_run_id=base_run_id
                     if attempt == 1
                     else f"{base_run_id}-retry{attempt - 1}",
-                },
+                ),
             ),
         )
         outcome = execute_run(job, client, run_id=run_id)
@@ -3291,10 +3287,7 @@ def _process_pipeline_job(
                         bare_run_id,
                         independence_issue,
                     )
-            extra: dict[str, Any] = {
-                "pipeline_run_id": bare_run_id,
-                "report": str(report_path),
-            }
+            extra = HistoryExtra(pipeline_run_id=bare_run_id, report=str(report_path))
             if reason is not None:
                 extra["reason"] = reason
             append(
@@ -3349,7 +3342,9 @@ def _process_pipeline_job(
                     job=job.name,
                     state="failed",
                     run_id=open_run.run_id,
-                    extra={"reason": "host_rebooted", "pipeline_run_id": bare_run_id},
+                    extra=HistoryExtra(
+                        reason="host_rebooted", pipeline_run_id=bare_run_id
+                    ),
                 ),
             )
             if _notify_gate(job, "failure"):
@@ -3377,7 +3372,7 @@ def _process_pipeline_job(
                 job=job.name,
                 state="failed",
                 run_id=open_run.run_id,
-                extra={"reason": "no_report", "pipeline_run_id": bare_run_id},
+                extra=HistoryExtra(reason="no_report", pipeline_run_id=bare_run_id),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -3396,7 +3391,7 @@ def _process_pipeline_job(
                 ts=now,
                 job=job.name,
                 state="skipped",
-                extra={"reason": "agent_name_live"},
+                extra=HistoryExtra(reason="agent_name_live"),
             ),
         )
         return f"{job.name}: skipped (agent already live)", False
@@ -3423,10 +3418,10 @@ def _process_pipeline_job(
                 ts=now,
                 job=job.name,
                 state="missed",
-                extra={
-                    "reason": "outside_catch_up_window",
-                    "scheduled_for": result.occurrence.isoformat(),
-                },
+                extra=HistoryExtra(
+                    reason="outside_catch_up_window",
+                    scheduled_for=result.occurrence.isoformat(),
+                ),
             ),
         )
         # Unlike a routine job's ~2h default grace, PIPELINE_CATCH_UP_MINUTES is tight
@@ -3469,7 +3464,7 @@ def _launch_pipeline_run(
     now: datetime,
     run_id: str,
     bare_run_id: str,
-    running_extra: dict[str, Any],
+    running_extra: HistoryExtra,
 ) -> tuple[str, bool]:
     """Sync the repo, launch the detached orchestrator unit, and record the outcome.
     `running_extra` goes into the `running` record's `extra` (scheduled_for/
@@ -3489,7 +3484,7 @@ def _launch_pipeline_run(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={"reason": "repo_sync_failed", "error": str(e)},
+                extra=HistoryExtra(reason="repo_sync_failed", error=str(e)),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -3520,11 +3515,9 @@ def _launch_pipeline_run(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra={
-                    "reason": "launch_failed",
-                    "rc": rc,
-                    "error": err.strip()[:2000],
-                },
+                extra=HistoryExtra(
+                    reason="launch_failed", rc=rc, error=err.strip()[:2000]
+                ),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -3543,13 +3536,13 @@ def _launch_pipeline_run(
             job=job.name,
             state="running",
             run_id=run_id,
-            extra={
+            extra=HistoryExtra(
                 **running_extra,
-                "pipeline_run_id": bare_run_id,
-                "report": str(report_path),
-                "unit": unit_name,
-                "deadline_epoch": deadline_epoch,
-            },
+                pipeline_run_id=bare_run_id,
+                report=str(report_path),
+                unit=unit_name,
+                deadline_epoch=deadline_epoch,
+            ),
         ),
     )
     return f"{job.name}: dispatched ({unit_name})", False
@@ -3797,7 +3790,7 @@ def _process_review_job(
         history_path, job.name, timeout_ms=run_timeout_ms, now=now
     )
     if stale is not None:
-        stale_extra: dict[str, Any] = {"reason": "stale_running_record"}
+        stale_extra = HistoryExtra(reason="stale_running_record")
         reaped = _reap_agents_of_rebooted_run(
             client, job, stale, boot_epoch=system_boot_epoch()
         )
@@ -3824,7 +3817,7 @@ def _process_review_job(
                 ts=now,
                 job=job.name,
                 state="skipped",
-                extra={"reason": "agent_name_live"},
+                extra=HistoryExtra(reason="agent_name_live"),
             ),
         )
         return f"{job.name}: skipped (agent already live)", False
@@ -3845,10 +3838,9 @@ def _process_review_job(
 
     if result.decision == Decision.MISSED:
         assert result.occurrence is not None
-        extra: dict[str, Any] = {
-            "reason": "outside_catch_up_window",
-            "occurrence": result.occurrence.isoformat(),
-        }
+        extra = HistoryExtra(
+            reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
+        )
         if result.skipped_occurrences:
             extra["skipped_occurrences"] = result.skipped_occurrences
         append(
@@ -3875,16 +3867,16 @@ def _process_review_job(
                 ts=now,
                 job=job.name,
                 state="missed",
-                extra={
-                    "reason": "collapsed_earlier_occurrences",
-                    "skipped_occurrences": result.skipped_occurrences,
-                    "skipped_first": result.skipped_first.isoformat()
+                extra=HistoryExtra(
+                    reason="collapsed_earlier_occurrences",
+                    skipped_occurrences=result.skipped_occurrences,
+                    skipped_first=result.skipped_first.isoformat()
                     if result.skipped_first
                     else None,
-                    "skipped_last": result.skipped_last.isoformat()
+                    skipped_last=result.skipped_last.isoformat()
                     if result.skipped_last
                     else None,
-                },
+                ),
             ),
         )
 
@@ -3895,10 +3887,10 @@ def _process_review_job(
             job=job.name,
             state="running",
             run_id=run_id,
-            extra={
-                "scheduled_for": result.occurrence.isoformat(),
-                "late_seconds": result.late_seconds,
-            },
+            extra=HistoryExtra(
+                scheduled_for=result.occurrence.isoformat(),
+                late_seconds=result.late_seconds,
+            ),
         ),
     )
 
@@ -3916,17 +3908,17 @@ def _review_terminal_failure(
     error: str | None = None,
 ) -> tuple[str, bool]:
     """Record a whole-cycle failure (auth/search) as this tick's terminal outcome."""
-    extra: dict[str, Any] = {
-        "gate": "failed",
-        "target": "pr",
-        "reason": reason,
-        "enumerated": 0,
-        "candidates": 0,
-        "dispatched": 0,
-        "skipped": 0,
-        "failed": 0,
-        "repos_failed": 0,
-    }
+    extra = HistoryExtra(
+        gate="failed",
+        target="pr",
+        reason=reason,
+        enumerated=0,
+        candidates=0,
+        dispatched=0,
+        skipped=0,
+        failed=0,
+        repos_failed=0,
+    )
     if error is not None:
         extra["error"] = error
     append(
@@ -4090,16 +4082,16 @@ def _review_cycle(
             job=job.name,
             state="failed" if any_failed else "done",
             run_id=run_id,
-            extra={
-                "gate": "failed" if any_failed else "passed",
-                "target": "pr",
-                "enumerated": outcome.enumerated,
-                "candidates": len(outcome.candidates),
-                "dispatched": dispatched_count,
-                "skipped": skipped_count,
-                "failed": failed_count,
-                "repos_failed": repos_failed,
-            },
+            extra=HistoryExtra(
+                gate="failed" if any_failed else "passed",
+                target="pr",
+                enumerated=outcome.enumerated,
+                candidates=len(outcome.candidates),
+                dispatched=dispatched_count,
+                skipped=skipped_count,
+                failed=failed_count,
+                repos_failed=repos_failed,
+            ),
         ),
     )
 
@@ -4159,19 +4151,19 @@ def _review_target_record(
     error: str | None = None,
 ) -> HistoryRecord:
     """One per-target history record, shaped per issue 055's "History and report"."""
-    extra: dict[str, Any] = {
-        "target_key": cand.target_key,
-        "repo": cand.repo,
-        "pr_number": cand.number,
-        "headRefName": cand.head_ref,
-        "select_mode": cand.select_mode,
-        "attempt": attempt,
-        "agent": agent_name,
-        "pane_id": pane_id,
-        "report_path": str(report_path) if report_path is not None else None,
-        "verified": verified,
-        "target": "pr",
-    }
+    extra = HistoryExtra(
+        target_key=cand.target_key,
+        repo=cand.repo,
+        pr_number=cand.number,
+        headRefName=cand.head_ref,
+        select_mode=cand.select_mode,
+        attempt=attempt,
+        agent=agent_name,
+        pane_id=pane_id,
+        report_path=str(report_path) if report_path is not None else None,
+        verified=verified,
+        target="pr",
+    )
     if reason is not None:
         extra["reason"] = reason
     if error is not None:
