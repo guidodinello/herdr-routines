@@ -142,7 +142,7 @@ def parse_spawn_command(text: str) -> SpawnCommand | None:
     return SpawnCommand(target=target, agent_kind=agent_kind, model=model)
 
 
-def is_authorized(chat_id: Any, allowed_chat_id: Any) -> bool:
+def is_authorized(chat_id: int | str, allowed_chat_id: int | str | None) -> bool:
     """Whether ``chat_id`` matches the single configured allowlist value.
 
     Fails closed: ``None`` or an empty/whitespace ``allowed_chat_id`` authorizes nobody,
@@ -174,9 +174,9 @@ def alias_table(spawn: Any) -> dict[str, dict[str, str | None]]:
 
 def handle_spawn_message(
     text: str,
-    chat_id: Any,
+    chat_id: int | str,
     *,
-    allowed_chat_id: Any,
+    allowed_chat_id: int | str | None,
     aliases: Mapping[str, Mapping[str, Any]],
     client: SpawnClient,
     reply: Callable[[str], None],

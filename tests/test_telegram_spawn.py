@@ -767,3 +767,27 @@ def test_spawn_alias_model_is_validated_and_reaches_the_handler(
     cfg_path.write_text(bad + "      model: pro\n")
     with pytest.raises(ConfigError, match="'model' is not supported"):
         load_config(cfg_path)
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "allowed", "expected"),
+    [
+        (12345, 12345, True),
+        (12345, "12345", True),
+        ("12345", 12345, True),
+        ("12345", "12345", True),
+        (" 12345 ", "12345", True),
+        (12345, " 12345 ", True),
+        (999, 12345, False),
+        (12345, None, False),
+        (12345, "", False),
+        (12345, "   ", False),
+        ("", "", False),
+    ],
+)
+def test_is_authorized_compares_int_and_str_ids_and_fails_closed(
+    chat_id: int | str, allowed: int | str | None, expected: bool
+) -> None:
+    from herdr_routines.telegram_spawn import is_authorized
+
+    assert is_authorized(chat_id, allowed) is expected

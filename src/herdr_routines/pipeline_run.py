@@ -48,7 +48,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, TypedDict, Unpack
 
 from logger import get_logger
 
@@ -197,6 +197,16 @@ class RunOutcome:
         return EXIT_OK if self.outcome == "ok" else EXIT_PARTIAL_OR_FAILED
 
 
+class _StateChanges(TypedDict, total=False):
+    """The `_State` fields the loop re-commits after the initial read; the identity
+    fields (run id, worktree, branch, spec, deadline) are fixed for the whole run."""
+
+    current_stage: int
+    pr_number: int | None
+    stage_sessions: dict[str, str]
+    stage_bases: dict[str, str]
+
+
 @dataclass(frozen=True, slots=True)
 class _State:
     """The parsed `state.json`, holding exactly the fields this loop reads.
@@ -310,11 +320,10 @@ class _State:
         )
         return doc
 
-    def commit(self, state_json: Path, **changes: object) -> _State:
+    def commit(self, state_json: Path, **changes: Unpack[_StateChanges]) -> _State:
         """Atomically write the changed state and return it. The write is the resume
         point, so it happens only after a gate has passed or a session id is real."""
-        # `**changes: object` cannot match replace()'s per-field types.
-        updated = replace(self, **changes)  # type: ignore[arg-type]
+        updated = replace(self, **changes)
         write_state_json(state_json, updated.payload())
         return updated
 
