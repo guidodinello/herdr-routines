@@ -22,7 +22,6 @@ from logger import get_logger
 
 from herdr_routines.auto_fix import (
     EligiblePR,
-    GateCheck,
     GithubEvent,
     PRInfo,
     RealGhClient,
@@ -54,7 +53,7 @@ from herdr_routines.auto_fix import (
     review_target_hash,
     run_checks,
 )
-from herdr_routines.config import Job, RoutinesConfig
+from herdr_routines.config import GateCheck, Job, RoutinesConfig
 from herdr_routines.findings import (
     Finding,
     FindingDiff,
@@ -1196,7 +1195,7 @@ def _process_gated_job(
                 client=client,
                 now=now,
                 run_id=run_id,
-                check=check,  # type: ignore[arg-type]
+                check=check,
             )
 
     if job.target == "pr":
@@ -2151,7 +2150,7 @@ def _process_base_target(
             )
         return f"{job.name}: failed (worktree_creation_failed)", True
 
-    gate_outcome = run_checks(job.checks, cwd=str(wt_path))  # type: ignore[arg-type]
+    gate_outcome = run_checks(job.checks, cwd=str(wt_path))
 
     try:
         subprocess.run(
@@ -2220,7 +2219,7 @@ def _process_base_target(
         gate_output=gate_outcome.combined_output,
         base=job.base,
         report_path=str(report_path),
-        checks=job.checks,  # type: ignore[arg-type]
+        checks=job.checks,
     )
     prompt_text = substitute_prompt(
         prompt_text, report_path=report_path, job_name=job.name, run_id=run_id

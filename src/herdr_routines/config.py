@@ -19,7 +19,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -340,11 +340,22 @@ class TelegramSpawn:
         return None
 
 
+GateCheckKind = Literal["pr_health", "command", "github_event"]
+
+
+class GithubEventMatch(TypedDict, total=False):
+    """The validated keys of a `github_event.match` mapping (VALID_GITHUB_EVENT_MATCH_KEYS)."""
+
+    label: str
+    branch: str
+    author: str
+
+
 @dataclass(frozen=True, slots=True)
 class GateCheck:
     """A single check in the unified gate model."""
 
-    kind: str  # "pr_health" | "command" | "github_event"
+    kind: GateCheckKind
     command: str | None = None
     timeout_ms: int = 120_000
     # -- kind: github_event (issue 014) -----------------------------------------
@@ -353,7 +364,7 @@ class GateCheck:
     # against VALID_GITHUB_EVENT_MATCH_KEYS. `timeout_ms` bounds one poll.
     query: str | None = None
     repo: str | None = None
-    match: dict[str, Any] | None = None
+    match: GithubEventMatch | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1075,7 +1086,7 @@ def _build_job(
             checks = None
         else:
             parsed_checks: list[GateCheck] = []
-            check_kinds: set[str] = set()
+            check_kinds: set[GateCheckKind] = set()
             for ci, c in enumerate(checks_raw):
                 if not isinstance(c, dict):
                     raise ConfigError(f"{label}: 'checks[{ci}]' must be a mapping")
@@ -1159,12 +1170,25 @@ def _build_job(
                             f"{label}: 'checks[{ci}].match' has unknown key(s): "
                             f"{sorted(unknown_match)}"
                         )
+                    for match_key, match_value in evt_match.items():
+                        if not isinstance(match_value, str) or not match_value:
+                            raise ConfigError(
+                                f"{label}: 'checks[{ci}].match.{match_key}' "
+                                "must be a non-empty string"
+                            )
                     # An issue has no head branch, so `branch` could never match one.
                     if evt_query == "issues:opened" and "branch" in evt_match:
                         raise ConfigError(
                             f"{label}: 'checks[{ci}].match.branch' does not apply to "
                             "query issues:opened"
                         )
+                    parsed_match = GithubEventMatch()
+                    if "label" in evt_match:
+                        parsed_match["label"] = evt_match["label"]
+                    if "branch" in evt_match:
+                        parsed_match["branch"] = evt_match["branch"]
+                    if "author" in evt_match:
+                        parsed_match["author"] = evt_match["author"]
                     et = evt.get("timeout_ms", 120_000)
                     if not isinstance(et, int) or isinstance(et, bool) or et <= 0:
                         raise ConfigError(
@@ -1175,7 +1199,7 @@ def _build_job(
                             kind="github_event",
                             query=evt_query,
                             repo=evt_repo,
-                            match=evt_match,
+                            match=parsed_match,
                             timeout_ms=et,
                         )
                     )
