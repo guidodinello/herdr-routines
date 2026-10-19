@@ -1647,3 +1647,22 @@ def test_retention_yaml_is_not_a_job_file(tmp_path: Path) -> None:
     if (deploy_dir / "retention.yaml").exists():
         deploy_cfg = load_config_dir(deploy_dir)
         assert deploy_cfg.job("retention") is None
+
+
+@pytest.mark.parametrize("bad_base", ["123", "true", "[main]"])
+def test_non_string_base_rejected_on_gated_base_job(
+    tmp_config_path: Path, bad_base: str
+) -> None:
+    text = f"""
+version: 1
+jobs:
+  - name: repo-hygiene
+    cron: "0 13 * * *"
+    repo: /repo/test
+    base: {bad_base}
+    kind: gated
+    checks:
+      - command: uv run ruff check .
+"""
+    with pytest.raises(ConfigError, match="'base' must be a string"):
+        load_config(write(tmp_config_path, text))
