@@ -57,7 +57,7 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --locked --dev
 
       # The commands live in scripts/ci-check.sh, which the pipeline also runs before
       # it pushes, so CI and the pipeline's own check cannot drift apart.
@@ -78,7 +78,7 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --locked --dev
 
       # Paths, strictness and the `logger` override live in [tool.mypy] in
       # pyproject.toml, so this matches what `uv run mypy` does locally.
@@ -99,7 +99,7 @@ jobs:
           cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --locked --dev
 
       - name: pytest
         run: scripts/ci-check.sh test

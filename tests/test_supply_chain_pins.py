@@ -38,3 +38,26 @@ def test_checkouts_do_not_persist_credentials() -> None:
         text = wf.read_text(encoding="utf-8")
         checkouts = text.count("actions/checkout@")
         assert text.count("persist-credentials: false") == checkouts, wf.name
+
+
+def test_logger_dependency_is_pinned_to_a_commit() -> None:
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(r'"logger @ git\+\S+\.git@[0-9a-f]{40}"', pyproject)
+
+
+def test_ci_installs_from_a_locked_lock() -> None:
+    for wf in WORKFLOWS:
+        for line in wf.read_text(encoding="utf-8").splitlines():
+            if "uv sync" in line and not line.lstrip().startswith("#"):
+                assert "--locked" in line, f"{wf.name}: {line.strip()}"
+
+
+def test_systemd_units_run_uv_locked() -> None:
+    execs = [
+        (unit.name, line)
+        for unit in sorted((REPO_ROOT / "deploy" / "systemd").glob("*.service"))
+        for line in unit.read_text(encoding="utf-8").splitlines()
+        if line.startswith("ExecStart=") and "uv run" in line
+    ]
+    assert execs, "no `uv run` ExecStart found; the guard would pass vacuously"
+    assert [e for e in execs if "uv run --locked " not in e[1]] == []
