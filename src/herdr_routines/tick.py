@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 
 from logger import get_logger
 
@@ -3595,7 +3595,9 @@ def _notify_gate(job: Job, kind: str) -> bool:
         return kind != "progress"
     if job.notify_policy == "on-finding":
         return kind in ("failure", "finding")
-    return kind == "failure"  # "on-failure"
+    if job.notify_policy == "on-failure":
+        return kind == "failure"
+    assert_never(job.notify_policy)
 
 
 # What follows `rt-<job>` in a worker agent name: auto_fix's `build_worker_agent_name`
