@@ -187,7 +187,7 @@ def _spawn_config_text(
 # 1. Intake contract: strict one-token parse, no Herdr call on reject. --------
 
 
-def test_spawn_parses_cold_start_command() -> None:
+def test_spawn_parses_cold_start_command(tmp_path: Path) -> None:
     mod = _spawn_module()
     parse = mod.parse_spawn_command
 
@@ -212,7 +212,7 @@ def test_spawn_parses_cold_start_command() -> None:
 
     # Rejected messages reach no Herdr call.
     client = FakeSpawnClient()
-    repo = _git_repo(Path("/tmp") / "x")
+    repo = _git_repo(tmp_path / "x")
     for bad in ("/run", "/run a -m", "hello world", ""):
         sent: list[str] = []
         mod.handle_spawn_message(
@@ -230,9 +230,9 @@ def test_spawn_parses_cold_start_command() -> None:
 # 2. Auth gate: wrong chat_id drops without Herdr calls or mapping leaks. ------
 
 
-def test_spawn_rejects_unauthorized_chat_id() -> None:
+def test_spawn_rejects_unauthorized_chat_id(tmp_path: Path) -> None:
     mod = _spawn_module()
-    repo = _git_repo(Path("/tmp") / "y")
+    repo = _git_repo(tmp_path / "y")
     aliases = _aliases(repo)
     client = FakeSpawnClient()
 
@@ -257,9 +257,9 @@ def test_spawn_rejects_unauthorized_chat_id() -> None:
 # 3. Fail-closed allowlist: unset/empty refuses; validate errors. ---------------
 
 
-def test_spawn_fails_closed_without_allowlist() -> None:
+def test_spawn_fails_closed_without_allowlist(tmp_path: Path) -> None:
     mod = _spawn_module()
-    repo = _git_repo(Path("/tmp") / "z")
+    repo = _git_repo(tmp_path / "z")
     aliases = _aliases(repo)
 
     for missing in (None, ""):
@@ -302,9 +302,9 @@ def test_spawn_fails_closed_without_allowlist() -> None:
 # 4. Unknown target: helpful reply listing valid aliases. -----------------------
 
 
-def test_spawn_unknown_target_lists_aliases() -> None:
+def test_spawn_unknown_target_lists_aliases(tmp_path: Path) -> None:
     mod = _spawn_module()
-    repo = _git_repo(Path("/tmp") / "w")
+    repo = _git_repo(tmp_path / "w")
     aliases = _aliases(repo)
     client = FakeSpawnClient()
 
@@ -391,7 +391,7 @@ def test_spawn_alias_map_validation(tmp_path: Path) -> None:
 # 6. Untrusted token: validated shape, shell-less argv only. --------------------
 
 
-def test_spawn_target_never_shell_interpolated() -> None:
+def test_spawn_target_never_shell_interpolated(tmp_path: Path) -> None:
     mod = _spawn_module()
     parse = mod.parse_spawn_command
 
@@ -409,7 +409,7 @@ def test_spawn_target_never_shell_interpolated() -> None:
 
     # Even past the parser, a malicious token never reaches Herdr or a shell.
     client = FakeSpawnClient()
-    repo = _git_repo(Path("/tmp") / "v")
+    repo = _git_repo(tmp_path / "v")
     sent: list[str] = []
     mod.handle_spawn_message(
         "/run foo;rm -rf /",
