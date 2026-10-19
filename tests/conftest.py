@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -48,3 +49,17 @@ def _hermetic_tmp_diagnosis(monkeypatch: pytest.MonkeyPatch) -> None:
         "herdr_routines.runner._best_effort_tmp_diagnosis",
         lambda *_args, **_kwargs: dict(NOT_FULL_DIAGNOSIS),
     )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide the host's global and system git config from every test.
+
+    Same reasoning as `_hermetic_tmp_diagnosis`: a developer `~/.gitconfig` with
+    `commit.gpgsign=true` made every fixture commit sign with the real key, and a
+    test that narrows `PATH` to just `git` then failed with "cannot run gpg" — on
+    the laptop only, since CI runners carry no global config.  Tests that need a
+    signing setup configure it on their own repo (see `test_signing.py`).
+    """
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")

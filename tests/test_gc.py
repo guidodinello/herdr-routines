@@ -1224,6 +1224,15 @@ def test_gc_delete_never_removes_nonempty_orphan(
     assert (orphan_dir / "somebody-elses-work.txt").exists()
 
 
+def _is_case_sensitive(directory: Path) -> bool:
+    probe = directory / "case-probe"
+    probe.touch()
+    try:
+        return not (directory / "CASE-PROBE").exists()
+    finally:
+        probe.unlink()
+
+
 def test_gc_preserves_live_worktree_alias(
     repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1231,6 +1240,10 @@ def test_gc_preserves_live_worktree_alias(
     is left completely untouched — not reported, not removed."""
     worktrees_root = tmp_path / "worktrees"
     worktrees_root.mkdir()
+    if not _is_case_sensitive(worktrees_root):
+        pytest.skip(
+            "a case-variant alias cannot coexist with its target here (e.g. APFS)"
+        )
     branch = "auto/pipeline-20260903T050016Z"
     real_dir = worktrees_root / "auto-pipeline-20260903t050016z"
     _git(repo, "worktree", "add", str(real_dir), "-b", branch)
