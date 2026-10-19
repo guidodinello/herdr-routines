@@ -12,7 +12,7 @@ import math
 import re
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -332,9 +332,19 @@ def detect_base(repo: Path) -> str:
 GH_MERGED_PR_LIMIT = 500
 
 
-def fetch_merged_pr_heads(repo: Path) -> dict[str, str | None]:
-    """``headRefName`` -> ``mergedAt`` of every merged PR, via a single batched
-    ``gh pr list`` call.
+@dataclass(frozen=True)
+class MergedPr:
+    """One merged PR as ``gh`` reports it: the commit its head branch ended on and when
+    it merged. ``head_oid`` is None when ``gh`` did not report one, which can vouch for
+    nothing."""
+
+    head_oid: str | None
+    merged_at: str | None
+
+
+def fetch_merged_pr_heads(repo: Path) -> dict[str, list[MergedPr]]:
+    """``headRefName`` -> every merged PR that used that head branch name, via a single
+    batched ``gh pr list`` call.
 
     Ancestry (``git merge-base --is-ancestor``) only proves a merge when the branch's
     own commits land on base — never true for a squash merge, where the PR lands as one
@@ -343,9 +353,14 @@ def fetch_merged_pr_heads(repo: Path) -> dict[str, str | None]:
     than one ``gh pr list --head`` per branch, as ``check_open_pr`` already does for the
     open-PR check) keeps the network cost flat as the branch count grows.
 
+    A branch *name* is not an identity: it can be reused after its PR merged, shared with
+    a fork's PR, or gain commits afterwards. So each PR carries its ``headRefOid`` and
+    every PR of a name is kept; ``merged_pr_for`` decides which, if any, covers the local
+    branch.
+
     ``mergedAt`` rides along on the same call (issue 044) so the age threshold doesn't
     need a second network round-trip per branch — callers needing merge dates just read
-    the value already carried on this dict rather than querying `gh` again.
+    the value already carried on the matched PR rather than querying `gh` again.
 
     Any ``gh`` failure (not installed, not authenticated, no configured remote) warns and
     returns an empty dict rather than raising: callers fall back to the ancestry check
@@ -362,7 +377,7 @@ def fetch_merged_pr_heads(repo: Path) -> dict[str, str | None]:
                 "--limit",
                 str(GH_MERGED_PR_LIMIT),
                 "--json",
-                "headRefName,mergedAt",
+                "headRefName,headRefOid,mergedAt",
             ],
             cwd=repo,
             capture_output=True,
@@ -382,11 +397,19 @@ def fetch_merged_pr_heads(repo: Path) -> dict[str, str | None]:
         return {}
     if not isinstance(data, list):
         return {}
-    return {
-        item["headRefName"]: item.get("mergedAt")
-        for item in data
-        if isinstance(item, dict) and isinstance(item.get("headRefName"), str)
-    }
+    prs: dict[str, list[MergedPr]] = {}
+    for item in data:
+        if not isinstance(item, dict) or not isinstance(item.get("headRefName"), str):
+            continue
+        oid = item.get("headRefOid")
+        merged_at = item.get("mergedAt")
+        prs.setdefault(item["headRefName"], []).append(
+            MergedPr(
+                head_oid=oid if isinstance(oid, str) else None,
+                merged_at=merged_at if isinstance(merged_at, str) else None,
+            )
+        )
+    return prs
 
 
 def _parse_iso_datetime(value: str | None) -> datetime | None:
@@ -457,14 +480,45 @@ def branch_age_days(
     return (now - dt).total_seconds() / 86400
 
 
+def merged_pr_for(
+    branch: str, repo: Path, merged_prs: Mapping[str, list[MergedPr]]
+) -> MergedPr | None:
+    """The merged PR that covers the local ``branch``, or None.
+
+    A PR covers the branch when the local tip is its head commit or an ancestor of it —
+    i.e. nothing on the branch is missing from what merged. Commits added after the
+    merge, a name reused for new work, and a same-named PR from a fork all fail that test.
+    Fails closed: a head commit this clone doesn't have (``merge-base`` exits 128), a
+    missing ``headRefOid`` or an unreadable tip all mean "not covered".
+    """
+    candidates = merged_prs.get(branch)
+    if not candidates:
+        return None
+    tip_proc = run_git(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+    tip = tip_proc.stdout.strip()
+    if tip_proc.returncode != 0 or not tip:
+        return None
+    for pr in candidates:
+        if pr.head_oid is None:
+            continue
+        if pr.head_oid == tip:
+            return pr
+        if (
+            run_git(repo, "merge-base", "--is-ancestor", tip, pr.head_oid).returncode
+            == 0
+        ):
+            return pr
+    return None
+
+
 def is_merged(
-    branch: str, base: str, repo: Path, merged_pr_heads: dict[str, str | None]
+    branch: str, base: str, repo: Path, merged_prs: Mapping[str, list[MergedPr]]
 ) -> bool:
     """True when the branch is merged into base — by ancestry (a fast-forward or
-    non-squash merge) OR because GitHub records its PR as merged (issue 042: the only
-    check that also catches a squash merge, where the branch's commits are never
-    ancestors of base). Unknown-ref ancestry failures warn, not raise."""
-    if branch in merged_pr_heads:
+    non-squash merge) OR because GitHub records a merged PR whose head covers the local
+    tip (issue 042: the only check that also catches a squash merge, where the branch's
+    commits are never ancestors of base). Unknown-ref ancestry failures warn, not raise."""
+    if merged_pr_for(branch, repo, merged_prs) is not None:
         return True
     proc = run_git(repo, "merge-base", "--is-ancestor", branch, base)
     if proc.returncode == 0:
@@ -521,16 +575,17 @@ def collect_rows(
     if names is None:
         return [], True, worktrees, all_worktree_paths
     # One batched gh call for the whole inventory (issue 042), not one per branch.
-    merged_pr_heads = fetch_merged_pr_heads(repo) if names else {}
+    merged_prs = fetch_merged_pr_heads(repo) if names else {}
     rows: list[Row] = []
     for branch in names:
         path = worktrees.get(branch)
+        pr = merged_pr_for(branch, repo, merged_prs)
         rows.append(
             Row(
                 branch=branch,
                 worktree_exists=path is not None and path.exists(),
-                merged_into_base=is_merged(branch, base, repo, merged_pr_heads),
-                age_days=branch_age_days(repo, branch, merged_pr_heads.get(branch)),
+                merged_into_base=is_merged(branch, base, repo, merged_prs),
+                age_days=branch_age_days(repo, branch, pr.merged_at if pr else None),
             )
         )
     return rows, False, worktrees, all_worktree_paths
