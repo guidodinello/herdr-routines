@@ -43,7 +43,7 @@ from herdr_routines.auto_fix import (
 )
 from herdr_routines.config import ConfigError, GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append, read_job
-from herdr_routines.tick import run_tick
+from herdr_routines.tick import _WorkerFailed, _WorkerResult, _WorkerSettled, run_tick
 
 SPEC_PATH = (
     Path(__file__).resolve().parent.parent
@@ -463,6 +463,110 @@ def test_github_event_new_event_dispatches_one_worker(
     event_id = attempts[0].extra.get("event_id") if attempts[0].extra else None
     assert event_id is not None, "attempt record carries no event_id"
     assert str(EVENT_NUMBER) in str(event_id)
+
+
+_EVENT_RECORD_KEYS = [
+    "event_id",
+    "event_number",
+    "attempt",
+    "reason",
+    "fix_worker_agent",
+    "pane_id",
+    "report_path",
+    "report_written",
+    "final_agent_status",
+    "target",
+]
+
+
+@pytest.mark.parametrize(
+    ("worker_result", "state", "extra_values", "trailing_keys"),
+    [
+        pytest.param(
+            _WorkerFailed(reason="agent_start_failed", error="boom", pane_id="p1"),
+            "failed",
+            {
+                "pane_id": "p1",
+                "report_path": None,
+                "report_written": False,
+                "final_agent_status": None,
+                "error": "boom",
+            },
+            ["error"],
+            id="failure-with-pane",
+        ),
+        pytest.param(
+            _WorkerFailed(reason="clone_failed", error="nope"),
+            "failed",
+            {
+                "pane_id": None,
+                "report_path": None,
+                "report_written": False,
+                "final_agent_status": None,
+                "error": "nope",
+            },
+            ["error"],
+            id="failure-without-pane",
+        ),
+        pytest.param(
+            _WorkerSettled(
+                state="done",
+                pane_id="p2",
+                report_path="/reports/r.md",
+                final_agent_status="idle",
+                session_id="sess-9",
+            ),
+            "done",
+            {
+                "pane_id": "p2",
+                "report_path": "/reports/r.md",
+                "report_written": True,
+                "final_agent_status": "idle",
+            },
+            [],
+            id="settled",
+        ),
+    ],
+)
+def test_github_event_worker_result_history_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_result: _WorkerResult,
+    state: str,
+    extra_values: dict[str, Any],
+    trailing_keys: list[str],
+) -> None:
+    """The per-event history record built from a worker result: exact `extra` key order
+    (it is the JSONL column order), the values copied from the worker, and the optional
+    `error` key present only when the worker reported one."""
+    monkeypatch.setattr(
+        "herdr_routines.tick._dispatch_event_worker", lambda **kwargs: worker_result
+    )
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo)
+    t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
+    history_path, _ = _register_then_tick(
+        job,
+        tmp_path,
+        monkeypatch,
+        EventGhClient(events=True),
+        RecordingHerdrClient(),
+        at=t0,
+    )
+
+    [record] = [
+        r
+        for r in read_job(history_path, job.name)
+        if r.extra and "fix_worker_agent" in r.extra
+    ]
+    assert record.state == state
+    assert record.extra is not None
+    assert list(record.extra) == _EVENT_RECORD_KEYS + trailing_keys
+    assert record.extra["reason"] == "gate_failed"
+    assert record.extra["target"] == "pr"
+    assert record.extra["attempt"] == 0
+    for key, value in extra_values.items():
+        assert record.extra[key] == value, key
 
 
 # -- AC 3: re-poll dedups --------------------------------------------------------

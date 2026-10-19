@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, TypeIs, get_args
+from typing import Any, Literal, TypedDict, TypeIs, get_args
 
 from logger import get_logger
 
@@ -51,13 +52,110 @@ def default_history_path() -> Path:
     return Path.home() / ".local" / "state" / "herdr-routines" / "history.jsonl"
 
 
+class HistoryExtra(TypedDict, total=False):
+    """Every key a writer puts in a record's `extra`, merged into the JSONL line after
+    the core fields. Write-side schema only: a record read back from disk carries
+    whatever its file holds (older files have keys no writer emits any more), so readers
+    narrow what they read by key instead of trusting this shape.
+
+    Statuses are plain `str` here so this module stays free of herdr/config imports.
+    """
+
+    # why/where
+    reason: str
+    error: str | None
+    gate: str
+    target: str
+    check: str
+    phase: str
+    trigger: str
+    # schedule guard
+    scheduled_for: str
+    late_seconds: float | None
+    occurrence: str
+    skipped_occurrences: int
+    skipped_first: str | None
+    skipped_last: str | None
+    reaped_agents: list[str]
+    # agent run
+    agent: str | None
+    agent_name: str
+    fix_worker_agent: str
+    pane_id: str | None
+    branch: str | None
+    gate_branch: str
+    final_agent_status: str | None
+    session_id: str | None
+    duration_seconds: float | None
+    nudged: bool
+    resigned_commits: int
+    reaped_stale_agent: bool
+    # reports and artifacts
+    report: str | None
+    report_path: str | None
+    report_written: bool
+    report_bytes: int
+    fix_report_path: str | None
+    fix_report_written: bool
+    manifest_path: str
+    ledger_path: str
+    audit_output_path: str
+    gate_output_path: str | None
+    failed_checks: str
+    exit_code: int
+    rc: int
+    # retries
+    attempt: int
+    max_retries: int
+    final_attempt: bool
+    primary_run_id: str
+    retried_from_run_id: str
+    retry_eligible_reason: str | None
+    # pipeline
+    pipeline_run_id: str
+    unit: str
+    deadline_epoch: int
+    # audit findings
+    findings_total: int
+    new: int
+    regressed: int
+    unchanged: int
+    resolved: int
+    adopted: int
+    suppressed: int
+    duplicate_ids: list[str]
+    dispatched_ids: list[str]
+    suppressed_ids: list[str]
+    # github event / pr / review gates
+    query: str | None
+    polled: int
+    event_id: str
+    event_number: int
+    last_seen_event_ids: list[str]
+    pr_number: int
+    headRefName: str
+    eligible_reason: str
+    enumerated: int
+    eligible: int
+    candidates: int
+    dispatched: int
+    skipped: int
+    skipped_over_cap: int
+    failed: int
+    repos_failed: int
+    target_key: str
+    repo: str
+    select_mode: str
+    verified: bool | None
+
+
 @dataclass(frozen=True, slots=True)
 class HistoryRecord:
     ts: datetime
     job: str
     state: HistoryState
     run_id: str | None = None
-    extra: dict[str, Any] | None = None
+    extra: Mapping[str, object] | None = None
 
     def to_json_line(self) -> str:
         payload: dict[str, Any] = {
@@ -72,15 +170,30 @@ class HistoryRecord:
         return json.dumps(payload, sort_keys=False)
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> HistoryRecord:
-        ts = datetime.fromisoformat(d["ts"])
+    def from_dict(d: Mapping[str, object]) -> HistoryRecord:
+        """Raises KeyError for a missing core field and ValueError for a mistyped one;
+        `_read_file` skips either as a bad line. Keys beyond the core fields are kept
+        as-is in `extra`."""
+        ts = d["ts"]
+        if not isinstance(ts, str):
+            raise ValueError(f"history ts must be a string, got {ts!r}")  # noqa: TRY004 — _read_file skips ValueError lines
+        job = d["job"]
+        if not isinstance(job, str):
+            raise ValueError(f"history job must be a string, got {job!r}")  # noqa: TRY004 — same
         state = d["state"]
         if not is_history_state(state):
             raise ValueError(f"unknown history state {state!r}")
+        run_id = d.get("run_id")
+        if run_id is not None and not isinstance(run_id, str):
+            raise ValueError(f"history run_id must be a string, got {run_id!r}")
         known = {"ts", "job", "state", "run_id"}
         extra = {k: v for k, v in d.items() if k not in known} or None
         return HistoryRecord(
-            ts=ts, job=d["job"], state=state, run_id=d.get("run_id"), extra=extra
+            ts=datetime.fromisoformat(ts),
+            job=job,
+            state=state,
+            run_id=run_id,
+            extra=extra,
         )
 
 

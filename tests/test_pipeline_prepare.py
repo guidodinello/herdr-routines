@@ -525,6 +525,31 @@ def test_pipeline_prepare_fails_loud_on_sync_error(
 # --- AC 4: the deadline is required; the exit codes are distinguishable -----------------
 
 
+def test_pipeline_prepare_reports_os_error_from_repo_sync(
+    tmp_path: Path, no_open_prs: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing git binary or a filesystem error raises OSError out of the sync helper;
+    it is reported as `repo_sync_failed` like any other sync failure, not raised."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+
+    def _boom(checkout: Path, *, base: str = "main") -> None:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(pipeline_prepare, "_fetch_and_fast_forward", _boom)
+    report = tmp_path / "reports" / f"pipeline-{RUN_ID}.md"
+    client = FakeHerdr(tmp_path / "worktrees")
+
+    result = prepare_run(
+        **_prepare_kwargs(tmp_path, parent=parent, base=base, client=client)
+    )
+
+    assert result.outcome == "sync_failed"
+    assert "## Outcome: failed (repo_sync_failed)" in report.read_text()
+    assert client.calls == []
+    assert not (tmp_path / "claims.json").exists()
+
+
 def test_pipeline_prepare_requires_deadline_epoch() -> None:
     """`--deadline-epoch` has no default: a prepare invocation must never be able to invent
     a deadline (the 2026-09-28 incident). argparse's usage error is the loudest possible

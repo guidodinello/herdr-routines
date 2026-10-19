@@ -1795,6 +1795,18 @@ def test_stage_bases_are_write_once(prepared: PipelineFixture) -> None:
     assert prepared.state()["stage_bases"] == {"3": first}
 
 
+def test_commit_rejects_an_unknown_field_and_writes_nothing(
+    prepared: PipelineFixture,
+) -> None:
+    state = pipeline_run._State.read(prepared.state_json)
+    before = prepared.state_json.read_text()
+
+    with pytest.raises(TypeError, match="bogus"):
+        state.commit(prepared.state_json, bogus=1)  # type: ignore[call-arg]
+
+    assert prepared.state_json.read_text() == before
+
+
 def test_tick_files_a_failed_ci_check_under_its_own_reason() -> None:
     assert tick._classify_pipeline_outcome(
         "## Outcome: failed (ci_check_failed)\n"

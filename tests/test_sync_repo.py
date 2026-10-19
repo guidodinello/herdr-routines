@@ -139,6 +139,25 @@ def test_sync_repo_fails_loudly_on_non_fast_forward(tmp_path: Path) -> None:
     assert not (checkout / "REMOTE.md").exists()
 
 
+def test_sync_repo_reports_os_error_instead_of_a_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A missing git binary raises OSError, not RuntimeError; it must take the same
+    log-and-exit-1 path rather than crash the launcher."""
+
+    def _boom(checkout: Path, *, base: str = "main") -> None:
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(cli, "_fetch_and_fast_forward", _boom)
+
+    code = cli.main(["sync-repo", "--path", str(tmp_path), "--base", "main"])
+
+    assert code == 1
+    assert "sync-repo failed" in caplog.text
+
+
 def test_sync_repo_requires_path() -> None:
     with pytest.raises(SystemExit):
         cli.main(["sync-repo", "--base", "main"])
