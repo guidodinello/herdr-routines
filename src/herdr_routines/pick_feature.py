@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -30,10 +31,10 @@ from typing import TextIO
 import yaml
 
 from herdr_routines.claims import (
-    claim_issue,
+    Claim,
     default_claims_path,
     load_claims,
-    save_claims,
+    locked_claims,
 )
 
 FRONTMATTER_DELIM = "---"
@@ -383,7 +384,7 @@ class ReclaimedPick:
 
 
 def reclaim_stale_claims(
-    claims_path: Path,
+    claims: dict[str, Claim],
     *,
     repo: Path,
     worktrees_root: Path | None = None,
@@ -392,7 +393,8 @@ def reclaim_stale_claims(
     lease_hours: float = LEASE_HOURS,
 ) -> list[ReclaimedPick]:
     """Release every claim older than `lease_hours` that has neither an open PR nor an
-    in-flight pipeline run still referencing it (issue 040).
+    in-flight pipeline run still referencing it (issue 040). Mutates `claims` in place:
+    the caller holds `claims.locked_claims`, which persists the releases.
 
     The dying-process-never-runs-cleanup case this exists for means reclamation must
     not depend on any cooperation from the run that claimed the issue — it is a pure
@@ -406,7 +408,6 @@ def reclaim_stale_claims(
     resolved_now = now or datetime.now(UTC)
     resolved_worktrees_root = worktrees_root or _default_pipeline_worktrees_root()
     resolved_reports_dir = reports_dir or _default_pipeline_reports_dir()
-    claims = load_claims(claims_path)
     stale = {
         issue_id: claim
         for issue_id, claim in claims.items()
@@ -424,8 +425,6 @@ def reclaim_stale_claims(
             continue
         del claims[issue_id]
         reclaimed.append(ReclaimedPick(issue_id=issue_id, claimed_at=claim.claimed_at))
-    if reclaimed:
-        save_claims(claims_path, claims)
     return reclaimed
 
 
@@ -467,55 +466,64 @@ def select_and_claim_feature(
         claims_path if claims_path is not None else default_claims_path()
     )
     issues = load_issues(issues_dir)
-    reclaimed: list[ReclaimedPick] = []
-    if mark:
-        reclaimed = reclaim_stale_claims(
-            resolved_claims_path,
-            repo=repo if repo is not None else Path.cwd(),
-            worktrees_root=worktrees_root,
-            reports_dir=reports_dir,
-            now=now,
+    # `mark` makes the whole reclaim -> select -> claim a single locked transaction so two
+    # concurrent pickers cannot choose the same issue or drop each other's claim.
+    with (
+        locked_claims(resolved_claims_path)
+        if mark
+        else nullcontext(load_claims(resolved_claims_path))
+    ) as claims:
+        reclaimed: list[ReclaimedPick] = []
+        if mark:
+            reclaimed = reclaim_stale_claims(
+                claims,
+                repo=repo if repo is not None else Path.cwd(),
+                worktrees_root=worktrees_root,
+                reports_dir=reports_dir,
+                now=now,
+            )
+            for reclaim in reclaimed:
+                if on_reclaim is not None:
+                    on_reclaim(reclaim)
+        claimed_ids = frozenset(claims)
+        # Issue 028 re-scoped: an issue with an open auto/pipeline-* PR is treated as
+        # claimed even when claims.py holds no claim for it. Unconditional, batched,
+        # fail-open (warn and pick anyway on gh failure).
+        pipeline_pr_ids: frozenset[int] | None
+        try:
+            pipeline_pr_ids = pipeline_open_pr_issue_ids(
+                repo if repo is not None else Path.cwd(),
+                worktrees_root=worktrees_root,
+            )
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+        ) as exc:  # defensive: never let a PR lookup brick the pick
+            print(f"warning: pipeline PR lookup failed: {exc}", file=sys.stderr)
+            pipeline_pr_ids = None
+        if pipeline_pr_ids is None:
+            # gh failure already warned inside pipeline_open_pr_issue_ids; for any
+            # other None path (e.g. no repo), ensure at least one warning so the
+            # fail-open is visible. If we already warned, this is harmless noise.
+            # We only warn once: check if stderr already got a warning in this call
+            # is fragile, so just treat None as "unknown — pick anyway" without an
+            # extra warning when the helper already warned. The helper always warns
+            # on None, except when called with a non-existent repo path that still
+            # returns a real gh failure shape. So here: no extra warning.
+            pipeline_pr_ids = frozenset()
+        picked = select_next(issues, claimed_ids, pipeline_pr_ids)
+        if picked is None:
+            return None
+        if mark:
+            claims[picked.id] = Claim(
+                issue_id=picked.id, claimed_at=now or datetime.now(UTC)
+            )
+        return PickResult(
+            issue=picked,
+            feature_idea=render_feature_idea(picked),
+            reclaimed=tuple(reclaimed),
         )
-        for reclaim in reclaimed:
-            if on_reclaim is not None:
-                on_reclaim(reclaim)
-    claimed_ids = frozenset(load_claims(resolved_claims_path))
-    # Issue 028 re-scoped: an issue with an open auto/pipeline-* PR is treated as
-    # claimed even when claims.py holds no claim for it. Unconditional, batched,
-    # fail-open (warn and pick anyway on gh failure).
-    pipeline_pr_ids: frozenset[int] | None
-    try:
-        pipeline_pr_ids = pipeline_open_pr_issue_ids(
-            repo if repo is not None else Path.cwd(),
-            worktrees_root=worktrees_root,
-        )
-    except (
-        OSError,
-        RuntimeError,
-        ValueError,
-    ) as exc:  # defensive: never let a PR lookup brick the pick
-        print(f"warning: pipeline PR lookup failed: {exc}", file=sys.stderr)
-        pipeline_pr_ids = None
-    if pipeline_pr_ids is None:
-        # gh failure already warned inside pipeline_open_pr_issue_ids; for any
-        # other None path (e.g. no repo), ensure at least one warning so the
-        # fail-open is visible. If we already warned, this is harmless noise.
-        # We only warn once: check if stderr already got a warning in this call
-        # is fragile, so just treat None as "unknown — pick anyway" without an
-        # extra warning when the helper already warned. The helper always warns
-        # on None, except when called with a non-existent repo path that still
-        # returns a real gh failure shape. So here: no extra warning.
-        pipeline_pr_ids = frozenset()
-    picked = select_next(issues, claimed_ids, pipeline_pr_ids)
-    if picked is None:
-        return None
-    if mark:
-        claim_issue(resolved_claims_path, picked.id)
-    return PickResult(
-        issue=picked,
-        feature_idea=render_feature_idea(picked),
-        reclaimed=tuple(reclaimed),
-    )
 
 
 def run_pick_feature(

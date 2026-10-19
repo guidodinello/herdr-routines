@@ -26,7 +26,6 @@ from herdr_routines.auto_fix import (
     PRInfo,
     RealGhClient,
     attempt_count_for_event,
-    attempt_count_for_gate_branch,
     attempt_count_for_pr,
     attempt_count_for_target,
     build_audit_agent_name,
@@ -41,6 +40,7 @@ from herdr_routines.auto_fix import (
     build_review_agent_prefix,
     build_review_prompt,
     build_worker_agent_name,
+    consecutive_base_gate_failures,
     enrich_event_detail,
     event_worktree_slug,
     fetch_failing_checks,
@@ -78,6 +78,7 @@ from herdr_routines.herdr import (
 from herdr_routines.history import (
     TERMINAL_STATES,
     HistoryRecord,
+    HistoryState,
     append,
     find_stale_running,
     first_seen_at,
@@ -1558,7 +1559,7 @@ def _process_event_target(
             handled.add(event.event_id)
         dispatched_count += 1
 
-    state = "failed" if any_failed else "done"
+    state: HistoryState = "failed" if any_failed else "done"
     append(
         history_path,
         HistoryRecord(
@@ -2098,30 +2099,7 @@ def _process_base_target(
     assert job.checks is not None
     gate_branch = build_branch_name(job.name, run_id)
 
-    attempt = attempt_count_for_gate_branch(history_path, job.name, gate_branch)
-    if attempt >= job.max_attempts_per_target:
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="skipped",
-                run_id=run_id,
-                extra={
-                    "reason": "max_attempts_exceeded",
-                    "gate_branch": gate_branch,
-                    "attempt": attempt,
-                },
-            ),
-        )
-        if _notify_gate(job, "failure"):
-            _notify(
-                client,
-                f"herdr-routines: {job.name} skipped",
-                body="max_attempts_exceeded",
-                sound="request",
-            )
-        return f"{job.name}: skipped (max_attempts_exceeded)", False
+    attempt = consecutive_base_gate_failures(history_path, job.name)
 
     # Ensure repo checkout before any worktree creation
     try:
@@ -2239,6 +2217,32 @@ def _process_base_target(
         if _notify_gate(job, "success"):
             _notify(client, f"herdr-routines: {job.name} done", sound="done")
         return f"{job.name}: done (gate passed)", False
+
+    # The budget limits fix-agent dispatches, not gate runs: a passing gate above
+    # still records `passed` and resets it, so only a failing gate is skipped here.
+    if attempt >= job.max_attempts_per_target:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                run_id=run_id,
+                extra={
+                    "reason": "max_attempts_exceeded",
+                    "gate_branch": gate_branch,
+                    "attempt": attempt,
+                },
+            ),
+        )
+        if _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} skipped",
+                body="max_attempts_exceeded",
+                sound="request",
+            )
+        return f"{job.name}: skipped (max_attempts_exceeded)", False
 
     gate_output_path = default_reports_dir() / f"{run_id}-gate-output.txt"
     try:
@@ -2453,7 +2457,9 @@ def _process_base_target(
     _close_run_pane(client, job_name=agent_name, pane_id=pane_id)
     _cleanup_worktree(job.repo, fix_wt_path)
 
-    state = "done" if settled_status in SETTLED_AGENT_STATUSES else "failed"
+    state: HistoryState = (
+        "done" if settled_status in SETTLED_AGENT_STATUSES else "failed"
+    )
     append(
         history_path,
         HistoryRecord(
@@ -3178,7 +3184,7 @@ def _pipeline_host_rebooted_mid_run(bare_run_id: str) -> bool:
     return host_rebooted_after_state_write(state_path, boot_epoch=system_boot_epoch())
 
 
-def _classify_pipeline_outcome(report_text: str) -> tuple[str, str | None]:
+def _classify_pipeline_outcome(report_text: str) -> tuple[HistoryState, str | None]:
     """(history_state, reason) from a terminal report's first `## Outcome:` line.
 
     `partial (deadline exceeded)` is tolerated content-wise (the orchestrator is
@@ -4200,7 +4206,7 @@ def _review_target_record(
     cand: Candidate,
     run_id: str,
     now: datetime,
-    state: str,
+    state: HistoryState,
     attempt: int,
     agent_name: str | None,
     pane_id: str | None,

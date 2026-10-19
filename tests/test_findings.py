@@ -352,3 +352,54 @@ def test_ledger_write_is_atomic_and_outside_reports_dir(
     # A torn write must leave the previous ledger intact, with no stray tmp file.
     assert path.read_text() == original
     assert not (path.parent / (path.name + ".tmp")).exists()
+
+
+def _ledger_payload(**entry_over: object) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "kind": "k",
+        "location": "a.php",
+        "severity": "high",
+        "state": "open",
+        "first_seen": "2026-01-01T00:00:00Z",
+        "last_seen": "2026-01-01T00:00:00Z",
+    }
+    entry.update(entry_over)
+    return {"version": 1, "job": "j", "entries": {"f1": entry}}
+
+
+def test_load_ledger_accepts_known_severity_and_state(tmp_path: Path) -> None:
+    loaded = load_ledger(
+        _write_manifest(
+            tmp_path / "l.json", _ledger_payload(severity="low", state="resolved")
+        )
+    )
+    assert loaded is not None
+    assert loaded.entries["f1"].severity == "low"
+    assert loaded.entries["f1"].state == "resolved"
+
+
+@pytest.mark.parametrize("over", [{"severity": "critical"}, {"state": "closed"}])
+def test_load_ledger_rejects_unknown_severity_or_state(
+    tmp_path: Path, over: dict[str, object]
+) -> None:
+    path = _write_manifest(tmp_path / "l.json", _ledger_payload(**over))
+    assert load_ledger(path) is None
+
+
+def test_manifest_rejects_unknown_severity(tmp_path: Path) -> None:
+    path = _write_manifest(
+        tmp_path / "m.json",
+        {
+            "version": 1,
+            "check": "c",
+            "findings": [
+                {
+                    "kind": "k",
+                    "severity": "critical",
+                    "location": "a.php",
+                    "summary": "s",
+                }
+            ],
+        },
+    )
+    assert load_findings_manifest_full(path) is None

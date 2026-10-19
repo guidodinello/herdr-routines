@@ -8,6 +8,7 @@ import pytest
 
 from herdr_routines.auto_fix import attempt_count_for_pr
 from herdr_routines.history import (
+    ALL_STATES,
     HistoryRecord,
     append,
     find_stale_running,
@@ -460,3 +461,25 @@ def test_maybe_rotate_skips_on_collision(
     # sorts ahead of it. The pre-existing roll is left exactly as it was.
     assert [r.job for r in read_all(tmp_history_path)] == ["z", "a"]
     assert squatter.read_text().endswith('"state": "done"}\n')
+
+
+def test_read_all_loads_every_known_state(tmp_history_path: Path) -> None:
+    states = sorted(ALL_STATES)
+    for state in states:
+        append(tmp_history_path, HistoryRecord(ts=T0, job="a", state=state))
+    assert [r.state for r in read_all(tmp_history_path)] == states
+
+
+def test_read_all_skips_unknown_state_line(
+    tmp_history_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    append(tmp_history_path, HistoryRecord(ts=T0, job="a", state="registered"))
+    with tmp_history_path.open("a") as f:
+        f.write('{"ts": "2026-08-22T06:00:00Z", "job": "a", "state": "bogus"}\n')
+    append(tmp_history_path, HistoryRecord(ts=T0, job="a", state="done"))
+
+    with caplog.at_level("WARNING"):
+        records = read_all(tmp_history_path)
+
+    assert [r.state for r in records] == ["registered", "done"]
+    assert f"skipping unparseable history line {tmp_history_path}:2" in caplog.text

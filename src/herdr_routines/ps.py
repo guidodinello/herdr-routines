@@ -129,7 +129,7 @@ class PsRow:
 
 
 def build_ps_rows(
-    agent_statuses: dict[str, str], pipeline_runs: dict[str, PipelineRun]
+    agent_statuses: Mapping[str, str], pipeline_runs: dict[str, PipelineRun]
 ) -> list[PsRow]:
     """One row per live (working) agent, bare names enriched to their pipeline run's
     stage indicator when an in-progress run matches the name (`pl-<N>-<run_id>`).
