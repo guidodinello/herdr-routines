@@ -19,7 +19,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -67,8 +67,10 @@ AGENT_MODEL_FLAGS: dict[str, str] = {
     "codex": "--model",
 }
 
-VALID_WORKSPACE_MODES = frozenset({"worktree", "root"})
-VALID_ON_MISSED = frozenset({"log", "notify"})
+WorkspaceMode = Literal["worktree", "root"]
+VALID_WORKSPACE_MODES: frozenset[WorkspaceMode] = frozenset(get_args(WorkspaceMode))
+OnMissed = Literal["log", "notify"]
+VALID_ON_MISSED: frozenset[OnMissed] = frozenset(get_args(OnMissed))
 
 # Per-job notification policy (issue 009). Governs the terminal-state `_notify()` calls
 # in tick.py — not `on_missed`, which is its own pre-existing opt-in and stays orthogonal
@@ -78,7 +80,8 @@ VALID_ON_MISSED = frozenset({"log", "notify"})
 # what "defaulting to a single terminal-state notification" in the issue's acceptance
 # criteria requires. "always" > "terminal" > "on-finding" > "on-failure" is a strict
 # hierarchy, each a subset of the last.
-VALID_NOTIFY_POLICIES = frozenset({"always", "terminal", "on-finding", "on-failure"})
+NotifyPolicy = Literal["always", "terminal", "on-finding", "on-failure"]
+VALID_NOTIFY_POLICIES: frozenset[NotifyPolicy] = frozenset(get_args(NotifyPolicy))
 
 # Single dispatch key (issue 049). "routine" (default) = plain unconditional execute_run;
 # "gated" = gate checks + fix dispatch (_process_gated_job); "pipeline" = detached
@@ -88,7 +91,8 @@ VALID_NOTIFY_POLICIES = frozenset({"always", "terminal", "on-finding", "on-failu
 # job (issue 055): one batched search, one review per unreviewed open PR, verified by a
 # content marker. Gate mode is no longer an orthogonal axis:
 # (the old `checks is not None` discriminator); kind is the exhaustive SSOT.
-VALID_JOB_KINDS = frozenset({"routine", "gated", "pipeline", "audit", "review"})
+JobKind = Literal["routine", "gated", "pipeline", "audit", "review"]
+VALID_JOB_KINDS: frozenset[JobKind] = frozenset(get_args(JobKind))
 
 # Recognized values for a kind: review job's `select` list (issue 055). "author" is the
 # default-worthy one; "review_requested" is opt-in because it puts the routine in someone
@@ -207,7 +211,8 @@ _JOB_ALLOWED_KEYS = (
 )
 
 VALID_CHECK_KINDS = frozenset({"pr_health", "command", "github_event"})
-VALID_TARGETS = frozenset({"pr", "base"})
+JobTarget = Literal["pr", "base"]
+VALID_TARGETS: frozenset[JobTarget] = frozenset(get_args(JobTarget))
 
 # Closed set of `github_event` query strings (issue 014, spec v2 §1). A poll-based
 # event predicate, not freeform GH search: the accepted shapes are what the poll
@@ -316,7 +321,7 @@ class SpawnAlias:
     alias: str
     repo: Path
     agent_kind: str = "claude"
-    workspace: str = "worktree"
+    workspace: WorkspaceMode = "worktree"
     base: str = "main"
     model: str | None = None
 
@@ -390,7 +395,7 @@ class Job:
     enabled: bool
     cron: str
     repo: Path
-    workspace: str  # "worktree" | "root"
+    workspace: WorkspaceMode
     base: str
     agent_kind: str
     model: str | None
@@ -399,11 +404,11 @@ class Job:
     start_timeout_ms: int
     catch_up_minutes: int
     timezone: str
-    on_missed: str  # "log" | "notify"
+    on_missed: OnMissed
     # Notification policy (issue 009): "always" | "terminal" (default) | "on-finding" |
     # "on-failure". Governs tick.py's terminal-state `_notify()` calls; `on_missed` is
     # unaffected — see tick._notify_gate.
-    notify_policy: str = "terminal"
+    notify_policy: NotifyPolicy = "terminal"
     # Optional git URL for managed clone lifecycle.
     repository: str | None = None
     # Screen markers scanned after a failed prompt wait (docs/failure-reaping.md §3.2).
@@ -416,7 +421,7 @@ class Job:
     # Unified gate model: ordered checks that gate the fix agent (None = plain job).
     checks: tuple[GateCheck, ...] | None = None
     # Inferred from check kinds or explicit override: "pr" | "base".
-    target: str | None = None
+    target: JobTarget | None = None
     # Dispatch cap per tick.
     max_workers_per_tick: int = 3
     # Retry budget keyed per target (per gate branch for base, per PR number for pr).
@@ -426,7 +431,7 @@ class Job:
     # source of truth for how a job is dispatched; it never serializes into history.jsonl
     # (records store job name / state / run_id / outcome extras; status/scheduled join
     # live config + history by job name only — see cli.py:432-434 / cli.py:481).
-    kind: Literal["routine", "gated", "pipeline", "audit", "review"] = "routine"
+    kind: JobKind = "routine"
     # Prompt source file, read by the pipeline launcher script (not by `load_config`).
     # Required for kind: pipeline; a plain routine may also use it as an I/O convenience.
     prompt_file: str | None = None
@@ -895,8 +900,8 @@ def _is_valid_repo_url(value: str) -> bool:
 
 
 def _build_job(
-    raw_job: dict[str, Any],
-    defaults: dict[str, Any],
+    raw_job: Mapping[str, object],
+    defaults: Mapping[str, object],
     *,
     index: int,
     label_prefix: str | None = None,
@@ -911,7 +916,7 @@ def _build_job(
         prefix = label_prefix or f"jobs[{index}]"
         raise ConfigError(f"{prefix}: missing required key(s): {sorted(missing)}")
 
-    merged = {**_JOB_DEFAULTS, **defaults, **raw_job}
+    merged: dict[str, object] = {**_JOB_DEFAULTS, **defaults, **raw_job}
     name = merged["name"]
     if label_prefix:
         label = f"{label_prefix} ({name!r})" if isinstance(name, str) else label_prefix
@@ -925,6 +930,25 @@ def _build_job(
             f"{label}: 'name' must match {NAME_RE.pattern} (max 24 chars, "
             "since the live agent name is 'rt-<name>' and Herdr caps names at 32)"
         )
+
+    def _int_field(
+        key: str, *, positive: bool, source: Mapping[str, object] = merged
+    ) -> int:
+        value = source[key]
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or (value <= 0 if positive else value < 0)
+        ):
+            article = "a positive" if positive else "a non-negative"
+            raise ConfigError(f"{label}: '{key}' must be {article} integer")
+        return value
+
+    def _bool_field(key: str, *, source: Mapping[str, object] = merged) -> bool:
+        value = source[key]
+        if not isinstance(value, bool):
+            raise ConfigError(f"{label}: '{key}' must be a boolean")
+        return value
 
     cron = merged["cron"]
     if not isinstance(cron, str):
@@ -1009,10 +1033,9 @@ def _build_job(
             f"{label}: 'notify_policy' must be one of {sorted(VALID_NOTIFY_POLICIES)}"
         )
 
-    for int_key in ("timeout_ms", "start_timeout_ms", "catch_up_minutes"):
-        value = merged[int_key]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ConfigError(f"{label}: '{int_key}' must be a non-negative integer")
+    timeout_ms = _int_field("timeout_ms", positive=False)
+    start_timeout_ms = _int_field("start_timeout_ms", positive=False)
+    configured_catch_up_minutes = _int_field("catch_up_minutes", positive=False)
 
     enabled = merged["enabled"]
     if not isinstance(enabled, bool):
@@ -1077,7 +1100,7 @@ def _build_job(
 
     checks_raw = merged.get("checks")
     checks: tuple[GateCheck, ...] | None = None
-    inferred_target: str | None = None
+    inferred_target: JobTarget | None = None
 
     if checks_raw is not None:
         if not isinstance(checks_raw, list):
@@ -1214,10 +1237,8 @@ def _build_job(
                 "pr" if check_kinds <= {"pr_health", "github_event"} else "base"
             )
 
-    for int_key in ("max_workers_per_tick", "max_attempts_per_target"):
-        value = merged[int_key]
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ConfigError(f"{label}: '{int_key}' must be a non-negative integer")
+    max_workers_per_tick = _int_field("max_workers_per_tick", positive=False)
+    max_attempts_per_target = _int_field("max_attempts_per_target", positive=False)
 
     # -- kind (issue 049: kind is the exhaustive single dispatch key) ----------------
     #
@@ -1300,23 +1321,28 @@ def _build_job(
             skill=audit_skill, command=audit_command, timeout_ms=audit_timeout
         )
 
-        for int_key in (
-            "max_findings_per_dispatch",
-            "max_attempts_per_target",
-            "ledger_retention_days",
-        ):
-            value = merged[int_key]
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ConfigError(f"{label}: '{int_key}' must be a positive integer")
-
-        if not isinstance(merged["adopt_baseline"], bool):
-            raise ConfigError(f"{label}: 'adopt_baseline' must be a boolean")
+        max_findings_per_dispatch = _int_field(
+            "max_findings_per_dispatch", positive=True
+        )
+        max_attempts_per_target = _int_field("max_attempts_per_target", positive=True)
+        ledger_retention_days = _int_field("ledger_retention_days", positive=True)
+        adopt_baseline = _bool_field("adopt_baseline")
     elif "audit" in raw_job:
         raise ConfigError(f"{label}: 'audit' requires kind: audit")
+    else:
+        # Inert outside kind: audit, so a malformed inherited value is not an error: store
+        # the default.
+        max_findings_per_dispatch = _int_field(
+            "max_findings_per_dispatch", positive=True, source=_JOB_DEFAULTS
+        )
+        ledger_retention_days = _int_field(
+            "ledger_retention_days", positive=True, source=_JOB_DEFAULTS
+        )
+        adopt_baseline = _bool_field("adopt_baseline", source=_JOB_DEFAULTS)
 
     # -- kind: review (issue 055) -------------------------------------------------------
     select: tuple[str, ...] | None = None
-    include_auto_branches = merged["include_auto_branches"]
+    include_auto_branches = False
     if kind == "review":
         select_raw = merged.get("select")
         if not isinstance(select_raw, list) or not select_raw:
@@ -1332,8 +1358,7 @@ def _build_job(
                     f"{label}: 'select[{si}]' must be one of {sorted(VALID_REVIEW_SELECT)}"
                 )
         select = tuple(select_raw)
-        if not isinstance(include_auto_branches, bool):
-            raise ConfigError(f"{label}: 'include_auto_branches' must be a boolean")
+        include_auto_branches = _bool_field("include_auto_branches")
     elif "select" in raw_job or "include_auto_branches" in raw_job:
         raise ConfigError(
             f"{label}: 'select'/'include_auto_branches' require kind: review"
@@ -1341,7 +1366,6 @@ def _build_job(
 
     # A review that landed is never redone, and a review that failed to land is a miss to
     # report, not to retry — so the budget is 1 unless the job explicitly asks otherwise.
-    max_attempts_per_target = merged["max_attempts_per_target"]
     if kind == "review" and "max_attempts_per_target" not in raw_job:
         max_attempts_per_target = 1
 
@@ -1380,7 +1404,7 @@ def _build_job(
                 f"{label}: 'deadline_ms' must be a positive integer for kind: pipeline"
             )
     else:
-        catch_up_minutes = merged["catch_up_minutes"]
+        catch_up_minutes = configured_catch_up_minutes
 
         deadline_ms = merged["deadline_ms"]
         if deadline_ms is not None and (
@@ -1402,7 +1426,7 @@ def _build_job(
 
     # -- target inference (after kind is resolved) ------------------------------------
     target_raw = merged.get("target")
-    target: str | None = None
+    target: JobTarget | None = None
     if target_raw is not None:
         if not isinstance(target_raw, str) or target_raw not in VALID_TARGETS:
             raise ConfigError(f"{label}: 'target' must be 'pr' or 'base' or null")
@@ -1528,8 +1552,8 @@ def _build_job(
         model=model,
         fallback_model=fallback_model,
         prompt=prompt,
-        timeout_ms=merged["timeout_ms"],
-        start_timeout_ms=merged["start_timeout_ms"],
+        timeout_ms=timeout_ms,
+        start_timeout_ms=start_timeout_ms,
         catch_up_minutes=catch_up_minutes,
         timezone=timezone,
         on_missed=on_missed,
@@ -1538,7 +1562,7 @@ def _build_job(
         failure_markers=failure_markers,
         checks=checks,
         target=target,
-        max_workers_per_tick=merged["max_workers_per_tick"],
+        max_workers_per_tick=max_workers_per_tick,
         max_attempts_per_target=max_attempts_per_target,
         kind=kind,
         prompt_file=prompt_file,
@@ -1547,9 +1571,9 @@ def _build_job(
         retry_attempts=retry_attempts,
         retry_on=retry_on,
         audit=audit,
-        max_findings_per_dispatch=merged["max_findings_per_dispatch"],
-        ledger_retention_days=merged["ledger_retention_days"],
-        adopt_baseline=merged["adopt_baseline"],
+        max_findings_per_dispatch=max_findings_per_dispatch,
+        ledger_retention_days=ledger_retention_days,
+        adopt_baseline=adopt_baseline,
         fix_prompt=fix_prompt,
         select=select,
         include_auto_branches=include_auto_branches,

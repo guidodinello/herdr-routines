@@ -9,6 +9,7 @@ import ast
 import inspect
 import textwrap
 from pathlib import Path
+from typing import Literal, get_origin, get_type_hints
 
 import pytest
 
@@ -232,10 +233,11 @@ jobs:
 def test_job_kind_is_literal() -> None:
     """AC 6: Job.kind is typed Literal['routine', 'gated', 'pipeline'].
     Verified via runtime annotation check (mypy gate covers the static side)."""
-    annotations = Job.__annotations__
-    kind_type = annotations["kind"]
-    # After from __future__ import annotations, annotations are strings
-    assert "Literal" in str(kind_type), f"Job.kind is not Literal, got: {kind_type}"
+    # After from __future__ import annotations, annotations are strings; resolve them.
+    kind_type = get_type_hints(Job)["kind"]
+    assert get_origin(kind_type) is Literal, (
+        f"Job.kind is not Literal, got: {kind_type}"
+    )
     assert "routine" in str(kind_type)
     assert "gated" in str(kind_type)
     assert "pipeline" in str(kind_type)

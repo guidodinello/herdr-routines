@@ -176,6 +176,25 @@ def _last_record(history_path: Path, job_name: str) -> Any:
 # -- AC 1 ---------------------------------------------------------------------------
 
 
+def test_audit_only_keys_are_ignored_off_kind(tmp_path: Path) -> None:
+    # Inert outside kind: audit, so a malformed value still loads and stores the default.
+    job = _load_jobs(
+        tmp_path,
+        {
+            "name": "plain",
+            "cron": "0 3 * * *",
+            "repo": str(tmp_path),
+            "adopt_baseline": "yes",
+            "max_findings_per_dispatch": "many",
+            "ledger_retention_days": 0,
+        },
+    ).job("plain")
+    assert job is not None
+    assert job.adopt_baseline is True
+    assert job.max_findings_per_dispatch == 10
+    assert job.ledger_retention_days == 90
+
+
 def test_audit_job_config_validation(tmp_path: Path) -> None:
     job = _load_jobs(tmp_path, _base_audit_job()).job("audit-type-health")
     assert job is not None
