@@ -57,6 +57,8 @@ from herdr_routines.auto_fix import (
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.findings import (
     Finding,
+    FindingDiff,
+    FindingsManifest,
     Ledger,
     apply_diff,
     diff_findings,
@@ -357,8 +359,8 @@ def _render_audit_report(
     run_id: str,
     check: str,
     gate: str,
-    manifest: Any,
-    diff: Any,
+    manifest: FindingsManifest,
+    diff: FindingDiff,
     dispatched_ids: list[str],
     suppressed_ids: list[str],
 ) -> str:

@@ -800,7 +800,7 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 
 
 def _extract_pane_id(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
-    node: Any = body
+    node: object = body
     for key in path:
         if not isinstance(node, dict) or key not in node:
             raise HerdrCliError(
@@ -816,7 +816,7 @@ def _extract_pane_id(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
 
 
 def _extract_str(body: dict[str, Any], *, path: tuple[str, ...]) -> str:
-    node: Any = body
+    node: object = body
     for key in path:
         if not isinstance(node, dict) or key not in node:
             raise HerdrCliError(

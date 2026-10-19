@@ -21,7 +21,7 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -325,7 +325,9 @@ def _issue_id_from_feature_source(feature_source: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _has_terminal_report(reports_dir: Path, run_id: str, raw_state: dict) -> bool:
+def _has_terminal_report(
+    reports_dir: Path, run_id: str, raw_state: Mapping[str, object]
+) -> bool:
     """Same three-candidate-path check as `pipeline_watchdog._has_terminal_report`
     (duplicated, not imported — see gc.py's own `PIPELINE_WORKTREE_GLOB` comment for
     why: a leaf module shouldn't pull in `herdr_routines.herdr` for a few lines of

@@ -14,7 +14,7 @@ import re
 import shlex
 import subprocess
 import textwrap
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -198,9 +198,12 @@ class RealGhClient:
         if exit_code != 0:
             raise RuntimeError(f"gh pr list failed: {stderr.strip()}")
         try:
-            return json.loads(stdout)
+            payload = json.loads(stdout)
         except json.JSONDecodeError:
             return []
+        if not isinstance(payload, list):
+            return []
+        return [p for p in payload if isinstance(p, dict)]
 
     def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
         exit_code, stdout, stderr = self._run(
@@ -222,9 +225,10 @@ class RealGhClient:
         if exit_code != 0:
             raise RuntimeError(f"gh pr view {number} failed: {stderr.strip()}")
         try:
-            return json.loads(stdout)
+            payload = json.loads(stdout)
         except json.JSONDecodeError:
             return {}
+        return payload if isinstance(payload, dict) else {}
 
     def pr_review_comments(
         self, *, owner: str, repo: str, number: int
@@ -382,9 +386,10 @@ class RealGhClient:
         if exit_code != 0:
             raise RuntimeError(f"gh api graphql failed: {stderr.strip()}")
         try:
-            return json.loads(stdout)
+            payload = json.loads(stdout)
         except json.JSONDecodeError:
             return {}
+        return payload if isinstance(payload, dict) else {}
 
     def commit_check_runs(
         self, *, owner: str, repo: str, sha: str
@@ -1247,7 +1252,7 @@ class GithubEvent:
     is_issue: bool = False
 
 
-def _label_names(labels: Any) -> list[str]:
+def _label_names(labels: object) -> list[str]:
     """Flatten the label shapes gh returns to bare names. Handles both the REST
     ``[{"name": ...}, ...]`` list and the GraphQL ``{"nodes": [{"name": ...}]}``
     wrapper, plus a bare list of strings."""
@@ -1264,7 +1269,7 @@ def _label_names(labels: Any) -> list[str]:
     return names
 
 
-def _event_matches(event: dict[str, Any], match: dict[str, Any]) -> bool:
+def _event_matches(event: Mapping[str, object], match: Mapping[str, object]) -> bool:
     """Elevate the config-level `match` mapping to a predicate over one polled event."""
     label = match.get("label")
     if label is not None and (
@@ -1430,7 +1435,7 @@ def _graphql_nodes(data: object, *path: str) -> list[Any]:
     """Walk a nested GraphQL response down ``path`` and return the node list, or an
     empty list when any hop is missing/wrong-shaped. Keeps the poll parsers free of
     the repeated isinstance ladder."""
-    node: Any = data
+    node: object = data
     for key in path:
         if not isinstance(node, dict):
             return []

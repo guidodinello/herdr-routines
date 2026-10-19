@@ -122,7 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     init_logging(log_file=default_log_path())
     parser = _build_parser()
     args = parser.parse_args(argv)
-    return args.handler(args)
+    handler: Callable[[argparse.Namespace], int] = args.handler
+    return handler(args)
 
 
 def _get_version() -> str:
@@ -1089,7 +1090,7 @@ def _cmd_run_audit(job: Job, *, run_id: str, now: datetime) -> int:
     return 1 if failed else 0
 
 
-def _cmd_run_pipeline(job, args: argparse.Namespace, *, now: datetime) -> int:
+def _cmd_run_pipeline(job: Job, args: argparse.Namespace, *, now: datetime) -> int:
     """`--run-id`, for kind: pipeline, is the orchestrator's bare UTC timestamp
     (design.md's same-RUN_ID relaunch path), not the full <job>-<ts> tick uses for its
     own history key. A resumed run gets an `-r<HHMMSS>` unit-name suffix so the

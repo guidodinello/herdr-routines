@@ -16,6 +16,7 @@ state.json degrades to a warning, never a crash.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -101,7 +102,9 @@ def _parse_state_json(state_path: Path) -> PipelineRun | None:
     )
 
 
-def _resolve_report_path(raw: dict, state_path: Path, run_id: str) -> Path:
+def _resolve_report_path(
+    raw: Mapping[str, object], state_path: Path, run_id: str
+) -> Path:
     """Where this run's final `pipeline-<run_id>.md` report lives. The orchestrator
     records the exact path under artifact_paths.report (reports root); fall back to
     the convention (beside state.json, then its parent — i.e. the reports root) when
