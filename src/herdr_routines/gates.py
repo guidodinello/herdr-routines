@@ -27,12 +27,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from herdr_routines.auto_fix import (
-    GateCheck,
     GateOutcome,
     GhClient,
     repo_owner_and_name,
     run_checks,
 )
+from herdr_routines.config import GateCheck
 
 # Bounds the CI-gate poll (issue 034): CI on this repo finishes in well under 2
 # minutes, so 10 minutes is generous headroom without letting a stuck check eat the
