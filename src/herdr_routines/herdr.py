@@ -418,7 +418,8 @@ class HerdrClient:
         never an exception — an unreachable server degrades to today's timeout path. With no
         marker ever confirmed this is behavior-identical to agent_prompt_wait: child exits
         parse through _parse_result (including the exit-124 wrapper timeout at
-        timeout_ms + PROMPT_WAIT_GRACE_S) and the settled status comes back."""
+        timeout_ms + PROMPT_WAIT_GRACE_S) and the settled agent_status comes back (None when herdr reports a value outside its
+        schema)."""
         args = ["agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)]
         proc = self.popen_factory([self.bin_path, *args])
         deadline = time.monotonic() + timeout_ms / 1000 + PROMPT_WAIT_GRACE_S

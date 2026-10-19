@@ -115,7 +115,8 @@ def prompt_with_watchdog(
     and never retried — one delivery, one terminal record — so it propagates immediately as
     PromptWatchdogKilled for the caller's fast-fail classification. Poll reads that fail are
     inert (the callback sees "", which matches nothing). Raises the last error if every
-    attempt fails. `target` is the agent name; `job_name` only labels log lines.
+    attempt fails. Returns the settled agent_status, or None when herdr reports a value
+    outside its schema. `target` is the agent name; `job_name` only labels log lines.
 
     `on_poll_hook` (a no-arg callback) fires inside the same `scan` closure that scans
     for markers, once per poll. `pipeline_run` uses it to write its liveness heartbeat —
