@@ -355,7 +355,6 @@ def _process_audit_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         extra = HistoryExtra(
             reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
         )
@@ -374,7 +373,6 @@ def _process_audit_job(
             )
         return f"{job.name}: missed", False
 
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
 
     if result.skipped_occurrences:
@@ -1232,7 +1230,6 @@ def _process_gated_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         extra = HistoryExtra(
             reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
         )
@@ -1252,7 +1249,6 @@ def _process_gated_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
 
     if result.skipped_occurrences:
@@ -3052,7 +3048,6 @@ def _process_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         extra = HistoryExtra(
             reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
         )
@@ -3072,7 +3067,6 @@ def _process_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
     if result.skipped_occurrences:
         append(
@@ -3629,7 +3623,6 @@ def _process_pipeline_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         append(
             history_path,
             HistoryRecord(
@@ -3657,7 +3650,6 @@ def _process_pipeline_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
     bare_run_id = _bare_pipeline_run_id(job.name, run_id)
     return _launch_pipeline_run(
@@ -4060,7 +4052,6 @@ def _process_review_job(
         return f"{job.name}: not due", False
 
     if result.decision == Decision.MISSED:
-        assert result.occurrence is not None
         extra = HistoryExtra(
             reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
         )
@@ -4080,7 +4071,6 @@ def _process_review_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    assert result.occurrence is not None
     run_id = make_run_id(job.name, result.occurrence)
 
     if result.skipped_occurrences:

@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from herdr_routines.history import HistoryRecord
-from herdr_routines.schedule import Decision, decide
+from herdr_routines.schedule import Decision, Due, NotDue, decide
 
 
 def _decide(**kwargs):
@@ -185,3 +185,36 @@ def test_local_timezone_offset_from_utc_is_respected() -> None:
     )
     assert result.decision == Decision.RUN
     assert result.occurrence == datetime(2026, 8, 22, 6, 0, 0, tzinfo=UTC)
+
+
+def _decide_at(now: datetime, catch_up_minutes: int):
+    return _decide(
+        cron="0 3 * * *",
+        timezone="UTC",
+        catch_up_minutes=catch_up_minutes,
+        now=now,
+        last_terminal=HistoryRecord(
+            ts=datetime(2026, 8, 21, 3, 0, 5, tzinfo=UTC), job="a", state="done"
+        ),
+        job_registered_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+def test_not_due_is_a_not_due_without_an_occurrence() -> None:
+    result = _decide_at(datetime(2026, 8, 22, 2, 0, 0, tzinfo=UTC), 120)
+    assert result == NotDue()
+    assert not hasattr(result, "occurrence")
+
+
+def test_run_and_missed_are_due_results_carrying_occurrence_and_lateness() -> None:
+    run = _decide_at(datetime(2026, 8, 22, 3, 1, 0, tzinfo=UTC), 120)
+    assert isinstance(run, Due)
+    assert run.decision == Decision.RUN
+    assert run.occurrence == datetime(2026, 8, 22, 3, 0, 0, tzinfo=UTC)
+    assert run.late_seconds == 60.0
+
+    missed = _decide_at(datetime(2026, 8, 22, 9, 0, 0, tzinfo=UTC), 120)
+    assert isinstance(missed, Due)
+    assert missed.decision == Decision.MISSED
+    assert missed.occurrence == datetime(2026, 8, 22, 3, 0, 0, tzinfo=UTC)
+    assert missed.late_seconds == 6 * 3600.0
