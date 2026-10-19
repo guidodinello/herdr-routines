@@ -1573,7 +1573,7 @@ _real_fetch_merged_pr_heads = gc.fetch_merged_pr_heads
 
 
 def _fake_gh_merged_prs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prs: list[dict[str, str]]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prs: list[dict[str, str | None]]
 ) -> None:
     """Put a `gh` on PATH that answers every call with `prs` and route gc to the real
     `fetch_merged_pr_heads` (the autouse fixture stubs it), so the JSON parsing and the
