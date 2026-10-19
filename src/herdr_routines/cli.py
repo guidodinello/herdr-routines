@@ -1037,9 +1037,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(" ".join(command))
         return 0
 
-    log.info("%s: starting run %s", job.name, run_id)
-    client = HerdrClient()
-    outcome = execute_run(job, client, run_id=run_id)
+    # A manual run shares the `rt-<job>` agent name and the repo checkout with the
+    # scheduled tick, so it takes the tick lock like `_cmd_run_audit` does.
+    with tick_lock(default_lock_path()) as acquired:
+        if not acquired:
+            log.error("%s: a tick is running; try again when it finishes", job.name)
+            return 1
+        log.info("%s: starting run %s", job.name, run_id)
+        client = HerdrClient()
+        outcome = execute_run(job, client, run_id=run_id)
     if outcome.state == "done":
         log.info("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
     else:
