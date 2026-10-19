@@ -1438,7 +1438,9 @@ def _prompt_with_fallback(
     Shared by a stage's own run and by a CI fix round, so "resume the implementer's
     session" is one mechanism, not two. The pane is left open for the caller: it has to
     read the session id from it, and closes it once its gate has passed."""
-    assert spec.model is not None
+    model = spec.model
+    if model is None:
+        raise ValueError(f"stage {spec.stage}: model=None has no agent to prompt")
     agent_name = _stage_agent_name(spec.stage, run_id)
 
     def attempt(
@@ -1458,7 +1460,7 @@ def _prompt_with_fallback(
         )
 
     pane_id, status = attempt(
-        model=spec.model,
+        model=model,
         session_id=session_id,
         text=text,
         markers=failure_markers,
@@ -1480,7 +1482,7 @@ def _prompt_with_fallback(
         # also what stage 7 resumes, so the implementer's record stays one session.
         _close_pane(client, pane_id)
         note = (
-            f"stage {spec.stage}: {spec.model} failed ({provider_error}); "
+            f"stage {spec.stage}: {model} failed ({provider_error}); "
             f"resumed its session on {spec.fallback_model}"
         )
         log.warning("pipeline %s: %s", run_id, note)
@@ -1526,7 +1528,10 @@ def _run_agent_stage(
     Raises `_Abort` for every failure, having already closed the pane: a pane left open
     by a crashed stage is a live agent the next tick's reconcile has to adopt or reap,
     and the whole point of closing per-stage is that there is nothing to reap."""
-    assert spec.model is not None, "caller must route model=None stages to _open_pr"
+    if spec.model is None:
+        raise ValueError(
+            f"stage {spec.stage}: caller must route model=None stages to _open_pr"
+        )
     agent_name = _stage_agent_name(spec.stage, run_id)
 
     resume_session = (

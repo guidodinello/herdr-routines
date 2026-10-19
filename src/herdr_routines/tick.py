@@ -3476,7 +3476,8 @@ def _process_pipeline_job(
         if _pipeline_run_is_live(client, job, history_path, now=now):
             return f"{job.name}: skipped (already running)", False
 
-        assert open_run.run_id is not None
+        if open_run.run_id is None:
+            raise RuntimeError(f"{job.name}: open pipeline run record has no run_id")
         bare_run_id = _bare_pipeline_run_id(job.name, open_run.run_id)
         report_path = pipeline_report_path(bare_run_id)
         report_text = ""

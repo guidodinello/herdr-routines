@@ -32,6 +32,7 @@ from herdr_routines.tick import (
     _classify_pipeline_outcome,
     _is_job_agent,
     _live_agent_exists,
+    _process_pipeline_job,
     _reap_agents_of_rebooted_run,
     _WorkerFailed,
     _WorkerResult,
@@ -3184,6 +3185,30 @@ def test_run_tick_pipeline_job_raising_leaves_running_record_open(
     assert outcome.summaries[-1] == "b: done"
     assert outcome.any_job_failed is True
     assert [r.state for r in read_job(history_path, "p")] == ["running"]
+
+
+def test_pipeline_open_run_without_run_id_raises_a_clear_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hand-edited or corrupt `running` line with no run_id cannot be reconciled; it
+    must fail with a message (run_tick's catch-all records it), not an AssertionError that
+    `python -O` would skip."""
+    history_path = tmp_path / "state" / "history.jsonl"
+    job = make_pipeline_job(tmp_path)
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    append(history_path, HistoryRecord(ts=t0, job=job.name, state="registered"))
+    append(history_path, HistoryRecord(ts=t0, job=job.name, state="running"))
+    monkeypatch.setattr(
+        "herdr_routines.tick._pipeline_run_is_live", lambda *a, **kw: False
+    )
+
+    with pytest.raises(RuntimeError, match="open pipeline run record has no run_id"):
+        _process_pipeline_job(
+            job,
+            history_path,
+            client=FakeStatusClient(),  # type: ignore[arg-type]
+            now=t0 + timedelta(minutes=1),
+        )
 
 
 # -- base-target gate budget (limits fix-agent dispatches, not gate runs) ---------------
