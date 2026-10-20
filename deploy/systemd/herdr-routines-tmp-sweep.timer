@@ -1,0 +1,10 @@
+[Unit]
+Description=Sweep leaked opencode native libraries out of /tmp hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

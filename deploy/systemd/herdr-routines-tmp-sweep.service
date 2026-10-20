@@ -1,0 +1,14 @@
+[Unit]
+Description=Sweep leaked opencode native libraries out of /tmp
+
+[Service]
+Type=oneshot
+# opencode is a Bun-compiled binary: every launch extracts its native library to
+# /tmp/.<16 hex>-<8 hex>.so, and an agent that is killed rather than exiting cleanly
+# leaves the file behind (~14 MiB each). On a host where /tmp is a RAM-backed tmpfs the
+# stock systemd-tmpfiles 10-day window lets these fill it — on 2026-10-20 the Pi's 2 GiB
+# /tmp hit 100% and failed that morning's jobs. Deleting a library a live process still
+# has mapped is safe on Linux (the inode lives until unmapped); the 2-hour age floor is
+# belt and braces. Only files owned by this user and matching the exact name shape go.
+ExecStart=/usr/bin/find /tmp -maxdepth 1 -type f -user %u -regextype posix-extended -regex "/tmp/[.][0-9a-f]{16}-[0-9a-f]{8}[.]so" -mmin +120 -delete
+TimeoutStartSec=60
