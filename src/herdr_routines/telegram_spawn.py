@@ -26,13 +26,14 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
 from logger import get_logger
 
 from herdr_routines.config import (
     AGENT_MODEL_FLAGS,
     VALID_AGENT_KINDS,
+    TelegramSpawn,
     is_private_chat_id,
 )
 from herdr_routines.herdr import HerdrCliError, WorktreeInfo
@@ -163,7 +164,7 @@ def is_authorized(chat_id: int | str, allowed_chat_id: int | str | None) -> bool
     return str(chat_id).strip() == allowed
 
 
-def alias_table(spawn: Any) -> dict[str, dict[str, str | None]]:
+def alias_table(spawn: TelegramSpawn) -> dict[str, dict[str, str | None]]:
     """Turn a ``config.TelegramSpawn`` into the plain ``alias -> record`` mapping
     ``handle_spawn_message`` consumes. Kept here so the bridge glue has one canonical
     adapter and the handler stays free of any config import."""
@@ -184,7 +185,7 @@ def handle_spawn_message(
     chat_id: int | str,
     *,
     allowed_chat_id: int | str | None,
-    aliases: Mapping[str, Mapping[str, Any]],
+    aliases: Mapping[str, Mapping[str, str | None]],
     client: SpawnClient,
     reply: Callable[[str], None],
 ) -> str:
