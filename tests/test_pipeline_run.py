@@ -911,7 +911,7 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_quota_marker
     assert outcome.outcome == "ok", outcome
     stage2 = [c for c in client.started if c["name"] == f"pl-2-{RUN_ID}".lower()]
     assert [(c["model"], c["session_id"]) for c in stage2] == [
-        ("opencode/muse-spark-1.3-contributor-free", None),
+        ("opencode/glm-5.3-flash-free", None),
         (AUTHOR_FALLBACK_MODEL, SESSION_IDS[2]),
     ]
     # The wedged pane is closed before its session is resumed in a new one.
@@ -1272,9 +1272,9 @@ def test_stages_table_matches_the_prompt_files_on_disk() -> None:
 def test_stages_declare_the_documented_models_and_timeouts() -> None:
     by_stage = {s.stage: s for s in STAGES}
 
-    assert by_stage[1].model == "opencode/muse-spark-1.3-contributor-free"
-    assert by_stage[2].model == "opencode/muse-spark-1.3-contributor-free"
-    assert by_stage[3].model == "opencode/muse-spark-1.3-contributor-free"
+    assert by_stage[1].model == "opencode/glm-5.3-flash-free"
+    assert by_stage[2].model == "opencode/glm-5.3-flash-free"
+    assert by_stage[3].model == "opencode/glm-5.3-flash-free"
     assert by_stage[3].fallback_model == REVIEWER_FALLBACK_MODEL
     assert by_stage[4].model == "opencode/big-pickle"
     assert by_stage[5].model is None

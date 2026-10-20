@@ -49,7 +49,7 @@ REVIEWER_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 # families instead of strings. `big-pickle` is Zen's own router: its upstream changes
 # night to night, so it is treated as a family of its own, which is all the repo can say.
 MODEL_FAMILY: dict[str, str] = {
-    "opencode/muse-spark-1.3-contributor-free": "meta",
+    "opencode/glm-5.3-flash-free": "zhipu",
     "opencode/big-pickle": "zen-router",
     AUTHOR_FALLBACK_MODEL: "moonshot",
     "opencode/nemotron-3-ultra-free": "nvidia",
@@ -89,7 +89,7 @@ ADDRESS_COMMENTS_STAGE = 7
 STAGES: tuple[StageSpec, ...] = (
     StageSpec(
         stage=1,
-        model="opencode/muse-spark-1.3-contributor-free",
+        model="opencode/glm-5.3-flash-free",
         prompt_file="stage-1.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -98,7 +98,7 @@ STAGES: tuple[StageSpec, ...] = (
     ),
     StageSpec(
         stage=2,
-        model="opencode/muse-spark-1.3-contributor-free",
+        model="opencode/glm-5.3-flash-free",
         prompt_file="stage-2.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -110,7 +110,7 @@ STAGES: tuple[StageSpec, ...] = (
         # The test author: writes the acceptance tests and nothing else. A different
         # family from stage 4's implementer, primary and fallback, so the tests are not
         # written by the model they are meant to check.
-        model="opencode/muse-spark-1.3-contributor-free",
+        model="opencode/glm-5.3-flash-free",
         prompt_file="stage-3.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
