@@ -1811,13 +1811,13 @@ def test_run_checks_runner_param_is_callable_contract(tmp_path: Path) -> None:
         alias.name
         for node in tree.body
         if isinstance(node, ast.ImportFrom) and node.module == "collections.abc"
-        for alias in node.aliases
+        for alias in node.names
     ]
     typing_names = [
         alias.name
         for node in tree.body
         if isinstance(node, ast.ImportFrom) and node.module == "typing"
-        for alias in node.aliases
+        for alias in node.names
     ]
     assert "Callable" in abc_names
     assert "Callable" not in typing_names
@@ -1871,24 +1871,31 @@ def test_github_event_payload_is_mapping_str_object() -> None:
     src = inspect.getsource(GithubEvent)
     assert "payload: Mapping[str, object]" in src
 
-    payload = {"action": "opened", "labels": [{"name": "bug"}]}
-    event_kwargs = {
-        "event_id": "event-1",
-        "number": 7,
-        "title": "Bug report",
-        "head_ref": "auto/fix",
-        "label": "bug",
-    }
+    payload: dict[str, object] = {"action": "opened", "labels": [{"name": "bug"}]}
     dict_prompt = build_event_fix_prompt(
         "pr-health",
-        GithubEvent(payload=payload, **event_kwargs),
+        GithubEvent(
+            payload=payload,
+            event_id="event-1",
+            number=7,
+            title="Bug report",
+            head_ref="auto/fix",
+            label="bug",
+        ),
         "owner/repo",
         "report.md",
         "main",
     )
     view_prompt = build_event_fix_prompt(
         "pr-health",
-        GithubEvent(payload=MappingProxyType(payload), **event_kwargs),
+        GithubEvent(
+            payload=MappingProxyType(payload),
+            event_id="event-1",
+            number=7,
+            title="Bug report",
+            head_ref="auto/fix",
+            label="bug",
+        ),
         "owner/repo",
         "report.md",
         "main",

@@ -896,7 +896,7 @@ def test_alias_table_spawn_param_is_telegram_spawn() -> None:
         alias.name
         for node in tree.body
         if isinstance(node, ast.ImportFrom) and node.module == "herdr_routines.config"
-        for alias in node.aliases
+        for alias in node.names
     ]
     assert "TelegramSpawn" in config_imports
 
@@ -952,7 +952,7 @@ def test_typed_boundaries_have_no_any() -> None:
         alias.name
         for node in tree.body
         if isinstance(node, ast.ImportFrom) and node.module == "typing"
-        for alias in node.aliases
+        for alias in node.names
     ]
     assert "Any" not in typing_names
     assert "Protocol" in typing_names
