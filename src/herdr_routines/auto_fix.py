@@ -14,7 +14,7 @@ import re
 import shlex
 import subprocess
 import textwrap
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, assert_never
@@ -1030,7 +1030,7 @@ def run_checks(
     *,
     cwd: str,
     env: dict[str, str] | None = None,
-    runner: Any | None = None,
+    runner: Callable[..., tuple[int, str, str]] | None = None,
 ) -> GateOutcome:
     """Run all gate checks sequentially, no short-circuit. Returns GateOutcome.
 
@@ -1346,7 +1346,7 @@ class GithubEvent:
     title: str
     head_ref: str | None
     label: str | None
-    payload: dict[str, Any]
+    payload: Mapping[str, object]
     is_issue: bool = False
 
 
