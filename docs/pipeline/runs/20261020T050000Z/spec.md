@@ -1,4 +1,4 @@
-# Spec v1 — Type the remaining `Any` boundaries (issue 065)
+# Spec v2 — Type the remaining `Any` boundaries (issue 065)
 
 Type-only change. No behavior change is permitted; the only non-source edits allowed
 are test fakes adapted where a narrower parameter type forces it (issue acceptance).
@@ -103,3 +103,71 @@ tick's gate check and the event-prompt builder:
 - Low priority / late in the audit's INVESTIGATE list: keep the change exactly the
   three boundaries; resist reformatting or refactoring import style beyond what the
   narrows require.
+
+## Acceptance criteria
+
+Each item states its tier (`blocking` or `non-blocking`) and a `confidence:` tier
+(`high` / `medium` / `low`), and ends with its exact verification test name. Items
+1–5 are new source-contract tests (they fail before the narrows land and pass
+after); items 6–9 anchor existing behavior suites that must stay green unmodified.
+
+1. [blocking, confidence: high] `alias_table` declares
+   `def alias_table(spawn: TelegramSpawn)` with `TelegramSpawn` imported from
+   `herdr_routines.config` (runtime import, no cycle, no `TYPE_CHECKING` guard) and
+   keeps its `dict[str, dict[str, str | None]]` return; body and the `cli.py`
+   call site (`aliases=alias_table(spawn)`, ~line 1071) unchanged. Test: test_alias_table_spawn_param_is_telegram_spawn
+2. [blocking, confidence: high] `handle_spawn_message` declares
+   `aliases: Mapping[str, Mapping[str, str | None]]` and reads aliases exactly as
+   before (`str(spec.get(...) or default)` coercion, `spec.get("model")` as
+   `str | None`); alias resolution behavior — unknown alias listing, per-alias
+   harness, model validation — is unchanged. Test: test_handle_spawn_message_aliases_are_str_or_none_mapping
+3. [blocking, confidence: high] `run_checks` declares
+   `runner: Callable[..., tuple[int, str, str]] | None = None` with `Callable` from
+   `collections.abc`; `_default_runner` keeps that exact signature, the
+   `runner = _default_runner` fallback wiring is untouched, and an explicitly
+   injected runner (as `gates.py:83` `gate3_result` already injects) still drives
+   the checks. Test: test_run_checks_runner_param_is_callable_contract
+4. [blocking, confidence: high] `GithubEvent` declares
+   `payload: Mapping[str, object]`; the field is never mutated in src, forwarded
+   unchanged at `auto_fix.py:1622`, and `build_event_fix_prompt` continues to build
+   from `event.*` fields so event-fix prompt output is byte-identical. Test: test_github_event_payload_is_mapping_str_object
+5. [blocking, confidence: high] No `Any` remains in the four named signatures;
+   `telegram_spawn.py` drops `Any` from its `typing` import (Protocol retained for
+   `SpawnClient`); the change introduces no `cast(` and no new `# type: ignore`
+   anywhere in src. Test: test_typed_boundaries_have_no_any
+6. [non-blocking, confidence: high] Duplicated-alias validation still rejects bad
+   alias maps with `ConfigError` on the narrowed type. Test: test_spawn_alias_map_validation
+7. [non-blocking, confidence: high] Alias model resolution still validates and
+   reaches the handler through `handle_spawn_message` only for the alias's own
+   harness on the narrowed type. Test: test_spawn_alias_model_is_validated_and_reaches_the_handler
+8. [non-blocking, confidence: medium] Unknown spawn targets still print the alias
+   list built by `alias_table` on the narrowed type. Test: test_spawn_unknown_target_lists_aliases
+9. [non-blocking, confidence: medium] `run_checks` partial-output-on-timeout and
+   specific-error reporting behavior is unchanged through the narrowed seam.
+   Test: test_run_checks_keeps_partial_output_on_timeout
+
+## Changelog v1→v2
+
+- Title `Spec v1` → `Spec v2`; v1 content kept verbatim (no design change — same
+  three boundaries, same narrows, same no-behavior-change rule).
+- Added `## Acceptance criteria`: 9 numbered items, each carrying a
+  `blocking`/`non-blocking` tier plus a `confidence:` tier (`high`/`medium`/`low`)
+  and ending `Test: <exact test name>` for the `rg -c "Test:"` extraction and
+  `rg -F` existence check (gate 2/3). Items 1–5 name new source-contract tests to
+  be written in stage 3 (`tests/test_telegram_spawn.py`,
+  `tests/test_auto_fix.py`) that grep the exact narrowed signatures — they fail
+  before the change exists and pass after; items 6–9 anchor existing promotion
+  tests already in `tests/` (`test_telegram_spawn.py:305/:329/:752`,
+  `test_auto_fix.py:1382`) as regression guards. `mypy --strict src` and
+  `scripts/ci-check.sh` greenness stays in Verification as commands for the
+  implementer to run, not as `Test:` items — a pytest criterion cannot nest the
+  CI script (it runs the full pytest suite recursively).
+- Review corrections found while verifying v1's claims against source (all four
+  boundary signatures, `gates.py:83`, `cli.py` call site, `_aliases` fixture
+  None-free dict, `collections.abc` imports confirmed accurate): v1's risk item
+  "telegram_spawn.py is also changing in the security PR (#177/#178)" is stale —
+  the security edit landed as PR #202 (`ec74180 fix: scope claim scans to own PRs
+  and Telegram spawn to a private chat`) and is already in this worktree's base;
+  line numbers 166/187 still match, so the merge-main precondition is satisfied.
+  Risk text kept verbatim for the audit trail; whoever implements should read
+  "#177/#178" as "already merged main (PR #202)".
