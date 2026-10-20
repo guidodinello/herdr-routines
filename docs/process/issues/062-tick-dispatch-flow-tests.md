@@ -36,3 +36,5 @@ This is a coverage gap, not a known bug.
   `_run_audit`, and the corrupt-ledger backup failure. When an agent never becomes
   interactive the review flow records `agent_start_failed` while the audit flow
   records `agent_not_interactive`; the tests pin both.
+- **2026-10-19**: the review flow now records a never-ready agent as
+  `agent_not_interactive`, like the audit flow (PR #205); the test asserts it.
