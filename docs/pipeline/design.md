@@ -78,9 +78,10 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > renamed; edits are disclosed in the PR body) are git checks in `pipeline_run`.
 
 > **Current models live in `src/herdr_routines/pipeline_stages.py` (`STAGES`), not this
-> table** — the column above is the original design. As of 2026-10-01 (both
-> `muse-spark-1.2-contributor-free` and `x-preview-f-free` were withdrawn): stages 1–3
-> `opencode/muse-spark-1.3-contributor-free` (the stage-3 test author falls back to the
+> table** — the column above is the original design. As of 2026-10-19
+> (`muse-spark-1.2-contributor-free` and `x-preview-f-free` were withdrawn on 2026-10-01,
+> `muse-spark-1.3-contributor-free` by 2026-10-18): stages 1–3
+> `opencode/glm-5.3-flash-free` (the stage-3 test author falls back to the
 > OpenRouter nemotron model, never to stage 4's families), stages 4/7 `opencode/big-pickle`,
 > stage 6 `opencode/nemotron-3-ultra-free` (a different family from the implementer).
 > `MODEL_FAMILY` declares each model's family and a test checks the independence rules. `pipeline-prepare`
