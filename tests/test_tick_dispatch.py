@@ -310,6 +310,28 @@ def test_missed_occurrence_is_recorded_and_notifies_only_when_asked(
     assert cycle_calls == []
 
 
+def test_missed_occurrence_records_how_many_earlier_ones_were_skipped(
+    kind: Kind, history: Path, cycle_calls: list[str]
+) -> None:
+    job = kind.make_job(catch_up_minutes=10)
+    append(
+        history,
+        HistoryRecord(
+            ts=datetime(2026, 10, 9, 12, 0, tzinfo=UTC),
+            job=job.name,
+            state="registered",
+        ),
+    )
+
+    _process(kind, job, history, GuardClient())
+
+    missed = read_job(history, job.name)[-1]
+    assert missed.state == "missed"
+    assert missed.extra is not None
+    assert missed.extra["skipped_occurrences"] == 2
+    assert cycle_calls == []
+
+
 def test_due_tick_records_running_and_hands_the_run_id_to_the_cycle(
     kind: Kind, history: Path, cycle_calls: list[str]
 ) -> None:
@@ -608,6 +630,30 @@ def test_review_target_with_a_live_agent_is_skipped_not_redispatched(
     assert record.extra["verified"] is None
     assert env.client.tabs == []
     assert env.client.started == []
+
+
+class _StatusesUnreachable(ReviewHerdrClient):
+    def agent_statuses(self) -> dict[str, str]:
+        raise HerdrCliError("herdr unreachable", exit_code=1)
+
+
+def test_review_live_agent_guard_fails_open_when_herdr_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _review_env(
+        tmp_path,
+        monkeypatch,
+        prs=(_pr(1),),
+        client=lambda gh: _StatusesUnreachable(on_prompt=_mark_posted(gh)),
+    )
+
+    _summary, failed = env.run()
+
+    assert failed is False
+    (record,) = env.target_records()
+    assert record.state == "done"
+    assert record.extra is not None
+    assert record.extra["verified"] is True
 
 
 def test_review_target_whose_head_ref_cannot_be_fetched_is_worktree_failed(
