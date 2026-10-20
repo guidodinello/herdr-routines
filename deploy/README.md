@@ -1,6 +1,6 @@
 # Deploying herdr-routines
 
-Four systemd **user** unit pairs drive this tool — no daemon of our own, no root required. See
+Five systemd **user** unit pairs drive this tool — no daemon of our own, no root required. See
 [`../docs/plan-v1.md`](../docs/plan-v1.md) §3 for the full rationale.
 
 ## Install
@@ -15,6 +15,7 @@ cp systemd/herdr-server.service systemd/herdr-routines.timer systemd/herdr-routi
    systemd/herdr-routines-watchdog.timer systemd/herdr-routines-watchdog.service \
    systemd/herdr-routines-digest.timer systemd/herdr-routines-digest.service \
    systemd/herdr-routines-update.timer systemd/herdr-routines-update.service \
+   systemd/herdr-routines-tmp-sweep.timer systemd/herdr-routines-tmp-sweep.service \
    ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
@@ -51,6 +52,13 @@ Preview it any time without touching the checkout:
 ```sh
 uv run herdr-routines self-update --dry-run
 ```
+
+`herdr-routines-tmp-sweep.{timer,service}` is a host-hygiene pair, not part of the tool
+proper. opencode extracts a ~14 MiB native library to `/tmp/.<hex>-<hex>.so` on every
+launch, and agents killed mid-run leave theirs behind; the stock `systemd-tmpfiles` 10-day
+window is far too slow when `/tmp` is a small RAM-backed tmpfs (the Pi's filled on
+2026-10-20). The unit deletes this user's files of exactly that name shape once they are
+two hours old, every hour. Skip it on a host whose `/tmp` is on disk and roomy.
 
 Note the unit updates a hardcoded path, not its own `WorkingDirectory`: `ExecStart`
 passes no `--path`, so the checkout acted on is the flag's default,

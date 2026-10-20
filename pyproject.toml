@@ -69,3 +69,6 @@ extra_checks = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# pytest keeps the last 3 runs' tmp_path trees by default; here one run is ~270 MiB, which
+# filled the Pi's RAM-backed /tmp alongside opencode's leaked libraries (2026-10-20).
+tmp_path_retention_policy = "failed"
