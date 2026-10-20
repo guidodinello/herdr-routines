@@ -1779,3 +1779,120 @@ def test_tick_uses_the_configured_trusted_review_authors(
     else:
         assert "eligible=0" in outcome.summaries[0]
         assert dispatched == []
+
+
+# Issue 065 (spec docs/pipeline/runs/20261020T050000Z/spec.md v2): type the remaining
+# `Any` boundaries — source contracts for the auto_fix narrows, plus behavioral
+# anchors proving the narrowed seams still drive the checks.
+
+
+def test_run_checks_runner_param_is_callable_contract(tmp_path: Path) -> None:
+    """AC 3 (blocking): ``run_checks`` declares
+    ``runner: Callable[..., tuple[int, str, str]] | None = None`` with ``Callable``
+    imported from ``collections.abc``; ``_default_runner`` keeps that exact signature
+    and the ``runner = _default_runner`` fallback wiring is untouched; an injected
+    runner (as ``gates.py``'s ``gate3_result`` already injects) still drives the
+    checks."""
+    import ast
+    import inspect
+    from collections.abc import Callable
+    from typing import get_type_hints
+
+    import herdr_routines.auto_fix as af
+    from herdr_routines.auto_fix import run_checks
+    from herdr_routines.config import GateCheck
+
+    hints = get_type_hints(run_checks)
+    assert hints["runner"] == Callable[..., tuple[int, str, str]] | None
+
+    module_path = Path(af.__file__)
+    tree = ast.parse(module_path.read_text(encoding="utf-8"))
+    abc_names = [
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "collections.abc"
+        for alias in node.aliases
+    ]
+    typing_names = [
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "typing"
+        for alias in node.aliases
+    ]
+    assert "Callable" in abc_names
+    assert "Callable" not in typing_names
+
+    src = inspect.getsource(run_checks)
+    assert "runner: Callable[..., tuple[int, str, str]] | None = None," in src
+    assert "def _default_runner(" in src
+    assert "argv: list[str], *, timeout_s: float" in src
+    assert ") -> tuple[int, str, str]:" in src
+    assert "runner = _default_runner" in src
+
+    # An explicitly injected runner still drives the checks end to end.
+    calls: list[tuple[tuple[str, ...], float]] = []
+
+    def runner(argv: list[str], *, timeout_s: float) -> tuple[int, str, str]:
+        calls.append((tuple(argv), timeout_s))
+        return 0, "ok\n", ""
+
+    outcome = run_checks(
+        (GateCheck(kind="command", command="echo ok", timeout_ms=5000),),
+        cwd=str(tmp_path),
+        runner=runner,
+    )
+    assert outcome.passed is True
+    assert outcome.results[0].passed is True
+    assert outcome.results[0].exit_code == 0
+    assert calls == [(("echo", "ok"), 5.0)]
+
+    # The fallback wiring is untouched: with runner=None the default runner runs.
+    outcome = run_checks(
+        (GateCheck(kind="command", command="true"),), cwd=str(tmp_path)
+    )
+    assert outcome.passed is True
+
+
+def test_github_event_payload_is_mapping_str_object() -> None:
+    """AC 4 (blocking): ``GithubEvent`` declares ``payload: Mapping[str, object]``;
+    ``build_event_fix_prompt`` builds from ``event.*`` fields only, so event-fix
+    prompt output is byte-identical for any ``Mapping`` shape of the payload (a
+    read-only ``MappingProxyType`` round-trips through the polled event untouched)."""
+    import inspect
+    from collections.abc import Mapping
+    from types import MappingProxyType
+    from typing import get_type_hints
+
+    from herdr_routines.auto_fix import GithubEvent, build_event_fix_prompt
+
+    hints = get_type_hints(GithubEvent)
+    assert hints["payload"] == Mapping[str, object]
+
+    src = inspect.getsource(GithubEvent)
+    assert "payload: Mapping[str, object]" in src
+
+    payload = {"action": "opened", "labels": [{"name": "bug"}]}
+    event_kwargs = {
+        "event_id": "event-1",
+        "number": 7,
+        "title": "Bug report",
+        "head_ref": "auto/fix",
+        "label": "bug",
+    }
+    dict_prompt = build_event_fix_prompt(
+        "pr-health",
+        GithubEvent(payload=payload, **event_kwargs),
+        "owner/repo",
+        "report.md",
+        "main",
+    )
+    view_prompt = build_event_fix_prompt(
+        "pr-health",
+        GithubEvent(payload=MappingProxyType(payload), **event_kwargs),
+        "owner/repo",
+        "report.md",
+        "main",
+    )
+    assert dict_prompt == view_prompt
+    assert "Bug report" in dict_prompt
+    assert "auto/fix" in dict_prompt

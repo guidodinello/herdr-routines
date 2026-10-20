@@ -856,3 +856,112 @@ def test_spawn_from_group_chat_reaches_no_herdr_call(tmp_path: Path) -> None:
     )
     assert client.workspace_calls == []
     assert client.agent_calls == []
+
+
+# Issue 065 (spec docs/pipeline/runs/20261020T050000Z/spec.md v2): type the remaining
+# `Any` boundaries. The four narrowed signatures are enforced as source contracts;
+# alias behavior itself is anchored by the existing tests above and in test_auto_fix.py
+
+
+def test_alias_table_spawn_param_is_telegram_spawn() -> None:
+    """AC 1 (blocking): ``alias_table`` declares ``spawn: TelegramSpawn`` with
+    ``TelegramSpawn`` imported at runtime from ``herdr_routines.config`` (no
+    ``TYPE_CHECKING`` guard, no cycle), keeps the ``dict[str, dict[str, str | None]]``
+    return, and the ``cli.py`` call site (``aliases=alias_table(spawn)``) is
+    unchanged."""
+    import ast
+    import inspect
+    from typing import get_type_hints
+
+    from herdr_routines.config import TelegramSpawn
+
+    mod = _spawn_module()
+
+    hints = get_type_hints(mod.alias_table)
+    assert hints["spawn"] is TelegramSpawn
+    assert hints["return"] == dict[str, dict[str, str | None]]
+
+    src = inspect.getsource(mod.alias_table)
+    assert src.startswith(
+        "def alias_table(spawn: TelegramSpawn) -> dict[str, dict[str, str | None]]:"
+    )
+
+    module_src = Path(mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(module_src)
+    assert not any(
+        isinstance(node, ast.If) and "TYPE_CHECKING" in ast.dump(node.test)
+        for node in tree.body
+    )
+    config_imports = [
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "herdr_routines.config"
+        for alias in node.aliases
+    ]
+    assert "TelegramSpawn" in config_imports
+
+    # The single in-repo consumer (cli.py) passes alias_table's own output, untouched.
+    cli_src = (Path(mod.__file__).parent / "cli.py").read_text(encoding="utf-8")
+    assert "aliases=alias_table(spawn)" in cli_src
+
+
+def test_handle_spawn_message_aliases_are_str_or_none_mapping() -> None:
+    """AC 2 (blocking): ``handle_spawn_message`` declares
+    ``aliases: Mapping[str, Mapping[str, str | None]]`` and reads it exactly as
+    before: aliased fields are read through the ``str(spec.get(...) or default)``
+    coercion and the model through ``spec.get("model")`` as ``str | None``."""
+    import inspect
+    from collections.abc import Mapping
+    from typing import get_type_hints
+
+    mod = _spawn_module()
+
+    hints = get_type_hints(mod.handle_spawn_message)
+    assert hints["aliases"] == Mapping[str, Mapping[str, str | None]]
+
+    src = inspect.getsource(mod.handle_spawn_message)
+    assert "aliases: Mapping[str, Mapping[str, str | None]]," in src
+    assert 'str(spec.get("repo") or "")' in src
+    assert 'str(spec.get("agent_kind") or "claude")' in src
+    assert 'str(spec.get("workspace") or "worktree")' in src
+    assert 'str(spec.get("base") or "main")' in src
+    assert 'spec.get("model")' in src
+
+
+def test_typed_boundaries_have_no_any() -> None:
+    """AC 5 (blocking): no ``Any`` remains in the four narrowed signatures
+    (``alias_table``, ``handle_spawn_message``, ``run_checks``, ``GithubEvent.payload``);
+    ``telegram_spawn.py`` drops ``Any`` from its ``typing`` import while keeping
+    ``Protocol`` ``SpawnClient``; the change adds no ``cast(`` and no
+    ``# type: ignore`` anywhere in src."""
+    import ast
+    import inspect
+
+    import herdr_routines.auto_fix as af
+
+    mod = _spawn_module()
+
+    for fn in (mod.alias_table, mod.handle_spawn_message):
+        assert "Any" not in inspect.getsource(fn)
+    assert "Any" not in inspect.getsource(af.run_checks)
+    assert "Any" not in inspect.getsource(af.GithubEvent)
+
+    module_src = Path(mod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(module_src)
+    typing_names = [
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "typing"
+        for alias in node.aliases
+    ]
+    assert "Any" not in typing_names
+    assert "Protocol" in typing_names
+
+    pkg_dir = Path(af.__file__).parent
+    suppressions = [
+        p.relative_to(pkg_dir).as_posix()
+        for p in sorted(pkg_dir.rglob("*.py"))
+        if "# type: ignore" in p.read_text(encoding="utf-8")
+        or re.search(r"\bcast\(", p.read_text(encoding="utf-8"))
+    ]
+    assert suppressions == []
