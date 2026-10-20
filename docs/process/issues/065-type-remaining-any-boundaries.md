@@ -1,7 +1,7 @@
 ---
 id: "065"
 title: "Type the remaining Any boundaries: telegram_spawn aliases, the auto_fix runner seam, GithubEvent.payload"
-status: open
+status: done
 priority: low
 area: infra
 ---
@@ -35,3 +35,6 @@ up must merge main first.
 
 - **2026-10-19**: filed from the type-health audit's INVESTIGATE list. It was found still
   open on main after the type-gaps run.
+- **2026-10-20**: built by feature-pipeline run 20261020T050000Z. The run ended
+  `ci_check_failed` (exit 134) only because the Pi's /tmp tmpfs was full (fixed in #208);
+  `scripts/ci-check.sh` is green on the same commits once /tmp had room. PR opened by hand.
