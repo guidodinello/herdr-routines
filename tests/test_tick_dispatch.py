@@ -739,10 +739,11 @@ def test_review_agent_that_cannot_be_started_fails_and_closes_its_pane(
     assert not (env.worktree_root / "review-pr1").exists()
 
 
-def test_review_agent_that_never_gets_ready_is_recorded_as_agent_start_failed(
+def test_review_agent_that_never_gets_ready_is_recorded_as_agent_not_interactive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The audit flow records `agent_not_interactive` for the same situation.
+    # Same reason as the audit flow and docs/failure-reaping.md for an exhausted
+    # readiness poll; still counted as a failed review target.
     monkeypatch.setattr(runner, "READY_POLL_INTERVAL_S", 0.0)
     env = _review_env(
         tmp_path,
@@ -757,7 +758,7 @@ def test_review_agent_that_never_gets_ready_is_recorded_as_agent_start_failed(
     assert failed is True
     (record,) = env.target_records()
     assert record.extra is not None
-    assert record.extra["reason"] == "agent_start_failed"
+    assert record.extra["reason"] == "agent_not_interactive"
     assert record.extra["pane_id"] == "w1:p1"
     assert env.client.closed == ["w1:p1"]
     assert env.client.prompt_texts == []

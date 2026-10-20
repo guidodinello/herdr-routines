@@ -4603,11 +4603,11 @@ def _dispatch_review_target(
                 pane_id=pane_id,
                 report_path=None,
                 verified=False,
-                reason="agent_start_failed",
+                reason="agent_not_interactive",
                 error=last_error,
             ),
         )
-        return "agent_start_failed"
+        return "agent_not_interactive"
 
     try:
         _prompt_with_watchdog(

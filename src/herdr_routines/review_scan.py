@@ -36,6 +36,7 @@ REVIEW_FAILURE_DISPOSITIONS = frozenset(
         "review_not_posted",
         "review_verification_failed",
         "agent_start_failed",
+        "agent_not_interactive",
         "agent_prompt_failed",
         "worktree_failed",
         "repo_info_failed",
