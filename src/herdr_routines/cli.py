@@ -23,7 +23,7 @@ from logger import get_logger, init_logging
 
 import herdr_routines
 from herdr_routines import gc, reports_prune
-from herdr_routines.auto_fix import RealGhClient
+from herdr_routines.auto_fix import RealGhClient, effective_trusted_authors
 from herdr_routines.config import (
     DEFAULT_REPORTS_MAX_AGE_DAYS,
     TINY_HISTORY_MAX_BYTES,
@@ -72,6 +72,11 @@ from herdr_routines.reports_prune import (
     prune_rolled_history,
 )
 from herdr_routines.repos import _fetch_and_fast_forward
+from herdr_routines.review_scan import (
+    Candidate,
+    Classification,
+    classify_review_candidates,
+)
 from herdr_routines.runner import (
     DEFAULT_FAILURE_MARKERS,
     build_dry_run_argv,
@@ -531,6 +536,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "derive the missing decision itself)",
     )
     p_refine.set_defaults(handler=_cmd_refine_issue)
+
+    p_review_scan = sub.add_parser(
+        "review-scan",
+        help=(
+            "read-only: classify one kind: review job's PR candidates the way the next "
+            "tick's selector would (would dispatch, or the exact skip reason) without "
+            "dispatching anything (issue 066)"
+        ),
+    )
+    p_review_scan.add_argument("job")
+    p_review_scan.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="max PRs to take from the search, 1-100 (GitHub's ceiling; default 100)",
+    )
+    p_review_scan.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the rows as JSON (header goes to stderr)",
+    )
+    p_review_scan.set_defaults(handler=_cmd_review_scan)
 
     p_digest = sub.add_parser(
         "digest",
@@ -1475,6 +1502,135 @@ def _cmd_refine_issue(args: argparse.Namespace) -> int:
         roadmap_path=args.roadmap,
         allow_blocked=args.allow_blocked,
     )
+
+
+# One fixed sentence for both output shapes: `review-scan` answers "would the selector
+# pick this PR, and if not, why" — never "will the next tick run it", which also needs
+# the cron decision and the live-agent guard (issue 066's explicit non-goals).
+_REVIEW_SCAN_NOTE = (
+    "note: this reports scan eligibility only — it does not evaluate the cron "
+    'schedule or the live-agent guard, so "would dispatch" does not mean the next '
+    "tick will run it."
+)
+
+
+def _cmd_review_scan(args: argparse.Namespace) -> int:
+    """`herdr-routines review-scan <job>` (issue 066): run the review selector's own
+    scan → attempt budget → marker guard → cap pipeline through the shared
+    `classify_review_candidates` helper and report one disposition per PR, without
+    dispatching anything.
+
+    Read-only by construction — no history append, no `reports/` file, no clone, no
+    worktree, no agent, no notification: the tick stays the only writer, and the CLI
+    is its inspect-only mirror of the same selector. Exit codes follow the CLI's own
+    vocabulary: 2 when the request itself is wrong (not a `kind: review` job, a
+    `--limit` GitHub could never honour), 1 when the answer is unknowable (missing
+    job, unusable gh auth, failed search — never a silent empty list), 0 on a
+    successful scan however many PRs it found."""
+    if not 1 <= args.limit <= 100:
+        # GitHub's search ceiling is 100 nodes; a wider --limit can never be honoured,
+        # so it is a usage error, rejected before any gh call runs.
+        print(
+            f"error: review-scan: --limit must be between 1 and 100 (got {args.limit})",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    config = _load_config_or_exit(args)
+    job = config.job(args.job)
+    if job is None:
+        print(f"error: review-scan: no such job: {args.job}", file=sys.stderr)
+        return EXIT_FAILURE
+    if job.kind != "review":
+        print(
+            f"error: review-scan: {job.name} has kind {job.kind!r}, not 'review'",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    gh = RealGhClient()
+    try:
+        login = gh.api_user()
+    except Exception as e:  # noqa: BLE001
+        # Same fail-closed posture as `_review_cycle`: an unauthenticated gh is never
+        # readable as "there is nothing to review".
+        print(f"error: review-scan: gh_auth_missing: {e}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    classification = classify_review_candidates(
+        gh,
+        job,
+        login=login,
+        history_path=default_history_path(),
+        trusted_authors=effective_trusted_authors(
+            _configured_trusted_review_authors(args), viewer_login=login
+        ),
+        limit=args.limit,
+    )
+    if classification is None:
+        print("error: review-scan: search_failed", file=sys.stderr)
+        return EXIT_FAILURE
+
+    header = _review_scan_header(job, login=login, classification=classification)
+    if args.json:
+        # stdout carries the JSON document and nothing else, so the framing goes
+        # beside it on stderr and `| jq` stays clean.
+        print(header, file=sys.stderr)
+        print(_REVIEW_SCAN_NOTE, file=sys.stderr)
+        print(json.dumps(_review_scan_json_rows(classification)))
+    else:
+        print(header)
+        print(_REVIEW_SCAN_NOTE)
+        for cand, disposition in _review_scan_entries(classification):
+            print(
+                f"{cand.target_key}  select_mode={cand.select_mode}  "
+                f"disposition={disposition}"
+            )
+    return EXIT_OK
+
+
+def _review_scan_entries(
+    classification: Classification,
+) -> list[tuple[Candidate, str]]:
+    """Every PR the scan enumerated, sorted by ``target_key`` for a stable listing,
+    each with exactly one disposition: ``would_dispatch`` for the candidates that
+    passed every guard and the cap, else the row's own skip reason."""
+    by_key: dict[str, tuple[Candidate, str]] = {
+        cand.target_key: (cand, disposition)
+        for cand, disposition in classification.rows
+    }
+    for cand in classification.dispatchable:
+        by_key[cand.target_key] = (cand, "would_dispatch")
+    return [by_key[key] for key in sorted(by_key)]
+
+
+def _review_scan_header(job: Job, *, login: str, classification: Classification) -> str:
+    lines = [
+        f"review-scan: job={job.name}",
+        f"select: {', '.join(job.select or ())}",
+        f"gh login: {login}",
+        f"enumerated: {classification.enumerated}",
+    ]
+    if classification.truncated_modes:
+        # A truncated search means candidates may be missing from this very listing,
+        # so it belongs in the header, not a footnote.
+        lines.append(f"search truncated: {', '.join(classification.truncated_modes)}")
+    return "\n".join(lines)
+
+
+def _review_scan_json_rows(classification: Classification) -> list[dict[str, object]]:
+    return [
+        {
+            "target_key": cand.target_key,
+            "repo": cand.repo,
+            "number": cand.number,
+            "title": cand.title,
+            "url": cand.url,
+            "select_mode": cand.select_mode,
+            "disposition": disposition,
+        }
+        for cand, disposition in _review_scan_entries(classification)
+    ]
 
 
 def _cmd_pipeline_watchdog(args: argparse.Namespace) -> int:
