@@ -9,6 +9,7 @@ Phase A exercises the pure selector (``review_scan``); Phase B drives the tick's
 from __future__ import annotations
 
 import dataclasses
+import re
 import subprocess
 import warnings
 from datetime import UTC, datetime
@@ -156,11 +157,13 @@ class ReviewGh:
         raw_bodies: dict[str, list[PostedBody]] | None = None,
         search_fail: bool = False,
         bodies_fail: bool = False,
+        truncated_modes: tuple[str, ...] = (),
     ) -> None:
         self.user = user
         self.prs = prs
         self.repo_infos = repo_infos or {}
         self.raw_bodies = raw_bodies or {}
+        self.truncated_modes = truncated_modes
         self.search_fail = search_fail
         self.bodies_fail = bodies_fail
         self.posted: set[str] = set()
@@ -201,7 +204,7 @@ class ReviewGh:
         self.search_calls.append((tuple(modes), limit))
         if self.search_fail:
             return None
-        return ReviewSearch(prs=self.prs, truncated_modes=())
+        return ReviewSearch(prs=self.prs, truncated_modes=self.truncated_modes)
 
     def pr_review_bodies(
         self, *, owner: str, repo: str, number: int
@@ -787,6 +790,37 @@ def test_review_dispatch_creates_per_repo_checkout(
     assert gh.repo_info_calls == [("acme", "widgets")]
     assert len(gh.search_calls) == 1
 
+    # The refactor must keep the report's aggregate block byte-identical (issue 066):
+    # same numbers today as after `_review_cycle`'s row-building moves into the shared
+    # classifier.
+    report_path = (
+        tick.default_reports_dir() / "review-review-my-prs-20261010T083000Z.md"
+    )
+    report = report_path.read_text()
+    for line in (
+        "**Enumerated**: 2",
+        "**Candidates**: 2",
+        "**Dispatched**: 2",
+        "**Skipped**: 0",
+        "**Failed**: 0",
+        "**Repos failed**: 0",
+    ):
+        assert line in report
+    assert report.count("acme/widgets#1: dispatched") == 1
+    assert report.count("acme/widgets#2: dispatched") == 1
+
+    # The terminal history record carries the same aggregate numbers, unchanged.
+    record = _terminal(tmp_path / "state" / "history.jsonl", job.name)
+    assert record.state == "done"
+    assert record.extra is not None
+    assert (
+        record.extra["enumerated"],
+        record.extra["candidates"],
+        record.extra["skipped"],
+        record.extra["failed"],
+        record.extra["repos_failed"],
+    ) == (2, 2, 0, 0, 0)
+
 
 def test_marker_guard_ignores_a_marker_from_an_untrusted_author() -> None:
     """The marker is plain text: a copy posted by someone outside the trusted set must
@@ -1340,4 +1374,313 @@ def test_real_pr_review_bodies_carry_their_authors(
     assert RealGhClient().pr_review_bodies(owner="o", repo="r", number=1) == [
         PostedBody(author="me", body="review"),
         PostedBody(author=None, body="ghost"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Issue 066 — shared classification helper (spec 20261021T050000Z)
+# ---------------------------------------------------------------------------
+
+
+def _mk_candidate(key: str, *, reason: str | None = None) -> Candidate:
+    owner, _, rest = key.partition("/")
+    repo_name, _, num = rest.partition("#")
+    return Candidate(
+        target_key=key,
+        repo=f"{owner}/{repo_name}",
+        owner=owner,
+        repo_name=repo_name,
+        number=int(num),
+        title="",
+        url="",
+        created_at="",
+        updated_at="",
+        head_ref="b",
+        author="me",
+        select_mode="author",
+        skip_reason=reason,
+    )
+
+
+def test_classify_review_candidates_pipeline_order_and_none_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The helper runs the pipeline in the documented, load-bearing order — scan →
+    attempt budget → marker guard → cap against `job.max_workers_per_tick` — and a
+    `None` scan result propagates as `None` (fail closed) without running any later
+    stage."""
+    from herdr_routines import review_scan as rs
+    from herdr_routines.review_scan import (
+        Classification,
+        classify_review_candidates,
+    )
+
+    # The documented dataclass shape: frozen, and exactly these fields.
+    assert [f.name for f in dataclasses.fields(Classification)] == [
+        "rows",
+        "dispatchable",
+        "truncated_modes",
+        "enumerated",
+        "candidate_count",
+    ]
+
+    job = _review_job(tmp_path, max_workers_per_tick=2)
+    history_path = tmp_path / "state" / "history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    trusted = frozenset({"me"})
+    # Three fresh candidates, budget nowhere near: #3 is starved by the 2-worker cap.
+    gh = ReviewGh(
+        prs=(
+            _pr(1, created_at="2026-10-01T00:00:00Z"),
+            _pr(2, created_at="2026-10-02T00:00:00Z"),
+            _pr(3, created_at="2026-10-03T00:00:00Z"),
+        )
+    )
+
+    order: list[str] = []
+    real: dict[str, Any] = {
+        "scan_review_targets": rs.scan_review_targets,
+        "apply_attempt_budget": rs.apply_attempt_budget,
+        "apply_marker_guard": rs.apply_marker_guard,
+        "cap_candidates": rs.cap_candidates,
+    }
+
+    def _wrap(name: str) -> Any:
+        fn = real[name]
+
+        def _recorded(*args: Any, **kwargs: Any) -> Any:
+            order.append(name)
+            return fn(*args, **kwargs)
+
+        return _recorded
+
+    for name in real:
+        monkeypatch.setattr(rs, name, _wrap(name))
+
+    result = classify_review_candidates(
+        gh, job, login="me", history_path=history_path, trusted_authors=trusted
+    )
+    assert result is not None
+    assert order == [
+        "scan_review_targets",
+        "apply_attempt_budget",
+        "apply_marker_guard",
+        "cap_candidates",
+    ]
+    # The marker guard costs one `gh pr view` per budget survivor (2), not per
+    # enumerated candidate (3).
+    assert len(gh.bodies_calls) == 2
+    assert result.truncated_modes == ()
+    assert result.enumerated == 3
+    assert result.candidate_count == 3
+    assert [c.number for c in result.dispatchable] == [1, 2]
+    assert [(c.target_key, d) for c, d in result.rows] == [
+        ("acme/widgets#3", "over_cap")
+    ]
+    # The helper is pure: Classification itself is frozen.
+    params = result.__dataclass_params__
+    assert params.frozen is True
+
+    # Fail closed: a `None` scan result propagates as `None` and no later stage runs.
+    order.clear()
+    gh_fail = ReviewGh(search_fail=True)
+    assert (
+        classify_review_candidates(
+            gh_fail,
+            job,
+            login="me",
+            history_path=history_path,
+            trusted_authors=trusted,
+        )
+        is None
+    )
+    assert order == ["scan_review_targets"]
+
+
+def test_classify_review_candidates_rows_reproduce_tick_order_and_fallbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Classification.rows` reproduces `_review_cycle`'s pre-dispatch row contract
+    exactly: scan skips, then max_attempts_exceeded skips, then review_already_posted
+    skips, then over_cap — each with the candidate's own `skip_reason`, falling back to
+    the four literal strings the tick has always used when a stage hands back a skip
+    with no reason."""
+    from herdr_routines import review_scan as rs
+    from herdr_routines.review_scan import ScanOutcome, classify_review_candidates
+
+    job = _review_job(tmp_path, max_workers_per_tick=1)
+    history_path = tmp_path / "state" / "history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # --- part 1: the real pipeline, all four stages with their own skip_reasons.
+    gh = ReviewGh(
+        prs=(
+            _pr(1, created_at="2026-10-01T00:00:00Z"),
+            _pr(2, created_at="2026-10-02T00:00:00Z"),
+            _pr(3, created_at="2026-10-03T00:00:00Z"),
+            _pr(4, created_at="2026-10-04T00:00:00Z"),
+            # Scan skips: sorted by target_key, in front of every later stage's rows.
+            _pr(5, author="someone-else"),
+            _pr(6, head_ref="auto/nightly"),
+            _pr(7, head_repo="someone/widgets"),
+        )
+    )
+    gh.posted.add("acme/widgets#2")
+    append(
+        history_path,
+        HistoryRecord(
+            ts=NOW,
+            job=job.name,
+            state="done",
+            run_id="prior",
+            extra={"target_key": "acme/widgets#1"},
+        ),
+    )
+
+    result = classify_review_candidates(
+        gh,
+        job,
+        login="me",
+        history_path=history_path,
+        trusted_authors=frozenset({"me"}),
+    )
+    assert result is not None
+    assert [(c.target_key, d) for c, d in result.rows] == [
+        ("acme/widgets#5", "author_mismatch"),
+        ("acme/widgets#6", "routine_owned_branch"),
+        ("acme/widgets#7", "fork_pr"),
+        ("acme/widgets#1", "max_attempts_exceeded"),
+        ("acme/widgets#2", "review_already_posted"),
+        ("acme/widgets#4", "over_cap"),
+    ]
+    assert [c.number for c in result.dispatchable] == [3]
+    # `enumerated` and `candidate_count` are the post-scan, pre-budget numbers the tick
+    # already writes as `enumerated=` / `candidates=`.
+    assert result.enumerated == 7
+    assert result.candidate_count == 4
+
+    # --- part 2: the four fallback strings, for skips that carry no `skip_reason`.
+    monkeypatch.setattr(
+        rs,
+        "scan_review_targets",
+        lambda _gh, _job, *, login="", limit=100: ScanOutcome(
+            candidates=(
+                _mk_candidate("acme/z#9"),
+                _mk_candidate("acme/z#10"),
+                _mk_candidate("acme/z#11"),
+            ),
+            skipped=(_mk_candidate("acme/z#8"),),
+            enumerated=4,
+        ),
+    )
+    monkeypatch.setattr(
+        rs,
+        "apply_attempt_budget",
+        lambda _h, _j, cands, **_k: (
+            list(cands[1:]),
+            [dataclasses.replace(cands[0], skip_reason=None)],
+        ),
+    )
+    monkeypatch.setattr(
+        rs,
+        "apply_marker_guard",
+        lambda _g, _j, cands, **_k: (
+            list(cands[1:]),
+            [dataclasses.replace(cands[0], skip_reason=None)],
+        ),
+    )
+    monkeypatch.setattr(
+        rs,
+        "cap_candidates",
+        lambda cands, _mw: ([], [dataclasses.replace(cands[0], skip_reason=None)]),
+    )
+
+    fallback = classify_review_candidates(
+        ReviewGh(),
+        job,
+        login="me",
+        history_path=history_path,
+        trusted_authors=frozenset({"me"}),
+    )
+    assert fallback is not None
+    assert fallback.dispatchable == ()
+    assert [(c.target_key, d) for c, d in fallback.rows] == [
+        ("acme/z#8", "skipped"),
+        ("acme/z#9", "max_attempts_exceeded"),
+        ("acme/z#10", "review_already_posted"),
+        ("acme/z#11", "over_cap"),
+    ]
+    assert fallback.enumerated == 4
+    assert fallback.candidate_count == 3
+
+
+_TARGET_LINE = re.compile(r"^- ([\w/.-]+#\d+): (.+)$")
+
+
+def test_review_scan_drift_tick_report_matches_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drift test: `classify_review_candidates` called directly, and `_review_cycle`
+    run with the same fake `GhClient` (`default_reports_dir` → `tmp_path`), produce the
+    same pre-dispatch target lines in the same order — the tick's report rows are the
+    shared helper's rows, then the post-dispatch appends."""
+    from herdr_routines.auto_fix import effective_trusted_authors
+    from herdr_routines.review_scan import classify_review_candidates
+
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    base = tmp_path / "repos"
+    origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
+    job = _review_job(tmp_path, repo=base, max_workers_per_tick=1)
+    history = tmp_path / "state" / "history.jsonl"
+    # #1 is at its attempt budget, #2 already carries a trusted review marker, and the
+    # one-worker cap starves #4 while #3 would dispatch.
+    append(
+        history,
+        HistoryRecord(
+            ts=NOW,
+            job=job.name,
+            state="done",
+            run_id="prior",
+            extra={"target_key": "acme/widgets#1"},
+        ),
+    )
+    gh = ReviewGh(
+        prs=(
+            _pr(1, created_at="2026-10-01T00:00:00Z"),
+            _pr(2, created_at="2026-10-02T00:00:00Z"),
+            _pr(3, created_at="2026-10-03T00:00:00Z"),
+            _pr(4, created_at="2026-10-04T00:00:00Z"),
+        ),
+        repo_infos={
+            ("acme", "widgets"): {"clone_url": str(origin), "default_branch": "main"}
+        },
+    )
+    gh.posted.add("acme/widgets#2")
+
+    classification = classify_review_candidates(
+        gh,
+        job,
+        login=gh.user,
+        history_path=history,
+        trusted_authors=effective_trusted_authors((), viewer_login=gh.user),
+    )
+    assert classification is not None
+
+    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
+    _summary, _failed = _run_cycle(job, history, gh, client, run_id="drift1")
+
+    report = (tick.default_reports_dir() / "review-drift1.md").read_text()
+    target_lines = [
+        m.groups() for m in map(_TARGET_LINE.match, report.splitlines()) if m
+    ]
+    expected = [(c.target_key, d) for c, d in classification.rows]
+    assert expected == [
+        ("acme/widgets#1", "max_attempts_exceeded"),
+        ("acme/widgets#2", "review_already_posted"),
+        ("acme/widgets#4", "over_cap"),
+    ]
+    assert target_lines == [
+        *expected,
+        ("acme/widgets#3", "dispatched"),
     ]
