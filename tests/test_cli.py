@@ -8,8 +8,11 @@ unit "failed" rather than always reporting success).
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,9 +22,10 @@ import pytest
 from herdr_routines import cli
 from herdr_routines.cli import _check_systemd_timeout, _cmd_validate, default_log_path
 from herdr_routines.config import GateCheck, Job, RoutinesConfig
-from herdr_routines.history import rolled_path
+from herdr_routines.history import HistoryRecord, append, rolled_path
 from herdr_routines.runner import RunOutcome
 from herdr_routines.tick import TickOutcome
+from tests.test_review_scan import ReviewGh, _pr
 
 
 def make_job(tmp_path: Path, timeout_ms: int, name: str = "a") -> Job:
@@ -1017,3 +1021,405 @@ def test_cmd_run_dry_run_ignores_the_tick_lock(
     with cli.tick_lock(lock_path) as holder_acquired:
         assert holder_acquired
         assert cli.main(["run", "a", "--dry-run"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue 066: inspect-only `review-scan` subcommand (spec 20261021T050000Z)
+# ---------------------------------------------------------------------------
+
+_SCAN_DISPOSITIONS = frozenset(
+    {
+        "would_dispatch",
+        "author_mismatch",
+        "routine_owned_branch",
+        "fork_pr",
+        "max_attempts_exceeded",
+        "review_already_posted",
+        "over_cap",
+    }
+)
+
+_TS = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
+
+
+def _code(call: Callable[[], object]) -> int:
+    """`cli.main` for handler returns; SystemExit (argparse usage/exit) unwrapped.
+
+    The observable exit code either way, so the tests pin the contract rather than
+    whether the handler returns 2 or argparse raises SystemExit(2)."""
+    try:
+        code = call()
+    except SystemExit as e:
+        code = e.code
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    return 2  # a string code means argparse's usage exit
+
+
+def _write_review_scan_config(tmp_path: Path) -> Path:
+    """One `kind: review` job to scan plus a non-review job for the wrong-kind exit."""
+    path = tmp_path / "jobs.yaml"
+    path.write_text(
+        "version: 1\n"
+        "jobs:\n"
+        "  - name: review-my-prs\n"
+        "    cron: '30 8 * * *'\n"
+        "    kind: review\n"
+        "    select: [author]\n"
+        "    max_workers_per_tick: 1\n"
+        f"  - name: not-review\n"
+        "    cron: '0 3 * * *'\n"
+        f"    repo: {tmp_path / 'plain-repo'}\n"
+    )
+    return path
+
+
+def _review_scan_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gh: ReviewGh
+) -> Path:
+    """Point the global `--config` at the tmp jobs file, the state dir at
+    `tmp/state` (history, reports, repos all resolve from the env var), and the
+    handler's RealGhClient at the fake."""
+    config_path = _write_review_scan_config(tmp_path)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(cli, "RealGhClient", lambda: gh)
+    return config_path
+
+
+def _scan_argv(config_path: Path, *extra: str) -> list[str]:
+    return ["--config", str(config_path), "review-scan", "review-my-prs", *extra]
+
+
+def _mixed_review_gh() -> ReviewGh:
+    """Six PRs in one repo hitting every pre-dispatch disposition: #1 author_mismatch
+    and #2 routine_owned_branch (scan skips), #3 max_attempts_exceeded (budget, seeded
+    in history), #4 review_already_posted (trusted marker), #5 would_dispatch, and #6
+    over_cap under the 1-worker cap. Sorted by target_key, the numbering is the order."""
+    prs = (
+        _pr(1, repo="acme/alpha", author="someone-else"),
+        _pr(2, repo="acme/alpha", head_ref="auto/nightly"),
+        _pr(3, repo="acme/alpha"),
+        _pr(4, repo="acme/alpha"),
+        _pr(5, repo="acme/alpha", created_at="2026-10-01T00:00:00Z"),
+        _pr(6, repo="acme/alpha", created_at="2026-10-02T00:00:00Z"),
+    )
+    gh = ReviewGh(prs=prs)
+    gh.posted.add("acme/alpha#4")
+    return gh
+
+
+_MIXED_DISPOSITIONS = {
+    1: "author_mismatch",
+    2: "routine_owned_branch",
+    3: "max_attempts_exceeded",
+    4: "review_already_posted",
+    5: "would_dispatch",
+    6: "over_cap",
+}
+
+
+def _seed_mixed_history(tmp_path: Path) -> None:
+    """A spent attempt for `acme/alpha#3` so the budget stage skips it."""
+    history = tmp_path / "state" / "history.jsonl"
+    history.parent.mkdir(parents=True, exist_ok=True)
+    append(
+        history,
+        HistoryRecord(
+            ts=_TS,
+            job="review-my-prs",
+            state="done",
+            run_id="prior",
+            extra={"target_key": "acme/alpha#3"},
+        ),
+    )
+
+
+def test_review_scan_cli_wiring() -> None:
+    """`review-scan` is wired like `refine-issue`/`ps`/`scheduled`: `sub.add_parser`
+    with `set_defaults(handler=_cmd_review_scan)`, a required positional `job`,
+    `--limit` (default 100) and a `--json` flag — under the global `--config`, with no
+    per-command `--config`."""
+    parser = cli._build_parser()
+    subparsers_action = next(
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    assert "review-scan" in subparsers_action.choices
+    sub = subparsers_action.choices["review-scan"]
+
+    args = parser.parse_args(["review-scan", "review-my-prs"])
+    assert args.handler is cli._cmd_review_scan
+    assert args.job == "review-my-prs"
+    assert args.limit == 100
+    assert args.json is False
+
+    opted = parser.parse_args(["review-scan", "j", "--limit", "7", "--json"])
+    assert opted.limit == 7
+    assert opted.json is True
+
+    # The config flag is the parser-level one; the subcommand adds its own nothing.
+    assert not any("--config" in a.option_strings for a in sub._actions)
+    assert parser.parse_args(["--config", "jobs.d", "review-scan", "j"]).config == Path(
+        "jobs.d"
+    )
+    # `job` is required, like `run`/`history`.
+    with pytest.raises(SystemExit):
+        parser.parse_args(["review-scan"])
+
+
+def test_review_scan_missing_job_and_non_review_kind_exit_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A missing job exits EXIT_FAILURE (1) with the problem named on stderr; a resolved
+    job whose `kind` is not `review` is a usage error, EXIT_USAGE (2), also named."""
+    config_path = _review_scan_setup(tmp_path, monkeypatch, gh=ReviewGh())
+
+    assert _code(lambda: cli.main(_scan_argv(config_path, "no-such-job"))) == 1
+    err = capsys.readouterr().err
+    assert "no-such-job" in err
+
+    assert _code(lambda: cli.main(_scan_argv(config_path, "not-review"))) == 2
+    err = capsys.readouterr().err
+    assert "not-review" in err
+    assert "kind" in err.lower()
+
+    # And a review job resolves: the same invocation goes on to a successful scan.
+    assert _code(lambda: cli.main(_scan_argv(config_path))) == 0
+
+
+def test_review_scan_auth_and_search_failures_exits_1_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """No silent empty output: an `api_user()` failure and a failed search each exit 1
+    with the reason on stderr — never a clean empty list."""
+    config_path = _write_review_scan_config(tmp_path)
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+    class _ApiUserFails(ReviewGh):
+        def api_user(self) -> str:
+            raise RuntimeError("gh: not logged in")
+
+    monkeypatch.setattr(cli, "RealGhClient", lambda: _ApiUserFails())
+    assert _code(lambda: cli.main(_scan_argv(config_path))) == 1
+    captured = capsys.readouterr()
+    assert "gh_auth_missing" in captured.err
+    assert captured.out.strip() == ""
+
+    monkeypatch.setattr(cli, "RealGhClient", lambda: ReviewGh(search_fail=True))
+    assert _code(lambda: cli.main(_scan_argv(config_path))) == 1
+    captured = capsys.readouterr()
+    assert "search_failed" in captured.err
+    assert captured.out.strip() == ""
+
+    # `--json` carries the same failure contract: errors to stderr, no JSON on stdout.
+    monkeypatch.setattr(cli, "RealGhClient", lambda: ReviewGh(search_fail=True))
+    assert _code(lambda: cli.main(_scan_argv(config_path, "--json"))) == 1
+    captured = capsys.readouterr()
+    assert "search_failed" in captured.err
+    assert captured.out.strip() == ""
+
+
+def test_review_scan_human_output_sorted_dispositions_and_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Header (job, select modes, gh login, enumerated; no truncated field on a clean
+    search) + the eligibility-only note, then one line per PR sorted by target_key
+    carrying target_key, select_mode and exactly one disposition from the closed set.
+    Exit 0 on a successful scan regardless of outcome count."""
+    config_path = _review_scan_setup(tmp_path, monkeypatch, gh=_mixed_review_gh())
+    _seed_mixed_history(tmp_path)
+
+    assert _code(lambda: cli.main(_scan_argv(config_path))) == 0
+    out = capsys.readouterr().out
+
+    # Header: job name, select modes, gh login, enumerated count, and no truncated
+    # field for an untruncated search.
+    assert "review-my-prs" in out
+    assert "author" in out
+    assert re.search(r"\bme\b", out)  # the gh login
+    assert re.search(r"enumerat", out) and "6" in out
+    assert "truncat" not in out.lower()
+
+    # One line per PR, sorted by target_key, exactly one disposition each.
+    lines = [line for line in out.splitlines() if "acme/alpha#" in line]
+    assert len(lines) == 6
+    keys = re.findall(r"acme/alpha#\d+", "\n".join(lines))
+    assert keys == sorted(keys)
+    assert len(set(keys)) == 6
+    for number, disposition in _MIXED_DISPOSITIONS.items():
+        (line,) = [line for line in lines if f"acme/alpha#{number}" in line]
+        assert "author" in line, "select_mode must be on the line"
+        assert "skipped" not in line, "no generic 'skipped' disposition"
+        hits = {
+            known
+            for known in _SCAN_DISPOSITIONS
+            if re.search(rf"(?<![\w-]){known}(?![\w-])", line)
+        }
+        assert hits == {disposition}
+
+    # The eligibility-only note: "would dispatch" is not "next tick will run it".
+    assert "would dispatch" in out
+    assert re.search(r"schedule|cron|next tick", out)
+
+    # Exit 0 with nothing to review at all, too.
+    monkeypatch.setattr(cli, "RealGhClient", lambda: ReviewGh())
+    assert _code(lambda: cli.main(_scan_argv(config_path))) == 0
+
+
+def test_review_scan_json_stdout_only_array_with_pinned_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Under `--json`, stdout parses as one JSON array of objects with exactly the
+    pinned fields (`number` an int), sorted by target_key; header and note go to
+    stderr; exit codes match the human path's."""
+    config_path = _review_scan_setup(tmp_path, monkeypatch, gh=_mixed_review_gh())
+    _seed_mixed_history(tmp_path)
+
+    assert _code(lambda: cli.main(_scan_argv(config_path, "--json"))) == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)  # any non-JSON text on stdout breaks this
+    assert isinstance(data, list)
+    assert len(data) == 6
+    pinned = {
+        "target_key",
+        "repo",
+        "number",
+        "title",
+        "url",
+        "select_mode",
+        "disposition",
+    }
+    assert {set(obj) for obj in data} == {pinned}
+    assert all(isinstance(obj["number"], int) for obj in data)
+    keys = [obj["target_key"] for obj in data]
+    assert keys == sorted(keys)
+    for obj in data:
+        number = int(obj["target_key"].partition("#")[2])
+        assert obj["repo"] == "acme/alpha"
+        assert obj["title"] == f"PR {number}"
+        assert obj["url"] == f"https://example.invalid/acme/alpha/{number}"
+        assert obj["select_mode"] == "author"
+        assert obj["disposition"] == _MIXED_DISPOSITIONS[number]
+
+    # Header + note on stderr, not mixed into the document.
+    assert "review-my-prs" in captured.err
+
+    # Exit codes identical to the human path: an auth failure is still 1, with the
+    # reason on stderr and no clean empty array on stdout.
+    class _ApiUserFails(ReviewGh):
+        def api_user(self) -> str:
+            raise RuntimeError("gh: not logged in")
+
+    monkeypatch.setattr(cli, "RealGhClient", lambda: _ApiUserFails())
+    assert _code(lambda: cli.main(_scan_argv(config_path, "--json"))) == 1
+    captured = capsys.readouterr()
+    assert "gh_auth_missing" in captured.err
+    assert captured.out.strip() == ""
+
+
+def test_review_scan_is_read_only_touches_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Read-only by observation, not by hoping a happy path writes nothing: history
+    bytes and mtime unchanged, no `reports/review-*.md`, no repos/worktree dir, and no
+    herdr/agent/notification call at all."""
+    config_path = _review_scan_setup(
+        tmp_path, monkeypatch, gh=ReviewGh(prs=(_pr(1, repo="acme/alpha"),))
+    )
+    state = tmp_path / "state"
+    history = state / "history.jsonl"
+    history.parent.mkdir(parents=True, exist_ok=True)
+    append(
+        history,
+        HistoryRecord(ts=_TS, job="review-my-prs", state="registered"),
+    )
+    before = (history.read_bytes(), history.stat().st_mtime_ns)
+
+    def _no_herdr(*_a: object, **_k: object) -> None:
+        raise AssertionError("review-scan must not touch herdr/agents/notifications")
+
+    def _no_execute(*_a: object, **_k: object) -> None:
+        raise AssertionError("review-scan must not run agents")
+
+    monkeypatch.setattr(cli, "HerdrClient", _no_herdr)
+    monkeypatch.setattr(cli, "execute_run", _no_execute)
+
+    assert _code(lambda: cli.main(_scan_argv(config_path))) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip(), "a successful scan still prints its human output"
+    assert (history.read_bytes(), history.stat().st_mtime_ns) == before
+    assert (
+        not (state / "reports").exists()
+        or list((state / "reports").glob("review-*.md")) == []
+    )
+    assert not (state / "repos").exists(), "no clone, so no worktree either"
+
+
+def test_review_scan_limit_validation_and_forwarding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--limit` outside 1–100 is a usage error (2) — before any search call — and an
+    in-range `--limit` is forwarded verbatim; the default is 100."""
+    gh = ReviewGh(prs=(_pr(1, repo="acme/alpha"),))
+    config_path = _review_scan_setup(tmp_path, monkeypatch, gh=gh)
+    argv = _scan_argv(config_path)
+
+    def run(limit: str) -> int:
+        return _code(lambda: cli.main([*argv, "--limit", limit]))
+
+    for bad in ("0", "101", "-5"):
+        assert run(bad) == 2
+        assert "limit" in capsys.readouterr().err.lower()
+    assert gh.search_calls == [], "the search must not run for an invalid limit"
+
+    for good in ("1", "7", "100"):
+        assert run(good) == 0
+    assert [limit for _modes, limit in gh.search_calls] == [1, 7, 100]
+
+    gh.search_calls.clear()
+    assert _code(lambda: cli.main(argv)) == 0  # no --limit: the 100 default
+    assert gh.search_calls[0][1] == 100
+
+
+def test_review_scan_truncated_modes_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A truncated search is surfaced on the human path (header field / note naming the
+    truncated mode), and the JSON path mirrors it on stderr without leaking non-JSON
+    text onto stdout."""
+    gh = ReviewGh(
+        prs=(_pr(1, repo="acme/alpha"),),
+        truncated_modes=("author",),
+    )
+    config_path = _review_scan_setup(tmp_path, monkeypatch, gh=gh)
+
+    assert _code(lambda: cli.main(_scan_argv(config_path))) == 0
+    out = capsys.readouterr().out
+    truncated_lines = [line for line in out.splitlines() if "truncat" in line.lower()]
+    assert truncated_lines, "the truncated search must be surfaced"
+    assert any("author" in line for line in truncated_lines)
+    assert re.search(r"acme/alpha#1", out), "the PR line is still there"
+
+    assert _code(lambda: cli.main(_scan_argv(config_path, "--json"))) == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)  # stdout stays pure JSON
+    assert isinstance(data, list) and len(data) == 1
+    assert "truncat" in captured.err.lower(), "the JSON path mirrors the note on stderr"
+    assert "author" in captured.err
