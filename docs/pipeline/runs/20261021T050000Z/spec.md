@@ -1,4 +1,4 @@
-# Spec v1 — 20261021T050000Z
+# Spec v2 — 20261021T050000Z
 
 **Feature:** Issue 066 — inspect-only CLI for review candidates (`herdr-routines review-scan`)
 **Source:** `docs/process/issues/066-inspect-only-review-candidate-cli.md`
@@ -112,21 +112,107 @@ what `tick` dispatches.
 - `tests/test_tick_dispatch.py` — existing tests stay green; report/history numbers
   (`enumerated`, `candidates`, dispositions) unchanged.
 
-## Acceptance (from the issue, all must hold)
+## Acceptance criteria
 
-1. Read-only: `history.jsonl` bytes and mtime unchanged; no report file; no
-   worktree/agent/notification call.
-2. Every PR from the search appears exactly once, sorted by `target_key`, with
-   exactly one disposition from the closed set above.
-3. Drift test proves the tick goes through the shared helper.
-4. `gh.api_user()` failure and `search_prs` failure both exit 1, reason on stderr,
-   never a clean empty list.
-5. Missing job → 1; non-review job → 2; both name the problem on stderr.
-6. `--json` parses as an array with the pinned fields; no non-JSON stdout leakage.
-7. `--limit` outside 1–100 rejected as usage error; forwarded to the search.
-8. Truncated-search note appears when `truncated_modes` non-empty.
-9. `scripts/ci-check.sh` green, including `uv run mypy --strict src`.
-10. Existing review tests stay green with the refactor; numbers unchanged.
+Each item states its tier (`blocking` or `non-blocking`) and a `confidence:` tier
+(`high` / `medium` / `low`), and ends with its exact verification test name (12
+items, 12 `Test:` lines — items 1, 2, 3, 7, 11 and 12 fail against today's tree
+and pass only after the changes land; items 4–6 and 8–10 are new CLI/contract
+tests). All are additions to `tests/test_review_scan.py` and `tests/test_cli.py`
+unless noted; exact names are the ones stage 3 must implement.
+
+1. [blocking, confidence: high] `classify_review_candidates` is added to
+   `review_scan.py` with the documented signature (`Classification` frozen dataclass:
+   `rows`, `dispatchable`, `truncated_modes`, `enumerated`, `candidate_count`) and
+   runs the pipeline in the load-bearing order scan → attempt budget → marker guard →
+   cap against `job.max_workers_per_tick`; a `None` scan result propagates as `None`
+   (fail closed). Test: test_classify_review_candidates_pipeline_order_and_none_fail_closed
+2. [blocking, confidence: high] `Classification.rows` reproduces `_review_cycle`'s
+   pre-dispatch row contract exactly: scan skips, then `max_attempts_exceeded` skips,
+   then `review_already_posted` skips, then `over_cap`, each candidate's `skip_reason`
+   with the same fallback strings as today (`skipped`, `max_attempts_exceeded`,
+   `review_already_posted`, `over_cap`); `enumerated` and `candidate_count` equal
+   `ScanOutcome`'s post-scan pre-budget numbers. Test: test_classify_review_candidates_rows_reproduce_tick_order_and_fallbacks
+3. [blocking, confidence: high] Drift test: calling `classify_review_candidates`
+   directly with the same fake `GhClient` fixtures a `_review_cycle` run
+   (`default_reports_dir` → `tmp_path`) is exercised with, the
+   `review-<run_id>.md` target lines equal the classification rows in the same
+   order — proving the tick goes through the shared helper. Test: test_review_scan_drift_tick_report_matches_classification
+4. [blocking, confidence: high] CLI wiring: `sub.add_parser("review-scan")` with
+   `set_defaults(handler=_cmd_review_scan)`, required positional `job`, `--limit`
+   (default 100), `--json` flag; wired like `refine-issue`/`ps`/`scheduled` (global
+   `--config`, `_load_config_or_exit`, `_configured_trusted_review_authors`) with no
+   per-command `--config`. Test: test_review_scan_cli_wiring
+5. [blocking, confidence: high] Exit codes for job resolution: missing job →
+   `EXIT_FAILURE` (1) with the problem named on stderr; resolved job whose `kind` is
+   not `review` → `EXIT_USAGE` (2), also named on stderr. Test: test_review_scan_missing_job_and_non_review_kind_exit_codes
+6. [blocking, confidence: high] No silent empty output: `gh.api_user()` failure exits
+   1 with `gh_auth_missing` on stderr and `scan_review_targets` returning `None` exits
+   1 with `search_failed` on stderr — never a clean empty list. Test: test_review_scan_auth_and_search_failures_exits_1_stderr
+7. [blocking, confidence: medium] Human output: short header (job name, select
+   modes, gh login, `enumerated`, `truncated_modes` when non-empty), a fixed
+   eligibility-only note (no schedule/live-agent evaluation, so "would dispatch" ≠
+   "next tick will run it"), then one line per PR sorted by `target_key` carrying
+   `target_key`, `select_mode`, and exactly one disposition from the closed set —
+   `would_dispatch` for `Classification.dispatchable`, else the exact skip reason
+   (`author_mismatch`, `routine_owned_branch`, `fork_pr`, `max_attempts_exceeded`,
+   `review_already_posted`, `over_cap`) with no generic `"skipped"`; exit 0 on a
+   successful scan regardless of outcome count. Test: test_review_scan_human_output_sorted_dispositions_and_note
+8. [blocking, confidence: high] `--json`: stdout carries only a JSON array of objects
+   with exactly `target_key`, `repo`, `number` (int), `title`, `url`, `select_mode`,
+   `disposition`; header and note go to stderr, all errors to stderr, exit codes
+   identical to the human path. Test: test_review_scan_json_stdout_only_array_with_pinned_fields
+9. [blocking, confidence: high] Read-only by observation, not absence of writes in a
+   happy path: after a full `review-scan` run, `history.jsonl` bytes and mtime are
+   unchanged, no `reports/review-<run_id>.md` appears, and no worktree, agent, or
+   notification call is made. Test: test_review_scan_is_read_only_touches_nothing
+10. [blocking, confidence: medium] `--limit` outside 1–100 is rejected as a usage
+    error (2); an in-range `--limit` is forwarded verbatim to the search (observed
+    via the fake client's recorded call). Test: test_review_scan_limit_validation_and_forwarding
+11. [non-blocking, confidence: medium] Truncated search is surfaced: when
+    `truncated_modes` is non-empty the human path shows the truncated-search note
+    (header field / note) and the JSON path mirrors it without leaking non-JSON text
+    onto stdout. Test: test_review_scan_truncated_modes_note
+12. [blocking, confidence: high] The `_review_cycle` refactor is byte-identical in
+    behaviour: the existing review suites stay green unmodified and the report and
+    history aggregate numbers (`enumerated`, `candidates`, `skipped_count`,
+    `failed_count`, `repos_failed`) are unchanged. Test: test_review_dispatch_creates_per_repo_checkout
+
+Non-test acceptance obligations: `scripts/ci-check.sh` green including
+`uv run mypy --strict src` (clause 9 of v1) stays in Verification below — it is a
+gate, not a single named test, and is asserted by the CI stage rather than by one
+of the tests named above.
+
+## Changelog v1→v2
+
+- Title `Spec v1` → `Spec v2`.
+- Replaced the informal `## Acceptance (from the issue, all must hold)` list with
+  `## Acceptance criteria` (12 numbered items): each item carries a
+  `blocking`/`non-blocking` tier plus a `confidence:` tier (`high`/`medium`/`low`)
+  and ends with its exact verification test name (12 items, 12 `Test:`-marked
+  lines, machine-extractable via `rg -c "Test:"` like prior runs).
+- Mapping from v1's 10 clauses: clause 1 → item 9 (read-only, by file-bytes/mtime
+  assertion); clause 2 → items 2 and 7 (row contract + CLI disposition set); clause
+  3 → item 3 (drift test); clause 4 → item 6; clause 5 → item 5; clause 6 → item 8;
+  clause 7 → item 10; clause 8 → item 11; clause 9 stays in Verification (CI gate,
+  no single test); clause 10 → item 12. Items 1 and 4 pin the helper contract and
+  CLI wiring that v1 only described in the Approach.
+- Review of v1 (stage 2): all line references verified against the tree
+  (`tick.py:_review_cycle` row order and fallbacks `cand.skip_reason or ...` at the
+  four stage nodes, `skipped_count`/report/history aggregate writes, `cli.py`
+  `EXIT_OK=0`/`EXIT_USAGE=2`/`EXIT_FAILURE=1`, `_configured_trusted_review_authors`
+  at `cli.py:1419`, `effective_trusted_authors` applied before the marker guard in
+  `_review_cycle`); **non-blocking** (confidence: low) the v1 wording "each row
+  using the candidate's `skip_reason`" hides that scan-stage skips may have
+  `skip_reason=None` and fall back to the literal `"skipped"` — item 2 pins the
+  fallback strings explicitly to remove that ambiguity. **non-blocking**
+  (confidence: medium) the v1 acceptance list mixed a CI gate (clause 9) with test
+  clauses; the gate is now called out under the criteria table instead of
+  masquerading as a test.
+- Test names follow the `test_review_scan_*` / existing `tests/test_review_scan.py`
+  helper conventions (`ReviewGh`, `_run_cycle`, `_pr`), so stage 3 can implement
+  them without further spec churn.
+- No change to Problem, Approach, Files touched, Risks, or Verification scope.
 
 ## Risks
 
