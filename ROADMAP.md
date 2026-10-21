@@ -292,7 +292,7 @@ files 2026-08-27.
 - **Inspect-only CLI for review candidates** — a read-only subcommand that runs
   the `kind: review` job's candidate scan and prints every PR it found with the
   reason it would or would not be dispatched, without spawning anything.
-  Answers "why didn't it review PR X?". Deferred in issue 055.
+  Answers "why didn't it review PR X?". Deferred in issue 055 → [`066`](docs/process/issues/066-inspect-only-review-candidate-cli.md)
 - **Close issue 057's two open review notes** — layer the write-ahead ledger
   ordering test (criterion 9) between the pure `apply_diff` test and a
   tick-level one, and add a criterion plus test asserting the shape of the
