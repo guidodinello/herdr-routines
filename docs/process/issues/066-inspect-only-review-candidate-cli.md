@@ -1,7 +1,7 @@
 ---
 id: "066"
 title: "Inspect-only CLI for review candidates (`herdr-routines review-scan`)"
-status: open
+status: done
 priority: medium
 area: infra
 ---
