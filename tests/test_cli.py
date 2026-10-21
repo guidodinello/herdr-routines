@@ -1089,7 +1089,14 @@ def _review_scan_setup(
 
 
 def _scan_argv(config_path: Path, *extra: str) -> list[str]:
-    return ["--config", str(config_path), "review-scan", "review-my-prs", *extra]
+    """Argv for `review-scan` over the default review job. A leading non-flag extra
+    replaces that job name (how a test targets another job); anything else is flags,
+    appended after the job."""
+    job = "review-my-prs"
+    rest = list(extra)
+    if rest and not rest[0].startswith("-"):
+        job = rest.pop(0)
+    return ["--config", str(config_path), "review-scan", job, *rest]
 
 
 def _mixed_review_gh() -> ReviewGh:
@@ -1300,7 +1307,7 @@ def test_review_scan_json_stdout_only_array_with_pinned_fields(
         "select_mode",
         "disposition",
     }
-    assert {set(obj) for obj in data} == {pinned}
+    assert all(set(obj) == pinned for obj in data)
     assert all(isinstance(obj["number"], int) for obj in data)
     keys = [obj["target_key"] for obj in data]
     assert keys == sorted(keys)

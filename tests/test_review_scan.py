@@ -1478,7 +1478,7 @@ def test_classify_review_candidates_pipeline_order_and_none_fail_closed(
         ("acme/widgets#3", "over_cap")
     ]
     # The helper is pure: Classification itself is frozen.
-    params = result.__dataclass_params__
+    params = result.__dataclass_params__  # type: ignore[attr-defined]
     assert params.frozen is True
 
     # Fail closed: a `None` scan result propagates as `None` and no later stage runs.
