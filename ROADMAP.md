@@ -297,7 +297,8 @@ files 2026-08-27.
   ordering test (criterion 9) between the pure `apply_diff` test and a
   tick-level one, and add a criterion plus test asserting the shape of the
   `gate` values and the history `extra` fields. Left open when 057's refine
-  loop hit its cap.
+  loop hit its cap. →
+  [`067`](docs/process/issues/067-close-issue-057-s-two-open-review-notes.md)
 - **Stable finding `id` from the audit skills** — without it, same-kind
   findings in one file collapse into one fix dispatch (issues 057, 058). The
   skills live in the target repo. Gate: the audit ledger holds real findings
