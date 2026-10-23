@@ -1,7 +1,7 @@
 ---
 id: "069"
 title: "Gate 6 fails a clean review, so stage 7 never addresses its non-blocking notes"
-status: open
+status: done
 priority: high
 area: pipeline
 ---
