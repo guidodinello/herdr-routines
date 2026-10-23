@@ -115,11 +115,8 @@ from herdr_routines.repos import _ensure_checkout, ensure_repo
 from herdr_routines.review_scan import (
     REVIEW_FAILURE_DISPOSITIONS,
     Candidate,
-    apply_attempt_budget,
-    apply_marker_guard,
-    cap_candidates,
+    classify_review_candidates,
     render_review_report,
-    scan_review_targets,
 )
 from herdr_routines.runner import (
     RunOutcome,
@@ -4200,8 +4197,21 @@ def _review_cycle(
         )
 
     trusted = effective_trusted_authors(trusted_review_authors, viewer_login=login)
-    outcome = scan_review_targets(gh, job, login=login)
-    if outcome is None:
+
+    # Pre-dispatch classification is one shared helper (issue 066), also used by the
+    # read-only `review-scan` CLI, so the two can never disagree on dispositions. Its
+    # stage order is load-bearing: scan (None → this tick failed) → attempt budget (a
+    # local history read, cheapest first) → marker guard (one `gh pr view` per
+    # cap-window candidate — everything past the cap can never dispatch, so it never
+    # costs an API call) → cap to job.max_workers_per_tick.
+    classification = classify_review_candidates(
+        gh,
+        job,
+        login=login,
+        history_path=history_path,
+        trusted_authors=trusted,
+    )
+    if classification is None:
         # Fail closed: an unknown search answer must never read as "nothing to review".
         return _review_terminal_failure(
             job,
@@ -4212,31 +4222,10 @@ def _review_cycle(
             reason="search_failed",
         )
 
-    rows: list[tuple[Candidate, str]] = [
-        (cand, cand.skip_reason or "skipped") for cand in outcome.skipped
-    ]
-
-    # The attempt budget is a local history read, so it runs first; the marker guard
-    # costs one `gh pr view` per candidate and only sees what the budget let through.
-    dispatchable, budget_skipped = apply_attempt_budget(
-        history_path,
-        job.name,
-        outcome.candidates,
-        max_attempts=job.max_attempts_per_target,
-    )
-    rows.extend(
-        (cand, cand.skip_reason or "max_attempts_exceeded") for cand in budget_skipped
-    )
-
-    dispatchable, marker_skipped = apply_marker_guard(
-        gh, job.name, dispatchable, trusted_authors=trusted
-    )
-    rows.extend(
-        (cand, cand.skip_reason or "review_already_posted") for cand in marker_skipped
-    )
-
-    to_dispatch, over_cap = cap_candidates(dispatchable, job.max_workers_per_tick)
-    rows.extend((cand, cand.skip_reason or "over_cap") for cand in over_cap)
+    # Pre-dispatch rows come from the helper; post-dispatch dispositions
+    # (repo_info_failed, clone_failed, dispatched) are appended below.
+    rows: list[tuple[Candidate, str]] = list(classification.rows)
+    to_dispatch = classification.dispatchable
 
     by_repo: dict[str, list[Candidate]] = {}
     for cand in to_dispatch:
@@ -4306,19 +4295,19 @@ def _review_cycle(
                 job_name=job.name,
                 run_id=run_id,
                 now=now,
-                enumerated=outcome.enumerated,
-                candidate_count=len(outcome.candidates),
+                enumerated=classification.enumerated,
+                candidate_count=classification.candidate_count,
                 repos_failed=repos_failed,
                 rows=rows,
-                truncated_modes=outcome.truncated_modes,
+                truncated_modes=classification.truncated_modes,
             )
         )
     except Exception as e:  # noqa: BLE001
         log.warning("%s: could not write review report: %s", job.name, e)
 
     summary = (
-        f"{job.name}: done (enumerated={outcome.enumerated}, "
-        f"candidates={len(outcome.candidates)}, dispatched={dispatched_count}, "
+        f"{job.name}: done (enumerated={classification.enumerated}, "
+        f"candidates={classification.candidate_count}, dispatched={dispatched_count}, "
         f"skipped={skipped_count}, failed={failed_count}, "
         f"repos_failed={repos_failed})"
     )
@@ -4333,8 +4322,8 @@ def _review_cycle(
             extra=HistoryExtra(
                 gate="failed" if any_failed else "passed",
                 target="pr",
-                enumerated=outcome.enumerated,
-                candidates=len(outcome.candidates),
+                enumerated=classification.enumerated,
+                candidates=classification.candidate_count,
                 dispatched=dispatched_count,
                 skipped=skipped_count,
                 failed=failed_count,

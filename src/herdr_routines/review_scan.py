@@ -219,6 +219,92 @@ def cap_candidates(
     return kept, over
 
 
+@dataclass(frozen=True, slots=True)
+class Classification:
+    """The pre-dispatch verdicts of the review selector, shared by ``tick`` and the
+    read-only ``review-scan`` CLI (issue 066).
+
+    ``rows`` is the tick's pre-dispatch row contract in tick order — scan skips, attempt
+    budget skips, marker skips, ``over_cap`` — each carrying the stage's fallback
+    disposition, so both callers report exactly the same dispositions for the same
+    inputs. ``dispatchable`` is what survived every stage *and* the cap; the tick appends
+    the post-dispatch dispositions to ``rows`` itself. ``enumerated`` and
+    ``candidate_count`` are the post-scan, pre-budget numbers the tick writes as
+    ``enumerated=`` / ``candidates=``."""
+
+    rows: tuple[tuple[Candidate, str], ...]
+    dispatchable: tuple[Candidate, ...]
+    truncated_modes: tuple[str, ...]
+    enumerated: int
+    candidate_count: int
+
+
+def classify_review_candidates(
+    gh: GhClient,
+    job: Job,
+    *,
+    login: str,
+    history_path: Path,
+    trusted_authors: frozenset[str],
+    limit: int = 100,
+) -> Classification | None:
+    """Run the whole selector pipeline once and return its pre-dispatch verdicts.
+
+    The stage order is load-bearing and must stay: ``scan_review_targets`` (``None`` →
+    ``None``, fail closed — an unknown search answer never reads as "nothing to
+    review") → ``apply_attempt_budget`` (a local history read, the cheapest guard) →
+    ``apply_marker_guard`` (one ``gh pr view`` per check) → ``cap_candidates`` against
+    ``job.max_workers_per_tick``. ``_review_cycle`` dispatches what comes back and
+    ``review-scan`` only reports it — neither re-runs a stage.
+
+    The marker guard is spent on the cap window (the oldest ``max_workers_per_tick``
+    budget survivors) and nothing else: everything past the window is ``over_cap`` by
+    definition and can never dispatch this tick, so it must not cost an API call. The
+    cap itself still runs last, over ``marker survivors + everything past the window``,
+    so the rows, the fallback strings and the newest-first starvation order are exactly
+    what the tick has always produced — a marker skip inside the window just lets the
+    next survivor up into the kept set."""
+    outcome = scan_review_targets(gh, job, login=login, limit=limit)
+    if outcome is None:
+        return None
+
+    rows: list[tuple[Candidate, str]] = [
+        (cand, cand.skip_reason or "skipped") for cand in outcome.skipped
+    ]
+
+    budgeted, budget_skipped = apply_attempt_budget(
+        history_path,
+        job.name,
+        outcome.candidates,
+        max_attempts=job.max_attempts_per_target,
+    )
+    rows.extend(
+        (cand, cand.skip_reason or "max_attempts_exceeded") for cand in budget_skipped
+    )
+
+    window = budgeted[: job.max_workers_per_tick]
+    checked, marker_skipped = apply_marker_guard(
+        gh, job.name, window, trusted_authors=trusted_authors
+    )
+    rows.extend(
+        (cand, cand.skip_reason or "review_already_posted") for cand in marker_skipped
+    )
+
+    to_dispatch, over_cap = cap_candidates(
+        [*checked, *budgeted[job.max_workers_per_tick :]],
+        job.max_workers_per_tick,
+    )
+    rows.extend((cand, cand.skip_reason or "over_cap") for cand in over_cap)
+
+    return Classification(
+        rows=tuple(rows),
+        dispatchable=tuple(to_dispatch),
+        truncated_modes=outcome.truncated_modes,
+        enumerated=outcome.enumerated,
+        candidate_count=len(outcome.candidates),
+    )
+
+
 def render_review_report(
     *,
     job_name: str,
