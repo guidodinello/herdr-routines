@@ -312,7 +312,8 @@ files 2026-08-27.
   kills a dead run and reports it as not resumed (issue 031). Now that
   `pipeline-run` owns the stage loop and persists resumable state, restart the
   run from its last completed stage instead, or at least write a partial report.
-  Deferred in issue 031 and `docs/pipeline/design.md`.
+  Deferred in issue 031 and `docs/pipeline/design.md`. →
+  [`068`](docs/process/issues/068-resume-a-pipeline-run-whose-orchestrator-died.md)
 - **Missed-run alert in the digest** — flag an enabled job whose last run is
   well past its own schedule ("should have run, didn't"), shown separately from
   failures. Suggested and deferred in issue 046; reads only the existing
