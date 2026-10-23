@@ -66,6 +66,14 @@ Pipeline work; no real-run evidence required.
   from implementation** — Stage-3 bookkeeping moves into `pipeline-run`; the PR
   is gated on `scripts/ci-check.sh` with a bounded fix loop. →
   [`059`](docs/process/issues/059-pipeline-bookkeeping-in-code.md)
+- **Gate 6 fails a clean review, so stage 7 never runs** — the gate needs a
+  literal `[blocking]` tag, which a review that finds 0 blocking issues never
+  writes. Its non-blocking threads stay unanswered and the PR stays blocked
+  (PR #211). → [`069`](docs/process/issues/069-gate6-fails-clean-reviews.md)
+- **`babysit-prs` records a fix worker as done when it left uncommitted
+  changes** — every retry is then refused on the dirty worktree, and each
+  refusal uses up an attempt until the PR hits `max_attempts_exceeded` (PR #211).
+  → [`070`](docs/process/issues/070-fix-worker-done-with-uncommitted-changes.md)
 
 Earlier items, kept as issue files for history: plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
