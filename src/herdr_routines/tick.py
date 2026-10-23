@@ -4222,8 +4222,8 @@ def _review_cycle(
             reason="search_failed",
         )
 
-    # Only the pre-dispatch rows: repo_info_failed / clone_failed and every post-dispatch
-    # disposition are appended below, after the helper returns.
+    # Pre-dispatch rows come from the helper; post-dispatch dispositions
+    # (repo_info_failed, clone_failed, dispatched) are appended below.
     rows: list[tuple[Candidate, str]] = list(classification.rows)
     to_dispatch = classification.dispatchable
 

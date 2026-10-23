@@ -1595,13 +1595,13 @@ def _review_scan_entries(
     """Every PR the scan enumerated, sorted by ``target_key`` for a stable listing,
     each with exactly one disposition: ``would_dispatch`` for the candidates that
     passed every guard and the cap, else the row's own skip reason."""
-    by_key: dict[str, tuple[Candidate, str]] = {
-        cand.target_key: (cand, disposition)
-        for cand, disposition in classification.rows
-    }
-    for cand in classification.dispatchable:
-        by_key[cand.target_key] = (cand, "would_dispatch")
-    return [by_key[key] for key in sorted(by_key)]
+    return sorted(
+        [
+            *classification.rows,
+            *[(cand, "would_dispatch") for cand in classification.dispatchable],
+        ],
+        key=lambda row: row[0].target_key,
+    )
 
 
 def _review_scan_header(job: Job, *, login: str, classification: Classification) -> str:

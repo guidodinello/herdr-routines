@@ -258,7 +258,7 @@ def classify_review_candidates(
     ``review-scan`` only reports it — neither re-runs a stage.
 
     The marker guard is spent on the cap window (the oldest ``max_workers_per_tick``
-    budget survivors) and nothing else: everything past the cap is ``over_cap`` by
+    budget survivors) and nothing else: everything past the window is ``over_cap`` by
     definition and can never dispatch this tick, so it must not cost an API call. The
     cap itself still runs last, over ``marker survivors + everything past the window``,
     so the rows, the fallback strings and the newest-first starvation order are exactly
