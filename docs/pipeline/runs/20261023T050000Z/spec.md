@@ -67,26 +67,32 @@ Design decisions, pinned:
 ## Acceptance criteria
 
 1. [blocking] Gate 6 passes when the only trusted tier labels are
-   `**[non-blocking]**` inline comments, provided the review summary body states
-   a blocking count ("Found 0 blocking issue(s) and 4 non-blocking note(s)");
-   the fixture copies PR #211's real shape (summary review body + 4 `**[non-blocking]**` inline comments, from a trusted author) — confidence: high — Test: test_gate6_passes_clean_review_with_only_non_blocking_notes
+   `**[non-blocking]**` inline comments, provided the review summary body states a
+   blocking count ("Found 0 blocking issue(s) and 4 non-blocking note(s)"); the
+   fixture copies PR #211's real shape (summary review body + 4
+   `**[non-blocking]**` inline comments, from a trusted author) — confidence: high —
+   Test: test_gate6_passes_clean_review_with_only_non_blocking_notes
 2. [blocking] Gate 6 still fails when the bodies contain neither a `[blocking]`
    tag nor a blocking-count summary: a review with only bare `[non-blocking]`
    labels and no summary phrase fails, with the verdict reason still containing
-   `[blocking]`. Issue 035's protection kept — confidence: high — Test: test_gate6_still_rejects_bare_non_blocking_without_summary
+   `[blocking]`. Issue 035's protection kept — confidence: high —
+   Test: test_gate6_still_rejects_bare_non_blocking_without_summary
 3. [blocking] A zero-findings review (summary "Found 0 blocking issue(s) and 0
    non-blocking note(s)", no tier tags anywhere) passes gate 6, and
    `evaluate_gate7` on an empty thread list passes in the same test, pinning the
-   end-to-end path (gate 6 → stage 7 → resolved PR) — confidence: high — Test: test_gate6_passes_zero_findings_review
+   end-to-end path (gate 6 → stage 7 → resolved PR) — confidence: high —
+   Test: test_gate6_passes_zero_findings_review
 4. [blocking] The summary match is anchored on the exact `code-review` skill
    phrase as a module constant `BLOCKING_SUMMARY_RE` next to `BLOCKING_TAG`
    (`gates.py:61`); prose containing the word `blocking` alone, unbracketed or
    reworded ("all blocking concerns cleared" / "nothing found"), does not
-   satisfy it — confidence: high — Test: test_gate6_summary_match_is_anchored_not_substring
+   satisfy it — confidence: high —
+   Test: test_gate6_summary_match_is_anchored_not_substring
 5. [non-blocking] With `trusted_authors`, the summary phrase counts only from a
    trusted author's body, on both `gh pr view` surfaces and inline comments,
-   mirroring `test_gate6_ignores_tier_labels_from_untrusted_authors
-   `- confidence: high — Test: test_gate6_ignores_summary_from_untrusted_authors
+   mirroring `test_gate6_ignores_tier_labels_from_untrusted_authors`
+   (`tests/test_gates.py:506`) — confidence: high —
+   Test: test_gate6_ignores_summary_from_untrusted_authors
 
 ## Files touched
 
@@ -114,13 +120,13 @@ code-invoked; `docs/pipeline/design.md` stage-table semantics unchanged).
   containing a bare `blocking` word — matches neither `BLOCKING_TAG` nor
   `BLOCKING_SUMMARY_RE`. — confidence: high
 - [blocking] **A pre-existing test silently flips.**
-  `test_gate5_rejects_nonblocking_only_review` (`tests/test_gates.py:454`)
-  feeds only `[non-blocking]` with no summary and must keep failing;
-  `test_gate5_reads_blocking_labels_from_inline_review_comments
-  ` (`:495`) has a summary + `**[blocking]**` inline and must keep passing;
-  the pipeline-run trusted-author test (`tests/test_pipeline_run.py:790`)
-  makes every review untrusted and must keep failing. Running the full suite
-  verifies all three unambiguously. — confidence: high
+  `test_gate5_rejects_nonblocking_only_review` (`tests/test_gates.py:454`) feeds
+  only `[non-blocking]` with no summary and must keep failing;
+  `test_gate5_reads_blocking_labels_from_inline_review_comments` (`:495`) has a
+  summary + `**[blocking]**` inline and must keep passing; the pipeline-run
+  trusted-author test (`tests/test_pipeline_run.py:790`) makes every review
+  untrusted and must keep failing. Running the full suite verifies all three
+  unambiguously. — confidence: high
 - [non-blocking] **Reason-string drift.** The grown failure sentence could
   break an assertion that pins the old wording mid-string. Mitigation: the only
   gate-6 reason assertion today checks `BLOCKING_TAG in verdict.reason`
@@ -139,3 +145,25 @@ code-invoked; `docs/pipeline/design.md` stage-table semantics unchanged).
   stage 7's reply coverage, not by arithmetic here.
 - Updates to `docs/pipeline/design.md` — the stage table's gate column already
   defers to the Gates doc, whose gate 6 entry is code-anchored, not prose.
+
+## Changelog v1→v2
+
+- Stage 2 fact-check pass: every code anchor in v1 verified as written —
+  `run_gate6` (`src/herdr_routines/gates.py:585`), `BLOCKING_TAG` (`:61`), the
+  `re` import (`:22`), `evaluate_gate7` (`gates.py:325`), the
+  `Found 1 blocking issue(s).` fixture (`tests/test_gates.py:500`), the at-risk
+  tests (`tests/test_gates.py:454`, `:495`, `:506`,
+  `tests/test_pipeline_run.py:790`) — no substantive correction.
+- The acceptance criteria drafted in v1 are confirmed unchanged as the criteria of
+  record for v2: numbered items, tier labels `[blocking]`/`[non-blocking]`,
+  `confidence:` tiers on every item and risk, each item ending
+  `Test: <name>` with the exact test name.
+- Fixed two markdown line-wrap artifacts that split a backtick-quoted name
+  mid-token (criterion 5, Risks item 2 "A pre-existing test silently flips").
+- Criterion 5 now cites the mirrored test's location
+  (`tests/test_gates.py:506`); reflowed criterion 1 to the shared wrap width.
+
+No semantic change to the approach: gate 6 gains the anchored
+`BLOCKING_SUMMARY_RE` summary-phrase evidence beside `BLOCKING_TAG`; gate 5,
+gate 7, the failure category `gate_6_failed`, and the trusted-author scope stay
+untouched.
