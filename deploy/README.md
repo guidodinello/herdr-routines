@@ -255,7 +255,16 @@ uv run herdr-routines spawn-from-telegram --chat-id "$CHAT_ID" --text "$MESSAGE_
 scripts/herdr-spawn-from-telegram.sh --chat-id "$CHAT_ID" --text "$MESSAGE_TEXT"
 ```
 
-The handler is event-only: it writes no `tick.lock`, no history terminal state, and owns no
+**Running a configured job: `/job <name>` (issue 075).** A job with `trigger: {request: true}`
+(and `enabled: true`) can be started from the same allowlisted chat with `/job <name>`. Every other
+job, an unknown name and any other chat are refused, with the same allowlist rule as `/run`. The
+entrypoint starts `herdr-routines run <name> --trigger request` detached, so the run goes through
+the same dispatch as the tick and `herdr-routines run` (tick lock included), and its history
+records say `extra.trigger: request`. If a tick holds the lock at that moment the run posts a
+"request refused" notification and you send `/job` again. The bot's `HERDR_TG_SPAWN_CMD` hook
+must forward `/job` to the shim, as it does `/run` and `/start`.
+
+The cold-start handler is event-only: it writes no `tick.lock`, no history terminal state, and owns no
 timer — the systemd `herdr-routines.timer` stays the sole scheduler. Secrets (the bot token)
 stay in the bridge's own secrets file; only the non-secret `allowed_chat_id` and alias map live
 in the host-specific jobs config, which is not committed.

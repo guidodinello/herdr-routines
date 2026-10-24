@@ -1,7 +1,7 @@
 ---
 id: "075"
 title: "Triggers as job config: cron, polled events and on-request runs (phase C of 071)"
-status: open
+status: done
 priority: medium
 area: scheduler
 ---
@@ -72,3 +72,30 @@ trigger:
 
 - Depends on 074 (one shared run path). Implement after it merges.
 - Related: 014 (github_event), 024 (Telegram spawn), 071/073 (phases A/B).
+
+## Log
+
+- **2026-10-24**: implemented. Where the code settled the spec's open points:
+  - A job with neither `cron:` nor `trigger:` is a load error; an explicit `trigger:` that
+    fires nothing loads and `validate` warns (AC 6).
+  - Cron goes first each tick; a due occurrence dispatches and the event poll waits for the
+    next tick, so a job starts at most one run per tick. For the same reason at most one new
+    event fires per tick (the rest fire on later ticks), which keeps `validate`'s systemd
+    timeout budget true.
+  - Event dedupe is issue 014's `last_seen_event_ids` watermark, but written before the
+    dispatch (at-most-once per event); a failed run is retried by its own `retry_on` /
+    `fallback_model`, not by the trigger, unlike 014's per-event attempt budget.
+  - `trigger.event` is rejected on `kind: pipeline`, `kind: review` and a gated job with its
+    own `github_event` check.
+  - Only `cron` runs feed `schedule.decide`: a run whose `trigger` is not `cron` (event,
+    request, manual) is skipped by `history.last_scheduled_terminal_run`, as are the
+    run_id-less event-poll records.
+  - AC 5 is met by the `running` record every run opens with, plus the routine and pipeline
+    terminals; the gated / audit / review cycles write their terminals without the
+    occurrence (linked by run_id, as 074 does).
+  - `/job` launches `herdr-routines run <name> --trigger request` detached, so it reaches
+    `dispatch_occurrence` through the same path as `run`. If a tick holds the lock, the run
+    posts a "request refused" notification instead of vanishing.
+  - **Deploy follow-up**: the `herdr-remote` fork's `HERDR_TG_SPAWN_CMD` hook only forwards
+    `/run` and `/start` to `scripts/herdr-spawn-from-telegram.sh`; it needs `/job` added
+    before the verb works on the Pi.

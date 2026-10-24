@@ -37,7 +37,8 @@ def next_fire_at(cron: str, timezone: str, *, now: datetime) -> datetime | None:
 class ScheduledRow:
     name: str
     enabled: bool
-    cron: str
+    # None for a job with no cron trigger (event / request only, issue 075).
+    cron: str | None
     timezone: str
     next_fire: datetime | None
     last_state: str | None
@@ -58,7 +59,9 @@ def build_scheduled_rows(
                 timezone=job.timezone,
                 # Disabled jobs still show their would-be next fire, marked inactive —
                 # a disabled job's schedule must stay inspectable (spec criterion 4).
-                next_fire=next_fire_at(job.cron, job.timezone, now=now),
+                next_fire=next_fire_at(job.cron, job.timezone, now=now)
+                if job.cron is not None
+                else None,
                 last_state=last.state if last else None,
                 last_run_at=last.ts if last else None,
             )
@@ -74,6 +77,8 @@ def _format_next_fire(row: ScheduledRow) -> str:
     """A disabled job keeps its would-be schedule visible (spec 20260825T070012Z §Risks:
     "still computes next-fire but marks it inactive") but parenthesised, so a time that
     will never actually arrive can't be misread as a live schedule."""
+    if row.cron is None:
+        return "-"
     if row.next_fire is None:
         return "never (within 1y)"
     rendered = _local(row.next_fire, row.timezone)
@@ -97,7 +102,7 @@ def render_scheduled(rows: list[ScheduledRow]) -> str:
             [
                 row.name,
                 "ENABLED" if row.enabled else "DISABLED",
-                row.cron,
+                row.cron or "-",
                 row.timezone,
                 _format_next_fire(row),
                 _format_last_run(row),

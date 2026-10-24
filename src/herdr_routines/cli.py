@@ -14,6 +14,7 @@ import importlib.metadata
 import json
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -44,6 +45,7 @@ from herdr_routines.gc import run_gc, run_gc_delete
 from herdr_routines.herdr import HerdrClient, HerdrCliError
 from herdr_routines.history import (
     TRIGGER_MANUAL,
+    TRIGGER_REQUEST,
     HistoryExtra,
     default_history_path,
     first_seen_at,
@@ -95,7 +97,12 @@ from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
 from herdr_routines.self_update import default_state_path, run_self_update
 from herdr_routines.table import render_table
-from herdr_routines.telegram_spawn import alias_table, handle_spawn_message
+from herdr_routines.telegram_spawn import (
+    alias_table,
+    handle_job_message,
+    handle_spawn_message,
+    is_job_verb,
+)
 from herdr_routines.tick import (
     _build_pipeline_launch_argv,
     default_lock_path,
@@ -228,6 +235,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "<job>-<timestamp>; for kind: pipeline it is the orchestrator's bare "
             "UTC timestamp RUN_ID (design.md's same-RUN_ID relaunch path)"
         ),
+    )
+    p_run.add_argument(
+        "--trigger",
+        choices=[TRIGGER_MANUAL, TRIGGER_REQUEST],
+        default=TRIGGER_MANUAL,
+        help=argparse.SUPPRESS,  # what Telegram `/job` passes (issue 075)
     )
     p_run.set_defaults(handler=_cmd_run)
 
@@ -751,6 +764,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for job in config.jobs:
         last = last_terminal_run(history_path, job.name)
         last_desc = f"{last.state} at {last.ts.isoformat()}" if last else "never run"
+        enabled_desc = "" if job.enabled else " [disabled]"
+        if job.cron is None:
+            # Event / request only (issue 075): nothing for the schedule to decide.
+            print(f"{job.name}{enabled_desc}: last={last_desc}; no schedule")
+            continue
         result = decide(
             cron=job.cron,
             timezone=job.timezone,
@@ -764,7 +782,6 @@ def _cmd_status(args: argparse.Namespace) -> int:
             Decision.RUN: "due now",
             Decision.MISSED: "missed",
         }[result.decision]
-        enabled_desc = "" if job.enabled else " [disabled]"
         print(f"{job.name}{enabled_desc}: last={last_desc}; {due_desc}")
     return 0
 
@@ -914,6 +931,17 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     problems.extend(config.errors)
 
     for job in config.jobs:
+        # Triggers (issue 075): a job that nothing fires, or one `/job` can never reach.
+        if job.cron is None and job.trigger_event is None and not job.request:
+            warnings.append(
+                f"{job.name}: no trigger (cron, event or request): it never runs on "
+                "its own; only `herdr-routines run` reaches it"
+            )
+        if job.request and not job.enabled:
+            warnings.append(
+                f"{job.name}: request: true but enabled: false: /job refuses it, so "
+                "it can never run"
+            )
         if job.kind == "review":
             # kind: review has no single checkout: `repo` is the managed base dir, and
             # per-repo checkouts are created lazily at tick time. Nothing on disk to
@@ -1184,6 +1212,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     with tick_lock(default_lock_path()) as acquired:
         if not acquired:
             log.error("%s: a tick is running; try again when it finishes", job.name)
+            if args.trigger == TRIGGER_REQUEST:
+                # Detached from Telegram, so nobody reads the log: say so where they look.
+                tick._notify(
+                    HerdrClient(),
+                    f"herdr-routines: {job.name} request refused",
+                    body="a tick is running; send /job again later",
+                    sound="request",
+                )
             return 1
         log.info("%s: starting run %s", job.name, run_id)
         # Same dispatch as a scheduled tick (issue 074): the schedule decision is the only
@@ -1191,7 +1227,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         summary, failed = tick.dispatch_occurrence(
             job,
             default_history_path(),
-            tick.Occurrence(run_id, HistoryExtra(trigger=TRIGGER_MANUAL)),
+            tick.Occurrence(run_id, HistoryExtra(trigger=args.trigger)),
             client=HerdrClient(),
             now=now,
             trusted_review_authors=config.trusted_review_authors,
@@ -1212,6 +1248,18 @@ def _cmd_spawn_from_telegram(args: argparse.Namespace) -> int:
     if spawn is None:
         log.error("telegram_spawn is not configured; nothing to spawn")
         return 1
+    if is_job_verb(args.text):
+        # `/job <name>` (issue 075): the same allowlist, then `herdr-routines run` detached,
+        # so the shared dispatch (tick lock included) runs it, not this event handler.
+        handle_job_message(
+            args.text,
+            args.chat_id,
+            allowed_chat_id=spawn.allowed_chat_id,
+            requestable={j.name for j in config.jobs if j.request and j.enabled},
+            launch=lambda name: _launch_request_run(name, args.config),
+            reply=_print_reply,
+        )
+        return 0
     handle_spawn_message(
         args.text,
         args.chat_id,
@@ -1221,6 +1269,23 @@ def _cmd_spawn_from_telegram(args: argparse.Namespace) -> int:
         reply=_print_reply,
     )
     return 0
+
+
+def _launch_request_run(name: str, config_path: Path | None) -> None:
+    """Start `herdr-routines run <name> --trigger request` detached: a run can outlast the
+    bridge hook waiting on this process, and it reports through the job's notification."""
+    argv = [sys.argv[0]]
+    if config_path is not None:
+        argv += ["--config", str(config_path)]
+    argv += ["run", name, "--trigger", TRIGGER_REQUEST]
+    # argv is ours: the name passed NAME_RE and the requestable allowlist, no shell involved.
+    subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def _print_reply(text: str) -> None:

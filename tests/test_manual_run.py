@@ -221,7 +221,7 @@ def test_manual_run_does_not_consume_scheduled_occurrence(
     scheduled_run = next(
         r
         for r in records
-        if r.state == "running" and (r.extra or {}).get("trigger") is None
+        if r.state == "running" and (r.extra or {}).get("trigger") == "cron"
     )
     assert scheduled_run.run_id == "a-20261020T100000Z"
     assert scheduled_run.extra is not None
@@ -374,7 +374,7 @@ def test_tick_and_manual_run_share_dispatch(
     assert outcome.summaries == ("a: spied",)
     assert len(calls) == 1
     name, scheduled = calls[0]
-    assert name == "a" and "trigger" not in scheduled.extra
+    assert name == "a" and scheduled.extra.get("trigger") == "cron"
     assert scheduled.extra.get("scheduled_for") == OCCURRENCE.isoformat()
 
     assert _run_cli(monkeypatch, job) == 0

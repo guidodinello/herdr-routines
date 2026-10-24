@@ -86,7 +86,8 @@ from herdr_routines.herdr import (
 )
 from herdr_routines.history import (
     TERMINAL_STATES,
-    TRIGGER_MANUAL,
+    TRIGGER_CRON,
+    TRIGGER_EVENT,
     HistoryExtra,
     HistoryRecord,
     HistoryState,
@@ -358,74 +359,7 @@ def _process_audit_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_scheduled_terminal_run(history_path, job.name)
-    registered_at = first_seen_at(history_path, job.name) or now
-    result = decide(
-        cron=job.cron,
-        timezone=job.timezone,
-        catch_up_minutes=job.catch_up_minutes,
-        now=now,
-        last_terminal=last,
-        job_registered_at=registered_at,
-    )
-
-    if result.decision == Decision.NOT_DUE:
-        return f"{job.name}: not due", False
-
-    if result.decision == Decision.MISSED:
-        extra = HistoryExtra(
-            reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
-        )
-        if result.skipped_occurrences:
-            extra["skipped_occurrences"] = result.skipped_occurrences
-        append(
-            history_path,
-            HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
-        )
-        if job.on_missed == "notify":
-            _notify(
-                client,
-                f"herdr-routines: {job.name} missed",
-                body="outside catch-up window",
-                sound="request",
-            )
-        return f"{job.name}: missed", False
-
-    run_id = make_run_id(job.name, result.occurrence)
-
-    if result.skipped_occurrences:
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="missed",
-                extra=HistoryExtra(
-                    reason="collapsed_earlier_occurrences",
-                    skipped_occurrences=result.skipped_occurrences,
-                    skipped_first=result.skipped_first.isoformat()
-                    if result.skipped_first
-                    else None,
-                    skipped_last=result.skipped_last.isoformat()
-                    if result.skipped_last
-                    else None,
-                ),
-            ),
-        )
-
-    return dispatch_occurrence(
-        job,
-        history_path,
-        Occurrence(
-            run_id,
-            HistoryExtra(
-                scheduled_for=result.occurrence.isoformat(),
-                late_seconds=result.late_seconds,
-            ),
-        ),
-        client=client,
-        now=now,
-    )
+    return _fire_triggers(job, history_path, client=client, now=now)
 
 
 # Per-run cap on how many suppressed IDs the history record carries. Suppression is
@@ -1213,72 +1147,9 @@ def _process_gated_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_scheduled_terminal_run(history_path, job.name)
-    registered_at = first_seen_at(history_path, job.name) or now
-    result = decide(
-        cron=job.cron,
-        timezone=job.timezone,
-        catch_up_minutes=job.catch_up_minutes,
-        now=now,
-        last_terminal=last,
-        job_registered_at=registered_at,
-    )
-
-    if result.decision == Decision.NOT_DUE:
-        return f"{job.name}: not due", False
-
-    if result.decision == Decision.MISSED:
-        extra = HistoryExtra(
-            reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
-        )
-        if result.skipped_occurrences:
-            extra["skipped_occurrences"] = result.skipped_occurrences
-        append(
-            history_path,
-            HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
-        )
-        if job.on_missed == "notify":
-            _notify(
-                client,
-                f"herdr-routines: {job.name} missed",
-                body="outside catch-up window",
-                sound="request",
-            )
-        return f"{job.name}: missed", False
-
-    # Decision.RUN
-    run_id = make_run_id(job.name, result.occurrence)
-
-    if result.skipped_occurrences:
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="missed",
-                extra=HistoryExtra(
-                    reason="collapsed_earlier_occurrences",
-                    skipped_occurrences=result.skipped_occurrences,
-                    skipped_first=result.skipped_first.isoformat()
-                    if result.skipped_first
-                    else None,
-                    skipped_last=result.skipped_last.isoformat()
-                    if result.skipped_last
-                    else None,
-                ),
-            ),
-        )
-
-    return dispatch_occurrence(
+    return _fire_triggers(
         job,
         history_path,
-        Occurrence(
-            run_id,
-            HistoryExtra(
-                scheduled_for=result.occurrence.isoformat(),
-                late_seconds=result.late_seconds,
-            ),
-        ),
         client=client,
         now=now,
         trusted_review_authors=trusted_review_authors,
@@ -2927,11 +2798,266 @@ def _retry_eligible(outcome: RunOutcome, job: Job) -> bool:
     )
 
 
+def _fire_triggers(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
+) -> tuple[str, bool]:
+    """What the job's triggers decide this tick (issue 075), after the guards (registered,
+    stale, already running, agent live) every kind shares.
+
+    The cron trigger goes first: a due occurrence dispatches and the event poll waits for
+    the next tick, so one tick starts at most one run per job. A cron that is not due, or
+    missed, falls through to the event trigger. A job with neither fires nothing and writes
+    nothing: a request-only job is never reported missed."""
+    cron_summary: str | None = None
+    if job.cron is not None:
+        last = last_scheduled_terminal_run(history_path, job.name)
+        registered_at = first_seen_at(history_path, job.name) or now
+        result = decide(
+            cron=job.cron,
+            timezone=job.timezone,
+            catch_up_minutes=job.catch_up_minutes,
+            now=now,
+            last_terminal=last,
+            job_registered_at=registered_at,
+        )
+
+        if result.decision == Decision.RUN:
+            run_id = make_run_id(job.name, result.occurrence)
+            if result.skipped_occurrences:
+                append(
+                    history_path,
+                    HistoryRecord(
+                        ts=now,
+                        job=job.name,
+                        state="missed",
+                        extra=HistoryExtra(
+                            reason="collapsed_earlier_occurrences",
+                            skipped_occurrences=result.skipped_occurrences,
+                            skipped_first=result.skipped_first.isoformat()
+                            if result.skipped_first
+                            else None,
+                            skipped_last=result.skipped_last.isoformat()
+                            if result.skipped_last
+                            else None,
+                        ),
+                    ),
+                )
+            return dispatch_occurrence(
+                job,
+                history_path,
+                Occurrence(
+                    run_id,
+                    HistoryExtra(
+                        trigger=TRIGGER_CRON,
+                        scheduled_for=result.occurrence.isoformat(),
+                        late_seconds=result.late_seconds,
+                    ),
+                ),
+                client=client,
+                now=now,
+                trusted_review_authors=trusted_review_authors,
+            )
+
+        if result.decision == Decision.MISSED:
+            extra = HistoryExtra(
+                reason="outside_catch_up_window",
+                occurrence=result.occurrence.isoformat(),
+            )
+            if result.skipped_occurrences:
+                extra["skipped_occurrences"] = result.skipped_occurrences
+            append(
+                history_path,
+                HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
+            )
+            if job.on_missed == "notify":
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} missed",
+                    body="outside catch-up window",
+                    sound="request",
+                )
+            cron_summary = f"{job.name}: missed"
+        else:
+            cron_summary = f"{job.name}: not due"
+
+    if job.trigger_event is None:
+        return cron_summary or f"{job.name}: not due (request only)", False
+
+    event_summary, failed = _poll_event_trigger(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        trusted_review_authors=trusted_review_authors,
+    )
+    if cron_summary is not None:
+        return f"{cron_summary}; {event_summary}", failed
+    return event_summary, failed
+
+
+# `phase` on the records `_poll_event_trigger` writes, so a poll's own history (watermark,
+# failures) is told apart from the runs it started, which carry the same `trigger: event`.
+_EVENT_POLL_PHASE = "event_poll"
+
+
+def _last_event_poll_failed(history_path: Path, job_name: str) -> bool:
+    for r in reversed(read_job(history_path, job_name)):
+        if r.extra and r.extra.get("phase") == _EVENT_POLL_PHASE:
+            return r.state == "failed"
+    return False
+
+
+def _poll_event_trigger(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...],
+) -> tuple[str, bool]:
+    """The `trigger.event` poll (issue 075): run the job once for the first new matching
+    event, through the same `dispatch_occurrence` a cron firing uses.
+
+    Dedupe is issue 014's: the polled event ids minus `_last_seen_event_ids`, the latest
+    watermark, so an event that clears and comes back fires again. At most one event fires
+    per tick (the rest stay out of the watermark and fire on later ticks), which keeps the
+    tick lock's worst case at one run per job, as `validate`'s timeout budget assumes.
+
+    The watermark is written *before* the dispatch: a crash mid-run never re-fires its
+    event. A failed run is retried by its own `retry_on` / `fallback_model`, not here.
+    Every record this writes without a run_id carries `trigger: event`, so none of them
+    counts toward `schedule.decide`. A poll failure fails closed (never "no events") and
+    pages once per outage, not every tick."""
+    check = job.trigger_event
+    if check is None:
+        raise RuntimeError(f"{job.name}: no event trigger configured")
+    event_target = _event_target(check)
+    previously_failed = _last_event_poll_failed(history_path, job.name)
+
+    def _poll_failed(reason: str, error: str) -> tuple[str, bool]:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="failed",
+                extra=HistoryExtra(
+                    trigger=TRIGGER_EVENT,
+                    phase=_EVENT_POLL_PHASE,
+                    reason=reason,
+                    error=error,
+                    target=event_target,
+                    query=check.query,
+                ),
+            ),
+        )
+        if not previously_failed and _notify_gate(job, "failure"):
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=reason,
+                sound="request",
+            )
+        return f"{job.name}: failed ({reason})", True
+
+    try:
+        ensure_repo(job)
+    except (RuntimeError, OSError) as e:
+        return _poll_failed(
+            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed",
+            str(e),
+        )
+    try:
+        owner, repo_name = _resolve_event_owner_repo(job, check)
+    except Exception as e:  # noqa: BLE001
+        return _poll_failed("repo_detection_failed", str(e))
+    try:
+        events = poll_github_event(
+            RealGhClient(),
+            owner=owner,
+            repo=repo_name,
+            check=check,
+            trusted_review_authors=trusted_review_authors,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _poll_failed("github_event_poll_failed", str(e))
+
+    last_seen = _last_seen_event_ids(history_path, job.name)
+
+    def _poll_record(
+        watermark: list[str], reason: str, *, new: int, dispatched: int
+    ) -> None:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="done",
+                extra=HistoryExtra(
+                    trigger=TRIGGER_EVENT,
+                    phase=_EVENT_POLL_PHASE,
+                    reason=reason,
+                    target=event_target,
+                    query=check.query,
+                    polled=len(events),
+                    new=new,
+                    dispatched=dispatched,
+                    last_seen_event_ids=watermark,
+                ),
+            ),
+        )
+
+    if last_seen is None and check.query == "issues:opened":
+        # Same first-poll rule as 014's gate: adopt the open issues as the baseline.
+        _poll_record(
+            [e.event_id for e in events], "event_baseline", new=0, dispatched=0
+        )
+        return f"{job.name}: baseline ({len(events)} open issues adopted)", False
+
+    seen = set(last_seen or [])
+    new_events = [e for e in events if e.event_id not in seen]
+    fired = new_events[:1]
+    keep = seen | {e.event_id for e in fired}
+    watermark = [e.event_id for e in events if e.event_id in keep]
+
+    # A quiet poll writes nothing, so a */5 tick adds no history line; a changed watermark
+    # or the first poll after a failed one (which ends the outage) does.
+    if watermark != (last_seen or []) or previously_failed:
+        _poll_record(
+            watermark, "event_poll", new=len(new_events), dispatched=len(fired)
+        )
+
+    if not fired:
+        return f"{job.name}: not due (no new events)", False
+
+    event = fired[0]
+    return dispatch_occurrence(
+        job,
+        history_path,
+        Occurrence(
+            make_run_id(job.name, now),
+            HistoryExtra(
+                trigger=TRIGGER_EVENT,
+                event_id=event.event_id,
+                event_number=event.number,
+            ),
+        ),
+        client=client,
+        now=now,
+        trusted_review_authors=trusted_review_authors,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Occurrence:
-    """One firing of a job (issue 074): a cron occurrence the tick found due, or a manual
-    `herdr-routines run`. `extra` goes into the `running` record: `scheduled_for` and
-    `late_seconds` for a cron firing, `trigger: manual` for a manual one."""
+    """One firing of a job (issues 074, 075): whatever a trigger decided should run now. `extra`
+    goes into the `running` record and always carries `trigger` (cron / event / request /
+    manual), plus `scheduled_for` and `late_seconds` for a cron firing or the event's id."""
 
     run_id: str
     extra: HistoryExtra
@@ -2944,11 +3070,12 @@ def _occurrence_extra(occ: Occurrence) -> HistoryExtra:
 def _with_trigger(
     source: Occurrence | HistoryExtra, extra: HistoryExtra
 ) -> HistoryExtra:
-    """Stamp `extra` with the occurrence's `trigger` when it is manual. A scheduled record
-    gets no `trigger` key, so a cron firing writes the same records it always did."""
+    """Stamp `extra` with the occurrence's `trigger` (issues 074, 075), so a terminal record
+    says what started its run just as the `running` record does."""
     origin = source.extra if isinstance(source, Occurrence) else source
-    if origin.get("trigger") == TRIGGER_MANUAL:
-        extra["trigger"] = TRIGGER_MANUAL
+    trigger = origin.get("trigger")
+    if trigger is not None:
+        extra["trigger"] = trigger
     return extra
 
 
@@ -2980,10 +3107,10 @@ def dispatch_occurrence(
     reaches it from each `_process_*_job` once `schedule.decide` says RUN; `herdr-routines
     run` skips that decision and calls it directly. One function, so the two cannot drift."""
     if job.kind == "pipeline":
-        # A manual run's `running` record would shadow an in-flight one, and tick reconciles
-        # only the latest open run, so refuse instead.
+        # An off-schedule run's `running` record would shadow an in-flight one, and tick
+        # reconciles only the latest open run, so refuse instead.
         if (
-            occ.extra.get("trigger") == TRIGGER_MANUAL
+            occ.extra.get("trigger", TRIGGER_CRON) != TRIGGER_CRON
             and _open_pipeline_run(history_path, job.name) is not None
         ):
             return f"{job.name}: skipped (already running)", True
@@ -3428,71 +3555,9 @@ def _process_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_scheduled_terminal_run(history_path, job.name)
-    registered_at = first_seen_at(history_path, job.name) or now
-    result = decide(
-        cron=job.cron,
-        timezone=job.timezone,
-        catch_up_minutes=job.catch_up_minutes,
-        now=now,
-        last_terminal=last,
-        job_registered_at=registered_at,
-    )
-
-    if result.decision == Decision.NOT_DUE:
-        return f"{job.name}: not due", False
-
-    if result.decision == Decision.MISSED:
-        extra = HistoryExtra(
-            reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
-        )
-        if result.skipped_occurrences:
-            extra["skipped_occurrences"] = result.skipped_occurrences
-        append(
-            history_path,
-            HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
-        )
-        if job.on_missed == "notify":
-            _notify(
-                client,
-                f"herdr-routines: {job.name} missed",
-                body="outside catch-up window",
-                sound="request",
-            )
-        return f"{job.name}: missed", False
-
-    # Decision.RUN
-    run_id = make_run_id(job.name, result.occurrence)
-    if result.skipped_occurrences:
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="missed",
-                extra=HistoryExtra(
-                    reason="collapsed_earlier_occurrences",
-                    skipped_occurrences=result.skipped_occurrences,
-                    skipped_first=result.skipped_first.isoformat()
-                    if result.skipped_first
-                    else None,
-                    skipped_last=result.skipped_last.isoformat()
-                    if result.skipped_last
-                    else None,
-                ),
-            ),
-        )
-
-    return dispatch_occurrence(
+    return _fire_triggers(
         job,
         history_path,
-        Occurrence(
-            run_id,
-            HistoryExtra(
-                scheduled_for=result.occurrence.isoformat(),
-                late_seconds=result.late_seconds,
-            ),
-        ),
         client=client,
         now=now,
         trusted_review_authors=trusted_review_authors,
@@ -3842,6 +3907,11 @@ def _process_pipeline_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
+    # Request-only (issue 075). After the reconcile block above, so a run started by `run` or
+    # `/job` still gets reconciled; nothing to decide and nothing to report missed.
+    if job.cron is None:
+        return f"{job.name}: not due (request only)", False
+
     last = last_scheduled_terminal_run(history_path, job.name)
     registered_at = first_seen_at(history_path, job.name) or now
     result = decide(
@@ -3890,6 +3960,7 @@ def _process_pipeline_job(
         Occurrence(
             make_run_id(job.name, result.occurrence),
             HistoryExtra(
+                trigger=TRIGGER_CRON,
                 scheduled_for=result.occurrence.isoformat(),
                 late_seconds=result.late_seconds,
             ),
@@ -4284,72 +4355,9 @@ def _process_review_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_scheduled_terminal_run(history_path, job.name)
-    registered_at = first_seen_at(history_path, job.name) or now
-    result = decide(
-        cron=job.cron,
-        timezone=job.timezone,
-        catch_up_minutes=job.catch_up_minutes,
-        now=now,
-        last_terminal=last,
-        job_registered_at=registered_at,
-    )
-
-    if result.decision == Decision.NOT_DUE:
-        return f"{job.name}: not due", False
-
-    if result.decision == Decision.MISSED:
-        extra = HistoryExtra(
-            reason="outside_catch_up_window", occurrence=result.occurrence.isoformat()
-        )
-        if result.skipped_occurrences:
-            extra["skipped_occurrences"] = result.skipped_occurrences
-        append(
-            history_path,
-            HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
-        )
-        if job.on_missed == "notify":
-            _notify(
-                client,
-                f"herdr-routines: {job.name} missed",
-                body="outside catch-up window",
-                sound="request",
-            )
-        return f"{job.name}: missed", False
-
-    # Decision.RUN
-    run_id = make_run_id(job.name, result.occurrence)
-
-    if result.skipped_occurrences:
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="missed",
-                extra=HistoryExtra(
-                    reason="collapsed_earlier_occurrences",
-                    skipped_occurrences=result.skipped_occurrences,
-                    skipped_first=result.skipped_first.isoformat()
-                    if result.skipped_first
-                    else None,
-                    skipped_last=result.skipped_last.isoformat()
-                    if result.skipped_last
-                    else None,
-                ),
-            ),
-        )
-
-    return dispatch_occurrence(
+    return _fire_triggers(
         job,
         history_path,
-        Occurrence(
-            run_id,
-            HistoryExtra(
-                scheduled_for=result.occurrence.isoformat(),
-                late_seconds=result.late_seconds,
-            ),
-        ),
         client=client,
         now=now,
         trusted_review_authors=trusted_review_authors,
