@@ -1021,30 +1021,51 @@ def build_review_prompt(
     """)
 
 
-# Failure reasons that still consume a review target's budget: the agent ran to settle,
-# so a review may well have landed (an unread or missing marker). Re-dispatching would
-# risk a duplicate review. Every other failure (worktree, agent start/prompt) happens
+# Failure reasons that still consume a review target's budget: the agent got the prompt and
+# ran to settle (or to a state we cannot tell from it), so a review may well have landed — an
+# unread or missing marker, a report the agent skipped after posting. Re-dispatching would
+# risk a duplicate review. Every other failure (worktree, agent start/prompt, quota) happens
 # before the agent could post anything and must not burn the target's only attempt.
+# `review_not_posted` / `review_verification_failed` are the reasons the review-only dispatch
+# recorded (issue 055); they stay counted for the history already on disk.
 _REVIEW_COUNTABLE_FAILURES = frozenset(
-    {"review_not_posted", "review_verification_failed"}
+    {
+        "review_not_posted",
+        "review_verification_failed",
+        "verify_failed:review_posted",
+        "no_report",
+        "blocked",
+    }
 )
+_REVIEW_COUNTABLE_PREFIXES = ("unsettled_status_",)
+
+
+def _review_attempt_consumed(state: str, reason: object) -> bool:
+    if state in ("done", "interrupted_unknown"):
+        return True
+    return (
+        state == "failed"
+        and isinstance(reason, str)
+        and (
+            reason in _REVIEW_COUNTABLE_FAILURES
+            or reason.startswith(_REVIEW_COUNTABLE_PREFIXES)
+        )
+    )
 
 
 def attempt_count_for_target(history_path: Path, job_name: str, target_key: str) -> int:
-    """Count prior review attempts for this job+target_key: ``done`` records plus
-    ``failed`` records whose agent actually ran (``_REVIEW_COUNTABLE_FAILURES``).
-    Sibling of ``attempt_count_for_pr``, keyed on the full ``owner/repo#N`` so ``#7``
-    in one repo is independent of ``#7`` in another. Skips and pre-agent infra failures
-    must not consume budget — with the default budget of 1, a transient failure would
-    otherwise exclude the PR forever."""
+    """Count prior review attempts for this job+target_key: ``done`` records, plus failed
+    ones whose agent actually ran (``_REVIEW_COUNTABLE_FAILURES``) and runs that ended
+    ``interrupted_unknown``. Sibling of ``attempt_count_for_pr``, keyed on the full
+    ``owner/repo#N`` so ``#7`` in one repo is independent of ``#7`` in another. Skips and
+    pre-agent infra failures must not consume budget — with the default budget of 1, a
+    transient failure would otherwise exclude the PR forever."""
     records = read_job(history_path, job_name)
     count = 0
     for r in records:
         if not r.extra or r.extra.get("target_key") != target_key:
             continue
-        if r.state == "done" or (
-            r.state == "failed" and r.extra.get("reason") in _REVIEW_COUNTABLE_FAILURES
-        ):
+        if _review_attempt_consumed(r.state, r.extra.get("reason")):
             count += 1
     return count
 

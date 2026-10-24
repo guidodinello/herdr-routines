@@ -27,6 +27,7 @@ from herdr_routines import gc, reports_prune, tick
 from herdr_routines.auto_fix import RealGhClient, effective_trusted_authors
 from herdr_routines.config import (
     DEFAULT_REPORTS_MAX_AGE_DAYS,
+    MULTI_TARGET_SELECTORS,
     TINY_HISTORY_MAX_BYTES,
     ConfigError,
     Job,
@@ -82,6 +83,7 @@ from herdr_routines.reports_prune import (
     prune_reports,
     prune_rolled_history,
 )
+from herdr_routines.repos import is_repo_less
 from herdr_routines.review_scan import (
     Candidate,
     Classification,
@@ -581,7 +583,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_review_scan = sub.add_parser(
         "review-scan",
         help=(
-            "read-only: classify one kind: review job's PR candidates the way the next "
+            "read-only: classify one pick: my_open_prs (kind: review) job's PR candidates the way the next "
             "tick's selector would (would dispatch, or the exact skip reason) without "
             "dispatching anything (issue 066)"
         ),
@@ -942,7 +944,7 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                 f"{job.name}: request: true but enabled: false: /job refuses it, so "
                 "it can never run"
             )
-        if job.kind == "review":
+        if is_repo_less(job):
             # kind: review has no single checkout: `repo` is the managed base dir, and
             # per-repo checkouts are created lazily at tick time. Nothing on disk to
             # validate here.
@@ -981,10 +983,10 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                 )
         elif (
             job.enabled
-            # gated, audit, and review jobs inject their own prompts when `prompt` is
-            # empty; an audit's verdict is its manifest and a review's is its posted
-            # review marker, neither of which is $ROUTINE_REPORT.
-            and job.kind not in ("gated", "audit", "review")
+            # gated and audit jobs inject their own prompts when `prompt` is empty; an
+            # audit's verdict is its manifest, not $ROUTINE_REPORT. (A `kind: review` job
+            # loads with the engine review prompt, which does name it.)
+            and job.kind not in ("gated", "audit")
             and (job.prompt is None or "$ROUTINE_REPORT" not in job.prompt)
         ):
             # A run only settles as "done" when the report file exists and is non-empty (see
@@ -1141,16 +1143,6 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
                 + job.timeout_ms / 1000
             )
             continue
-        # kind: review (issue 055) dispatches up to max_workers_per_tick read-only review
-        # agents sequentially in one tick, each bounded by start + run + slop.
-        if job.kind == "review":
-            total_job_seconds += (
-                GATE_SLOP_S
-                + job.max_workers_per_tick
-                * (job.start_timeout_ms + job.timeout_ms)
-                / 1000
-            )
-            continue
         if job.kind == "gated":
             gate_time_s = sum(c.timeout_ms for c in job.require_checks()) / 1000
             if job.require_target() == "base":
@@ -1171,9 +1163,15 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
         else:
             # Scale by (1 + retry_attempts) so the validate check accounts for
             # the worst-case tick time when a routine job retries transient failures
-            # (issue 008, spec risk 2: retry loop holds the tick lock).
+            # (issue 008, spec risk 2: retry loop holds the tick lock), and by
+            # max_targets_per_run: a multi-target run (issue 076) runs one agent per
+            # target in turn, each bounded by start + run, plus the worktree/gh slop once.
             total_job_seconds += (
-                (job.start_timeout_ms + job.timeout_ms) * (1 + job.retry_attempts)
+                GATE_SLOP_S if job.pick in MULTI_TARGET_SELECTORS else 0
+            ) + (
+                max(1, job.max_targets_per_run)
+                * (job.start_timeout_ms + job.timeout_ms)
+                * (1 + job.retry_attempts)
             ) / 1000
     required_s = total_job_seconds + SYSTEMD_TIMEOUT_MARGIN_SECONDS
     if unit_timeout_s < required_s:
@@ -1694,7 +1692,7 @@ def _cmd_review_scan(args: argparse.Namespace) -> int:
     Read-only by construction — no history append, no `reports/` file, no clone, no
     worktree, no agent, no notification: the tick stays the only writer, and the CLI
     is its inspect-only mirror of the same selector. Exit codes follow the CLI's own
-    vocabulary: 2 when the request itself is wrong (not a `kind: review` job, a
+    vocabulary: 2 when the request itself is wrong (not a `pick: my_open_prs` job, a
     `--limit` GitHub could never honour), 1 when the answer is unknowable (missing
     job, unusable gh auth, failed search — never a silent empty list), 0 on a
     successful scan however many PRs it found."""
@@ -1712,9 +1710,10 @@ def _cmd_review_scan(args: argparse.Namespace) -> int:
     if job is None:
         print(f"error: review-scan: no such job: {args.job}", file=sys.stderr)
         return EXIT_FAILURE
-    if job.kind != "review":
+    if job.pick != "my_open_prs":
         print(
-            f"error: review-scan: {job.name} has kind {job.kind!r}, not 'review'",
+            f"error: review-scan: {job.name} does not use the my_open_prs selector "
+            f"(pick: {job.pick}, kind: {job.kind})",
             file=sys.stderr,
         )
         return EXIT_USAGE
@@ -1723,7 +1722,7 @@ def _cmd_review_scan(args: argparse.Namespace) -> int:
     try:
         login = gh.api_user()
     except Exception as e:  # noqa: BLE001
-        # Same fail-closed posture as `_review_cycle`: an unauthenticated gh is never
+        # Same fail-closed posture as the `my_open_prs` selector: an unauthenticated gh is never
         # readable as "there is nothing to review".
         print(f"error: review-scan: gh_auth_missing: {e}", file=sys.stderr)
         return EXIT_FAILURE

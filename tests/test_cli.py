@@ -1486,6 +1486,8 @@ def test_validate_warns_inherited_verify_on_non_routine_kind(
         tmp_path,
         {
             "defaults.yaml": "verify: [report_wellformed]\n",
+            "g.yaml": f"name: g\ncron: '0 3 * * *'\nrepo: {repo}\nkind: gated\n"
+            "checks:\n  - command: 'true'\n",
             "r.yaml": "name: r\ncron: '0 3 * * *'\nkind: review\nselect: [author]\n",
             "a.yaml": f"name: a\ncron: '0 3 * * *'\nrepo: {repo}\n"
             "prompt: write $ROUTINE_REPORT\n",
@@ -1493,7 +1495,9 @@ def test_validate_warns_inherited_verify_on_non_routine_kind(
         capsys,
     )
     assert (
-        "r: inherits verify from defaults but kind review does not honor it yet "
+        "g: inherits verify from defaults but kind gated does not honor it yet "
         "(issue 071 phase A)"
     ) in err
     assert "a: inherits verify" not in err
+    # `kind: review` fixes its own gate, so the default is overridden, not warned about.
+    assert "r: inherits verify" not in err

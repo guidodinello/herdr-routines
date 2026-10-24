@@ -2,8 +2,9 @@
 
 19 tests, one per acceptance criterion in
 ``docs/pipeline/runs/20261011T050000Z/spec.md``, named exactly as the spec requires.
-Phase A exercises the pure selector (``review_scan``); Phase B drives the tick's
-``_review_cycle`` against real local git repos and an in-memory ``gh``.
+Phase A exercises the pure selector (``review_scan``); Phase B drives the routine
+fan-out (issue 076: ``dispatch_occurrence`` → ``_run_routine_targets``, which is what a
+``kind: review`` job loads as) against real local git repos and an in-memory ``gh``.
 """
 
 from __future__ import annotations
@@ -33,13 +34,14 @@ from herdr_routines.auto_fix import (
 )
 from herdr_routines.config import (
     _DEFAULTS_ALLOWED_KEYS,
+    ACCEPTED_KIND_VALUES,
     VALID_JOB_KINDS,
     ConfigError,
     Job,
     load_config,
     load_config_dir,
 )
-from herdr_routines.history import HistoryRecord, append, read_job
+from herdr_routines.history import HistoryExtra, HistoryRecord, append, read_job
 from herdr_routines.review_scan import (
     Candidate,
     apply_attempt_budget,
@@ -93,28 +95,43 @@ def _jobs_dir(tmp_path: Path, files: dict[str, str]) -> Path:
 
 
 def _review_job(tmp_path: Path, **over: Any) -> Job:
+    """A `kind: review` job as it loads (issue 076): a routine with `pick: my_open_prs`, the
+    review gate and the engine review prompt as a template. `repo` is the managed base dir,
+    which is where a target's checkout lands."""
+    from herdr_routines.repos import default_repos_dir
+
     job = Job(
         name="review-my-prs",
         enabled=True,
         cron="30 8 * * *",
-        repo=tmp_path / "repos",
-        workspace="root",
+        repo=default_repos_dir(),
+        workspace="worktree",
         base="main",
         agent_kind="opencode",
         model=None,
-        prompt="",
+        prompt=build_review_prompt(
+            job_name="review-my-prs",
+            target_key="$ROUTINE_TARGET",
+            url="$ROUTINE_TARGET_URL",
+            report_path="$ROUTINE_REPORT",
+        ),
         timeout_ms=60_000,
         start_timeout_ms=5_000,
         catch_up_minutes=720,
         timezone="UTC",
         on_missed="log",
-        kind="review",
+        kind="routine",
         select=("author",),
         include_auto_branches=False,
         max_workers_per_tick=5,
+        max_targets_per_run=5,
         max_attempts_per_target=1,
+        pick="my_open_prs",
+        verify=("review_posted",),
         notify_policy="on-finding",
     )
+    if "max_workers_per_tick" in over:
+        over.setdefault("max_targets_per_run", over["max_workers_per_tick"])
     return dataclasses.replace(job, **over)
 
 
@@ -286,6 +303,16 @@ class ReviewHerdrClient:
     def agent_read_visible(self, target: str, *, lines: int = 200) -> str:
         return ""
 
+    def agent_prompt_wait(self, *, target: str, text: str, timeout_ms: int) -> str:
+        """The no-report nudge `execute_run` sends a settled agent that wrote nothing."""
+        return self.settle_status
+
+    def settled_agent_pane(self, name: str) -> str | None:
+        return None
+
+    def agent_session_id(self, target: str) -> str | None:
+        return None
+
     def pane_close(self, pane_id: str) -> None:
         self.closed.append(pane_id)
 
@@ -298,13 +325,24 @@ class ReviewHerdrClient:
         self.notifications.append((title, body, sound))
 
 
+def _write_report(text: str) -> None:
+    """The agent's summary: the file the prompt names as its report."""
+    match = re.search(r"Report: (\S+)", text)
+    if match:
+        path = Path(match.group(1))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("## Outcome: ok\nreviewed\n")
+
+
 def _mark_posted(gh: ReviewGh) -> Any:
-    import re
+    """A fake agent that posts the review (the marker the prompt carries) and writes its
+    report."""
 
     def _cb(text: str) -> None:
         match = re.search(r"key=(\S+)", text)
         if match:
             gh.posted.add(match.group(1))
+        _write_report(text)
 
     return _cb
 
@@ -353,12 +391,12 @@ def _run_cycle(
     *,
     run_id: str,
 ) -> tuple[str, bool]:
-    return tick._review_cycle(
+    return tick.dispatch_occurrence(
         job,
         history_path,
+        tick.Occurrence(run_id, HistoryExtra()),
         client=client,  # type: ignore[arg-type]
         now=NOW,
-        run_id=run_id,
     )
 
 
@@ -376,16 +414,23 @@ def _terminal(history_path: Path, job_name: str) -> Any:
 def test_review_job_config_validation(tmp_path: Path) -> None:
     job = _load_jobs(tmp_path, _base_review_job_dict()).job("review-my-prs")
     assert job is not None
-    assert job.kind == "review"
+    # `kind: review` is sugar (issue 076): it loads as a routine.
+    assert job.kind == "routine"
+    assert job.pick == "my_open_prs"
+    assert job.verify == ("review_posted",)
     assert job.select == ("author", "review_requested")
     assert job.include_auto_branches is False
     assert job.max_attempts_per_target == 1  # kind: review default
-    assert job.target == "pr"
+    assert job.max_targets_per_run == job.max_workers_per_tick == 3
+    assert job.target is None
+    assert job.workspace == "worktree"
+    assert job.prompt is not None and "$ROUTINE_TARGET_URL" in job.prompt
     from herdr_routines.repos import default_repos_dir
 
     assert job.repo == default_repos_dir()
 
-    assert "review" in VALID_JOB_KINDS
+    assert "review" not in VALID_JOB_KINDS
+    assert "review" in ACCEPTED_KIND_VALUES
     assert "select" not in _DEFAULTS_ALLOWED_KEYS
     assert "include_auto_branches" not in _DEFAULTS_ALLOWED_KEYS
 
@@ -404,6 +449,9 @@ def test_review_job_config_validation(tmp_path: Path) -> None:
     _reject({"select": ["bogus"]}, "select\\[0\\]")
     _reject({"include_auto_branches": "yes"}, "boolean")
     _reject({"target": "base"}, "absent or 'pr'")
+    _reject({"pick": "oldest_unreviewed_pr"}, "fixed by kind: review")
+    _reject({"verify": ["report_wellformed"]}, "fixed by kind: review")
+    _reject({"max_targets_per_run": 2}, "max_workers_per_tick")
 
     # select/include_auto_branches require kind: review.
     with pytest.raises(ConfigError, match="require kind: review"):
@@ -751,7 +799,8 @@ def test_shipped_review_job_config_validates() -> None:
     cfg = load_config_dir(example_dir)
     job = cfg.job("review-my-prs")
     assert job is not None, cfg.errors
-    assert job.kind == "review"
+    assert job.kind == "routine"
+    assert job.pick == "my_open_prs"
     assert job.enabled is False
     assert job.select == ("author", "review_requested")
 
@@ -765,9 +814,9 @@ def test_review_dispatch_creates_per_repo_checkout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     gh = ReviewGh(
         prs=(_pr(1), _pr(2, head_ref="feature-x")),
         repo_infos={
@@ -863,9 +912,9 @@ def test_review_post_condition_ignores_an_untrusted_marker(
     dispatched, and that copy does not satisfy the post-condition either: the review
     counts as not posted."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     key = "acme/widgets#1"
     gh = ReviewGh(
         prs=(_pr(1),),
@@ -878,7 +927,7 @@ def test_review_post_condition_ignores_an_untrusted_marker(
             ]
         },
     )
-    client = ReviewHerdrClient()
+    client = ReviewHerdrClient(on_prompt=_write_report)
     monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
     history = tmp_path / "state" / "history.jsonl"
 
@@ -887,7 +936,9 @@ def test_review_post_condition_ignores_an_untrusted_marker(
     assert len(client.started) == 1, "an untrusted marker suppressed the review"
     assert failed is True
     reasons = [r.extra.get("reason") for r in read_job(history, job.name) if r.extra]
-    assert "review_not_posted" in reasons
+    assert "verify_failed:review_posted" in reasons
+    errors = [r.extra.get("error") for r in read_job(history, job.name) if r.extra]
+    assert "review_not_posted" in errors
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +950,7 @@ def test_review_dispatch_does_not_contend_for_head_branch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
     # Another owner (e.g. the orchestrator) has the PR head branch checked out.
     other_wt = tmp_path / "orchestrator-worktree"
@@ -914,7 +965,7 @@ def test_review_dispatch_does_not_contend_for_head_branch(
     )
     branches_before = _git("branch", "--list", cwd=checkout)
 
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
     gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
@@ -947,7 +998,7 @@ def test_review_dispatch_reuses_own_review_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
     wt_path = checkout / ".worktrees" / "review-pr1"
     # A clean worktree left behind by a prior tick — exactly what "reuse" targets.
@@ -961,7 +1012,7 @@ def test_review_dispatch_reuses_own_review_worktree(
         cwd=checkout,
     )
 
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     gh = ReviewGh(
         prs=(_pr(1),),
         repo_infos={
@@ -1032,11 +1083,11 @@ def test_review_dispatch_removes_worktree_after_settle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
     wt_path = checkout / ".worktrees" / "review-pr1"
 
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     gh = ReviewGh(
         prs=(_pr(1),),
         repo_infos={
@@ -1080,7 +1131,7 @@ def test_review_dispatch_removes_worktree_after_settle(
             ("acme", "widgets"): {"clone_url": str(origin), "default_branch": "main"}
         },
     )
-    client2 = ReviewHerdrClient()  # never posts
+    client2 = ReviewHerdrClient(on_prompt=_write_report)  # reports, never posts
     monkeypatch.setattr(tick, "RealGhClient", lambda: gh2)
     _run_cycle(
         job,
@@ -1101,9 +1152,9 @@ def test_review_verification_is_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
 
     # (a) marker present → done + verified True + gate passed.
@@ -1124,7 +1175,7 @@ def test_review_verification_is_fail_closed(
 
     # (b) marker absent → failed (review_not_posted), never done.
     gh2 = ReviewGh(prs=(_pr(2),), repo_infos={("acme", "widgets"): info})
-    client2 = ReviewHerdrClient()  # never posts
+    client2 = ReviewHerdrClient(on_prompt=_write_report)  # reports, never posts
     monkeypatch.setattr(tick, "RealGhClient", lambda: gh2)
     _, failed2 = _run_cycle(job, history, gh2, client2, run_id="r2")
     assert failed2 is True
@@ -1136,7 +1187,7 @@ def test_review_verification_is_fail_closed(
     gh3 = ReviewGh(
         prs=(_pr(3),), repo_infos={("acme", "widgets"): info}, bodies_fail=True
     )
-    client3 = ReviewHerdrClient()
+    client3 = ReviewHerdrClient(on_prompt=_write_report)
     monkeypatch.setattr(tick, "RealGhClient", lambda: gh3)
     _, failed3 = _run_cycle(job, history, gh3, client3, run_id="r3")
     assert failed3 is True
@@ -1154,9 +1205,9 @@ def test_kind_review_uses_review_posted_gate(
     from herdr_routines.gates import GateVerdict
 
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
     gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
@@ -1167,7 +1218,7 @@ def test_kind_review_uses_review_posted_gate(
         seen.append(ctx)
         return GateVerdict(passed=False, reason="review_not_posted")
 
-    monkeypatch.setattr(verify, "review_posted", stub_gate)
+    monkeypatch.setitem(verify.VERIFY_GATES, "review_posted", stub_gate)
     history = tmp_path / "state" / "history.jsonl"
     _, failed = _run_cycle(job, history, gh, client, run_id="r1")
 
@@ -1180,7 +1231,9 @@ def test_kind_review_uses_review_posted_gate(
     ][-1]
     assert target_rec.state == "failed"
     assert target_rec.extra is not None
-    assert target_rec.extra["reason"] == "review_not_posted"
+    # The run's reason names the gate; the gate's own reason is the error.
+    assert target_rec.extra["reason"] == "verify_failed:review_posted"
+    assert target_rec.extra["error"] == "review_not_posted"
     assert "verify" not in target_rec.extra
 
 
@@ -1193,9 +1246,9 @@ def test_review_dispatch_isolates_per_repo_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin_a, _checkout_a = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     gh = ReviewGh(
         prs=(
             _pr(1, repo="acme/widgets"),
@@ -1291,9 +1344,9 @@ def test_review_is_not_repeated_across_ticks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
-    job = _review_job(tmp_path, repo=base)
+    job = _review_job(tmp_path)
     info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
     history = tmp_path / "state" / "history.jsonl"
 
@@ -1447,7 +1500,7 @@ def test_classify_review_candidates_pipeline_order_and_none_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The helper runs the pipeline in the documented, load-bearing order — scan →
-    attempt budget → marker guard → cap against `job.max_workers_per_tick` — and a
+    attempt budget → marker guard → cap against `job.max_targets_per_run` — and a
     `None` scan result propagates as `None` (fail closed) without running any later
     stage."""
     from herdr_routines import review_scan as rs
@@ -1463,6 +1516,7 @@ def test_classify_review_candidates_pipeline_order_and_none_fail_closed(
         "truncated_modes",
         "enumerated",
         "candidate_count",
+        "trusted_authors",
     ]
 
     job = _review_job(tmp_path, max_workers_per_tick=2)
@@ -1661,7 +1715,7 @@ _TARGET_LINE = re.compile(r"^- ([\w/.-]+#\d+): (.+)$")
 def test_review_scan_drift_tick_report_matches_classification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Drift test: `classify_review_candidates` called directly, and `_review_cycle`
+    """Drift test: `classify_review_candidates` called directly, and the fan-out
     run with the same fake `GhClient` (`default_reports_dir` → `tmp_path`), produce the
     same pre-dispatch target lines in the same order — the tick's report rows are the
     shared helper's rows, then the post-dispatch appends."""
@@ -1669,9 +1723,9 @@ def test_review_scan_drift_tick_report_matches_classification(
     from herdr_routines.review_scan import classify_review_candidates
 
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
-    job = _review_job(tmp_path, repo=base, max_workers_per_tick=1)
+    job = _review_job(tmp_path, max_workers_per_tick=1)
     history = tmp_path / "state" / "history.jsonl"
     # #1 is at its attempt budget, #2 already carries a trusted review marker, and the
     # one-worker cap starves #4 while #3 would dispatch.

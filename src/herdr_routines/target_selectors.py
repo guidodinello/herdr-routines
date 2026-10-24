@@ -1,10 +1,15 @@
 """Target selectors (issue 073): code decides what a routine run acts on, before any agent.
 
-A job names a selector under `pick:`; `tick._process_job` and `cli._cmd_run` call
-`select_target` before dispatch. No target means the run is skipped (`no_target`), a target
-reaches the prompt as `$ROUTINE_TARGET`, the history record and the verify gates. A selector
-that cannot answer (gh failure, truncated listing, an unreadable review thread) is
-`SelectorFailed`, never "no target": an error must not look like an idle queue.
+A job names a selector under `pick:`; `tick._run_routine` (the tick and `herdr-routines run`
+both land there) calls `select_target` before dispatch. No target means the run is skipped
+(`no_target`), a target reaches the prompt as `$ROUTINE_TARGET`, the history record and the
+verify gates. A selector that cannot answer (gh failure, truncated listing, an unreadable
+review thread) is `SelectorFailed`, never "no target": an error must not look like an idle
+queue.
+
+A multi-target selector (issue 076, `MULTI_TARGET_REGISTRY`) answers with a `Classification`
+instead: every PR it looked at with its verdict, and the ordered ones to act on. It goes
+through `select_targets`.
 
 Every network call goes through the injected `GhClient`, which bounds each call with a
 timeout. The one non-gh call is the local `git remote get-url origin` lookup.
@@ -15,6 +20,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from herdr_routines import verify
 from herdr_routines.auto_fix import (
@@ -23,8 +29,10 @@ from herdr_routines.auto_fix import (
     effective_trusted_authors,
     repo_owner_and_name,
 )
-from herdr_routines.config import Job, TargetSelector
+from herdr_routines.config import MULTI_TARGET_SELECTORS, Job, TargetSelector
 from herdr_routines.gates import remote_owner_and_repo
+from herdr_routines.repos import is_repo_less
+from herdr_routines.review_scan import Classification, classify_review_candidates
 from herdr_routines.verify import VerifyTarget
 
 log = logging.getLogger(__name__)
@@ -47,11 +55,24 @@ class SelectorContext:
     job: Job
     gh: GhClient
     trusted_review_authors: tuple[str, ...]
+    # The attempt budget of `my_open_prs` reads the job's own history.
+    history_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SelectorFailed:
     error: str
+    # The `reason` the run's `failed` record carries.
+    reason: str = "selector_failed"
+
+
+class SelectorError(RuntimeError):
+    """A selector that cannot answer, with the `reason` its `failed` record should carry
+    (`gh_auth_missing` and `search_failed` are the reasons `kind: review` always recorded)."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _job_owner_and_repo(job: Job) -> tuple[str, str]:
@@ -60,6 +81,16 @@ def _job_owner_and_repo(job: Job) -> tuple[str, str]:
     if job.repository:
         return repo_owner_and_name(job.repository)
     return remote_owner_and_repo(job.repo)
+
+
+def job_own_repo(job: Job) -> str | None:
+    """`owner/repo` of the job's own checkout, or None for a repo-less job (`kind: review`,
+    whose `repo` is the managed base dir that per-repo checkouts land under). Raises when
+    the checkout's `origin` cannot be read."""
+    if is_repo_less(job):
+        return None
+    owner, repo = _job_owner_and_repo(job)
+    return f"{owner}/{repo}"
 
 
 def _is_bot_author(pr: Mapping[str, object]) -> bool:
@@ -121,10 +152,47 @@ def oldest_unreviewed_pr(ctx: SelectorContext) -> SelectedTarget | None:
     return None
 
 
+def my_open_prs(ctx: SelectorContext) -> Classification:
+    """The open PRs the authenticated user opened and/or was asked to review, in every repo,
+    through the review scan's search, skip rules and re-review guards (marker and attempt
+    budget), capped to `max_targets_per_run`. Raises `SelectorError` when the answer is
+    unknowable: an unknown search result must never read as "nothing to review"."""
+    job = ctx.job
+    if not job.select:
+        raise SelectorError("selector_failed", "my_open_prs needs a 'select' list")
+    if ctx.history_path is None:
+        raise SelectorError(
+            "selector_failed",
+            "my_open_prs needs the job's history for its attempt budget",
+        )
+    try:
+        login = ctx.gh.api_user()
+    except Exception as e:
+        raise SelectorError("gh_auth_missing", str(e)) from e
+    classification = classify_review_candidates(
+        ctx.gh,
+        job,
+        login=login,
+        history_path=ctx.history_path,
+        trusted_authors=effective_trusted_authors(
+            ctx.trusted_review_authors, viewer_login=login
+        ),
+    )
+    if classification is None:
+        raise SelectorError("search_failed", "the PR search failed")
+    return classification
+
+
 TARGET_SELECTORS: dict[
     TargetSelector, Callable[[SelectorContext], SelectedTarget | None]
 ] = {
     "oldest_unreviewed_pr": oldest_unreviewed_pr,
+}
+
+MULTI_TARGET_REGISTRY: dict[
+    TargetSelector, Callable[[SelectorContext], Classification]
+] = {
+    "my_open_prs": my_open_prs,
 }
 
 
@@ -134,8 +202,26 @@ def select_target(ctx: SelectorContext) -> SelectedTarget | SelectorFailed | Non
     pick = ctx.job.pick
     if pick is None:
         return None
+    if pick in MULTI_TARGET_SELECTORS:
+        return SelectorFailed(f"selector {pick} returns several targets")
     try:
         return TARGET_SELECTORS[pick](ctx)
+    except Exception as e:  # noqa: BLE001 — a selector that blows up has not said "nothing to do"
+        log.warning("%s: selector %s failed: %s", ctx.job.name, pick, e)
+        return SelectorFailed(str(e))
+
+
+def select_targets(ctx: SelectorContext) -> Classification | SelectorFailed:
+    """Run the job's multi-target selector: the `Classification` of what it found, or
+    `SelectorFailed`. Same fail-closed rule as `select_target`."""
+    pick = ctx.job.pick
+    if pick is None or pick not in MULTI_TARGET_REGISTRY:
+        return SelectorFailed(f"selector {pick} is not a multi-target selector")
+    try:
+        return MULTI_TARGET_REGISTRY[pick](ctx)
+    except SelectorError as e:
+        log.warning("%s: selector %s failed: %s", ctx.job.name, pick, e)
+        return SelectorFailed(str(e), reason=e.reason)
     except Exception as e:  # noqa: BLE001 — a selector that blows up has not said "nothing to do"
         log.warning("%s: selector %s failed: %s", ctx.job.name, pick, e)
         return SelectorFailed(str(e))

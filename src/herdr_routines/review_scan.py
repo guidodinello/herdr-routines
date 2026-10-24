@@ -1,11 +1,11 @@
-"""Pure selection for ``kind: review`` jobs (issue 055 Phase A).
+"""Pure selection behind the ``my_open_prs`` selector (issues 055, 076).
 
 No subprocess, no clock reads beyond the injected ``now``: everything is driven through
 an injected :class:`~herdr_routines.auto_fix.GhClient`, so the whole selector is
 unit-testable with a fake. The module turns one batched GraphQL search into a sorted,
 de-duplicated candidate list, drops the skip-reason PRs (author mismatch, ``auto/*``
 branches, forks), applies the two load-bearing re-review guards (content marker and
-per-target attempt budget), caps to ``max_workers_per_tick`` newest-last, and renders the
+per-target attempt budget), caps to ``max_targets_per_run`` newest-last, and renders the
 aggregate report.
 """
 
@@ -29,20 +29,27 @@ from herdr_routines.config import Job
 
 log = get_logger(__name__)
 
-# Target dispositions that count as this tick having failed. Skips (over cap, marker,
-# budget, live agent) are not failures, and neither is a verified "dispatched".
-REVIEW_FAILURE_DISPOSITIONS = frozenset(
+# Target dispositions that are not failures: a verified "dispatched" and every skip (scan
+# skip, attempt budget, marker, cap, a live agent). Any other disposition is the reason a
+# target's run failed (a `RunOutcome.reason`, `worktree_failed`, `clone_failed`, ...), so a
+# reason nobody listed here still counts as a failure instead of reading as a skip.
+DISPATCHED = "dispatched"
+SKIP_DISPOSITIONS = frozenset(
     {
-        "review_not_posted",
-        "review_verification_failed",
-        "agent_start_failed",
-        "agent_not_interactive",
-        "agent_prompt_failed",
-        "worktree_failed",
-        "repo_info_failed",
-        "clone_failed",
+        "author_mismatch",
+        "routine_owned_branch",
+        "fork_pr",
+        "max_attempts_exceeded",
+        "review_already_posted",
+        "over_cap",
+        "agent_live",
+        "skipped",
     }
 )
+
+
+def is_failure_disposition(disposition: str) -> bool:
+    return disposition != DISPATCHED and disposition not in SKIP_DISPOSITIONS
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,13 +237,15 @@ class Classification:
     inputs. ``dispatchable`` is what survived every stage *and* the cap; the tick appends
     the post-dispatch dispositions to ``rows`` itself. ``enumerated`` and
     ``candidate_count`` are the post-scan, pre-budget numbers the tick writes as
-    ``enumerated=`` / ``candidates=``."""
+    ``enumerated=`` / ``candidates=``. ``trusted_authors`` is the set the marker guard
+    used, which the post-run gate must use too."""
 
     rows: tuple[tuple[Candidate, str], ...]
     dispatchable: tuple[Candidate, ...]
     truncated_modes: tuple[str, ...]
     enumerated: int
     candidate_count: int
+    trusted_authors: frozenset[str]
 
 
 def classify_review_candidates(
@@ -254,10 +263,10 @@ def classify_review_candidates(
     ``None``, fail closed — an unknown search answer never reads as "nothing to
     review") → ``apply_attempt_budget`` (a local history read, the cheapest guard) →
     ``apply_marker_guard`` (one ``gh pr view`` per check) → ``cap_candidates`` against
-    ``job.max_workers_per_tick``. ``_review_cycle`` dispatches what comes back and
+    ``job.max_targets_per_run``. The routine fan-out dispatches what comes back and
     ``review-scan`` only reports it — neither re-runs a stage.
 
-    The marker guard is spent on the cap window (the oldest ``max_workers_per_tick``
+    The marker guard is spent on the cap window (the oldest ``max_targets_per_run``
     budget survivors) and nothing else: everything past the window is ``over_cap`` by
     definition and can never dispatch this tick, so it must not cost an API call. The
     cap itself still runs last, over ``marker survivors + everything past the window``,
@@ -282,7 +291,7 @@ def classify_review_candidates(
         (cand, cand.skip_reason or "max_attempts_exceeded") for cand in budget_skipped
     )
 
-    window = budgeted[: job.max_workers_per_tick]
+    window = budgeted[: job.max_targets_per_run]
     checked, marker_skipped = apply_marker_guard(
         gh, job.name, window, trusted_authors=trusted_authors
     )
@@ -291,8 +300,8 @@ def classify_review_candidates(
     )
 
     to_dispatch, over_cap = cap_candidates(
-        [*checked, *budgeted[job.max_workers_per_tick :]],
-        job.max_workers_per_tick,
+        [*checked, *budgeted[job.max_targets_per_run :]],
+        job.max_targets_per_run,
     )
     rows.extend((cand, cand.skip_reason or "over_cap") for cand in over_cap)
 
@@ -302,6 +311,7 @@ def classify_review_candidates(
         truncated_modes=outcome.truncated_modes,
         enumerated=outcome.enumerated,
         candidate_count=len(outcome.candidates),
+        trusted_authors=trusted_authors,
     )
 
 
@@ -319,8 +329,8 @@ def render_review_report(
     """The aggregate ``reports/review-<run_id>.md``: counts plus one line per candidate
     with its disposition. Every candidate appears — including skips and why — so the
     report is the audit trail that stands in for a dry-run subcommand in phase A."""
-    dispatched = sum(1 for _, disposition in rows if disposition == "dispatched")
-    failed = sum(1 for _, d in rows if d in REVIEW_FAILURE_DISPOSITIONS)
+    dispatched = sum(1 for _, disposition in rows if disposition == DISPATCHED)
+    failed = sum(1 for _, d in rows if is_failure_disposition(d))
     skipped = len(rows) - dispatched - failed
     lines = [
         f"# Review tick report: {run_id}",
