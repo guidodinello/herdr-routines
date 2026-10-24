@@ -80,6 +80,10 @@ Pipeline work; no real-run evidence required.
   (070). A `verify:` list usable by every kind, starting with `review_posted`; phase A
   of splitting trigger / target / payload / proof out of `kind`.
   → [`071`](docs/process/issues/071-post-run-verify-gates.md)
+- **Target selectors for routine jobs** — phase B of 071: code picks what a routine
+  job acts on (`selector: oldest_unreviewed_pr`) and records the run `skipped` when
+  there is nothing, instead of the agent choosing in prose and phase A's gate failing
+  idle runs. → [`073`](docs/process/issues/073-routine-target-selectors.md)
 
 Earlier items, kept as issue files for history: plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
@@ -332,7 +336,8 @@ files 2026-08-27.
   well past its own schedule ("should have run, didn't"), shown separately from
   failures. Suggested and deferred in issue 046; reads only the existing
   history, reports and job config.
+  → [`072`](docs/process/issues/072-missed-run-alert-in-the-digest.md)
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives
-only inside `docs/`. → [`071`](docs/process/issues/071-missed-run-alert-in-the-digest.md)
+only inside `docs/`.
