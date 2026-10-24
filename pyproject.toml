@@ -31,10 +31,15 @@ dev = [
     "ruff>=0.16.4",
     "types-croniter>=6.0.0",
     "types-PyYAML>=6.0.0",
+    "vulture>=2.16",
 ]
 
 [tool.ruff]
 extend-exclude = ["docs"]
+
+# A vulture whitelist is bare attribute accesses by design: each one marks a name as used.
+[tool.ruff.lint.per-file-ignores]
+"vulture_whitelist.py" = ["B018"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -66,6 +71,15 @@ disallow_untyped_decorators = true
 warn_return_any = true
 strict_equality = true
 extra_checks = true
+
+[tool.vulture]
+# src/ only, never tests/: a helper that only tests call must show up as unused, which is the
+# "implemented but never wired in" bug this check exists for (audit, 2026-10-23).
+paths = ["src", "vulture_whitelist.py"]
+# Not 80: vulture rates every unused function, method, attribute and variable at exactly
+# 60% (only unused imports, arguments and unreachable code rate 90-100%), so 80 reports
+# nothing here.
+min_confidence = 60
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

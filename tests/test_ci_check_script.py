@@ -30,11 +30,13 @@ def test_ci_check_script_matches_ci_workflow(tmp_path: Path) -> None:
     # No job re-states a CI command: each one goes through the script, so the pipeline's
     # own check (which runs the script bare) cannot drift from what CI enforces.
     for step in steps:
-        assert not any(tool in step for tool in ("ruff", "mypy", "pytest")), step
+        assert not any(
+            tool in step for tool in ("ruff", "vulture", "mypy", "pytest")
+        ), step
     for part in ("lint", "typecheck", "test"):
         assert f"scripts/ci-check.sh {part}" in steps
 
-    # The bare script runs exactly CI's four commands, in order. A fake `uv` logs argv.
+    # The bare script runs exactly CI's five commands, in order. A fake `uv` logs argv.
     log = tmp_path / "argv.log"
     fake_uv = tmp_path / "bin" / "uv"
     fake_uv.parent.mkdir()
@@ -48,6 +50,7 @@ def test_ci_check_script_matches_ci_workflow(tmp_path: Path) -> None:
     assert log.read_text().splitlines() == [
         "run ruff format --check .",
         "run ruff check .",
+        "run vulture",
         "run mypy",
         "run pytest -q",
     ]
@@ -55,3 +58,20 @@ def test_ci_check_script_matches_ci_workflow(tmp_path: Path) -> None:
         [str(SCRIPT), "nope"], env=env, capture_output=True, text=True, check=False
     )
     assert bad.returncode == 2
+
+
+def test_lint_runs_the_dead_code_check(tmp_path: Path) -> None:
+    """vulture is the only check that fails on code with tests but no production caller
+    (audit, 2026-10-23), and it runs under `lint`, the part CI's lint job calls. Dropping it
+    from lint() would leave every other check green, so pin it here."""
+    log = tmp_path / "argv.log"
+    fake_uv = tmp_path / "bin" / "uv"
+    fake_uv.parent.mkdir()
+    fake_uv.write_text(f'#!/usr/bin/env bash\necho "$@" >> "{log}"\n')
+    fake_uv.chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake_uv.parent}:{os.environ['PATH']}"}
+    proc = subprocess.run(
+        [str(SCRIPT), "lint"], env=env, capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "run vulture" in log.read_text().splitlines()
