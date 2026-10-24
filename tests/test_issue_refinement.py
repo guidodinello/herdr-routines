@@ -321,6 +321,32 @@ def test_parse_reviewer_confidence_reads_the_raw_reply() -> None:
     assert parse_reviewer_confidence("confidence: high\nno gaps") == "high"
     assert parse_reviewer_confidence("Preamble.\nConfidence: MEDIUM — x") == "medium"
     assert parse_reviewer_confidence("looks fine to me") is None
+    # Markdown emphasis around the label or the level still counts.
+    assert parse_reviewer_confidence("**Confidence:** high\n- none") == "high"
+    assert parse_reviewer_confidence("- confidence: *low*") == "low"
+    # An echoed prompt lists every level inside quotes; only the reviewer's own
+    # line-leading verdict counts, so this is medium, not a fake "high" consensus.
+    echoed = (
+        "Reply with one line 'confidence: high' | 'confidence: medium' | "
+        "'confidence: low' followed by the gaps.\n\nconfidence: medium\n- gap"
+    )
+    assert parse_reviewer_confidence(echoed) == "medium"
+    # A gap that mentions the phrase mid-sentence is not a verdict.
+    assert (
+        parse_reviewer_confidence("I'd give confidence: high if X were fixed") is None
+    )
+
+
+def test_parse_reviewer_confidence_on_a_real_reviewer_reply() -> None:
+    """Shape captured from a real `opencode run ... > FILE` reviewer call: tool
+    chatter goes to stderr, stdout is the verdict line then the gap bullets."""
+    reply = (
+        "confidence: medium\n\n"
+        "- Criterion 1 vs 2 leaves the core rule ambiguous: is a trusted "
+        "blocking-count summary sufficient on its own?\n"
+        "- The exact phrase to match is never pinned down.\n"
+    )
+    assert parse_reviewer_confidence(reply) == "medium"
 
 
 @pytest.mark.parametrize(

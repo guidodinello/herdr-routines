@@ -71,7 +71,13 @@ REQUIRED_FRONTMATTER = ("id", "title", "status", "priority", "area")
 
 # The reviewer is told to reply with one 'confidence: high|medium|low' line; the
 # loop check reads it off the raw reply so consensus is not the author's call.
-_CONFIDENCE_RE = re.compile(r"\bconfidence:\s*(high|medium|low)\b", re.IGNORECASE)
+# Line-anchored (after stripping markdown emphasis, so `**Confidence:** high`
+# still counts): an echoed prompt's `'confidence: high' | ...` or a gap that
+# mentions the phrase mid-sentence must never read as consensus.
+_CONFIDENCE_RE = re.compile(
+    r"^[\s>#-]*confidence:\s*(high|medium|low)\b", re.IGNORECASE | re.MULTILINE
+)
+_MARKDOWN_EMPHASIS_RE = re.compile(r"[*_`]")
 
 # Exit codes for the code-enforced loop steps — the `gate` contract: 0 pass /
 # continue, 1 fail / stop (reason on stderr), 2 usage (nothing was checked).
@@ -308,7 +314,7 @@ def select_next_bullet(
 def parse_reviewer_confidence(reply: str) -> str | None:
     """The first ``confidence: high|medium|low`` in a reviewer reply, lowercased;
     ``None`` when the reviewer never gave one (treated as not-consensus)."""
-    match = _CONFIDENCE_RE.search(reply)
+    match = _CONFIDENCE_RE.search(_MARKDOWN_EMPHASIS_RE.sub("", reply))
     return match.group(1).lower() if match else None
 
 
