@@ -88,12 +88,16 @@ VALID_NOTIFY_POLICIES: frozenset[NotifyPolicy] = frozenset(get_args(NotifyPolicy
 # "gated" = gate checks + fix dispatch (_process_gated_job); "pipeline" = detached
 # systemd-run launch (_process_pipeline_job); "audit" = report-diff gate job (issue 057):
 # schedule an audit skill, parse its findings manifest, diff against the ledger, and
-# dispatch fixes only for new/regressed findings; "review" = cross-repo @me PR review
-# job (issue 055): one batched search, one review per unreviewed open PR, verified by a
-# content marker. Gate mode is no longer an orthogonal axis:
+# dispatch fixes only for new/regressed findings. Gate mode is no longer an orthogonal axis:
 # (the old `checks is not None` discriminator); kind is the exhaustive SSOT.
-JobKind = Literal["routine", "gated", "pipeline", "audit", "review"]
+JobKind = Literal["routine", "gated", "pipeline", "audit"]
 VALID_JOB_KINDS: frozenset[JobKind] = frozenset(get_args(JobKind))
+
+# `kind: review` (issue 055) is accepted in a job file as config sugar (issue 076): it loads
+# as a `kind: routine` job with `pick: my_open_prs`, `verify: [review_posted]`, the engine
+# review prompt and `max_targets_per_run = max_workers_per_tick`, so no `Job` ever has it.
+REVIEW_SUGAR_KIND = "review"
+ACCEPTED_KIND_VALUES = VALID_JOB_KINDS | {REVIEW_SUGAR_KIND}
 
 # Post-run verify gates a job can list under `verify:` (issue 071). The registry of gate
 # functions lives in verify.py, which imports Job from here, so the closed name set is
@@ -117,10 +121,13 @@ FIX_WORKER_VERIFY_GATES: frozenset[VerifyGate] = frozenset(
 # lives in target_selectors.py (which imports Job), the closed name set lives here. The key
 # is `pick`, not `selector`, so it cannot be misread as `kind: review`'s `select:` list or
 # the gated kind's `target: pr|base`.
-TargetSelector = Literal["oldest_unreviewed_pr"]
+TargetSelector = Literal["oldest_unreviewed_pr", "my_open_prs"]
 VALID_TARGET_SELECTORS: frozenset[TargetSelector] = frozenset(get_args(TargetSelector))
+# The selectors that may return several targets (issue 076). Only they accept
+# `max_targets_per_run` above 1, and `select:` / `include_auto_branches:` configure them.
+MULTI_TARGET_SELECTORS: frozenset[TargetSelector] = frozenset({"my_open_prs"})
 
-# Recognized values for a kind: review job's `select` list (issue 055). "author" is the
+# Recognized values for a `my_open_prs` job's `select` list (issues 055, 076). "author" is the
 # default-worthy one; "review_requested" is opt-in because it puts the routine in someone
 # else's PR queue.
 VALID_REVIEW_SELECT = frozenset({"author", "review_requested"})
@@ -236,6 +243,7 @@ _JOB_ALLOWED_KEYS = (
             "checks",
             "target",
             "max_workers_per_tick",
+            "max_targets_per_run",
             "max_attempts_per_target",
             "repo",
             "repository",
@@ -252,8 +260,9 @@ _JOB_ALLOWED_KEYS = (
             "ledger_retention_days",
             "adopt_baseline",
             "fix_prompt",
-            # kind: review (issue 055). Deliberately NOT in _DEFAULTS_ALLOWED_KEYS:
-            # what a review job watches is per-job identity, not a shared default.
+            # `pick: my_open_prs` / kind: review (issues 055, 076). Deliberately NOT in
+            # _DEFAULTS_ALLOWED_KEYS: what a review job watches is per-job identity, not a
+            # shared default.
             "select",
             "include_auto_branches",
             # Triggers (issue 075): `cron:` is shorthand for `trigger: {cron: ...}`. Exactly
@@ -296,6 +305,7 @@ _JOB_DEFAULTS = {
     "checks": None,
     "target": None,
     "max_workers_per_tick": 3,
+    "max_targets_per_run": 1,
     "max_attempts_per_target": 3,
     "repository": None,
     "kind": "routine",
@@ -312,7 +322,7 @@ _JOB_DEFAULTS = {
     "ledger_retention_days": 90,
     "adopt_baseline": True,
     "fix_prompt": "",
-    # kind: review (issue 055). None for every other kind.
+    # `pick: my_open_prs` (issues 055, 076). None for every other job.
     "select": None,
     "include_auto_branches": False,
 }
@@ -492,10 +502,13 @@ class Job:
     target: JobTarget | None = None
     # Dispatch cap per tick.
     max_workers_per_tick: int = 3
+    # How many targets one routine run acts on (issue 076): one agent per target, in turn,
+    # inside the occurrence. Above 1 needs a multi-target selector (`pick: my_open_prs`).
+    max_targets_per_run: int = 1
     # Retry budget keyed per target (per gate branch for base, per PR number for pr).
     max_attempts_per_target: int = 3
     # Scheduling-only mode discriminator (issue 026, unified in 049):
-    # "routine" | "gated" | "pipeline" | "audit" | "review". kind is the exhaustive single
+    # "routine" | "gated" | "pipeline" | "audit". kind is the exhaustive single
     # source of truth for how a job is dispatched; it never serializes into history.jsonl
     # (records store job name / state / run_id / outcome extras; status/scheduled join
     # live config + history by job name only — see cli.py:432-434 / cli.py:481).
@@ -532,9 +545,9 @@ class Job:
     # The fix worker's prompt template, seeded with $ROUTINE_FINDINGS. None = the
     # built-in default. NOT inheritable via defaults.yaml.
     fix_prompt: str | None = None
-    # -- kind: review (issue 055) --------------------------------------------------
+    # -- pick: my_open_prs (issues 055, 076) ----------------------------------------
     # Which PR sets to watch: a non-empty, duplicate-free subset of
-    # {author, review_requested}. Required for kind: review, None otherwise.
+    # {author, review_requested}. Required for `pick: my_open_prs`, None otherwise.
     select: tuple[str, ...] | None = None
     # Opt in to reviewing `auto/*` (pipeline-owned) branches too; default off so a
     # pipeline PR is never reviewed twice.
@@ -547,9 +560,9 @@ class Job:
     # so `validate` can say so instead of dropping it silently.
     ignored_verify: tuple[VerifyGate, ...] = ()
     # Target selector (issue 073), run before dispatch by `tick._run_routine` (the tick
-    # and `herdr-routines run` both land there, issue 074): no target skips the run (`no_target`), a target reaches the prompt as
-    # $ROUTINE_TARGET and the verify gates. Only a routine job honors it. Inheritable via
-    # defaults.yaml; an explicit null opts out.
+    # and `herdr-routines run` both land there, issue 074): no target skips the run
+    # (`no_target`), a target reaches the prompt as $ROUTINE_TARGET and the verify gates.
+    # Only a routine job honors it. Inheritable via defaults.yaml; an explicit null opts out.
     pick: TargetSelector | None = None
     # The `pick` a non-routine job inherited from defaults.yaml and does not honor, kept so
     # `validate` can say so instead of dropping it silently.
@@ -1314,14 +1327,16 @@ def _build_job(
     # `kind: review` job has no single checkout: it derives `repo` from the managed
     # base dir and never calls `ensure_repo`, so the repo/repository machinery must be
     # bypassed before it runs.
-    kind = merged["kind"]
-    if kind not in VALID_JOB_KINDS:
-        raise ConfigError(f"{label}: 'kind' must be one of {sorted(VALID_JOB_KINDS)}")
+    if merged["kind"] not in ACCEPTED_KIND_VALUES:
+        raise ConfigError(
+            f"{label}: 'kind' must be one of {sorted(ACCEPTED_KIND_VALUES)}"
+        )
+    review_sugar = merged["kind"] == REVIEW_SUGAR_KIND
 
     repo_raw = merged["repo"]
     repository = merged["repository"]
 
-    if kind == "review":
+    if review_sugar:
         from herdr_routines.repos import default_repos_dir
 
         for not_applicable in ("repo", "repository", "workspace", "checks"):
@@ -1331,9 +1346,9 @@ def _build_job(
                     "(the job has no single checkout or gate; per-repo checkouts are "
                     "discovered at tick time)"
                 )
-        # Overload is safe only because `ensure_repo` is never called with a review job
-        # (see repos.ensure_repo): `repo` is just the base dir per-repo checkouts land
-        # under, `<base>/<owner>/<repo>`.
+        # Overload is safe only because `execute_run` skips `ensure_repo` for a run that
+        # has a per-target placement (issue 076): `repo` is just the base dir per-repo
+        # checkouts land under, `<base>/<owner>/<repo>`.
         repo = default_repos_dir()
         repository = None
     else:
@@ -1361,11 +1376,16 @@ def _build_job(
                 raise ConfigError(f"{label}: 'repo' must be a non-empty string path")
             repo = Path(repo_raw).expanduser()
 
-    workspace = merged["workspace"]
-    if workspace not in VALID_WORKSPACE_MODES:
+    declared_workspace = merged["workspace"]
+    if declared_workspace not in VALID_WORKSPACE_MODES:
         raise ConfigError(
             f"{label}: 'workspace' must be one of {sorted(VALID_WORKSPACE_MODES)}"
         )
+    workspace = declared_workspace
+    if review_sugar:
+        # Whatever defaults.yaml says: each review closes its own pane, as the review-only
+        # dispatch always did, and the agent runs in the target's own worktree anyway.
+        workspace = "worktree"
 
     agent_kind = merged["agent_kind"]
     if agent_kind not in VALID_AGENT_KINDS:
@@ -1424,6 +1444,17 @@ def _build_job(
         raise ConfigError(f"{label}: 'prompt' must be a string")
     # An empty prompt is "not set"; whitespace-only stays a string (readers differ).
     prompt = prompt or None
+    if review_sugar and prompt is None:
+        # The engine review prompt as a template: the run fills in the target it was handed.
+        # Imported here because auto_fix imports this module.
+        from herdr_routines.auto_fix import build_review_prompt
+
+        prompt = build_review_prompt(
+            job_name=name,
+            target_key="$ROUTINE_TARGET",
+            url="$ROUTINE_TARGET_URL",
+            report_path="$ROUTINE_REPORT",
+        )
 
     timezone = merged["timezone"]
     if not isinstance(timezone, str):
@@ -1530,9 +1561,18 @@ def _build_job(
     # live Pi's `workspace: worktree` + `catch_up_minutes: 120`) must not retroactively
     # invalidate every pipeline job — only an *explicit* per-job setting is rejected.
 
-    kind = merged["kind"]
-    if kind not in VALID_JOB_KINDS:
-        raise ConfigError(f"{label}: 'kind' must be one of {sorted(VALID_JOB_KINDS)}")
+    # `kind: review` is sugar (issue 076): from here on the job is a routine, and
+    # `review_sugar` marks the few places that still need to know it was spelled that way.
+    kind: JobKind
+    if review_sugar:
+        kind = "routine"
+    else:
+        declared_kind = merged["kind"]
+        if declared_kind not in VALID_JOB_KINDS:
+            raise ConfigError(
+                f"{label}: 'kind' must be one of {sorted(ACCEPTED_KIND_VALUES)}"
+            )
+        kind = declared_kind
 
     # -- kind: gated requires non-empty checks -------------------------------------------
     if kind == "gated" and (checks is None or len(checks) == 0):
@@ -1552,9 +1592,18 @@ def _build_job(
                 f"{label}: 'trigger.event' is not supported on kind: pipeline "
                 "(one open run at a time)"
             )
-        if kind == "review":
+        from herdr_routines.repos import default_repos_dir
+
+        if repo == default_repos_dir():
+            # No checkout to poll against: what `kind: review` loads with (`repo` is the
+            # managed base dir), or a `repo:` someone pointed at it.
+            spelled = (
+                "on kind: review"
+                if review_sugar
+                else "on a job whose repo is the managed base dir"
+            )
             raise ConfigError(
-                f"{label}: 'trigger.event' is not supported on kind: review "
+                f"{label}: 'trigger.event' is not supported {spelled} "
                 "(no single checkout to poll against)"
             )
         if any(c.kind == "github_event" for c in checks or ()):
@@ -1643,15 +1692,16 @@ def _build_job(
         )
         adopt_baseline = _bool_field("adopt_baseline", source=_JOB_DEFAULTS)
 
-    # -- kind: review (issue 055) -------------------------------------------------------
+    # -- pick: my_open_prs (issues 055, 076) ---------------------------------------------
+    reviews_my_prs = review_sugar or merged["pick"] == "my_open_prs"
     select: tuple[str, ...] | None = None
     include_auto_branches = False
-    if kind == "review":
+    if reviews_my_prs:
         select_raw = merged.get("select")
         if not isinstance(select_raw, list) or not select_raw:
             raise ConfigError(
-                f"{label}: kind: review requires a non-empty 'select' list "
-                f"drawn from {sorted(VALID_REVIEW_SELECT)}"
+                f"{label}: kind: review / pick: my_open_prs requires a non-empty "
+                f"'select' list drawn from {sorted(VALID_REVIEW_SELECT)}"
             )
         if len(set(select_raw)) != len(select_raw):
             raise ConfigError(f"{label}: 'select' must not contain duplicates")
@@ -1664,13 +1714,26 @@ def _build_job(
         include_auto_branches = _bool_field("include_auto_branches")
     elif "select" in raw_job or "include_auto_branches" in raw_job:
         raise ConfigError(
-            f"{label}: 'select'/'include_auto_branches' require kind: review"
+            f"{label}: 'select'/'include_auto_branches' require kind: review "
+            "or pick: my_open_prs"
         )
 
     # A review that landed is never redone, and a review that failed to land is a miss to
     # report, not to retry — so the budget is 1 unless the job explicitly asks otherwise.
-    if kind == "review" and "max_attempts_per_target" not in raw_job:
+    if reviews_my_prs and "max_attempts_per_target" not in raw_job:
         max_attempts_per_target = 1
+
+    # How many targets one run acts on (issue 076). A `kind: review` job has always spelled
+    # this `max_workers_per_tick`, so that is where the sugar reads it from.
+    if review_sugar:
+        if "max_targets_per_run" in raw_job:
+            raise ConfigError(
+                f"{label}: 'max_targets_per_run' is not applicable to kind: review "
+                "(its cap is 'max_workers_per_tick')"
+            )
+        max_targets_per_run = max_workers_per_tick
+    else:
+        max_targets_per_run = _int_field("max_targets_per_run", positive=True)
 
     if kind == "pipeline":
         if checks is not None:
@@ -1748,13 +1811,14 @@ def _build_job(
     if kind == "audit":
         target = "base"
 
-    # A review job's target is always a PR ("pr"), and only "pr" is accepted.
-    if kind == "review":
+    # A review job's target is always a PR, so only "pr" is accepted; the routine it loads
+    # as has no `target` (its selector names the PR).
+    if review_sugar:
         if target is not None and target != "pr":
             raise ConfigError(
                 f"{label}: 'target' must be absent or 'pr' for kind: review"
             )
-        target = "pr"
+        target = None
 
     if target == "base" and kind == "gated" and not base:
         raise ConfigError(
@@ -1827,8 +1891,14 @@ def _build_job(
     #
     # Like the kind rules above, an explicit per-job `verify` on a kind that never reaches
     # `execute_run` is rejected, while an inherited one is kept aside as `ignored_verify`
-    # (a shared defaults.yaml must not invalidate every gated/audit job).
-    verify_raw = merged["verify"]
+    # (a shared defaults.yaml must not invalidate every gated/audit job). `kind: review`
+    # fixes it: the review's post-condition is not the job's to choose.
+    if review_sugar and "verify" in raw_job:
+        raise ConfigError(
+            f"{label}: 'verify' is fixed by kind: review (it is "
+            "[review_posted]); use kind: routine with pick: my_open_prs to choose gates"
+        )
+    verify_raw = ["review_posted"] if review_sugar else merged["verify"]
     verify: tuple[VerifyGate, ...] = ()
     if verify_raw is not None:
         if not isinstance(verify_raw, list):
@@ -1861,7 +1931,12 @@ def _build_job(
     # -- pick (issue 073) --------------------------------------------------------------
     # Same rule as `verify`: explicit on a kind that never reaches the routine dispatch is
     # an error, inherited is kept aside as `ignored_pick` for `validate` to report.
-    pick_raw = merged["pick"]
+    if review_sugar and "pick" in raw_job:
+        raise ConfigError(
+            f"{label}: 'pick' is fixed by kind: review (it is my_open_prs); "
+            "use kind: routine with pick: my_open_prs"
+        )
+    pick_raw = "my_open_prs" if review_sugar else merged["pick"]
     pick: TargetSelector | None = None
     if pick_raw is not None:
         if not isinstance(pick_raw, str) or pick_raw not in VALID_TARGET_SELECTORS:
@@ -1878,6 +1953,19 @@ def _build_job(
                 f"(kind: {kind} does not run a target selector, issue 073)"
             )
         ignored_pick, pick = pick, None
+
+    # Several targets need a selector that can return several (issue 076).
+    if max_targets_per_run > 1 and pick not in MULTI_TARGET_SELECTORS:
+        raise ConfigError(
+            f"{label}: 'max_targets_per_run' above 1 needs a multi-target selector "
+            f"({sorted(MULTI_TARGET_SELECTORS)}) under 'pick'"
+        )
+    if retry_attempts > 0 and pick in MULTI_TARGET_SELECTORS:
+        warnings.warn(
+            f"{label}: 'retry_attempts' is ignored for a multi-target selector — "
+            "each target gets one attempt, since a retry could post a second review",
+            stacklevel=2,
+        )
 
     return Job(
         name=name,
@@ -1903,6 +1991,7 @@ def _build_job(
         checks=checks,
         target=target,
         max_workers_per_tick=max_workers_per_tick,
+        max_targets_per_run=max_targets_per_run,
         max_attempts_per_target=max_attempts_per_target,
         kind=kind,
         prompt_file=prompt_file,

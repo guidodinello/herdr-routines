@@ -348,8 +348,11 @@ def substitute_prompt(
     if findings_path is not None:
         resolved = resolved.replace("$ROUTINE_FINDINGS", str(findings_path))
     # $ROUTINE_TARGET resolves only when a selector picked one (issue 073), same rule.
+    # $ROUTINE_TARGET_URL goes first: `$ROUTINE_TARGET` is a prefix of it.
     if target is not None:
-        resolved = resolved.replace("$ROUTINE_TARGET", target.ref)
+        resolved = resolved.replace("$ROUTINE_TARGET_URL", target.url).replace(
+            "$ROUTINE_TARGET", target.ref
+        )
     return resolved
 
 
@@ -397,6 +400,19 @@ class _CommonOutcomeFields(TypedDict):
 
 
 RunState = Literal["done", "failed", "interrupted_unknown"]
+
+
+@dataclass(frozen=True, slots=True)
+class TargetPlacement:
+    """Where one target of a multi-target routine run happens (issue 076): the worktree the
+    caller made for it, the agent's name there, its own report file, and what the
+    `review_posted` gate should look for."""
+
+    workdir: Path
+    agent_name: str
+    report_path: Path
+    marker: str | None = None
+    trusted_authors: frozenset[str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,9 +533,10 @@ def _start_agent_reaping_stale_collision(
     *,
     pane_id: str,
     session_id: str | None = None,
+    agent_name: str | None = None,
 ) -> bool:
-    """Start `job.agent_name` on `pane_id`. If the start fails because a prior run's
-    blocked/unknown agent still holds the name (issue 051 — nothing answers a cron job's
+    """Start `agent_name` (default `job.agent_name`) on `pane_id`. If the start fails
+    because a prior run's blocked/unknown agent still holds the name (issue 051 — nothing answers a cron job's
     blocked prompt, so it wedges every subsequent run), force-close that agent's pane and
     retry the start exactly once. Returns True iff a stale agent was reaped. Propagates
     the start error unchanged when the collision is not reapable (agent still working, or
@@ -528,9 +545,10 @@ def _start_agent_reaping_stale_collision(
     `session_id` is threaded through the same `partial` (issue 056 §8) so the reaped-retry
     resumes a conversation rather than starting cold; routine jobs never pass one, but the
     parameter has to live here or a caller that did would silently start a fresh session."""
+    agent_name = agent_name or job.agent_name
     start = partial(
         client.agent_start,
-        name=job.agent_name,
+        name=agent_name,
         kind=job.agent_kind,
         pane_id=pane_id,
         start_timeout_ms=job.start_timeout_ms,
@@ -544,7 +562,7 @@ def _start_agent_reaping_stale_collision(
         if not _is_agent_name_taken(first_error):
             raise
         try:
-            stale = client.sticky_agent_pane(job.agent_name)
+            stale = client.sticky_agent_pane(agent_name)
         except (HerdrCliError, OSError):
             stale = None
         if stale is None:
@@ -554,7 +572,7 @@ def _start_agent_reaping_stale_collision(
             "%s: agent name %s is held by a %s agent (pane %s) from a prior run — "
             "force-closing it and retrying start once (issue 051)",
             job.name,
-            job.agent_name,
+            agent_name,
             stale_status,
             stale_pane,
         )
@@ -571,22 +589,38 @@ def execute_run(
     gh: GhClient | None = None,
     trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
     target: VerifyTarget | None = None,
+    placement: TargetPlacement | None = None,
 ) -> RunOutcome:
     """Runs one job to completion (or failure) against a real or faked HerdrClient. Never
     raises — every failure mode is captured in the returned RunOutcome so `tick.py` can always
     write a terminal history record. (A `job.model` unsupported for `job.agent_kind` would raise
     `ValueError` from `agent_start`, but `config.py` already rejects that combination at load
-    time, so it can't reach here.)"""
+    time, so it can't reach here.)
+
+    `placement` (issue 076) is a multi-target run's one target: the caller has already made
+    the worktree, so this skips the repo sync and the branch, runs the agent in
+    `placement.workdir` under `placement.agent_name`, and always closes the pane after."""
     started_at = datetime.now(UTC)
-    report_path = default_reports_dir() / f"{run_id}.md"
+    report_path = (
+        placement.report_path
+        if placement is not None
+        else default_reports_dir() / f"{run_id}.md"
+    )
+    agent_name = placement.agent_name if placement is not None else job.agent_name
+    # A placed run's pane sits in a worktree that is removed right after, so it is closed
+    # whatever `workspace` says; a root-mode job otherwise leaves its pane in the ambient tab.
+    owns_pane = placement is not None or job.workspace != "root"
     branch = (
-        build_branch_name(job.name, run_id) if job.workspace == "worktree" else None
+        build_branch_name(job.name, run_id)
+        if job.workspace == "worktree" and placement is None
+        else None
     )
 
     # Ensure the repo checkout exists (clone-if-missing / fetch) before any worktree
-    # or tab creation.
+    # or tab creation. A placed run's checkout was prepared per target by the caller.
     try:
-        ensure_repo(job)
+        if placement is None:
+            ensure_repo(job)
     except (RuntimeError, OSError) as e:
         return RunOutcome(
             state="failed",
@@ -626,9 +660,9 @@ def execute_run(
     # only when its agent is settled to idle/done (never working/blocked/unknown), never
     # for workspace:root jobs (their tab lives in the shared ambient workspace), and
     # closing only the single pane (not the whole workspace) to preserve sibling tabs.
-    if job.workspace != "root":
+    if owns_pane:
         try:
-            stale_pane = client.settled_agent_pane(job.agent_name)
+            stale_pane = client.settled_agent_pane(agent_name)
             if stale_pane is not None:
                 client.pane_close(stale_pane)
                 log.info(
@@ -640,7 +674,9 @@ def execute_run(
             log.warning("%s: could not reap previous pane: %s", job.name, e)
 
     try:
-        if job.workspace == "worktree":
+        if placement is not None:
+            pane_id = client.tab_create(cwd=str(placement.workdir), label=agent_name)
+        elif job.workspace == "worktree":
             pane_id = client.worktree_create(
                 cwd=str(job.repo), branch=branch or "", base=job.base, label=job.name
             )
@@ -657,13 +693,13 @@ def execute_run(
 
     try:
         reaped_stale_agent = _start_agent_reaping_stale_collision(
-            client, job, pane_id=pane_id
+            client, job, pane_id=pane_id, agent_name=agent_name
         )
     except (HerdrCliError, OSError, ValueError) as e:
         # Our pane, dead run: leave nothing behind to wedge later ticks on agent_name_live
         # (docs/failure-reaping.md §3.1).
         _capture_visible_tail(
-            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
         )
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)
         diagnosis = _best_effort_tmp_diagnosis(report_path.parent, run_id)
@@ -683,17 +719,17 @@ def execute_run(
     # start_timeout_ms as the readiness bound since both describe "how long agent startup
     # may take". All poll errors are handled inside the wait, so nothing escapes this call.
     ready, last_poll_error = _wait_for_agent_ready(
-        client, job.agent_name, timeout_s=job.start_timeout_ms / 1000
+        client, agent_name, timeout_s=job.start_timeout_ms / 1000
     )
     if not ready:
         error = (
-            f"agent {job.agent_name} did not report interactive_ready within "
+            f"agent {agent_name} did not report interactive_ready within "
             f"{job.start_timeout_ms}ms of start"
         )
         if last_poll_error:
             error = f"{error}; last poll error: {last_poll_error}"
         _capture_visible_tail(
-            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
         )
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)
         diagnosis = _best_effort_tmp_diagnosis(report_path.parent, run_id)
@@ -704,7 +740,7 @@ def execute_run(
             if diagnosis and diagnosis.get("tmp_full")
             else "agent_not_interactive",
             error=error,
-            agent_name=job.agent_name,
+            agent_name=agent_name,
             pane_id=pane_id,
             branch=branch,
             diagnosis=diagnosis,
@@ -723,7 +759,7 @@ def execute_run(
         settled_status = _prompt_with_watchdog(
             client,
             job_name=job.name,
-            target=job.agent_name,
+            target=agent_name,
             text=prompt,
             timeout_ms=job.timeout_ms,
             markers=effective_markers,
@@ -747,7 +783,7 @@ def execute_run(
             run_id=run_id,
             reason="quota_exhausted",
             error=f"failure marker matched: {e.marker!r}",
-            agent_name=job.agent_name,
+            agent_name=agent_name,
             pane_id=pane_id,
             branch=branch,
             reaped_stale_agent=reaped_stale_agent,
@@ -758,7 +794,7 @@ def execute_run(
         # quota exhaustion from it, then close our pane — otherwise every future tick skips
         # this job forever (docs/failure-reaping.md §1).
         screen_tail = _capture_visible_tail(
-            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
         )
         marker = _matched_failure_marker(screen_tail, effective_markers, prompt)
         reason = "quota_exhausted" if marker else "agent_prompt_failed"
@@ -769,7 +805,7 @@ def execute_run(
             run_id=run_id,
             reason=reason,
             error=error,
-            agent_name=job.agent_name,
+            agent_name=agent_name,
             pane_id=pane_id,
             branch=branch,
             reaped_stale_agent=reaped_stale_agent,
@@ -780,7 +816,7 @@ def execute_run(
 
     common: _CommonOutcomeFields = {
         "run_id": run_id,
-        "agent_name": job.agent_name,
+        "agent_name": agent_name,
         "pane_id": pane_id,
         "branch": branch,
         "final_agent_status": settled_status,
@@ -797,7 +833,7 @@ def execute_run(
         # the pane may not survive until then (manual close, host reboot). Uses
         # agent_read_visible (visible source) which succeeds while unsettled/blocked.
         tail = _capture_visible_tail(
-            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
         )
         return RunOutcome(state="failed", reason="blocked", visible_tail=tail, **common)
 
@@ -816,7 +852,7 @@ def execute_run(
         # exactly like the prompt-failed path (docs/failure-reaping.md §3.1). Capture a
         # diagnostic tail via visible source before close (issue 033).
         _capture_visible_tail(
-            client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
         )
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)
         # None is a status outside herdr's schema (the raw value went to the boundary
@@ -839,9 +875,7 @@ def execute_run(
     if not report_written or report_bytes == 0:
         nudged = True
         try:
-            _attempt_report_nudge(
-                client, target=job.agent_name, report_path=report_path
-            )
+            _attempt_report_nudge(client, target=agent_name, report_path=report_path)
         except (HerdrCliError, OSError) as e:
             # Never loop: any nudge failure/timeout falls straight through to the existing
             # no_report path below, exactly as if the nudge had never been attempted.
@@ -858,7 +892,7 @@ def execute_run(
     # Bounded visible-tail capture (issue 011): placed after the nudge so the tail
     # reflects the nudge's final screen if the nudge ran, matching spec v2 L33.
     _capture_visible_tail(
-        client, job.agent_name, reports_dir=report_path.parent, run_id=run_id
+        client, agent_name, reports_dir=report_path.parent, run_id=run_id
     )
 
     # Pane-lifecycle v2: close our own pane now instead of leaving it for the next run's
@@ -867,8 +901,8 @@ def execute_run(
     # nothing to resume-and-inspect for a pane that's never closed). Session id is captured
     # before closing since a closed pane's agent record won't answer `agent get` afterwards.
     session_id: str | None = None
-    if job.workspace != "root":
-        session_id = _capture_session_id(client, job.agent_name)
+    if owns_pane:
+        session_id = _capture_session_id(client, agent_name)
         _close_run_pane(client, job_name=job.name, pane_id=pane_id)
 
     # An agent can push unsigned commits however the clone is configured (`git -c
@@ -911,6 +945,8 @@ def execute_run(
                 gh=gh if gh is not None else RealGhClient(),
                 trusted_review_authors=trusted_review_authors,
                 target=target,
+                trusted_authors=placement.trusted_authors if placement else None,
+                marker=placement.marker if placement else None,
             ),
         )
     failed_gate = next((r for r in verify_results if not r.passed), None)

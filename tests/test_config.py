@@ -1855,6 +1855,11 @@ def test_require_accessor_raises_naming_job_and_field(
 
 _VERIFY_JOB = "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n"
 _VERIFY_REVIEW_JOB = "name: r\ncron: '0 3 * * *'\nkind: review\nselect: [author]\n"
+# A kind that never reaches `execute_run`, so it cannot honor a gate.
+_VERIFY_GATED_JOB = (
+    "name: g\ncron: '0 3 * * *'\nrepo: /repo/g\nkind: gated\nchecks:\n"
+    "  - command: 'true'\n"
+)
 
 
 def test_verify_unknown_gate_rejected_and_inherits_from_defaults(
@@ -1906,8 +1911,30 @@ def test_verify_rejects_the_gates_only_the_fix_worker_path_can_run(
 
 
 def test_verify_on_a_kind_that_never_runs_gates(tmp_path: Path) -> None:
-    """An explicit `verify` on kind: review is an error; an inherited one is kept aside
+    """An explicit `verify` on kind: gated is an error; an inherited one is kept aside
     (not silently dropped) so `validate` can name it."""
+    inherited = _make_jobs_d(
+        tmp_path / "i",
+        {
+            "defaults.yaml": "verify: [report_wellformed]\n",
+            "g.yaml": _VERIFY_GATED_JOB,
+        },
+    )
+    (job,) = load_config(inherited).jobs
+    assert job.verify == ()
+    assert job.ignored_verify == ("report_wellformed",)
+
+    explicit = _make_jobs_d(
+        tmp_path / "e", {"g.yaml": _VERIFY_GATED_JOB + "verify: [review_posted]\n"}
+    )
+    cfg = load_config_dir(explicit)
+    assert cfg.jobs == ()
+    assert any("only supported on kind: routine" in err for err in cfg.errors)
+
+
+def test_kind_review_fixes_verify_whatever_defaults_say(tmp_path: Path) -> None:
+    """`kind: review` loads with its own gate (issue 076): a shared default is overridden, not
+    ignored-and-warned, and an explicit `verify` is an error."""
     inherited = _make_jobs_d(
         tmp_path / "i",
         {
@@ -1916,15 +1943,8 @@ def test_verify_on_a_kind_that_never_runs_gates(tmp_path: Path) -> None:
         },
     )
     (job,) = load_config(inherited).jobs
-    assert job.verify == ()
-    assert job.ignored_verify == ("report_wellformed",)
-
-    explicit = _make_jobs_d(
-        tmp_path / "e", {"r.yaml": _VERIFY_REVIEW_JOB + "verify: [review_posted]\n"}
-    )
-    cfg = load_config_dir(explicit)
-    assert cfg.jobs == ()
-    assert any("only supported on kind: routine" in err for err in cfg.errors)
+    assert job.verify == ("review_posted",)
+    assert job.ignored_verify == ()
 
 
 def test_deploy_fitted_pr_review_example_declares_its_verify_gates(

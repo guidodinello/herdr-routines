@@ -1,7 +1,7 @@
 ---
 id: "076"
 title: "Rebuild `kind: review` as a routine with a multi-target, cross-repo selector"
-status: open
+status: done
 priority: medium
 area: scheduler
 ---

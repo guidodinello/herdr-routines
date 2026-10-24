@@ -1,9 +1,10 @@
 """Behavior tests for tick's review and audit dispatch flows (issue 062).
 
-`_process_review_job` and `_process_audit_job` share one schedule-guard shape (registered,
+`_process_job` (for a `kind: review` job, which since issue 076 is a routine with a
+multi-target selector) and `_process_audit_job` share one schedule-guard shape (registered,
 stale reap, already running, live agent, not due, missed, collapsed, due) that differs only
 in the running-record staleness window, so the guards are one table over both kinds. The
-cycles behind them (`_review_cycle` / `_dispatch_review_target`, `_audit_cycle` /
+cycles behind them (`_run_routine_targets` / `_run_one_target`, `_audit_cycle` /
 `_run_audit` / `_dispatch_audit_fix`) run against real local git and a fake herdr / gh,
 reusing the fakes of `test_review_scan` and `test_audit_dispatch`.
 """
@@ -85,6 +86,9 @@ class Kind:
     make_job: Callable[..., Job]
     process: str
     cycle: str
+    # The review cycle writes its own `running` record (after its selector answers); the
+    # audit one is handed an occurrence that already has it.
+    cycle_writes_running: bool
     # Running-record ages (ms since it started): one that is still inside this kind's
     # staleness window but past a bare `timeout_ms` (so a wrong formula reads it stale),
     # and one past the window.
@@ -98,8 +102,9 @@ def _review_kind(tmp_path: Path) -> Kind:
     return Kind(
         name="review",
         make_job=lambda **over: _review_job(tmp_path, max_workers_per_tick=3, **over),
-        process="_process_review_job",
-        cycle="_review_cycle",
+        process="_process_job",
+        cycle="_run_routine_targets",
+        cycle_writes_running=True,
         inside_age_ms=STALE_MARGIN_MS + 120_000,
         stale_age_ms=STALE_MARGIN_MS + 200_000,
         live_agent=lambda job: job.agent_name,
@@ -117,6 +122,7 @@ def _audit_kind(tmp_path: Path) -> Kind:
         ),
         process="_process_audit_job",
         cycle="_audit_cycle",
+        cycle_writes_running=False,
         inside_age_ms=STALE_MARGIN_MS + 3_000_000,
         stale_age_ms=STALE_MARGIN_MS + 4_600_000,
         live_agent=lambda job: build_audit_agent_name(job.name, "any-run"),
@@ -138,7 +144,19 @@ def cycle_calls(kind: Kind, monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Replace the kind's cycle with a recorder of the run_ids it is handed."""
     calls: list[str] = []
 
-    def _cycle(job: Job, history_path: Path, *, run_id: str, **_kw: Any) -> Any:
+    def _cycle(
+        job: Job,
+        history_path: Path,
+        occ: tick.Occurrence | None = None,
+        *,
+        run_id: str | None = None,
+        **_kw: Any,
+    ) -> Any:
+        if occ is not None:
+            run_id = occ.run_id
+            if kind.cycle_writes_running:
+                tick._append_running(job, history_path, occ, now=NOW)
+        assert run_id is not None
         calls.append(run_id)
         return f"{job.name}: cycle ran", False
 
@@ -377,7 +395,7 @@ def test_earlier_occurrences_collapse_into_one_missed_record_before_the_run(
     assert cycle_calls == [records[2].run_id]
 
 
-def test_process_job_routes_kind_review_to_the_review_flow(
+def test_process_job_treats_a_review_job_like_any_routine(
     tmp_path: Path, history: Path
 ) -> None:
     job = _review_job(tmp_path)
@@ -389,7 +407,7 @@ def test_process_job_routes_kind_review_to_the_review_flow(
         now=NOW,
     )
 
-    # First sight is `_process_review_job`'s own answer; no other kind registers a review job.
+    # A review job is a routine: first sight registers it, like every other routine.
     assert (summary, failed) == (f"{job.name}: registered", False)
     assert _states(history, job) == ["registered"]
 
@@ -406,7 +424,7 @@ class ReviewEnv:
     checkout: Path
 
     def run(self) -> tuple[str, bool]:
-        return tick._process_review_job(
+        return tick._process_job(
             self.job,
             self.history,
             client=self.client,  # type: ignore[arg-type]
@@ -421,7 +439,7 @@ class ReviewEnv:
         return [
             r
             for r in read_job(self.history, self.job.name)
-            if r.extra and "target_key" in r.extra
+            if r.extra and "target_key" in r.extra and r.state != "running"
         ]
 
     def run_id(self) -> str:
@@ -444,9 +462,9 @@ def _review_env(
     """A due review job over a real `acme/widgets` clone, with gh and herdr faked.
     The default herdr fake plays a worker that posts its review."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    base = tmp_path / "repos"
+    base = tmp_path / "state" / "repos"
     origin, checkout = _setup_repo(tmp_path, "acme", "widgets", head_branch, base)
-    job = _review_job(tmp_path, repo=base, **job_over)
+    job = _review_job(tmp_path, **job_over)
     gh = ReviewGh(
         prs=prs,
         repo_infos={
@@ -558,8 +576,6 @@ def test_review_flow_fails_closed_when_gh_has_no_login(
     assert record.extra is not None
     assert record.extra["reason"] == "gh_auth_missing"
     assert record.extra["error"] == "gh: not logged in"
-    assert record.extra["gate"] == "failed"
-    assert record.extra["dispatched"] == 0
     assert env.gh.search_calls == []
     assert env.client.notifications == [
         ("herdr-routines: review-my-prs failed", "gh_auth_missing", "request")
@@ -704,10 +720,10 @@ class _AgentStartFails(ReviewHerdrClient):
 
 
 @pytest.mark.parametrize(
-    ("client_cls", "pane_id", "error"),
+    ("client_cls", "pane_id", "reason", "error"),
     [
-        (_TabCreateFails, None, "tab_create refused"),
-        (_AgentStartFails, "w1:p1", "agent_start refused"),
+        (_TabCreateFails, None, "pane_creation_failed", "tab_create refused"),
+        (_AgentStartFails, "w1:p1", "agent_start_failed", "agent_start refused"),
     ],
 )
 def test_review_agent_that_cannot_be_started_fails_and_closes_its_pane(
@@ -715,6 +731,7 @@ def test_review_agent_that_cannot_be_started_fails_and_closes_its_pane(
     monkeypatch: pytest.MonkeyPatch,
     client_cls: type[ReviewHerdrClient],
     pane_id: str | None,
+    reason: str,
     error: str,
 ) -> None:
     env = _review_env(
@@ -730,7 +747,7 @@ def test_review_agent_that_cannot_be_started_fails_and_closes_its_pane(
     (record,) = env.target_records()
     assert record.state == "failed"
     assert record.extra is not None
-    assert record.extra["reason"] == "agent_start_failed"
+    assert record.extra["reason"] == reason
     assert error in str(record.extra["error"])
     assert record.extra["pane_id"] == pane_id
     assert record.extra["verified"] is False
@@ -774,7 +791,7 @@ def test_review_agent_whose_prompt_fails_is_recorded_as_agent_prompt_failed(
         monkeypatch,
         prs=(_pr(1),),
         client=lambda gh: ReviewHerdrClient(
-            on_prompt=_raises(RuntimeError("agent crashed"))
+            on_prompt=_raises(HerdrCliError("agent crashed", exit_code=1))
         ),
     )
 

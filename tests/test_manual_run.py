@@ -271,7 +271,7 @@ def test_manual_run_dispatches_by_kind(
     checks_pass: bool,
 ) -> None:
     def fail_execute_run(*a: Any, **kw: Any) -> RunOutcome:
-        raise AssertionError("gated and review jobs never go through execute_run")
+        raise AssertionError("gated jobs never go through execute_run")
 
     monkeypatch.setattr(tick, "execute_run", fail_execute_run)
 
@@ -311,13 +311,19 @@ def test_manual_run_dispatches_by_kind(
         assert client.tab_creates == 1  # the fix worker was started
         assert terminal.extra["gate"] == "failed"
 
-    # review: the review cycle runs (here it stops at gh auth).
+    # review: the multi-target routine runs (here its selector stops at gh auth).
     class _NoAuthGh:
         def api_user(self) -> str:
             raise RuntimeError("gh auth missing")
 
     monkeypatch.setattr(tick, "RealGhClient", _NoAuthGh)
-    review = _job(tmp_path, name="r", kind="review", target="pr", select=("author",))
+    review = _job(
+        tmp_path,
+        name="r",
+        pick="my_open_prs",
+        select=("author",),
+        verify=("review_posted",),
+    )
     assert _run_cli(monkeypatch, review, "--run-id", "r-manual") == 1
     review_terminal = read_job(history, "r")[-1]
     assert review_terminal.run_id == "r-manual"
@@ -334,7 +340,12 @@ def _kinds(tmp_path: Path) -> dict[str, Job]:
             target="base",
             checks=(GateCheck(kind="command", command="true"),),
         ),
-        "review": _job(tmp_path, kind="review", target="pr", select=("author",)),
+        "review": _job(
+            tmp_path,
+            pick="my_open_prs",
+            select=("author",),
+            verify=("review_posted",),
+        ),
         "audit": _job(tmp_path, kind="audit", audit=AuditSpec(command="true")),
         "pipeline": _job(
             tmp_path,

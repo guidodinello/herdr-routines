@@ -16,6 +16,7 @@ import pytest
 from herdr_routines import cli, tick, verify
 from herdr_routines.auto_fix import PostedBody, RealGhClient
 from herdr_routines.config import (
+    MULTI_TARGET_SELECTORS,
     VALID_TARGET_SELECTORS,
     Job,
     RoutinesConfig,
@@ -24,6 +25,7 @@ from herdr_routines.config import (
 )
 from herdr_routines.history import read_job
 from herdr_routines.target_selectors import (
+    MULTI_TARGET_REGISTRY,
     TARGET_SELECTORS,
     SelectorContext,
     SelectorFailed,
@@ -466,13 +468,27 @@ def test_selector_config_validation(
     jobs_dir = _write_jobs_d(
         root,
         {
+            "g.yaml": f"name: g\ncron: '0 3 * * *'\nrepo: {repo}\nkind: gated\n"
+            "checks:\n  - command: 'true'\npick: oldest_unreviewed_pr\n"
+        },
+    )
+    cfg = load_config_dir(jobs_dir)
+    assert cfg.jobs == ()
+    assert any("only supported on kind: routine" in err for err in cfg.errors)
+
+    # `kind: review` fixes its selector, so an explicit `pick` is refused too.
+    root = tmp_path / "explicit-review"
+    root.mkdir()
+    jobs_dir = _write_jobs_d(
+        root,
+        {
             "r.yaml": "name: r\ncron: '0 3 * * *'\nkind: review\nselect: [author]\n"
             "pick: oldest_unreviewed_pr\n"
         },
     )
     cfg = load_config_dir(jobs_dir)
     assert cfg.jobs == ()
-    assert any("only supported on kind: routine" in err for err in cfg.errors)
+    assert any("fixed by kind: review" in err for err in cfg.errors)
 
     # Inherited: a routine honors it, another kind keeps it aside and `validate` says so.
     root = tmp_path / "inherited"
@@ -481,6 +497,8 @@ def test_selector_config_validation(
         root,
         {
             "defaults.yaml": "pick: oldest_unreviewed_pr\n",
+            "g.yaml": f"name: g\ncron: '0 3 * * *'\nrepo: {repo}\nkind: gated\n"
+            "checks:\n  - command: 'true'\n",
             "r.yaml": "name: r\ncron: '0 3 * * *'\nkind: review\nselect: [author]\n",
             "a.yaml": routine,
             "nopick.yaml": routine.replace("name: a", "name: nopick") + "pick: null\n",
@@ -490,15 +508,21 @@ def test_selector_config_validation(
     by_name = {j.name: j for j in config.jobs}
     assert by_name["a"].pick == "oldest_unreviewed_pr"
     assert by_name["nopick"].pick is None
-    assert by_name["r"].pick is None
-    assert by_name["r"].ignored_pick == "oldest_unreviewed_pr"
+    assert by_name["g"].pick is None
+    assert by_name["g"].ignored_pick == "oldest_unreviewed_pr"
+    # `kind: review` fixes its own selector: the default is overridden, not ignored.
+    assert by_name["r"].pick == "my_open_prs"
+    assert by_name["r"].ignored_pick is None
     cli._cmd_validate(
         argparse.Namespace(config=jobs_dir, systemd_unit=tmp_path / "x.service")
     )
     err = capsys.readouterr().err
-    assert "r: inherits pick from defaults but kind review does not honor it" in err
+    assert "g: inherits pick from defaults but kind gated does not honor it" in err
     assert "a: inherits pick" not in err
+    assert "r: inherits pick" not in err
 
 
 def test_selector_registry_matches_the_config_names() -> None:
-    assert set(TARGET_SELECTORS) == VALID_TARGET_SELECTORS
+    assert set(TARGET_SELECTORS) | set(MULTI_TARGET_REGISTRY) == VALID_TARGET_SELECTORS
+    assert set(MULTI_TARGET_REGISTRY) == MULTI_TARGET_SELECTORS
+    assert not set(TARGET_SELECTORS) & set(MULTI_TARGET_REGISTRY)

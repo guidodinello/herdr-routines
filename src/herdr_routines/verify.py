@@ -3,8 +3,9 @@
 A routine run is `done` once its agent settles with a non-empty `$ROUTINE_REPORT`, which
 is the agent's word and nothing more (fitted #839: a one-line report claimed a review that
 was never posted). A job lists gates under `verify:`; `runner.execute_run` runs them after
-the agent settles and fails the run on any miss. `kind: review` calls `review_posted`
-directly for its per-target post-condition, so there is one implementation of it.
+the agent settles and fails the run on any miss. `kind: review` loads with
+`verify: [review_posted]` and a target known to code (issue 076), so its per-target
+post-condition is this gate and there is one implementation of it.
 
 Every external call goes through the injected `GhClient` (which bounds each call with a
 timeout). A probe that errors or times out is a failed gate, never an exception and never
@@ -36,8 +37,8 @@ log = logging.getLogger(__name__)
 # caller has none (a routine job's agent picks its own target and has no per-target marker).
 CODE_REVIEW_HEADER = "### Code review"
 
-# Gate reasons. `kind: review` records these verbatim as its dispositions, so they are the
-# same strings its post-condition used before it called the gate.
+# Gate reasons. A review target's record carries these as its `error` (its `reason` is
+# `verify_failed:review_posted`), the strings its post-condition used before it was a gate.
 REASON_TARGET_UNDECLARED = "target_undeclared"
 REASON_VERIFICATION_FAILED = "review_verification_failed"
 REASON_NOT_POSTED = "review_not_posted"
@@ -60,6 +61,11 @@ class VerifyTarget:
         """`<owner>/<repo>#<n>`, the form `$ROUTINE_TARGET` and `extra.target` carry."""
         return f"{self.owner}/{self.repo}#{self.number}"
 
+    @property
+    def url(self) -> str:
+        """The PR's web URL, `$ROUTINE_TARGET_URL`."""
+        return f"https://github.com/{self.owner}/{self.repo}/pull/{self.number}"
+
 
 @dataclass(frozen=True, slots=True)
 class VerifyContext:
@@ -74,8 +80,9 @@ class VerifyContext:
     report_path: Path
     gh: GhClient
     trusted_review_authors: tuple[str, ...]
-    # Known to code for `kind: review`; a routine's agent chooses its own, so it is parsed
-    # from the report's `Target:` line when this is None.
+    # Known to code when a selector picked it (`pick:`, and so `kind: review`); a routine's
+    # agent otherwise chooses its own, so it is parsed from the report's `Target:` line when
+    # this is None.
     target: VerifyTarget | None = None
     # Precomputed trusted set; resolved from `trusted_review_authors` plus the gh viewer
     # when None.

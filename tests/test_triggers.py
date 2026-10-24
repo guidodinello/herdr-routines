@@ -435,7 +435,13 @@ def _kind_job(tmp_path: Path, kind: str) -> Job:
     if kind == "audit":
         return _job(tmp_path, kind="audit", audit=AuditSpec(command="true"))
     if kind == "review":
-        return _job(tmp_path, kind="review", target="pr", select=("author",))
+        # As `kind: review` loads (issue 076): a routine with the multi-target selector.
+        return _job(
+            tmp_path,
+            pick="my_open_prs",
+            select=("author",),
+            verify=("review_posted",),
+        )
     return _job(tmp_path)
 
 
@@ -463,8 +469,16 @@ def test_run_records_its_trigger(
         )
         return "a: stubbed", False
 
-    for cycle in ("_process_base_target", "_audit_cycle", "_review_cycle"):
+    def closed_targets(
+        job: Job, history_path: Path, occ: tick.Occurrence, *, now: datetime, **kw: Any
+    ) -> tuple[str, bool]:
+        # The multi-target fan-out opens its own run once its selector has answered.
+        tick._append_running(job, history_path, occ, now=now)
+        return closed_cycle(job, history_path, run_id=occ.run_id, now=now)
+
+    for cycle in ("_process_base_target", "_audit_cycle"):
         monkeypatch.setattr(tick, cycle, closed_cycle)
+    monkeypatch.setattr(tick, "_run_routine_targets", closed_targets)
     job = replace(_kind_job(tmp_path, kind), request=True)
     event_job = (
         replace(job, trigger_event=EVENT_CHECK)

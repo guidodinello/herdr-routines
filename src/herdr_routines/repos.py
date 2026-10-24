@@ -39,6 +39,12 @@ def default_repos_dir() -> Path:
     return base / "repos"
 
 
+def is_repo_less(job: Job) -> bool:
+    """Whether `job.repo` is only the managed base dir rather than a checkout (issue 076):
+    what `kind: review` loads with, since each PR it picks is checked out in its own repo."""
+    return job.repo == default_repos_dir()
+
+
 def ensure_repo(job: Job) -> Path:
     """Ensure the job's checkout exists and is up-to-date.
 
@@ -67,9 +73,9 @@ def _ensure_checkout(clone_url: str | None, dest: Path, *, base: str) -> Path:
     """Ensure *dest* exists and is up-to-date, cloning from *clone_url* when it
     is missing and the URL is known.
 
-    The per-repo checkout path for ``kind: review`` jobs calls this directly:
-    its clone URL and default branch are discovered per-repo at tick time, so
-    there is no ``Job`` to hand it.  ``ensure_repo`` is the ``Job``-shaped
+    The per-target checkout of a multi-target routine (``pick: my_open_prs``, so
+    ``kind: review``) calls this directly: its clone URL and default branch are
+    discovered per-repo at tick time, so there is no ``Job`` to hand it.  ``ensure_repo`` is the ``Job``-shaped
     caller and preserves the pre-refactor behavior exactly — a plain ``repo:``
     job (``clone_url is None``) is still never cloned, only synced.
 

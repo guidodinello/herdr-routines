@@ -47,3 +47,14 @@ timezone: America/Montevideo
 #                                          # `pick` replaces it; `pick: null` opts out. Only
 #                                          # kind: routine honors it (other kinds warn in
 #                                          # `validate`). See fitted-pr-review.yaml.
+#                                          # `pick: my_open_prs` (issue 076) returns several
+#                                          # targets (every open PR you opened / are asked
+#                                          # to review, in any repo) and takes `select:`,
+#                                          # `include_auto_branches:` and
+#                                          # `max_targets_per_run:` on the job: one agent per
+#                                          # target, in turn, each in its repo's checkout.
+#                                          # `kind: review` is sugar for exactly that plus
+#                                          # `verify: [review_posted]` and the engine review
+#                                          # prompt; it loads as a routine, and sets `pick`,
+#                                          # `verify` and its cap (`max_workers_per_tick`)
+#                                          # itself, whatever this file says.
