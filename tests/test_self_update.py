@@ -155,6 +155,8 @@ class Sandbox:
             "base": self.base,
             "runner": FakeValidate(),
             "uv_resolver": lambda: "/usr/bin/uv",
+            # No drift by default; the host-drift tests pass a real check_host.
+            "host_check": list,
         }
         kwargs.update(overrides)
         return run_self_update(**kwargs)
@@ -985,6 +987,16 @@ def test_self_update_honors_config_override_and_reports_config_errors(
     assert seen[0]["checkout"] == sb.checkout
     assert seen[0]["base"] == sb.base
     assert notifications == []
+    # The host check it is handed runs on the same checkout and base.
+    checked: list[tuple[Path, str]] = []
+
+    def recording_check_host(checkout: Path, *, base: str) -> list[object]:
+        checked.append((checkout, base))
+        return []
+
+    monkeypatch.setattr(cli, "check_host", recording_check_host)
+    seen[0]["host_check"]()
+    assert checked == [(sb.checkout, sb.base)]
 
     # (b) a config that will not load at all -> refused, notified, exit 1.
     code = cli.main(

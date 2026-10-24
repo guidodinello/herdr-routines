@@ -15,7 +15,11 @@ herdr-routines project itself.
 
 The service runs a fresh oneshot each tick (every 5 min), so it picks up any
 new code/config on the *next* tick — no restart or daemon-reload needed after a
-merge.
+merge, **except** when the merge touched `deploy/systemd/`. Units are installed
+by copying, and neither the update nor self-update re-copies them, so the host
+keeps running the old unit until step 5 below. `herdr-routines host-check`
+reports it as `stale_unit` until then. That check is also appended to the
+self-update notification and the daily digest.
 
 ## When to run
 
@@ -68,6 +72,13 @@ ssh $HOST "cd ~/projects/herdr-routines && git fetch origin && git pull --ff-onl
 
 # 4. Validate — ok: N job(s) valid is the pass signal
 ssh $HOST "cd ~/projects/herdr-routines && ~/.local/bin/uv run herdr-routines validate"
+
+# 5. If the PR changed deploy/systemd/, install the changed units and reload
+ssh $HOST "cp ~/projects/herdr-routines/deploy/systemd/<changed units> ~/.config/systemd/user/ \
+  && systemctl --user daemon-reload"
+
+# 6. Confirm the host matches the checkout — "ok: no host drift" is the pass signal
+ssh $HOST "cd ~/projects/herdr-routines && ~/.local/bin/uv run herdr-routines host-check"
 ```
 
 Back up the live config before migrating:
@@ -122,5 +133,5 @@ this, `validate` / `tick` raise a ConfigError containing `kind: gated` and
   routines' own changes already flow through PR + green CI, so the Pi may
   fast-forward *itself*. Plugins, the herdr CLI and `jobs.yaml` stay explicit and
   are never auto-mutated, and `deploy/` changes are reported by the notification
-  rather than applied. Run the manual steps when the timer refuses the host (it
+  rather than applied. Steps 5-6 above apply them by hand. Run the manual steps when the timer refuses the host (it
   says why) or when a merge needs a config migration before it can validate.

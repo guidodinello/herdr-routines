@@ -4,10 +4,16 @@ Issue 010. Reads existing run history (`history.jsonl`) and the reports director
 no new state store, no new per-job config field. A job with no history at all (never
 seen, or seen but never terminal) renders as "never run" rather than being omitted, so a
 newly added job that hasn't fired yet is still visible in the digest.
+
+A host drift section (`host_drift.check_host`) is appended when there is any: a
+missing or stale systemd unit is otherwise invisible, and the digest is the one
+message read every morning. It is not the only place drift is reported — the digest
+timer was itself the unit missing on the Pi — so self-update reports it too.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from herdr_routines.config import RoutinesConfig
 from herdr_routines.history import HistoryRecord, last_terminal_run
+from herdr_routines.host_drift import DriftFinding, format_findings
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +81,7 @@ def render_digest(
     timezone: str,
     now: datetime,
     all_disabled: bool = False,
+    drift: Sequence[DriftFinding] = (),
 ) -> str:
     """Plain-text digest body, one line per job. `timezone` renders each job's last-run
     timestamp in local time (there's no single "the" timezone across jobs, so this is a
@@ -86,9 +94,14 @@ def render_digest(
     header = (
         f"herdr-routines digest — {now.astimezone(tz).strftime('%Y-%m-%d %H:%M %Z')}"
     )
+    drift_lines = (
+        ["", "host drift (run `herdr-routines host-check`):", *format_findings(drift)]
+        if drift
+        else []
+    )
     if not rows:
         marker = "(all jobs disabled)" if all_disabled else "(no jobs configured)"
-        return f"{header}\n{marker}"
+        return "\n".join([header, marker, *drift_lines])
 
     lines = [header]
     for row in rows:
@@ -108,7 +121,7 @@ def render_digest(
             lines.append(f"- {row.name}: never run")
             continue
         lines.append(f"- {row.name}: {row.state} at {when}{report}")
-    return "\n".join(lines)
+    return "\n".join([*lines, *drift_lines])
 
 
 def digest_now(
@@ -119,6 +132,7 @@ def digest_now(
     timezone: str,
     now: datetime | None = None,
     include_disabled: bool = False,
+    drift: Sequence[DriftFinding] = (),
 ) -> str:
     """Convenience wrapper: build + render in one call, for the CLI handler."""
     now = now or datetime.now(UTC)
@@ -126,4 +140,6 @@ def digest_now(
         config, history_path, reports_dir, include_disabled=include_disabled
     )
     all_disabled = not include_disabled and bool(config.jobs) and not rows
-    return render_digest(rows, timezone=timezone, now=now, all_disabled=all_disabled)
+    return render_digest(
+        rows, timezone=timezone, now=now, all_disabled=all_disabled, drift=drift
+    )

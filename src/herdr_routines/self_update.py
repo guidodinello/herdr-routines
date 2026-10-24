@@ -59,6 +59,8 @@ Sequence (spec 20260929T050000Z, `### Sequence`):
                                                       refused if HEAD is a rejected SHA
     9. post validate                   failed / fewer jobs -> reset --keep, rc 1
    10. deploy changes are reported, never applied
+   11. host_check (updated / up_to_date / deferred) -> drift appended to the
+                                                      notification, or notified alone
 
 Nothing on this path raises: every git call is bounded and a `TimeoutExpired` comes
 back as a non-zero git (see `_git`), so a degraded link is a `SelfUpdateResult` and
@@ -89,6 +91,7 @@ from herdr_routines.gates import (
     evaluate_commit_checks,
     remote_owner_and_repo,
 )
+from herdr_routines.host_drift import DriftFinding, format_findings
 from herdr_routines.tick import _open_pipeline_run, tick_lock
 
 log = get_logger(__name__)
@@ -101,7 +104,9 @@ log = get_logger(__name__)
 GIT_TIMEOUT_S = 120
 # The unit's TimeoutStartSec is sized so systemd cannot land a SIGTERM inside the
 # git merge window: two `uv run` invocations at up to VALIDATE_TIMEOUT_S each, plus
-# up to five bounded git calls, plus one `gh` call, plus slack.
+# up to five bounded git calls, plus one `gh` call, plus the host check run while
+# the night's notification is held (host_drift.PROBE_TIMEOUT_S per probe, a dozen
+# probes at most), plus slack.
 VALIDATE_TIMEOUT_S = 300
 # How long to keep retrying a held tick lock before deferring. A tick holds it for
 # seconds (~8s on the Pi), so a timer that lands on a tick boundary — 21:30 UTC is
@@ -559,6 +564,7 @@ def run_self_update(
     gh: GhClient,
     notify: Notify,
     state_path: Path,
+    host_check: Callable[[], list[DriftFinding]],
     base: str = "main",
     dry_run: bool = False,
     runner: Runner = subprocess.run,
@@ -583,7 +589,87 @@ def run_self_update(
     deferral, it is the one that recurs nightly without anything else changing. A
     dry run does not wait: it is a preview a human is watching, and an immediate
     `deferred` is the answer `--help` promises them.
+
+    After an `updated`, `up_to_date` or `deferred` run, `host_check` (the CLI passes
+    `host_drift.check_host` on the same checkout) is run and its findings appended to
+    the run's notification — or sent as their own when the run was quiet, which is
+    why an `up_to_date` night with drift is not silent. This is the one place the
+    check runs even when the digest timer is the thing missing from the host. The
+    run's notifications are held until then and flushed in a `finally`, so a broken
+    host check can never swallow a refusal or a rollback.
     """
+    outbox: list[tuple[str, str | None]] = []
+
+    def held(title: str, body: str | None = None) -> None:
+        outbox.append((title, body))
+
+    drift: list[DriftFinding] = []
+    try:
+        result = _run_self_update(
+            checkout=checkout,
+            lock_path=lock_path,
+            history_path=history_path,
+            config=config,
+            gh=gh,
+            notify=held,
+            state_path=state_path,
+            base=base,
+            dry_run=dry_run,
+            runner=runner,
+            uv_resolver=uv_resolver,
+            lock_wait_s=lock_wait_s,
+            sleep=sleep,
+        )
+        # A dry run promises no notification; refused / rolled_back are already loud.
+        if not dry_run and result.status in ("updated", "up_to_date", "deferred"):
+            try:
+                drift = host_check()
+            except Exception as e:  # noqa: BLE001 - the check must not fail the update
+                drift = [DriftFinding("probe_failed", f"host check crashed: {e}")]
+        return result
+    finally:
+        _flush_notifications(outbox, drift, checkout=checkout, notify=notify)
+
+
+def _flush_notifications(
+    outbox: list[tuple[str, str | None]],
+    drift: list[DriftFinding],
+    *,
+    checkout: Path,
+    notify: Notify,
+) -> None:
+    """Send the run's held notifications, with any drift findings appended to the
+    last one; drift on an otherwise quiet run gets a notification of its own."""
+    if drift:
+        section = "host drift (`herdr-routines host-check`):\n" + "\n".join(
+            format_findings(drift)
+        )
+        if outbox:
+            title, body = outbox[-1]
+            outbox[-1] = (title, f"{body}\n{section}" if body else section)
+        else:
+            outbox.append((f"herdr-routines: host drift ({checkout})", section))
+    for title, body in outbox:
+        notify(title, body=body)
+
+
+def _run_self_update(
+    *,
+    checkout: Path,
+    lock_path: Path,
+    history_path: Path,
+    config: RoutinesConfig,
+    gh: GhClient,
+    notify: Notify,
+    state_path: Path,
+    base: str = "main",
+    dry_run: bool = False,
+    runner: Runner = subprocess.run,
+    uv_resolver: Callable[[], str | None] = resolve_uv,
+    lock_wait_s: float = TICK_LOCK_WAIT_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> SelfUpdateResult:
+    """`run_self_update` minus the host check; see there."""
     wait_s = 0 if dry_run else lock_wait_s
     with _wait_for_tick_lock(lock_path, wait_s=wait_s, sleep=sleep) as acquired:
         if not acquired:

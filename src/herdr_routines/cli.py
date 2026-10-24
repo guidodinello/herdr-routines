@@ -48,6 +48,7 @@ from herdr_routines.history import (
     last_terminal_run,
     read_job,
 )
+from herdr_routines.host_drift import check_host, format_findings
 from herdr_routines.issue_refinement import (
     job_is_opencode_only,
     run_check_issue,
@@ -112,6 +113,13 @@ log = get_logger(__name__)
 # filing "failed" in tick history for a typo is the wrong signal.
 EXIT_OK = 0
 EXIT_USAGE = 2
+
+
+def _default_runner_checkout() -> Path:
+    """The runner checkout — the one the systemd units run. `self-update`,
+    `host-check` and `digest` all act on it by default, never on the cwd (see
+    `self-update --path`)."""
+    return Path.home() / "projects" / "herdr-routines"
 
 
 def default_log_path() -> Path:
@@ -601,6 +609,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="include disabled jobs in the digest output (default: omit them)",
     )
+    p_digest.add_argument(
+        "--path",
+        type=Path,
+        default=_default_runner_checkout(),
+        help=(
+            "the runner checkout to run the host drift check on "
+            "(default: ~/projects/herdr-routines)"
+        ),
+    )
     p_digest.set_defaults(handler=_cmd_digest)
 
     p_watchdog = sub.add_parser(
@@ -624,7 +641,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_self_update.add_argument(
         "--path",
         type=Path,
-        default=Path.home() / "projects" / "herdr-routines",
+        default=_default_runner_checkout(),
         help=(
             "the runner checkout to update (default: ~/projects/herdr-routines, NOT "
             "the cwd — a deliberate deviation from the spec, which said Path.cwd(): a "
@@ -648,6 +665,33 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_self_update.set_defaults(handler=_cmd_self_update)
+
+    p_host_check = sub.add_parser(
+        "host-check",
+        help=(
+            "read-only: report systemd units from deploy/systemd/ that are missing, "
+            "stale or not enabled on this host, and a runner checkout behind "
+            "origin/<base> (exit 1 on drift; never fetches, never installs)"
+        ),
+    )
+    p_host_check.add_argument(
+        "--path",
+        type=Path,
+        default=_default_runner_checkout(),
+        help="the runner checkout to check (default: ~/projects/herdr-routines)",
+    )
+    p_host_check.add_argument(
+        "--base",
+        default="main",
+        help="branch the runner tracks (default: main)",
+    )
+    p_host_check.add_argument(
+        "--unit-dir",
+        type=Path,
+        default=None,
+        help="installed user unit dir (default: ~/.config/systemd/user)",
+    )
+    p_host_check.set_defaults(handler=_cmd_host_check)
 
     # Cold-start spawn from Telegram (issue 024). The inbound-message glue: the bridge
     # plugin/bot calls this with one message's text + chat_id, and the handler either
@@ -1717,6 +1761,7 @@ def _cmd_digest(args: argparse.Namespace) -> int:
         default_reports_dir(),
         timezone=args.timezone,
         include_disabled=args.include_disabled,
+        drift=check_host(args.path),
     )
     print(text)
     if args.notify:
@@ -1725,6 +1770,20 @@ def _cmd_digest(args: argparse.Namespace) -> int:
         except HerdrCliError as e:
             log.warning("digest: notification failed: %s", e)
     return 0
+
+
+def _cmd_host_check(args: argparse.Namespace) -> int:
+    """`herdr-routines host-check`: gate-style — findings on stdout, exit 1 on any
+    drift, 0 when clean. Report only; the fix for every finding is the install steps
+    in deploy/README.md."""
+    findings = check_host(args.path, base=args.base, unit_dir=args.unit_dir)
+    if not findings:
+        print(f"ok: no host drift ({args.path})")
+        return EXIT_OK
+    print(f"host drift ({args.path}):")
+    for line in format_findings(findings):
+        print(line)
+    return EXIT_FAILURE
 
 
 def _self_update_notify(title: str, body: str | None = None) -> None:
@@ -1781,6 +1840,7 @@ def _cmd_self_update(args: argparse.Namespace) -> int:
         lock_path=default_lock_path(),
         history_path=default_history_path(),
         state_path=default_state_path(),
+        host_check=lambda: check_host(args.path, base=args.base),
     )
     # up_to_date and deferred are quiet by design (the handler logs them at info /
     # warning inside the module, and notifies itself for the one loud deferral, a

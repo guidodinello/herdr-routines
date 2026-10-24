@@ -63,3 +63,15 @@ def _hermetic_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_host_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the host drift check the CLI runs for `digest` and `self-update`.
+
+    Same reasoning as `_hermetic_tmp_diagnosis`: unstubbed, every CLI test would run
+    real `systemctl --user` and git against `~/projects/herdr-routines` — failing on
+    CI, reading live state on a laptop.  Tests that exercise the check override this
+    with their own `cli.check_host` (see `tests/test_host_drift.py`).
+    """
+    monkeypatch.setattr("herdr_routines.cli.check_host", lambda *_a, **_kw: [])
