@@ -530,8 +530,8 @@ class Job:
     # The `verify` a non-routine job inherited from defaults.yaml and does not honor. Kept
     # so `validate` can say so instead of dropping it silently.
     ignored_verify: tuple[VerifyGate, ...] = ()
-    # Target selector (issue 073), run before dispatch by `tick._process_job` and
-    # `cli._cmd_run`: no target skips the run (`no_target`), a target reaches the prompt as
+    # Target selector (issue 073), run before dispatch by `tick._run_routine` (the tick
+    # and `herdr-routines run` both land there, issue 074): no target skips the run (`no_target`), a target reaches the prompt as
     # $ROUTINE_TARGET and the verify gates. Only a routine job honors it. Inheritable via
     # defaults.yaml; an explicit null opts out.
     pick: TargetSelector | None = None

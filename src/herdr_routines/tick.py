@@ -86,6 +86,7 @@ from herdr_routines.herdr import (
 )
 from herdr_routines.history import (
     TERMINAL_STATES,
+    TRIGGER_MANUAL,
     HistoryExtra,
     HistoryRecord,
     HistoryState,
@@ -95,7 +96,7 @@ from herdr_routines.history import (
     first_seen_at,
     has_ever_been_seen,
     is_currently_running,
-    last_terminal_run,
+    last_scheduled_terminal_run,
     maybe_rotate,
     read_job,
 )
@@ -357,7 +358,7 @@ def _process_audit_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_terminal_run(history_path, job.name)
+    last = last_scheduled_terminal_run(history_path, job.name)
     registered_at = first_seen_at(history_path, job.name) or now
     result = decide(
         cron=job.cron,
@@ -412,21 +413,19 @@ def _process_audit_job(
             ),
         )
 
-    append(
+    return dispatch_occurrence(
+        job,
         history_path,
-        HistoryRecord(
-            ts=now,
-            job=job.name,
-            state="running",
-            run_id=run_id,
-            extra=HistoryExtra(
+        Occurrence(
+            run_id,
+            HistoryExtra(
                 scheduled_for=result.occurrence.isoformat(),
                 late_seconds=result.late_seconds,
             ),
         ),
+        client=client,
+        now=now,
     )
-
-    return _audit_cycle(job, history_path, client=client, now=now, run_id=run_id)
 
 
 # Per-run cap on how many suppressed IDs the history record carries. Suppression is
@@ -726,24 +725,6 @@ def _audit_cycle(
     return _diff_and_fix(
         job, history_path, client=client, now=now, run_id=run_id, paths=paths
     )
-
-
-def run_audit_now(
-    job: Job, history_path: Path, *, client: HerdrClient, now: datetime, run_id: str
-) -> tuple[str, bool]:
-    """`herdr-routines run <audit job>`: one audit cycle outside the schedule, recorded
-    like a cron fire. The caller holds the tick lock."""
-    append(
-        history_path,
-        HistoryRecord(
-            ts=now,
-            job=job.name,
-            state="running",
-            run_id=run_id,
-            extra=HistoryExtra(trigger="manual"),
-        ),
-    )
-    return _audit_cycle(job, history_path, client=client, now=now, run_id=run_id)
 
 
 def _run_audit(
@@ -1191,9 +1172,6 @@ def _process_gated_job(
 ) -> tuple[str, bool]:
     """Process a gated job: run checks, dispatch fix agent on failure.
     Handles both pr and base targets."""
-    checks = job.require_checks()
-    target = job.require_target()
-
     # Standard guards (same as _process_job for regular jobs).
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
@@ -1235,7 +1213,7 @@ def _process_gated_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_terminal_run(history_path, job.name)
+    last = last_scheduled_terminal_run(history_path, job.name)
     registered_at = first_seen_at(history_path, job.name) or now
     result = decide(
         cron=job.cron,
@@ -1291,49 +1269,20 @@ def _process_gated_job(
             ),
         )
 
-    # Record running state
-    append(
+    return dispatch_occurrence(
+        job,
         history_path,
-        HistoryRecord(
-            ts=now,
-            job=job.name,
-            state="running",
-            run_id=run_id,
-            extra=HistoryExtra(
+        Occurrence(
+            run_id,
+            HistoryExtra(
                 scheduled_for=result.occurrence.isoformat(),
                 late_seconds=result.late_seconds,
             ),
         ),
+        client=client,
+        now=now,
+        trusted_review_authors=trusted_review_authors,
     )
-
-    # github_event (issue 014) is a poll predicate: same schedule guards as every
-    # gated job, but its "gate" is a diff against last-seen event IDs rather than a
-    # pr/base fix path — the event itself decides, so it routes to its own target.
-    for check in checks:
-        if check.kind == "github_event":
-            return _process_event_target(
-                job,
-                history_path,
-                client=client,
-                now=now,
-                run_id=run_id,
-                check=check,
-                trusted_review_authors=trusted_review_authors,
-            )
-
-    if target == "pr":
-        return _process_pr_target(
-            job,
-            history_path,
-            client=client,
-            now=now,
-            run_id=run_id,
-            trusted_review_authors=trusted_review_authors,
-        )
-    else:
-        return _process_base_target(
-            job, history_path, client=client, now=now, run_id=run_id
-        )
 
 
 def _last_seen_event_ids(history_path: Path, job_name: str) -> list[str] | None:
@@ -2978,6 +2927,423 @@ def _retry_eligible(outcome: RunOutcome, job: Job) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class Occurrence:
+    """One firing of a job (issue 074): a cron occurrence the tick found due, or a manual
+    `herdr-routines run`. `extra` goes into the `running` record: `scheduled_for` and
+    `late_seconds` for a cron firing, `trigger: manual` for a manual one."""
+
+    run_id: str
+    extra: HistoryExtra
+
+
+def _occurrence_extra(occ: Occurrence) -> HistoryExtra:
+    return HistoryExtra(**occ.extra)
+
+
+def _with_trigger(
+    source: Occurrence | HistoryExtra, extra: HistoryExtra
+) -> HistoryExtra:
+    """Stamp `extra` with the occurrence's `trigger` when it is manual. A scheduled record
+    gets no `trigger` key, so a cron firing writes the same records it always did."""
+    origin = source.extra if isinstance(source, Occurrence) else source
+    if origin.get("trigger") == TRIGGER_MANUAL:
+        extra["trigger"] = TRIGGER_MANUAL
+    return extra
+
+
+def _append_running(
+    job: Job, history_path: Path, occ: Occurrence, *, now: datetime
+) -> None:
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="running",
+            run_id=occ.run_id,
+            extra=_occurrence_extra(occ),
+        ),
+    )
+
+
+def dispatch_occurrence(
+    job: Job,
+    history_path: Path,
+    occ: Occurrence,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
+) -> tuple[str, bool]:
+    """Everything after "this job is due" for one occurrence, per kind (issue 074). The tick
+    reaches it from each `_process_*_job` once `schedule.decide` says RUN; `herdr-routines
+    run` skips that decision and calls it directly. One function, so the two cannot drift."""
+    if job.kind == "pipeline":
+        # A manual run's `running` record would shadow an in-flight one, and tick reconciles
+        # only the latest open run, so refuse instead.
+        if (
+            occ.extra.get("trigger") == TRIGGER_MANUAL
+            and _open_pipeline_run(history_path, job.name) is not None
+        ):
+            return f"{job.name}: skipped (already running)", True
+        return _launch_pipeline_run(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            run_id=occ.run_id,
+            bare_run_id=_bare_pipeline_run_id(job.name, occ.run_id),
+            running_extra=_occurrence_extra(occ),
+        )
+    if job.kind == "audit":
+        _append_running(job, history_path, occ, now=now)
+        return _audit_cycle(
+            job, history_path, client=client, now=now, run_id=occ.run_id
+        )
+    if job.kind == "gated":
+        return _gated_cycle(
+            job,
+            history_path,
+            occ,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+        )
+    if job.kind == "review":
+        _append_running(job, history_path, occ, now=now)
+        return _review_cycle(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            run_id=occ.run_id,
+            trusted_review_authors=trusted_review_authors,
+        )
+    return _run_routine(
+        job,
+        history_path,
+        occ,
+        client=client,
+        now=now,
+        trusted_review_authors=trusted_review_authors,
+    )
+
+
+def _gated_cycle(
+    job: Job,
+    history_path: Path,
+    occ: Occurrence,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...],
+) -> tuple[str, bool]:
+    """One occurrence of a gated job, after the schedule guards: record `running`, then
+    route to the event / pr / base target. The tick and `run` both land here (issue 074)."""
+    checks = job.require_checks()
+    target = job.require_target()
+    run_id = occ.run_id
+
+    _append_running(job, history_path, occ, now=now)
+
+    # github_event (issue 014) is a poll predicate: same schedule guards as every
+    # gated job, but its "gate" is a diff against last-seen event IDs rather than a
+    # pr/base fix path — the event itself decides, so it routes to its own target.
+    for check in checks:
+        if check.kind == "github_event":
+            return _process_event_target(
+                job,
+                history_path,
+                client=client,
+                now=now,
+                run_id=run_id,
+                check=check,
+                trusted_review_authors=trusted_review_authors,
+            )
+
+    if target == "pr":
+        return _process_pr_target(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            run_id=run_id,
+            trusted_review_authors=trusted_review_authors,
+        )
+    else:
+        return _process_base_target(
+            job, history_path, client=client, now=now, run_id=run_id
+        )
+
+
+def _run_routine(
+    job: Job,
+    history_path: Path,
+    occ: Occurrence,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...],
+) -> tuple[str, bool]:
+    """One occurrence of a plain routine job: selector, `running` record, `execute_run` with
+    the fallback_model and retry loop, terminal record, notification. The tick and
+    `herdr-routines run` both land here (issue 074)."""
+    run_id = occ.run_id
+    # Target selector (issue 073): answered in code before any worktree or agent exists.
+    # Both outcomes below are terminal records, so the occurrence counts as having run:
+    # the next tick sees `not due`, never `missed`, and neither is retried.
+    gh: RealGhClient | None = None
+    target: VerifyTarget | None = None
+    if job.pick is not None:
+        gh = RealGhClient()
+        selected = select_target(
+            SelectorContext(
+                job=job, gh=gh, trusted_review_authors=trusted_review_authors
+            )
+        )
+        pre_dispatch_extra = _occurrence_extra(occ)
+        if isinstance(selected, SelectorFailed):
+            pre_dispatch_extra["reason"] = "selector_failed"
+            pre_dispatch_extra["error"] = selected.error
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="failed",
+                    run_id=run_id,
+                    extra=pre_dispatch_extra,
+                ),
+            )
+            if _notify_gate(job, "failure"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} failed",
+                    body="selector_failed",
+                    sound="request",
+                )
+            return f"{job.name}: failed (selector_failed)", True
+        if selected is None:
+            pre_dispatch_extra["reason"] = "no_target"
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    run_id=run_id,
+                    extra=pre_dispatch_extra,
+                ),
+            )
+            # Nothing to do is not news: only `notify_policy: always` hears about it.
+            if _notify_gate(job, "progress"):
+                _notify(client, f"herdr-routines: {job.name} skipped", body="no_target")
+            return f"{job.name}: skipped (no_target)", False
+        target = selected
+
+    running_extra = _occurrence_extra(occ)
+    if target is not None:
+        running_extra["target"] = target.ref
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="running",
+            run_id=run_id,
+            extra=running_extra,
+        ),
+    )
+
+    outcome = execute_run(
+        job,
+        client,
+        run_id=run_id,
+        trusted_review_authors=trusted_review_authors,
+        gh=gh,
+        target=target,
+    )
+    used_fallback = False
+    attempt = 0  # 0 = first try
+
+    # Per-job retry loop (issue 008): bounded synchronous retries within the same
+    # tick, gated on retry_on whitelist. The fallback_model quota retry runs inside
+    # each attempt so retried attempts also get the fallback treatment.
+    base_run_id = run_id
+    while True:
+        # Fallback_model quota retry (issue 008): runs inside each attempt so a
+        # retried attempt that hits quota_exhausted also gets the fallback.
+        if (
+            outcome.state == "failed"
+            and outcome.reason == "quota_exhausted"
+            and job.fallback_model
+            and job.fallback_model != job.model
+        ):
+            used_fallback = True
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state=outcome.state,
+                    run_id=run_id,
+                    extra=_with_trigger(occ, _outcome_extra(outcome, target=target)),
+                ),
+            )
+            log.info(
+                "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
+                job.name,
+                job.fallback_model,
+            )
+            fallback_run_id = make_run_id(f"{job.name}-fallback", now)
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="running",
+                    run_id=fallback_run_id,
+                    extra=_with_trigger(
+                        occ,
+                        HistoryExtra(reason="fallback_retry", primary_run_id=run_id),
+                    ),
+                ),
+            )
+            run_id = fallback_run_id
+            outcome = execute_run(
+                replace(job, model=job.fallback_model),
+                client,
+                run_id=run_id,
+                trusted_review_authors=trusted_review_authors,
+                gh=gh,
+                target=target,
+            )
+
+        # Check if this outcome is eligible for a retry attempt
+        if not _retry_eligible(outcome, job) or attempt >= job.retry_attempts:
+            break
+
+        # Log the failed attempt as a distinct history record with attempt metadata
+        extra = _with_trigger(occ, _outcome_extra(outcome, target=target))
+        extra["attempt"] = attempt
+        extra["retry_eligible_reason"] = outcome.reason
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state=outcome.state,
+                run_id=run_id,
+                extra=extra,
+            ),
+        )
+        attempt += 1
+        run_id = f"{base_run_id}-retry{attempt}"
+        log.info(
+            "%s: retry attempt %d/%d after %s",
+            job.name,
+            attempt,
+            job.retry_attempts,
+            outcome.reason,
+        )
+        # Brief backoff (reuses PROMPT_RETRY_DELAYS_S shape: 5s, 15s, ...)
+        backoff = (5.0, 15.0)[min(attempt - 1, 1)]
+        time.sleep(backoff)
+        # Append a running record for the retry attempt
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="running",
+                run_id=run_id,
+                extra=_with_trigger(
+                    occ,
+                    HistoryExtra(
+                        attempt=attempt,
+                        max_retries=job.retry_attempts,
+                        retried_from_run_id=base_run_id
+                        if attempt == 1
+                        else f"{base_run_id}-retry{attempt - 1}",
+                    ),
+                ),
+            ),
+        )
+        outcome = execute_run(
+            job,
+            client,
+            run_id=run_id,
+            trusted_review_authors=trusted_review_authors,
+            gh=gh,
+            target=target,
+        )
+
+    # Terminal record for final outcome (last retry or first attempt if no retries)
+    final_extra = _with_trigger(occ, _outcome_extra(outcome, target=target))
+    final_extra["attempt"] = attempt
+    final_extra["max_retries"] = job.retry_attempts
+    if attempt > 0:
+        final_extra["final_attempt"] = True
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state=outcome.state,
+            run_id=run_id,
+            extra=final_extra,
+        ),
+    )
+
+    if outcome.state == "done":
+        # Both of these mean the job ultimately succeeded but something a human should know
+        # about happened on the way — surface as a "finding", not a plain "success":
+        #  - fallback retry ⇒ the primary model hit quota_exhausted
+        #  - reaped_stale_agent ⇒ a prior run's blocked agent was force-closed (issue 051)
+        notes = []
+        if used_fallback:
+            notes.append(f"via fallback_model={job.fallback_model}")
+        if outcome.reaped_stale_agent:
+            notes.append("force-closed a prior run's blocked agent (issue 051)")
+        done_body = "; ".join(notes) or None
+        gate = "finding" if (used_fallback or outcome.reaped_stale_agent) else "success"
+        if _notify_gate(job, gate):
+            _notify(
+                client, f"herdr-routines: {job.name} done", body=done_body, sound="done"
+            )
+        return f"{job.name}: done", False
+
+    if _notify_gate(job, "failure"):
+        if outcome.reason == "blocked":
+            excerpt = extract_prompt_excerpt(outcome.visible_tail or "")
+            body_lines = [
+                f"job={job.name}",
+                f"run={run_id}",
+                f"pane={outcome.pane_id or 'unknown'}",
+                f"agent={outcome.agent_name or 'unknown'}",
+            ]
+            if excerpt:
+                body_lines.append(f"prompt: {excerpt}")
+            body_lines.append(
+                'Reply to this message to approve — e.g. "yes" / "approve"'
+            )
+            _notify(
+                client,
+                f"herdr-routines: {job.name} blocked",
+                body="\n".join(body_lines),
+                sound="request",
+            )
+        else:
+            _notify(
+                client,
+                f"herdr-routines: {job.name} failed",
+                body=outcome.reason or "unknown",
+                sound="request",
+            )
+    return f"{job.name}: failed ({outcome.reason})", True
+
+
 def _process_job(
     job: Job,
     history_path: Path,
@@ -3062,7 +3428,7 @@ def _process_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_terminal_run(history_path, job.name)
+    last = last_scheduled_terminal_run(history_path, job.name)
     registered_at = first_seen_at(history_path, job.name) or now
     result = decide(
         cron=job.cron,
@@ -3117,258 +3483,20 @@ def _process_job(
             ),
         )
 
-    # Target selector (issue 073): answered in code before any worktree or agent exists.
-    # Both outcomes below are terminal records, so the occurrence counts as having run:
-    # the next tick sees `not due`, never `missed`, and neither is retried.
-    gh: RealGhClient | None = None
-    target: VerifyTarget | None = None
-    if job.pick is not None:
-        gh = RealGhClient()
-        selected = select_target(
-            SelectorContext(
-                job=job, gh=gh, trusted_review_authors=trusted_review_authors
-            )
-        )
-        pre_dispatch_extra = HistoryExtra(
-            scheduled_for=result.occurrence.isoformat(),
-            late_seconds=result.late_seconds,
-        )
-        if isinstance(selected, SelectorFailed):
-            pre_dispatch_extra["reason"] = "selector_failed"
-            pre_dispatch_extra["error"] = selected.error
-            append(
-                history_path,
-                HistoryRecord(
-                    ts=now,
-                    job=job.name,
-                    state="failed",
-                    run_id=run_id,
-                    extra=pre_dispatch_extra,
-                ),
-            )
-            if _notify_gate(job, "failure"):
-                _notify(
-                    client,
-                    f"herdr-routines: {job.name} failed",
-                    body="selector_failed",
-                    sound="request",
-                )
-            return f"{job.name}: failed (selector_failed)", True
-        if selected is None:
-            pre_dispatch_extra["reason"] = "no_target"
-            append(
-                history_path,
-                HistoryRecord(
-                    ts=now,
-                    job=job.name,
-                    state="skipped",
-                    run_id=run_id,
-                    extra=pre_dispatch_extra,
-                ),
-            )
-            # Nothing to do is not news: only `notify_policy: always` hears about it.
-            if _notify_gate(job, "progress"):
-                _notify(client, f"herdr-routines: {job.name} skipped", body="no_target")
-            return f"{job.name}: skipped (no_target)", False
-        target = selected
-
-    running_extra = HistoryExtra(
-        scheduled_for=result.occurrence.isoformat(),
-        late_seconds=result.late_seconds,
-    )
-    if target is not None:
-        running_extra["target"] = target.ref
-    append(
-        history_path,
-        HistoryRecord(
-            ts=now,
-            job=job.name,
-            state="running",
-            run_id=run_id,
-            extra=running_extra,
-        ),
-    )
-
-    outcome = execute_run(
+    return dispatch_occurrence(
         job,
-        client,
-        run_id=run_id,
-        trusted_review_authors=trusted_review_authors,
-        gh=gh,
-        target=target,
-    )
-    used_fallback = False
-    attempt = 0  # 0 = first try
-
-    # Per-job retry loop (issue 008): bounded synchronous retries within the same
-    # tick, gated on retry_on whitelist. The fallback_model quota retry runs inside
-    # each attempt so retried attempts also get the fallback treatment.
-    base_run_id = run_id
-    while True:
-        # Fallback_model quota retry (issue 008): runs inside each attempt so a
-        # retried attempt that hits quota_exhausted also gets the fallback.
-        if (
-            outcome.state == "failed"
-            and outcome.reason == "quota_exhausted"
-            and job.fallback_model
-            and job.fallback_model != job.model
-        ):
-            used_fallback = True
-            append(
-                history_path,
-                HistoryRecord(
-                    ts=now,
-                    job=job.name,
-                    state=outcome.state,
-                    run_id=run_id,
-                    extra=_outcome_extra(outcome, target=target),
-                ),
-            )
-            log.info(
-                "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
-                job.name,
-                job.fallback_model,
-            )
-            fallback_run_id = make_run_id(f"{job.name}-fallback", now)
-            append(
-                history_path,
-                HistoryRecord(
-                    ts=now,
-                    job=job.name,
-                    state="running",
-                    run_id=fallback_run_id,
-                    extra=HistoryExtra(reason="fallback_retry", primary_run_id=run_id),
-                ),
-            )
-            run_id = fallback_run_id
-            outcome = execute_run(
-                replace(job, model=job.fallback_model),
-                client,
-                run_id=run_id,
-                trusted_review_authors=trusted_review_authors,
-                gh=gh,
-                target=target,
-            )
-
-        # Check if this outcome is eligible for a retry attempt
-        if not _retry_eligible(outcome, job) or attempt >= job.retry_attempts:
-            break
-
-        # Log the failed attempt as a distinct history record with attempt metadata
-        extra = _outcome_extra(outcome, target=target)
-        extra["attempt"] = attempt
-        extra["retry_eligible_reason"] = outcome.reason
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state=outcome.state,
-                run_id=run_id,
-                extra=extra,
-            ),
-        )
-        attempt += 1
-        run_id = f"{base_run_id}-retry{attempt}"
-        log.info(
-            "%s: retry attempt %d/%d after %s",
-            job.name,
-            attempt,
-            job.retry_attempts,
-            outcome.reason,
-        )
-        # Brief backoff (reuses PROMPT_RETRY_DELAYS_S shape: 5s, 15s, ...)
-        backoff = (5.0, 15.0)[min(attempt - 1, 1)]
-        time.sleep(backoff)
-        # Append a running record for the retry attempt
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="running",
-                run_id=run_id,
-                extra=HistoryExtra(
-                    attempt=attempt,
-                    max_retries=job.retry_attempts,
-                    retried_from_run_id=base_run_id
-                    if attempt == 1
-                    else f"{base_run_id}-retry{attempt - 1}",
-                ),
-            ),
-        )
-        outcome = execute_run(
-            job,
-            client,
-            run_id=run_id,
-            trusted_review_authors=trusted_review_authors,
-            gh=gh,
-            target=target,
-        )
-
-    # Terminal record for final outcome (last retry or first attempt if no retries)
-    final_extra = _outcome_extra(outcome, target=target)
-    final_extra["attempt"] = attempt
-    final_extra["max_retries"] = job.retry_attempts
-    if attempt > 0:
-        final_extra["final_attempt"] = True
-    append(
         history_path,
-        HistoryRecord(
-            ts=now,
-            job=job.name,
-            state=outcome.state,
-            run_id=run_id,
-            extra=final_extra,
+        Occurrence(
+            run_id,
+            HistoryExtra(
+                scheduled_for=result.occurrence.isoformat(),
+                late_seconds=result.late_seconds,
+            ),
         ),
+        client=client,
+        now=now,
+        trusted_review_authors=trusted_review_authors,
     )
-
-    if outcome.state == "done":
-        # Both of these mean the job ultimately succeeded but something a human should know
-        # about happened on the way — surface as a "finding", not a plain "success":
-        #  - fallback retry ⇒ the primary model hit quota_exhausted
-        #  - reaped_stale_agent ⇒ a prior run's blocked agent was force-closed (issue 051)
-        notes = []
-        if used_fallback:
-            notes.append(f"via fallback_model={job.fallback_model}")
-        if outcome.reaped_stale_agent:
-            notes.append("force-closed a prior run's blocked agent (issue 051)")
-        done_body = "; ".join(notes) or None
-        gate = "finding" if (used_fallback or outcome.reaped_stale_agent) else "success"
-        if _notify_gate(job, gate):
-            _notify(
-                client, f"herdr-routines: {job.name} done", body=done_body, sound="done"
-            )
-        return f"{job.name}: done", False
-
-    if _notify_gate(job, "failure"):
-        if outcome.reason == "blocked":
-            excerpt = extract_prompt_excerpt(outcome.visible_tail or "")
-            body_lines = [
-                f"job={job.name}",
-                f"run={run_id}",
-                f"pane={outcome.pane_id or 'unknown'}",
-                f"agent={outcome.agent_name or 'unknown'}",
-            ]
-            if excerpt:
-                body_lines.append(f"prompt: {excerpt}")
-            body_lines.append(
-                'Reply to this message to approve — e.g. "yes" / "approve"'
-            )
-            _notify(
-                client,
-                f"herdr-routines: {job.name} blocked",
-                body="\n".join(body_lines),
-                sound="request",
-            )
-        else:
-            _notify(
-                client,
-                f"herdr-routines: {job.name} failed",
-                body=outcome.reason or "unknown",
-                sound="request",
-            )
-    return f"{job.name}: failed ({outcome.reason})", True
 
 
 # -- kind: pipeline dispatch (issue 026) --------------------------------------------
@@ -3714,7 +3842,7 @@ def _process_pipeline_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_terminal_run(history_path, job.name)
+    last = last_scheduled_terminal_run(history_path, job.name)
     registered_at = first_seen_at(history_path, job.name) or now
     result = decide(
         cron=job.cron,
@@ -3756,19 +3884,18 @@ def _process_pipeline_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    run_id = make_run_id(job.name, result.occurrence)
-    bare_run_id = _bare_pipeline_run_id(job.name, run_id)
-    return _launch_pipeline_run(
+    return dispatch_occurrence(
         job,
         history_path,
+        Occurrence(
+            make_run_id(job.name, result.occurrence),
+            HistoryExtra(
+                scheduled_for=result.occurrence.isoformat(),
+                late_seconds=result.late_seconds,
+            ),
+        ),
         client=client,
         now=now,
-        run_id=run_id,
-        bare_run_id=bare_run_id,
-        running_extra={
-            "scheduled_for": result.occurrence.isoformat(),
-            "late_seconds": result.late_seconds,
-        },
     )
 
 
@@ -3800,7 +3927,10 @@ def _launch_pipeline_run(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra=HistoryExtra(reason="repo_sync_failed", error=str(e)),
+                extra=_with_trigger(
+                    running_extra,
+                    HistoryExtra(reason="repo_sync_failed", error=str(e)),
+                ),
             ),
         )
         if _notify_gate(job, "failure"):
@@ -3831,8 +3961,11 @@ def _launch_pipeline_run(
                 job=job.name,
                 state="failed",
                 run_id=run_id,
-                extra=HistoryExtra(
-                    reason="launch_failed", rc=rc, error=err.strip()[:2000]
+                extra=_with_trigger(
+                    running_extra,
+                    HistoryExtra(
+                        reason="launch_failed", rc=rc, error=err.strip()[:2000]
+                    ),
                 ),
             ),
         )
@@ -4151,7 +4284,7 @@ def _process_review_job(
         )
         return f"{job.name}: skipped (agent already live)", False
 
-    last = last_terminal_run(history_path, job.name)
+    last = last_scheduled_terminal_run(history_path, job.name)
     registered_at = first_seen_at(history_path, job.name) or now
     result = decide(
         cron=job.cron,
@@ -4207,26 +4340,18 @@ def _process_review_job(
             ),
         )
 
-    append(
+    return dispatch_occurrence(
+        job,
         history_path,
-        HistoryRecord(
-            ts=now,
-            job=job.name,
-            state="running",
-            run_id=run_id,
-            extra=HistoryExtra(
+        Occurrence(
+            run_id,
+            HistoryExtra(
                 scheduled_for=result.occurrence.isoformat(),
                 late_seconds=result.late_seconds,
             ),
         ),
-    )
-
-    return _review_cycle(
-        job,
-        history_path,
         client=client,
         now=now,
-        run_id=run_id,
         trusted_review_authors=trusted_review_authors,
     )
 

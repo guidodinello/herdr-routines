@@ -53,6 +53,11 @@ class ScriptedClient:
     """A HerdrClient-shaped fake for runner-level tests, scripted per method rather than at the
     subprocess seam (that's what test_herdr.py covers)."""
 
+    notifications: list[tuple[str, str | None]]
+
+    def notification_show(self, title, *, body=None, sound="none"):
+        self.notifications = [*getattr(self, "notifications", []), (title, body)]
+
     def __init__(
         self,
         *,
