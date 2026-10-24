@@ -503,6 +503,161 @@ def test_gate6_ignores_tier_labels_from_untrusted_authors() -> None:
     assert reason is not None and "trusted author" in reason
 
 
+# ---------------------------------------------------------------------------
+# Gate 6's second evidence type — the review skill's summary phrase (issue 069,
+# spec docs/pipeline/runs/20261023T050000Z/spec.md)
+# ---------------------------------------------------------------------------
+
+
+def test_gate6_passes_clean_review_with_only_non_blocking_notes() -> None:
+    """Criterion 1 — a review that finds nothing blocking must pass. The fixture copies
+    PR #211's real shape (run 20261021T050000Z): a summary review body stating the
+    blocking count ("Found 0 blocking issue(s) and 4 non-blocking note(s)") plus
+    4 inline `**[non-blocking]**` comments, all from a trusted author. No body holds
+    the literal `[blocking]`, which is exactly why the pre-069 gate failed a clean
+    review and left its 4 threads unanswered for a human to resolve."""
+    gh = FakeGhClient(
+        pr_views=[
+            {
+                "reviews": [
+                    {
+                        "author": {"login": "owner"},
+                        "body": "Found 0 blocking issue(s) and 4 non-blocking note(s).",
+                    }
+                ],
+            }
+        ],
+        inline_comments=[
+            {"user": {"login": "owner"}, "body": f"**[non-blocking]** note {n}"}
+            for n in range(4)
+        ],
+    )
+    verdict = run_gate6(
+        gh, owner="o", repo="r", pr=211, trusted_authors=frozenset({"owner"})
+    )
+    assert verdict.passed is True
+
+
+def test_gate6_still_rejects_bare_non_blocking_without_summary() -> None:
+    """Criterion 2 — issue 035's protection is kept. Only bare `[non-blocking]` labels
+    on every surface and no `Found N blocking issue(s)` summary: neither evidence
+    type, so the gate still fails — and the verdict reason still names `[blocking]`
+    (the only gate-6 reason assertion in the suite keeps `BLOCKING_TAG in
+    verdict.reason`)."""
+    gh = FakeGhClient(
+        pr_views=[{"reviews": [{"body": "[non-blocking] tidy this"}]}],
+        inline_comments=[{"body": "**[non-blocking]** rename this"}],
+    )
+    verdict = run_gate6(gh, owner="o", repo="r", pr=7)
+    assert verdict.passed is False
+    assert verdict.reason is not None and BLOCKING_TAG in verdict.reason
+
+
+def test_gate6_passes_zero_findings_review() -> None:
+    """Criterion 3 — the zero-findings review (summary only, no tier tags anywhere)
+    passes gate 6, and `evaluate_gate7` on an empty thread list passes in the same
+    test: with no findings there is nothing for stage 7 to answer, so gate 6 must not
+    be the step standing between a clean review and a resolved PR."""
+    gh = FakeGhClient(
+        pr_views=[
+            {
+                "reviews": [
+                    {
+                        "body": "Review complete. Found 0 blocking issue(s) and 0 "
+                        "non-blocking note(s).",
+                    }
+                ],
+            }
+        ],
+    )
+    assert run_gate6(gh, owner="o", repo="r", pr=313).passed is True
+    assert evaluate_gate7([]).passed is True
+
+
+def test_gate6_summary_match_is_anchored_not_substring() -> None:
+    """Criterion 4 — the second evidence type is a compiled anchored regex on the
+    `code-review` skill's exact summary phrase, pinned as a module constant
+    `BLOCKING_SUMMARY_RE` from `herdr_routines.gates` (beside `BLOCKING_TAG`), not a
+    substring test: prose merely containing the word `blocking`, unbracketed or
+    reworded, matches neither evidence and still fails the gate.
+    (Fetched via ``getattr`` so `uv run mypy` over ``tests/`` — a required CI job —
+    stays green until the constant lands, leaving pytest as the red signal.)"""
+    import herdr_routines.gates as gates_module
+
+    summary_re = getattr(gates_module, "BLOCKING_SUMMARY_RE", None)
+    assert summary_re is not None, "BLOCKING_SUMMARY_RE module constant missing"
+    assert summary_re.pattern == r"Found \d+ blocking issue\(s\)"
+    assert summary_re.search("Found 0 blocking issue(s) and 4 non-blocking note(s).")
+    assert summary_re.search("Found 1 blocking issue(s).")
+    for prose in (
+        "all blocking concerns cleared",
+        "nothing found, no blocking notes",
+        "[non-blocking] tier label only",
+        "this review found nothing",
+    ):
+        assert summary_re.search(prose) is None, prose
+
+    prose_only = FakeGhClient(
+        pr_views=[
+            {"reviews": [{"body": "all blocking concerns cleared, nothing found"}]}
+        ]
+    )
+    assert run_gate6(prose_only, owner="o", repo="r", pr=7).passed is False
+
+
+def test_gate6_ignores_summary_from_untrusted_authors() -> None:
+    """Criterion 5 — trusted-author scoping is inherited for the summary evidence
+    too, on both surfaces (`gh pr view` rows via ``author.login`` and REST inline
+    comments via ``user.login``), mirroring
+    test_gate6_ignores_tier_labels_from_untrusted_authors: a drive-by quoting the
+    skill's summary line, or a deleted "ghost" author, is not evidence; without a
+    set (the standalone CLI) every author still counts."""
+    trusted = frozenset({"owner"})
+    untrusted_summary = FakeGhClient(
+        pr_views=[
+            {
+                "reviews": [
+                    {
+                        "author": {"login": "drive-by"},
+                        "body": "Found 0 blocking issue(s) and 2 non-blocking note(s).",
+                    },
+                    {"author": None, "body": "Found 1 blocking issue(s)."},
+                ],
+            }
+        ],
+        inline_comments=[
+            {"user": {"login": "drive-by"}, "body": "Found 2 blocking issue(s)."}
+        ],
+    )
+    verdict = run_gate6(
+        untrusted_summary, owner="o", repo="r", pr=7, trusted_authors=trusted
+    )
+    assert verdict.passed is False
+    assert run_gate6(untrusted_summary, owner="o", repo="r", pr=7).passed is True
+
+    trusted_summary = FakeGhClient(
+        pr_views=[
+            {
+                "reviews": [
+                    {
+                        "author": {"login": "owner"},
+                        "body": "Found 0 blocking issue(s) and 1 non-blocking note(s).",
+                    }
+                ],
+            }
+        ],
+        inline_comments=[
+            {"user": {"login": "Owner"}, "body": "Found 0 blocking issue(s)."}
+        ],
+    )
+    assert (
+        run_gate6(
+            trusted_summary, owner="o", repo="r", pr=7, trusted_authors=trusted
+        ).passed
+        is True
+    )
+
+
 def test_gates_3_and_4_are_not_cli_stages() -> None:
     """Gates 3 and 4 are git checks `pipeline_run` runs on its own worktree (the test
     author touched only tests/, the implementer removed no named test), so `3` and `4`

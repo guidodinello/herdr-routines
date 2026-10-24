@@ -54,6 +54,13 @@ ACCEPTED_COMMIT_CONCLUSIONS = frozenset({"SUCCESS", "SKIPPED", "NEUTRAL"})
 # (issue 035's secondary finding: jq's `test("blocking")` matched both).
 BLOCKING_TAG = "[blocking]"
 
+# The `code-review` skill's review-summary phrase, e.g. "Found 0 blocking issue(s) and 4
+# non-blocking note(s)." Anchored on that exact prefix, not a bare `blocking` substring:
+# a genuinely clean review has no `[blocking]` tag anywhere but still proves the skill's
+# tier structure ran (issue 069). Count-agnostic by design — a review with findings tags
+# them inline anyway, so `BLOCKING_TAG` covers that case; this is the clean-review proof.
+BLOCKING_SUMMARY_RE = re.compile(r"Found \d+ blocking issue\(s\)")
+
 # Every unresolved thread must carry at least the original comment plus one reply.
 MIN_REPLIED_COMMENT_COUNT = 2
 
@@ -552,11 +559,17 @@ def run_gate6(
 ) -> GateVerdict:
     """The review skill's `blocking`/`non-blocking` tier structure is present.
 
-    Anchored on the literal bracketed ``[blocking]``, never a substring test. The prompt's
-    original check was ``test("blocking")``, which ``[non-blocking]`` satisfies — the
-    exact false positive issue 035 exists to kill, and the reason `BLOCKING_TAG` above is
-    a bracketed constant. A review that only ever writes `[non-blocking]` has not labelled
-    a blocking tier, so it is not evidence the skill's structure ran.
+    Two accepted proofs, one per evidence type. (a) A body carries the literal bracketed
+    ``[blocking]`` tag. (b) A body carries the skill's summary phrase — ``Found N
+    blocking issue(s)`` — which a clean review emits even though it tags nothing
+    ``[blocking]`` (issue 069).
+
+    The tag is anchored on the literal bracketed form, never a substring test. The
+    prompt's original check was ``test("blocking")``, which ``[non-blocking]``
+    satisfies — the exact false positive issue 035 exists to kill, and the reason
+    `BLOCKING_TAG` above is a bracketed constant. A review that only ever writes
+    `[non-blocking]` and has no summary phrase has not labelled a blocking tier, so it
+    is not evidence the skill's structure ran.
 
     With ``trusted_authors``, only bodies a trusted author posted count, the same scope
     gate 7 takes: a tier label anyone else typed is not evidence the review ran. None
@@ -565,7 +578,9 @@ def run_gate6(
     Note this is deliberately *stricter* than the prose it replaces: prose asked for
     "at least one ``[blocking]`` or ``[non-blocking]`` label", which `[non-blocking]`
     alone satisfies, and so keeps the bug. See the spec's note on the prose/acceptance-
-    criteria conflict."""
+    criteria conflict. Correction (issue 069): that strictness overshot — a clean
+    review's `[non-blocking]`-only output is genuine evidence the skill ran, so the
+    summary phrase above is accepted alongside the tag."""
     view = gh.pr_view(owner=owner, repo=repo, number=pr)
     bodies = _pr_bodies(view, trusted_authors=trusted_authors)
     # The `code-review` skill posts every finding as an inline comment prefixed
@@ -587,12 +602,15 @@ def run_gate6(
                 "to check for tier labels"
             ),
         )
-    if any(BLOCKING_TAG in body for body in bodies):
+    if any(BLOCKING_TAG in body for body in bodies) or any(
+        BLOCKING_SUMMARY_RE.search(body) for body in bodies
+    ):
         return GateVerdict(passed=True)
     return GateVerdict(
         passed=False,
         reason=(
-            f"no {BLOCKING_TAG} tier label in any of PR #{pr}'s "
+            f"no {BLOCKING_TAG} tier label and no review skill summary "
+            f"(Found N blocking issue(s)) in any of PR #{pr}'s "
             f"{len(bodies)} review/comment body/bodies — the review skill's tier "
             f"structure is unproven"
         ),
