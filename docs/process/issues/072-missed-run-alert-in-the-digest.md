@@ -1,5 +1,5 @@
 ---
-id: "071"
+id: "072"
 title: "Missed-run alert in the digest"
 status: open
 priority: medium
@@ -18,7 +18,7 @@ This idea was suggested and deferred in issue 046. The fix must read only existi
 
 ### What counts as "missed"
 - Consider only jobs with `enabled: true` (disabled jobs are already handled by issue 046's behavior; do not lump them into missed-run alerts).
-- A job is "missed" if, relative to the digest's `now` (and using the job's schedule), it *should have run at least once by now* and there is no terminal run in the expected window / the last terminal run is too old relative to the schedule, or there is evidence it should have fired but produced no terminal record (and it's not merely "never run" in a benign newly-added sense). 
+- A job is "missed" if, relative to the digest's `now` (and using the job's schedule), it *should have run at least once by now* and there is no terminal run in the expected window / the last terminal run is too old relative to the schedule, or there is evidence it should have fired but produced no terminal record (and it's not merely "never run" in a benign newly-added sense).
 - Need to be precise about "should have run": use the job's schedule/crontab/interval as configured (jobs.d config). The digest already has access to `RoutinesConfig` and history; no new background tracking.
 - Distinguish from failures: render in its own section/group (e.g. "Missed runs" or "Should have run") separate from the failure list. Do not count a missed run as `failed` in the existing terminal-state line.
 
@@ -30,7 +30,7 @@ This idea was suggested and deferred in issue 046. The fix must read only existi
 ### Rendering
 - Add a separate section in the digest output, e.g.:
   - `Missed runs (should have run, didn't):`
-  - `- <job>: last terminal <state> at <when> (expected by <schedule>; > <grace> overdue)` or similar. If never run but enabled and overdue per schedule, say "never run; expected by ..." 
+  - `- <job>: last terminal <state> at <when> (expected by <schedule>; > <grace> overdue)` or similar. If never run but enabled and overdue per schedule, say "never run; expected by ..."
 - Keep existing per-job lines intact. Missed-run alerts are *additional* callouts shown separately from failures.
 - Respect `--include-disabled` semantics: disabled jobs never produce missed-run alerts.
 

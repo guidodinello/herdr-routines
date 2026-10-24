@@ -1,7 +1,7 @@
 ---
 id: "071"
 title: "Post-run verify gates as a job field, so no kind records done on the agent's word"
-status: open
+status: done
 priority: high
 area: scheduler
 ---
