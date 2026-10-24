@@ -44,7 +44,8 @@ ticks, because at 21:30 it collided with one and deferred. `ExecStart` is
 after the new code has validated this host's live config *out of process*; if that
 validate fails the checkout goes back to where it was with `git reset --keep` and a
 notification. It reports (and applies) nothing under `deploy/` — unit changes are
-reported in the notification and installed by hand, per this file. Deferrals (a pipeline run in flight, a red or pending CI, a commit already rolled
+reported in the notification and installed by hand, per this file (see "After a
+`deploy/systemd/` change merges" below). Deferrals (a pipeline run in flight, a red or pending CI, a commit already rolled
 back) are silent and exit 0. A held tick lock is retried for up to 5 minutes first;
 if it is *still* held the run defers (exit 0) with a WARNING and a notification,
 since that is a night lost; refusals (dirty tree, not on `main`, detached HEAD, a
@@ -107,7 +108,33 @@ systemctl --user enable --now herdr-routines.timer
 systemctl --user enable --now herdr-routines-watchdog.timer
 systemctl --user enable --now herdr-routines-digest.timer
 systemctl --user enable --now herdr-routines-update.timer
+systemctl --user enable --now herdr-routines-tmp-sweep.timer  # skip if /tmp is on disk and roomy
+uv run herdr-routines host-check   # must print "ok: no host drift"
 ```
+
+### After a `deploy/systemd/` change merges
+
+self-update fast-forwards the runner but never installs units, so a merged unit fix
+does nothing until it is copied over the installed one (the 2026-10-23 Pi had the
+pre-#219 `herdr-routines-update.{service,timer}` running after the runner already had
+the fix). Re-run the `cp` from Install for the changed units, then:
+
+```sh
+systemctl --user daemon-reload
+uv run herdr-routines host-check
+```
+
+`host-check` is read-only and never fetches. It compares every unit in this
+checkout's `deploy/systemd/` with `~/.config/systemd/user/` and reports a unit that is
+missing (`missing_unit`), not enabled and active when it has an `[Install]` section
+(so the timers and `herdr-server.service`, not the timer-driven services), or not
+byte-identical to the repo copy (`stale_unit`). It also reports a runner checkout
+behind `origin/main` (`runner_behind`), using the ref self-update's nightly fetch left
+behind and saying when that fetch was more than two days ago. It exits 1 on any
+finding. The same findings are appended to the self-update notification on every
+updated, up-to-date or deferred night, and to the daily digest. Every unit here is
+expected, the tmp-sweep pair included, so a host that skips the tmp-sweep timer will
+see it reported.
 
 **Note on /tmp hygiene (issue 027):** every `tick` runs one age-based `/tmp` reap
 before it dispatches any job, under the tick lock. It removes top-level entries
