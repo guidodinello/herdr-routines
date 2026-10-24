@@ -1,14 +1,23 @@
-# Example (issue 071): a routine PR reviewer whose "done" is proven, not claimed.
+# Example (issues 071, 073): a routine PR reviewer whose target is picked in code and whose
+# "done" is proven, not claimed.
+#
+# `pick:` names a target selector that runs before any agent starts. `oldest_unreviewed_pr`
+# chooses the lowest-numbered open PR in `repo` that is not a draft, not a bot's and does
+# not already carry a trusted code review. With none, the run is recorded `skipped`
+# (`no_target`): no worktree, no agent, no notification (except `notify_policy: always`).
+# A selector that errors fails the run as `selector_failed`, it never reads as "nothing
+# to do". The pick reaches the prompt as $ROUTINE_TARGET (<owner>/<repo>#<n>).
 #
 # A routine run is `done` once its agent settles with a non-empty $ROUTINE_REPORT, which
 # is the agent's word. `verify:` lists post-run gates the runner checks before recording
 # the run; any failed gate makes it `failed` with reason `verify_failed:<gate>`.
-#   review_posted      the PR named on the report's `Target:` line carries a review from a
-#                      trusted author, posted since this run started
+#   review_posted      the picked PR carries a review from a trusted author, posted since
+#                      this run started
 #   report_wellformed  the report is real Markdown (not empty, not one line of `\n` escapes)
 #
 # Ships DISABLED; point `repo` at your checkout and enable it. Only a `routine` job honors
-# `verify`; it is also inheritable from defaults.yaml (an explicit `verify: []` opts out).
+# `pick` and `verify`; both are also inheritable from defaults.yaml (an explicit `null` /
+# `[]` opts out).
 enabled: false
 cron: "0 9 * * 1-5"
 repo: /home/you/projects/your-repo
@@ -16,12 +25,10 @@ workspace: worktree
 base: main
 agent_kind: opencode
 model: null
+pick: oldest_unreviewed_pr
 prompt: |
-  Pick the oldest open PR in this repo that has no review yet and run /code-review on it.
-  Post the review on the PR.
-  Then write your summary to $ROUTINE_REPORT as Markdown, with the PR on a line of its own
-  in exactly this form (the run is failed without it):
-  Target: <owner>/<repo>#<number>
+  Run /code-review on $ROUTINE_TARGET and post the review on the PR.
+  Then write your summary to $ROUTINE_REPORT as Markdown.
 verify:
   - review_posted
   - report_wellformed

@@ -28,11 +28,15 @@ When the answer is no, nothing runs.
 
 ## Design
 
-### `selector:` job key (routine only in this phase)
+### `pick:` job key (routine only in this phase)
 
 ```yaml
-selector: oldest_unreviewed_pr
+pick: oldest_unreviewed_pr
 ```
+
+The key is `pick`, not `selector`: it shares no stem with `kind: review`'s `select:` list or
+the gated kind's `target: pr|base`, so it cannot be misread or mistyped as either. Everywhere
+below, "selector" names the concept and `pick` the job key.
 
 - Closed registry of selector names, validated at load like `verify` gates (unknown
   name → `ConfigError`). Inheritable from `defaults.yaml` with the same rule as
@@ -79,7 +83,7 @@ no marker, and both selector and gate already ignore it.
 
 ## Acceptance criteria
 
-1. [blocking] A routine job with `selector: oldest_unreviewed_pr` whose repo has no
+1. [blocking] A routine job with `pick: oldest_unreviewed_pr` whose repo has no
    unreviewed PR is recorded `skipped`, reason `no_target`, and no agent or worktree is
    created. Test: `test_selector_no_target_skips_without_spawning`
 2. [blocking] With a target, the prompt receives it as `$ROUTINE_TARGET`, history
@@ -99,7 +103,7 @@ no marker, and both selector and gate already ignore it.
    handled with the same explicit-error / inherited-warning rule as `verify`. Test:
    `test_selector_config_validation`
 8. [non-blocking] `deploy/jobs.d/fitted-pr-review.yaml` uses
-   `selector: oldest_unreviewed_pr` with `verify: [review_posted, report_wellformed]`,
+   `pick: oldest_unreviewed_pr` with `verify: [review_posted, report_wellformed]`,
    and its prompt shrinks to "run /code-review on $ROUTINE_TARGET". The selection prose
    and the `Target:` instruction go.
 

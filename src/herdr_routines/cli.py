@@ -93,6 +93,11 @@ from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
 from herdr_routines.self_update import default_state_path, run_self_update
 from herdr_routines.table import render_table
+from herdr_routines.target_selectors import (
+    SelectorContext,
+    SelectorFailed,
+    select_target,
+)
 from herdr_routines.telegram_spawn import alias_table, handle_spawn_message
 from herdr_routines.tick import (
     _build_pipeline_launch_argv,
@@ -105,6 +110,7 @@ from herdr_routines.tick import (
     tick_lock,
 )
 from herdr_routines.tmp_hygiene import reap_tmp
+from herdr_routines.verify import VerifyTarget
 
 log = get_logger(__name__)
 
@@ -979,6 +985,11 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     # be dropped without a word; and a prompt that runs /code-review with no
     # `review_posted` gate is done on the agent's word, the #839 incident.
     for job in config.jobs:
+        if job.ignored_pick:
+            warnings.append(
+                f"{job.name}: inherits pick from defaults but kind {job.kind} does "
+                f"not honor it (issue 073)"
+            )
         if job.ignored_verify:
             warnings.append(
                 f"{job.name}: inherits verify from defaults but kind {job.kind} does "
@@ -1180,6 +1191,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if not acquired:
             log.error("%s: a tick is running; try again when it finishes", job.name)
             return 1
+        # Same pre-dispatch selector as a scheduled tick (issue 073). A manual run writes
+        # no history, so the skip and the failure are only logged.
+        gh: RealGhClient | None = None
+        target: VerifyTarget | None = None
+        if job.pick is not None:
+            gh = RealGhClient()
+            selected = select_target(
+                SelectorContext(
+                    job=job, gh=gh, trusted_review_authors=config.trusted_review_authors
+                )
+            )
+            if isinstance(selected, SelectorFailed):
+                log.error("%s: failed (selector_failed: %s)", job.name, selected.error)
+                return 1
+            if selected is None:
+                log.info("%s: skipped (no_target)", job.name)
+                return 0
+            target = selected
         log.info("%s: starting run %s", job.name, run_id)
         client = HerdrClient()
         outcome = execute_run(
@@ -1187,6 +1216,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             client,
             run_id=run_id,
             trusted_review_authors=config.trusted_review_authors,
+            gh=gh,
+            target=target,
         )
     if outcome.state == "done":
         log.info("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")

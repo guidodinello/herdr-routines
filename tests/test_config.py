@@ -1927,4 +1927,9 @@ def test_deploy_fitted_pr_review_example_declares_its_verify_gates(
     job = cfg.job("fitted-pr-review")
     assert job is not None
     assert job.verify == ("review_posted", "report_wellformed")
-    assert job.prompt is not None and "Target: <owner>/<repo>#<number>" in job.prompt
+    # Issue 073: the target is picked in code, so the prompt neither selects nor asks the
+    # agent to declare it.
+    assert job.pick == "oldest_unreviewed_pr"
+    assert job.prompt is not None
+    assert "$ROUTINE_TARGET" in job.prompt
+    assert "Target:" not in job.prompt

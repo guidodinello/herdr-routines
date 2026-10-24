@@ -129,6 +129,11 @@ from herdr_routines.runner import (
     substitute_prompt,
 )
 from herdr_routines.schedule import Decision, decide
+from herdr_routines.target_selectors import (
+    SelectorContext,
+    SelectorFailed,
+    select_target,
+)
 from herdr_routines.tmp_hygiene import reap_tmp
 from herdr_routines.verify import VerifyContext, VerifyTarget
 
@@ -2929,7 +2934,9 @@ def _dispatch_fix_worker(
     )
 
 
-def _outcome_extra(outcome: RunOutcome) -> HistoryExtra:
+def _outcome_extra(
+    outcome: RunOutcome, *, target: VerifyTarget | None = None
+) -> HistoryExtra:
     extra = HistoryExtra(
         agent=outcome.agent_name,
         pane_id=outcome.pane_id,
@@ -2951,6 +2958,8 @@ def _outcome_extra(outcome: RunOutcome) -> HistoryExtra:
         extra["resigned_commits"] = outcome.resigned_commits
     if outcome.reaped_stale_agent:
         extra["reaped_stale_agent"] = True
+    if target is not None:
+        extra["target"] = target.ref  # issue 073: what the selector picked
     if outcome.verify:
         extra["verify"] = [
             VerifyRecord(gate=r.gate, passed=r.passed, reason=r.reason)
@@ -3108,6 +3117,67 @@ def _process_job(
             ),
         )
 
+    # Target selector (issue 073): answered in code before any worktree or agent exists.
+    # Both outcomes below are terminal records, so the occurrence counts as having run:
+    # the next tick sees `not due`, never `missed`, and neither is retried.
+    gh: RealGhClient | None = None
+    target: VerifyTarget | None = None
+    if job.pick is not None:
+        gh = RealGhClient()
+        selected = select_target(
+            SelectorContext(
+                job=job, gh=gh, trusted_review_authors=trusted_review_authors
+            )
+        )
+        pre_dispatch_extra = HistoryExtra(
+            scheduled_for=result.occurrence.isoformat(),
+            late_seconds=result.late_seconds,
+        )
+        if isinstance(selected, SelectorFailed):
+            pre_dispatch_extra["reason"] = "selector_failed"
+            pre_dispatch_extra["error"] = selected.error
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="failed",
+                    run_id=run_id,
+                    extra=pre_dispatch_extra,
+                ),
+            )
+            if _notify_gate(job, "failure"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} failed",
+                    body="selector_failed",
+                    sound="request",
+                )
+            return f"{job.name}: failed (selector_failed)", True
+        if selected is None:
+            pre_dispatch_extra["reason"] = "no_target"
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    run_id=run_id,
+                    extra=pre_dispatch_extra,
+                ),
+            )
+            # Nothing to do is not news: only `notify_policy: always` hears about it.
+            if _notify_gate(job, "progress"):
+                _notify(client, f"herdr-routines: {job.name} skipped", body="no_target")
+            return f"{job.name}: skipped (no_target)", False
+        target = selected
+
+    running_extra = HistoryExtra(
+        scheduled_for=result.occurrence.isoformat(),
+        late_seconds=result.late_seconds,
+    )
+    if target is not None:
+        running_extra["target"] = target.ref
     append(
         history_path,
         HistoryRecord(
@@ -3115,15 +3185,17 @@ def _process_job(
             job=job.name,
             state="running",
             run_id=run_id,
-            extra=HistoryExtra(
-                scheduled_for=result.occurrence.isoformat(),
-                late_seconds=result.late_seconds,
-            ),
+            extra=running_extra,
         ),
     )
 
     outcome = execute_run(
-        job, client, run_id=run_id, trusted_review_authors=trusted_review_authors
+        job,
+        client,
+        run_id=run_id,
+        trusted_review_authors=trusted_review_authors,
+        gh=gh,
+        target=target,
     )
     used_fallback = False
     attempt = 0  # 0 = first try
@@ -3149,7 +3221,7 @@ def _process_job(
                     job=job.name,
                     state=outcome.state,
                     run_id=run_id,
-                    extra=_outcome_extra(outcome),
+                    extra=_outcome_extra(outcome, target=target),
                 ),
             )
             log.info(
@@ -3174,6 +3246,8 @@ def _process_job(
                 client,
                 run_id=run_id,
                 trusted_review_authors=trusted_review_authors,
+                gh=gh,
+                target=target,
             )
 
         # Check if this outcome is eligible for a retry attempt
@@ -3181,7 +3255,7 @@ def _process_job(
             break
 
         # Log the failed attempt as a distinct history record with attempt metadata
-        extra = _outcome_extra(outcome)
+        extra = _outcome_extra(outcome, target=target)
         extra["attempt"] = attempt
         extra["retry_eligible_reason"] = outcome.reason
         append(
@@ -3224,11 +3298,16 @@ def _process_job(
             ),
         )
         outcome = execute_run(
-            job, client, run_id=run_id, trusted_review_authors=trusted_review_authors
+            job,
+            client,
+            run_id=run_id,
+            trusted_review_authors=trusted_review_authors,
+            gh=gh,
+            target=target,
         )
 
     # Terminal record for final outcome (last retry or first attempt if no retries)
-    final_extra = _outcome_extra(outcome)
+    final_extra = _outcome_extra(outcome, target=target)
     final_extra["attempt"] = attempt
     final_extra["max_retries"] = job.retry_attempts
     if attempt > 0:

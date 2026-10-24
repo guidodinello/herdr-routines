@@ -101,6 +101,14 @@ VALID_JOB_KINDS: frozenset[JobKind] = frozenset(get_args(JobKind))
 VerifyGate = Literal["review_posted", "report_wellformed"]
 VALID_VERIFY_GATES: frozenset[VerifyGate] = frozenset(get_args(VerifyGate))
 
+# Target selectors a routine job can name under `pick:` (issue 073): code chooses what the
+# run acts on before any agent starts. Same arrangement as the verify gates: the registry
+# lives in target_selectors.py (which imports Job), the closed name set lives here. The key
+# is `pick`, not `selector`, so it cannot be misread as `kind: review`'s `select:` list or
+# the gated kind's `target: pr|base`.
+TargetSelector = Literal["oldest_unreviewed_pr"]
+VALID_TARGET_SELECTORS: frozenset[TargetSelector] = frozenset(get_args(TargetSelector))
+
 # Recognized values for a kind: review job's `select` list (issue 055). "author" is the
 # default-worthy one; "review_requested" is opt-in because it puts the routine in someone
 # else's PR queue.
@@ -159,6 +167,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
         "tmp_hygiene",
         "notify_policy",
         "verify",
+        "pick",
     }
 )
 
@@ -281,6 +290,7 @@ _JOB_DEFAULTS = {
     "retry_attempts": 0,
     "retry_on": None,
     "verify": None,
+    "pick": None,
     # kind: audit (issue 057). None for every other kind.
     "audit": None,
     "max_findings_per_dispatch": 10,
@@ -520,6 +530,14 @@ class Job:
     # The `verify` a non-routine job inherited from defaults.yaml and does not honor. Kept
     # so `validate` can say so instead of dropping it silently.
     ignored_verify: tuple[VerifyGate, ...] = ()
+    # Target selector (issue 073), run before dispatch by `tick._process_job` and
+    # `cli._cmd_run`: no target skips the run (`no_target`), a target reaches the prompt as
+    # $ROUTINE_TARGET and the verify gates. Only a routine job honors it. Inheritable via
+    # defaults.yaml; an explicit null opts out.
+    pick: TargetSelector | None = None
+    # The `pick` a non-routine job inherited from defaults.yaml and does not honor, kept so
+    # `validate` can say so instead of dropping it silently.
+    ignored_pick: TargetSelector | None = None
 
     @property
     def agent_name(self) -> str:
@@ -1739,6 +1757,27 @@ def _build_job(
             )
         ignored_verify, verify = verify, ()
 
+    # -- pick (issue 073) --------------------------------------------------------------
+    # Same rule as `verify`: explicit on a kind that never reaches the routine dispatch is
+    # an error, inherited is kept aside as `ignored_pick` for `validate` to report.
+    pick_raw = merged["pick"]
+    pick: TargetSelector | None = None
+    if pick_raw is not None:
+        if not isinstance(pick_raw, str) or pick_raw not in VALID_TARGET_SELECTORS:
+            raise ConfigError(
+                f"{label}: 'pick' must be null or a known selector, got {pick_raw!r} — "
+                f"valid selectors: {sorted(VALID_TARGET_SELECTORS)}"
+            )
+        pick = pick_raw
+    ignored_pick: TargetSelector | None = None
+    if kind != "routine" and pick is not None:
+        if "pick" in raw_job:
+            raise ConfigError(
+                f"{label}: 'pick' is only supported on kind: routine "
+                f"(kind: {kind} does not run a target selector, issue 073)"
+            )
+        ignored_pick, pick = pick, None
+
     return Job(
         name=name,
         enabled=enabled,
@@ -1777,4 +1816,6 @@ def _build_job(
         include_auto_branches=include_auto_branches,
         verify=verify,
         ignored_verify=ignored_verify,
+        pick=pick,
+        ignored_pick=ignored_pick,
     )

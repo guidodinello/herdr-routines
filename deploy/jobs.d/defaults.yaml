@@ -40,3 +40,10 @@ timezone: America/Montevideo
 #                                          # own `verify` replaces this list; `verify: []`
 #                                          # opts out. Only kind: routine honors it (other
 #                                          # kinds warn in `validate`). See fitted-pr-review.yaml.
+# pick: oldest_unreviewed_pr # optional (issue 073): a target selector every routine job
+#                                          # runs before dispatch. No target skips the run
+#                                          # (`no_target`); a target reaches the prompt as
+#                                          # $ROUTINE_TARGET and the verify gates. A job's own
+#                                          # `pick` replaces it; `pick: null` opts out. Only
+#                                          # kind: routine honors it (other kinds warn in
+#                                          # `validate`). See fitted-pr-review.yaml.

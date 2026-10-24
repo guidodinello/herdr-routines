@@ -28,7 +28,12 @@ from herdr_routines.herdr import (
 )
 from herdr_routines.repos import ensure_repo
 from herdr_routines.signing import ResignError, resign_unsigned_branch
-from herdr_routines.verify import VerifyContext, VerifyResult, run_verify_gates
+from herdr_routines.verify import (
+    VerifyContext,
+    VerifyResult,
+    VerifyTarget,
+    run_verify_gates,
+)
 from herdr_routines.wait_loop import (
     PROMPT_RETRY_DELAYS_S,
     WATCHDOG_POLL_INTERVAL_S,
@@ -330,6 +335,7 @@ def substitute_prompt(
     job_name: str,
     run_id: str,
     findings_path: Path | None = None,
+    target: VerifyTarget | None = None,
 ) -> str:
     resolved = (
         prompt_template.replace("$ROUTINE_REPORT", str(report_path))
@@ -341,6 +347,9 @@ def substitute_prompt(
     # prompt that happens to contain it fails loudly instead of silently pointing nowhere.
     if findings_path is not None:
         resolved = resolved.replace("$ROUTINE_FINDINGS", str(findings_path))
+    # $ROUTINE_TARGET resolves only when a selector picked one (issue 073), same rule.
+    if target is not None:
+        resolved = resolved.replace("$ROUTINE_TARGET", target.ref)
     return resolved
 
 
@@ -561,6 +570,7 @@ def execute_run(
     run_id: str,
     gh: GhClient | None = None,
     trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
+    target: VerifyTarget | None = None,
 ) -> RunOutcome:
     """Runs one job to completion (or failure) against a real or faked HerdrClient. Never
     raises — every failure mode is captured in the returned RunOutcome so `tick.py` can always
@@ -601,7 +611,11 @@ def execute_run(
 
     # A routine with no prompt still sends an empty one (it fails as agent_prompt_failed).
     prompt = substitute_prompt(
-        job.prompt or "", report_path=report_path, job_name=job.name, run_id=run_id
+        job.prompt or "",
+        report_path=report_path,
+        job_name=job.name,
+        run_id=run_id,
+        target=target,
     )
 
     # A recurring job reuses one agent name, and every settled terminal path below now closes
@@ -896,6 +910,7 @@ def execute_run(
                 report_path=report_path,
                 gh=gh if gh is not None else RealGhClient(),
                 trusted_review_authors=trusted_review_authors,
+                target=target,
             ),
         )
     failed_gate = next((r for r in verify_results if not r.passed), None)
