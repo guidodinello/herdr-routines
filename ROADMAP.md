@@ -95,6 +95,15 @@ Pipeline work; no real-run evidence required.
   (cross-repo search, several targets per run, per-repo checkouts) becomes a
   multi-target selector plus routine fan-out.
   → [`076`](docs/process/issues/076-review-kind-as-routine-with-selector.md)
+- **Gated `github_event` checks as `trigger.event`** — one event mechanism instead of
+  two; keep 014's attempt budget and 070's rules.
+  → [`077`](docs/process/issues/077-gated-github-event-checks-as-event-triggers.md)
+- **Verify gates for event fix workers** — 070 covered PR targets only.
+  → [`078`](docs/process/issues/078-verify-gates-for-event-fix-workers.md)
+- **Long runs block scheduled ticks** — a manual or request run holds the tick lock for
+  its whole duration. → [`079`](docs/process/issues/079-long-runs-block-scheduled-ticks.md)
+- **issue-refinement number collisions** — next id from main plus open PRs, in code.
+  → [`080`](docs/process/issues/080-refinement-issue-number-collisions.md)
 
 Earlier items, kept as issue files for history: plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
