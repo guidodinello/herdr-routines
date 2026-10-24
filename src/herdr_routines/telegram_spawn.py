@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -32,6 +32,7 @@ from logger import get_logger
 
 from herdr_routines.config import (
     AGENT_MODEL_FLAGS,
+    NAME_RE,
     VALID_AGENT_KINDS,
     TelegramSpawn,
     is_private_chat_id,
@@ -46,8 +47,10 @@ __all__ = [
     "SpawnClient",
     "SpawnCommand",
     "alias_table",
+    "handle_job_message",
     "handle_spawn_message",
     "is_authorized",
+    "is_job_verb",
     "parse_spawn_command",
 ]
 
@@ -66,6 +69,11 @@ _TARGET_RE = re.compile(r"[a-z][a-z0-9_-]*")
 _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 
 _USAGE = "Usage: /run <alias> [harness] [model]"
+
+# The configured-job verb (issue 075): `/job <name>` runs a job that opted in with
+# `trigger: {request: true}`. Case-sensitive for the same reason as the cold-start verbs.
+_JOB_VERB = "/job"
+_JOB_USAGE = "Usage: /job <name>"
 
 # How long ``agent start`` may take. A cold spawn has no per-job config to inherit
 # ``start_timeout_ms`` from, so it uses the same default a plain routine job gets.
@@ -274,6 +282,55 @@ def handle_spawn_message(
         reply,
         f"Spawned {name} ({kind}{f' {model}' if model else ''}) on {where}, "
         f"pane {pane_id}. Reply to this message to steer it.",
+    )
+
+
+def is_job_verb(text: object) -> bool:
+    """Whether ``text`` starts with ``/job``, well-formed or not."""
+    parts = text.split() if isinstance(text, str) else []
+    return bool(parts) and parts[0] == _JOB_VERB
+
+
+def handle_job_message(
+    text: str,
+    chat_id: int | str,
+    *,
+    allowed_chat_id: int | str | None,
+    requestable: Collection[str],
+    launch: Callable[[str], None],
+    reply: Callable[[str], None],
+) -> str:
+    """Handle one inbound ``/job <name>`` message (issue 075); return (and send) the reply.
+
+    Same contract as ``handle_spawn_message``: verb, then the same allowlist/chat-id rule,
+    then parse, then lookup, so a rejected message reaches nothing and only the allowlisted
+    chat learns which jobs are requestable. ``requestable`` is the names of the enabled jobs
+    with ``request: true``; any other job, or an unknown name, is refused. The run itself is
+    ``launch(name)``, which the caller points at the shared run path: this module writes no
+    history and takes no lock."""
+    if not is_job_verb(text):
+        return ""
+
+    if not is_authorized(chat_id, allowed_chat_id):
+        return _reply(reply, _REFUSAL)
+
+    valid = ", ".join(sorted(requestable)) or "(none configured)"
+    parts = text.split()
+    if len(parts) != 2 or not NAME_RE.fullmatch(parts[1]):
+        return _reply(reply, f"{_JOB_USAGE}. Requestable jobs: {valid}.")
+    name = parts[1]
+    if name not in requestable:
+        return _reply(
+            reply,
+            f"Job {name!r} is not requestable. Requestable jobs: {valid}.",
+        )
+
+    try:
+        launch(name)
+    except OSError as e:
+        return _reply(reply, f"could not start {name}: {e}")
+    return _reply(
+        reply, f"Started {name} (request). Results arrive via the job's notification."
     )
 
 

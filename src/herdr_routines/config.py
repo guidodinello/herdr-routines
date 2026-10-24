@@ -182,7 +182,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
     }
 )
 
-_JOB_REQUIRED_KEYS = frozenset({"name", "cron"})
+_JOB_REQUIRED_KEYS = frozenset({"name"})
 _RETENTION_ALLOWED_KEYS = frozenset(
     {"history_max_bytes", "history_max_age_days", "reports_max_age_days"}
 )
@@ -256,6 +256,10 @@ _JOB_ALLOWED_KEYS = (
             # what a review job watches is per-job identity, not a shared default.
             "select",
             "include_auto_branches",
+            # Triggers (issue 075): `cron:` is shorthand for `trigger: {cron: ...}`. Exactly
+            # one of the two is required (`_build_trigger`); neither is a defaults key.
+            "cron",
+            "trigger",
         }
     )
 )
@@ -456,7 +460,8 @@ class JobInvariantError(RuntimeError):
 class Job:
     name: str
     enabled: bool
-    cron: str
+    # The cron trigger (issue 075); None for a job that only fires on an event or a request.
+    cron: str | None
     repo: Path
     workspace: WorkspaceMode
     base: str
@@ -549,6 +554,11 @@ class Job:
     # The `pick` a non-routine job inherited from defaults.yaml and does not honor, kept so
     # `validate` can say so instead of dropping it silently.
     ignored_pick: TargetSelector | None = None
+    # Event trigger (issue 075): a `github_event` query polled every tick, firing the job
+    # once per new matching event. Reuses issue 014's check shape and `last_seen_event_ids`.
+    trigger_event: GateCheck | None = None
+    # Request trigger (issue 075): the job may be started by Telegram `/job <name>`.
+    request: bool = False
 
     @property
     def agent_name(self) -> str:
@@ -1116,6 +1126,137 @@ def _is_valid_repo_url(value: str) -> bool:
     return any(value.startswith(p) for p in _REPO_URL_PREFIXES)
 
 
+def _build_github_event_check(evt: object, label: str, where: str) -> GateCheck:
+    """Parse one `github_event` mapping (issue 014) into a `GateCheck`. `where` names it in
+    errors: `checks[0]` for a gated check, `trigger.event` for an event trigger (issue 075)."""
+    if evt is not None:
+        if not isinstance(evt, dict):
+            raise ConfigError(
+                f"{label}: '{where}.github_event' must be a mapping or null"
+            )
+    else:
+        evt = {}
+    unknown_evt = set(evt) - {"query", "repo", "match", "timeout_ms"}
+    if unknown_evt:
+        raise ConfigError(
+            f"{label}: '{where}.github_event' has unknown key(s): {sorted(unknown_evt)}"
+        )
+    evt_query = evt.get("query")
+    if evt_query not in VALID_GITHUB_EVENT_QUERIES:
+        raise ConfigError(
+            f"{label}: '{where}.query' must be one of "
+            f"{sorted(VALID_GITHUB_EVENT_QUERIES)}"
+        )
+    evt_repo = evt.get("repo")
+    if evt_repo is not None and (
+        not isinstance(evt_repo, str) or not re.fullmatch(r"[^/\s]+/[^/\s]+", evt_repo)
+    ):
+        raise ConfigError(f"{label}: '{where}.repo' must be 'owner/name' or null")
+    evt_match = evt.get("match")
+    if evt_match is None:
+        evt_match = {}
+    if not isinstance(evt_match, dict):
+        raise ConfigError(f"{label}: '{where}.match' must be a mapping or null")
+    unknown_match = set(evt_match) - VALID_GITHUB_EVENT_MATCH_KEYS
+    if unknown_match:
+        raise ConfigError(
+            f"{label}: '{where}.match' has unknown key(s): {sorted(unknown_match)}"
+        )
+    for match_key, match_value in evt_match.items():
+        if not isinstance(match_value, str) or not match_value:
+            raise ConfigError(
+                f"{label}: '{where}.match.{match_key}' must be a non-empty string"
+            )
+    # An issue has no head branch, so `branch` could never match one.
+    if evt_query == "issues:opened" and "branch" in evt_match:
+        raise ConfigError(
+            f"{label}: '{where}.match.branch' does not apply to query issues:opened"
+        )
+    parsed_match = GithubEventMatch()
+    if "label" in evt_match:
+        parsed_match["label"] = evt_match["label"]
+    if "branch" in evt_match:
+        parsed_match["branch"] = evt_match["branch"]
+    if "author" in evt_match:
+        parsed_match["author"] = evt_match["author"]
+    et = evt.get("timeout_ms", 120_000)
+    if not isinstance(et, int) or isinstance(et, bool) or et <= 0:
+        raise ConfigError(f"{label}: '{where}.timeout_ms' must be a positive integer")
+    return GateCheck(
+        kind="github_event",
+        query=evt_query,
+        repo=evt_repo,
+        match=parsed_match,
+        timeout_ms=et,
+    )
+
+
+_TRIGGER_ALLOWED_KEYS = frozenset({"cron", "event", "request"})
+
+
+def _build_trigger(
+    raw_job: Mapping[str, object], label: str
+) -> tuple[str | None, GateCheck | None, bool]:
+    """Resolve a job's triggers (issue 075) to `(cron, event, request)`.
+
+    `cron: X` is shorthand for `trigger: {cron: X}`; exactly one of the two spellings must
+    be present. An explicit `trigger:` that fires nothing (`{}` or `{request: false}`) loads,
+    and `validate` warns about it."""
+    has_cron = "cron" in raw_job
+    has_trigger = "trigger" in raw_job
+    if has_cron and has_trigger:
+        raise ConfigError(
+            f"{label}: give 'cron' or 'trigger', not both ('cron: X' is shorthand "
+            "for 'trigger: {cron: X}')"
+        )
+    if not (has_cron or has_trigger):
+        raise ConfigError(f"{label}: missing required key: 'cron' or 'trigger'")
+
+    if has_cron:
+        raw_cron: object = raw_job["cron"]
+        raw_event: object = None
+        raw_request: object = False
+    else:
+        trigger = raw_job["trigger"]
+        if not isinstance(trigger, dict):
+            raise ConfigError(f"{label}: 'trigger' must be a mapping")
+        unknown = set(trigger) - _TRIGGER_ALLOWED_KEYS
+        if unknown:
+            raise ConfigError(
+                f"{label}: 'trigger' has unknown key(s): {sorted(unknown)}"
+            )
+        raw_cron = trigger.get("cron")
+        raw_event = trigger.get("event")
+        raw_request = trigger.get("request", False)
+
+    cron: str | None = None
+    if has_cron or raw_cron is not None:
+        if not isinstance(raw_cron, str):
+            raise ConfigError(f"{label}: 'cron' must be a string")
+        try:
+            croniter(raw_cron)
+        except (ValueError, KeyError) as e:
+            raise ConfigError(
+                f"{label}: invalid cron expression {raw_cron!r}: {e}"
+            ) from e
+        cron = raw_cron
+
+    event: GateCheck | None = None
+    if raw_event is not None:
+        if not isinstance(raw_event, dict) or set(raw_event) != {"github_event"}:
+            raise ConfigError(
+                f"{label}: 'trigger.event' must be a mapping with exactly "
+                "'github_event'"
+            )
+        event = _build_github_event_check(
+            raw_event["github_event"], label, "trigger.event"
+        )
+
+    if not isinstance(raw_request, bool):
+        raise ConfigError(f"{label}: 'trigger.request' must be a boolean")
+    return cron, event, raw_request
+
+
 def _build_job(
     raw_job: Mapping[str, object],
     defaults: Mapping[str, object],
@@ -1167,13 +1308,7 @@ def _build_job(
             raise ConfigError(f"{label}: '{key}' must be a boolean")
         return value
 
-    cron = merged["cron"]
-    if not isinstance(cron, str):
-        raise ConfigError(f"{label}: 'cron' must be a string")
-    try:
-        croniter(cron)
-    except (ValueError, KeyError) as e:
-        raise ConfigError(f"{label}: invalid cron expression {cron!r}: {e}") from e
+    cron, trigger_event, request = _build_trigger(raw_job, label)
 
     # kind is read here (not only where its rules live below) because a
     # `kind: review` job has no single checkout: it derives `repo` from the managed
@@ -1370,79 +1505,9 @@ def _build_job(
                     )
                 else:
                     check_kinds.add("github_event")
-                    evt = c["github_event"]
-                    if evt is not None:
-                        if not isinstance(evt, dict):
-                            raise ConfigError(
-                                f"{label}: 'checks[{ci}].github_event' "
-                                "must be a mapping or null"
-                            )
-                    else:
-                        evt = {}
-                    unknown_evt = set(evt) - {"query", "repo", "match", "timeout_ms"}
-                    if unknown_evt:
-                        raise ConfigError(
-                            f"{label}: 'checks[{ci}].github_event' has unknown key(s): "
-                            f"{sorted(unknown_evt)}"
-                        )
-                    evt_query = evt.get("query")
-                    if evt_query not in VALID_GITHUB_EVENT_QUERIES:
-                        raise ConfigError(
-                            f"{label}: 'checks[{ci}].query' must be one of "
-                            f"{sorted(VALID_GITHUB_EVENT_QUERIES)}"
-                        )
-                    evt_repo = evt.get("repo")
-                    if evt_repo is not None and (
-                        not isinstance(evt_repo, str)
-                        or not re.fullmatch(r"[^/\s]+/[^/\s]+", evt_repo)
-                    ):
-                        raise ConfigError(
-                            f"{label}: 'checks[{ci}].repo' must be 'owner/name' or null"
-                        )
-                    evt_match = evt.get("match")
-                    if evt_match is None:
-                        evt_match = {}
-                    if not isinstance(evt_match, dict):
-                        raise ConfigError(
-                            f"{label}: 'checks[{ci}].match' must be a mapping or null"
-                        )
-                    unknown_match = set(evt_match) - VALID_GITHUB_EVENT_MATCH_KEYS
-                    if unknown_match:
-                        raise ConfigError(
-                            f"{label}: 'checks[{ci}].match' has unknown key(s): "
-                            f"{sorted(unknown_match)}"
-                        )
-                    for match_key, match_value in evt_match.items():
-                        if not isinstance(match_value, str) or not match_value:
-                            raise ConfigError(
-                                f"{label}: 'checks[{ci}].match.{match_key}' "
-                                "must be a non-empty string"
-                            )
-                    # An issue has no head branch, so `branch` could never match one.
-                    if evt_query == "issues:opened" and "branch" in evt_match:
-                        raise ConfigError(
-                            f"{label}: 'checks[{ci}].match.branch' does not apply to "
-                            "query issues:opened"
-                        )
-                    parsed_match = GithubEventMatch()
-                    if "label" in evt_match:
-                        parsed_match["label"] = evt_match["label"]
-                    if "branch" in evt_match:
-                        parsed_match["branch"] = evt_match["branch"]
-                    if "author" in evt_match:
-                        parsed_match["author"] = evt_match["author"]
-                    et = evt.get("timeout_ms", 120_000)
-                    if not isinstance(et, int) or isinstance(et, bool) or et <= 0:
-                        raise ConfigError(
-                            f"{label}: 'checks[{ci}].timeout_ms' must be a positive integer"
-                        )
                     parsed_checks.append(
-                        GateCheck(
-                            kind="github_event",
-                            query=evt_query,
-                            repo=evt_repo,
-                            match=parsed_match,
-                            timeout_ms=et,
+                        _build_github_event_check(
+                            c["github_event"], label, f"checks[{ci}]"
                         )
                     )
 
@@ -1479,6 +1544,24 @@ def _build_job(
             f"{label}: 'checks' requires kind: gated "
             "(a job with checks is a gated workflow; add kind: gated)"
         )
+
+    # -- event trigger (issue 075): where it cannot run ----------------------------------
+    if trigger_event is not None:
+        if kind == "pipeline":
+            raise ConfigError(
+                f"{label}: 'trigger.event' is not supported on kind: pipeline "
+                "(one open run at a time)"
+            )
+        if kind == "review":
+            raise ConfigError(
+                f"{label}: 'trigger.event' is not supported on kind: review "
+                "(no single checkout to poll against)"
+            )
+        if any(c.kind == "github_event" for c in checks or ()):
+            raise ConfigError(
+                f"{label}: 'trigger.event' cannot be combined with a github_event "
+                "check (both track last_seen_event_ids for the job)"
+            )
 
     # -- kind: audit (issue 057 Phase A) ------------------------------------------------
     #
@@ -1800,6 +1883,8 @@ def _build_job(
         name=name,
         enabled=enabled,
         cron=cron,
+        trigger_event=trigger_event,
+        request=request,
         repo=repo,
         workspace=workspace,
         base=base,

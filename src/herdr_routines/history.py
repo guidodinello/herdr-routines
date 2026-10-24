@@ -30,8 +30,12 @@ TERMINAL_STATES: frozenset[TerminalState] = frozenset(get_args(TerminalState))
 NON_TERMINAL_STATES: frozenset[NonTerminalState] = frozenset(get_args(NonTerminalState))
 ALL_STATES: frozenset[HistoryState] = TERMINAL_STATES | NON_TERMINAL_STATES
 
-# `extra.trigger` on a record written by `herdr-routines run` (issue 074). A scheduled
-# record carries no `trigger` key at all, so a missing key means "the cron fired this".
+# `extra.trigger`: what started a run (issues 074, 075). Every `running` record carries one
+# from 075 on; a record with no `trigger` key predates it and was fired by the cron.
+# `cron` is the only trigger that counts toward `schedule.decide`; the rest are off-schedule.
+TRIGGER_CRON = "cron"
+TRIGGER_EVENT = "event"
+TRIGGER_REQUEST = "request"
 TRIGGER_MANUAL = "manual"
 
 
@@ -368,34 +372,35 @@ def last_terminal_run(path: Path, job_name: str) -> HistoryRecord | None:
     return None
 
 
-def _is_manual(record: HistoryRecord) -> bool:
-    return (record.extra or {}).get("trigger") == TRIGGER_MANUAL
+def _is_off_schedule(record: HistoryRecord) -> bool:
+    trigger = (record.extra or {}).get("trigger")
+    return trigger is not None and trigger != TRIGGER_CRON
 
 
 def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | None:
-    """Like `last_terminal_run`, but skipping terminal records of manual runs (issue 074):
-    `schedule.decide` feeds on this, so `herdr-routines run` never consumes the next cron
-    occurrence or shifts the missed-run window.
+    """Like `last_terminal_run`, but skipping terminal records of off-schedule runs (issues
+    074, 075): `schedule.decide` feeds on this, so a manual, request or event run never
+    consumes the next cron occurrence or shifts the missed-run window.
 
-    A terminal record is manual when it carries `trigger: manual` itself, or when the latest
+    A terminal record is off-schedule when its own `trigger` is not `cron`, or when the latest
     `running` record before it with the same run_id does. The second clause covers the
     terminals the gated / review / audit cycles write without knowing the trigger, and the
     `interrupted_unknown` / pipeline-reconcile records, which reuse the run's run_id. "Latest
     before it" keeps `run --run-id <scheduled run_id>` from un-counting that run's original
     scheduled terminal record."""
-    manual_run_ids: set[str] = set()
+    off_schedule_run_ids: set[str] = set()
     scheduled: HistoryRecord | None = None
     for record in read_job(path, job_name):
         if record.state == "running" and record.run_id:
-            if _is_manual(record):
-                manual_run_ids.add(record.run_id)
+            if _is_off_schedule(record):
+                off_schedule_run_ids.add(record.run_id)
             else:
-                manual_run_ids.discard(record.run_id)
+                off_schedule_run_ids.discard(record.run_id)
         elif record.state in TERMINAL_STATES:
-            manual = _is_manual(record) or (
-                record.run_id is not None and record.run_id in manual_run_ids
+            off_schedule = _is_off_schedule(record) or (
+                record.run_id is not None and record.run_id in off_schedule_run_ids
             )
-            if not manual:
+            if not off_schedule:
                 scheduled = record
     return scheduled
 

@@ -3,7 +3,8 @@
 # points at. The bridge's poller calls this once per inbound message with the
 # sender's chat id and the raw text; the reply the handler prints to stdout is
 # what the bridge sends back to the chat. Nothing is spawned unless the message
-# is a `/run <alias>` or `/start <alias>` command AND the chat id matches the
+# is a `/run <alias>` or `/start <alias>` command (or a `/job <name>` for a job with
+# `trigger: {request: true}`, issue 075) AND the chat id matches the
 # `telegram_spawn.allowed_chat_id` in the jobs config.
 #
 # Secrets stay out of this script: the bot token lives in the bridge's own

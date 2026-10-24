@@ -155,6 +155,21 @@ jobs:
   #   start_timeout_ms: 120000
   #   on_missed: log
 
+  # Triggers (issue 075): `cron: X` above is shorthand for `trigger: {cron: X}`. A job may
+  # instead (or also) fire on a polled GitHub event, or only on request. At least one of
+  # `cron:` / `trigger:` is required, not both spellings at once.
+  # - name: ship-labelled-prs
+  #   repo: /home/guido/projects/herdr-routines
+  #   prompt: "Ship the PR. Write a summary to $ROUTINE_REPORT."
+  #   trigger:
+  #     cron: "0 9 * * *"            # optional: the usual schedule
+  #     event:                       # optional: polled every tick, one run per new event
+  #       github_event: { query: "prs:labels", match: { label: ship-it } }
+  #     request: true                # optional: Telegram `/job ship-labelled-prs`
+  #   # An event run is started after a due cron occurrence, at most one run per tick.
+  #   # `request: true` alone makes a job that never fires on its own and is never
+  #   # reported missed; `herdr-routines run <name>` works on any job regardless.
+
 # telegram_spawn: # optional (issue 024): cold-start a session from a cold Telegram
 #   # message. The bridge's poller calls `herdr-routines spawn-from-telegram` (or the
 #   # scripts/herdr-spawn-from-telegram.sh shim) with the sender's chat id and the
