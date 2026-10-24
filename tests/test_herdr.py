@@ -315,17 +315,19 @@ def test_agent_prompt_wait_returns_unknown() -> None:
 
 
 @pytest.mark.parametrize("status", ["idle", "done", "working", "blocked", "unknown"])
-def test_agent_get_parses_every_schema_status(status: str) -> None:
+def test_agent_prompt_wait_parses_every_schema_status(status: str) -> None:
     client = HerdrClient(runner=FakeRunner([ok(agent_response(status))]))
-    assert client.agent_get("rt-a") == status
+    assert client.agent_prompt_wait(target="rt-a", text="hi", timeout_ms=1000) == status
 
 
-def test_agent_get_returns_none_and_logs_for_off_schema_status(
+def test_agent_prompt_wait_returns_none_and_logs_for_off_schema_status(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = HerdrClient(runner=FakeRunner([ok(agent_response("paused"))]))
     with caplog.at_level(logging.WARNING, logger="herdr_routines.herdr"):
-        assert client.agent_get("rt-a") is None
+        assert (
+            client.agent_prompt_wait(target="rt-a", text="hi", timeout_ms=1000) is None
+        )
     assert "paused" in caplog.text
 
 
@@ -345,7 +347,7 @@ def test_exit_2_is_syntax_error() -> None:
     runner = FakeRunner([(2, "", "error: unrecognized argument")])
     client = HerdrClient(runner=runner)
     with pytest.raises(HerdrCliError) as exc_info:
-        client.agent_get("rt-a")
+        client.agent_prompt_wait(target="rt-a", text="hi", timeout_ms=1000)
     assert exc_info.value.exit_code == 2
 
 
@@ -361,14 +363,14 @@ def test_non_json_stdout_raises() -> None:
     runner = FakeRunner([(0, "not json at all", "")])
     client = HerdrClient(runner=runner)
     with pytest.raises(HerdrCliError):
-        client.agent_get("rt-a")
+        client.agent_prompt_wait(target="rt-a", text="hi", timeout_ms=1000)
 
 
 def test_missing_expected_field_raises() -> None:
     runner = FakeRunner([ok({"result": {"agent": {}}})])  # no agent_status key
     client = HerdrClient(runner=runner)
     with pytest.raises(HerdrCliError):
-        client.agent_get("rt-a")
+        client.agent_prompt_wait(target="rt-a", text="hi", timeout_ms=1000)
 
 
 def test_agent_statuses_maps_names_to_status() -> None:
@@ -443,11 +445,9 @@ def test_settled_and_sticky_lookups_treat_off_schema_status_as_unsettled() -> No
         "name": "rt-a",
         "agent_status": "exploding",
         "pane_id": "p1",
-        "workspace_id": "w1",
     }
-    runner = FakeRunner([_agents_ok(entry)] * 3)
+    runner = FakeRunner([_agents_ok(entry)] * 2)
     client = HerdrClient(runner=runner)
-    assert client.settled_agent_workspace("rt-a") is None
     assert client.settled_agent_pane("rt-a") is None
     assert client.sticky_agent_pane("rt-a") is None
 
@@ -457,11 +457,9 @@ def test_settled_and_sticky_lookups_in_schema() -> None:
         "name": "rt-a",
         "agent_status": "idle",
         "pane_id": "p1",
-        "workspace_id": "w1",
     }
     blocked = {"name": "rt-b", "agent_status": "blocked", "pane_id": "p2"}
-    client = HerdrClient(runner=FakeRunner([_agents_ok(idle, blocked)] * 3))
-    assert client.settled_agent_workspace("rt-a") == "w1"
+    client = HerdrClient(runner=FakeRunner([_agents_ok(idle, blocked)] * 2))
     assert client.settled_agent_pane("rt-a") == "p1"
     assert client.sticky_agent_pane("rt-b") == ("p2", "blocked")
 
@@ -509,12 +507,14 @@ def test_workspace_list_bad_shape_raises(body: dict) -> None:
         client.workspace_list()
 
 
-def test_agent_get_off_schema_status_warns_and_returns_none(
+def test_agent_prompt_wait_off_schema_status_warns_and_returns_none(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = HerdrClient(runner=FakeRunner([ok(agent_response("exploding"))]))
     with caplog.at_level(logging.WARNING, logger="herdr_routines.herdr"):
-        assert client.agent_get("rt-a") is None
+        assert (
+            client.agent_prompt_wait(target="rt-a", text="hi", timeout_ms=1000) is None
+        )
     assert "unrecognized agent_status 'exploding'" in caplog.text
 
 
@@ -526,10 +526,10 @@ def test_agent_get_off_schema_status_warns_and_returns_none(
         ({"result": {"agent": {"agent_status": 3}}}, "unexpected agent_status type"),
     ],
 )
-def test_agent_get_bad_shape_raises(body: dict, message: str) -> None:
+def test_agent_prompt_wait_bad_shape_raises(body: dict, message: str) -> None:
     client = HerdrClient(runner=FakeRunner([ok(body)]))
     with pytest.raises(HerdrCliError, match=message):
-        client.agent_get("rt-a")
+        client.agent_prompt_wait(target="rt-a", text="hi", timeout_ms=1000)
 
 
 @pytest.mark.parametrize(
@@ -652,25 +652,6 @@ def test_settled_agent_pane_returns_pane_when_settled() -> None:
     runner = FakeRunner([ok(body)])
     client = HerdrClient(runner=runner)
     assert client.settled_agent_pane("rt-a") == "w9:p1"
-    assert runner.calls[0][1:3] == ["agent", "list"]
-
-
-def test_settled_agent_workspace_returns_workspace_when_settled() -> None:
-    body = {
-        "result": {
-            "agents": [
-                {
-                    "name": "rt-a",
-                    "agent_status": "done",
-                    "pane_id": "w9:p1",
-                    "workspace_id": "w9",
-                }
-            ]
-        }
-    }
-    runner = FakeRunner([ok(body)])
-    client = HerdrClient(runner=runner)
-    assert client.settled_agent_workspace("rt-a") == "w9"
     assert runner.calls[0][1:3] == ["agent", "list"]
 
 
@@ -969,13 +950,6 @@ def test_pane_close_builds_expected_argv() -> None:
     client = HerdrClient(runner=runner)
     client.pane_close("w9:p1")
     assert runner.calls[0] == ["herdr", "pane", "close", "w9:p1"]
-
-
-def test_workspace_close_builds_expected_argv() -> None:
-    runner = FakeRunner([ok({"result": {}})])
-    client = HerdrClient(runner=runner)
-    client.workspace_close("w9")
-    assert runner.calls[0] == ["herdr", "workspace", "close", "w9"]
 
 
 @pytest.mark.parametrize(
@@ -1408,14 +1382,12 @@ EMPTY_BODY: dict = {"result": {}}
     [
         (PANE_BODY, lambda c: c.tab_create(cwd="/repo")),
         (WORKSPACE_BODY, lambda c: c.workspace_create(cwd="/repo")),
-        (agent_response("idle"), lambda c: c.agent_get("rt-a")),
         (agent_response("idle"), lambda c: c.agent_interactive_ready("rt-a")),
         (EMPTY_BODY, lambda c: c.notification_show("title")),
     ],
     ids=[
         "tab_create",
         "workspace_create",
-        "agent_get",
         "agent_interactive_ready",
         "notification_show",
     ],

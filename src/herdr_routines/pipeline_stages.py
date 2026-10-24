@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,9 +15,8 @@ class StageSpec:
 
     - `model` is None => no agent at all (stage 5: bookkeeping and the PR).
     - `prompt_file` is None when no agent is started.
-    - `isolation` is the G-17 layout category: `independent`, `none` (model=None),
-      or `reused` (stage 7 reuses stage 4).
-    - `reuses_stage` is the stage number whose session id is reused, if any.
+    - `reuses_stage` is the stage number whose session id is reused, if any (stage 7
+      reuses stage 4); every other stage with a model runs in its own session (G-17).
     - `fallback_model` is what `pipeline_run` resumes the stage's session on, once, when
       `model`'s provider rejects a call mid-stage (an opencode `APIError`). A different
       provider from `model`, so one provider's bad night is not the run's.
@@ -29,7 +27,6 @@ class StageSpec:
     prompt_file: str | None
     timeout_ms: int
     start_timeout_ms: int
-    isolation: Literal["independent", "none", "reused"]
     reuses_stage: int | None = None
     fallback_model: str | None = None
 
@@ -93,7 +90,6 @@ STAGES: tuple[StageSpec, ...] = (
         prompt_file="stage-1.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
-        isolation="independent",
         fallback_model=AUTHOR_FALLBACK_MODEL,
     ),
     StageSpec(
@@ -102,7 +98,6 @@ STAGES: tuple[StageSpec, ...] = (
         prompt_file="stage-2.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
-        isolation="independent",
         fallback_model=AUTHOR_FALLBACK_MODEL,
     ),
     StageSpec(
@@ -114,7 +109,6 @@ STAGES: tuple[StageSpec, ...] = (
         prompt_file="stage-3.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
-        isolation="independent",
         fallback_model=REVIEWER_FALLBACK_MODEL,
     ),
     StageSpec(
@@ -123,7 +117,6 @@ STAGES: tuple[StageSpec, ...] = (
         prompt_file="stage-4.md",
         timeout_ms=90 * 60 * 1000,
         start_timeout_ms=120_000,
-        isolation="independent",
         fallback_model=AUTHOR_FALLBACK_MODEL,
     ),
     StageSpec(
@@ -132,7 +125,6 @@ STAGES: tuple[StageSpec, ...] = (
         prompt_file=None,
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
-        isolation="none",
     ),
     StageSpec(
         stage=6,
@@ -142,7 +134,6 @@ STAGES: tuple[StageSpec, ...] = (
         prompt_file="stage-6.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
-        isolation="independent",
         fallback_model=REVIEWER_FALLBACK_MODEL,
     ),
     StageSpec(
@@ -151,7 +142,6 @@ STAGES: tuple[StageSpec, ...] = (
         prompt_file="stage-7.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
-        isolation="reused",
         reuses_stage=4,
         fallback_model=AUTHOR_FALLBACK_MODEL,
     ),

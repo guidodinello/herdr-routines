@@ -2,21 +2,21 @@
 
 Recording a pick as an uncommitted edit to the issue file in `$REPO_PARENT` collided
 with the implementing PR's own edit to the same line once it merged to `main`:
-`sync-repo`'s `git merge --ff-only` then refuses (modified locally + changed
-upstream), and `ensure_repo` fails every subsequent job on that repo path. See
+the parent clone's sync (`git merge --ff-only`) then refuses (modified locally +
+changed upstream), and `ensure_repo` fails every subsequent job on that repo path. See
 docs/process/issues/041-pick-flip-blocks-repo-sync.md.
 
 The fix: claims live here instead, keyed by issue id with a `claimed_at`
 timestamp, so `$REPO_PARENT` stays a clean mirror of `origin/main` — which is what
-`sync-repo`/`ensure_repo` assume. JSON dict, not JSONL: a claim is a single
+`pipeline-prepare`/`ensure_repo` assume. JSON dict, not JSONL: a claim is a single
 mutable fact ("is this issue claimed, since when") that gets released, not an
 append-only log of events.
 
 Shape chosen with issue 040 (lease-expiry reclamation) in mind: a `claimed_at`
-timestamp per issue id, queryable and releasable (`is_claimed`, `release_claim`)
-without touching any tracked file in a checkout this process doesn't own. 040
-only needs to add a "claimed longer than the lease" check against `claimed_at`
-and call `release_claim` — no new storage.
+timestamp per issue id, read and released under `locked_claims` without touching any
+tracked file in a checkout this process doesn't own. 040's
+`pick_feature.reclaim_stale_claims` checks `claimed_at` against the lease and drops
+the entry in place — no new storage.
 """
 
 from __future__ import annotations
@@ -137,21 +137,3 @@ def locked_claims(path: Path) -> Generator[dict[str, Claim]]:
             save_claims(path, claims)
     finally:
         os.close(lock_fd)
-
-
-def claim_issue(path: Path, issue_id: str, *, now: datetime | None = None) -> None:
-    """Record that `issue_id` has been picked, replacing any prior claim for it."""
-    with locked_claims(path) as claims:
-        claims[issue_id] = Claim(issue_id=issue_id, claimed_at=now or datetime.now(UTC))
-
-
-def is_claimed(path: Path, issue_id: str) -> bool:
-    """True if any claim is recorded for issue_id, however old. Ignores the lease:
-    pick_feature decides reclaimability against LEASE_HOURS."""
-    return issue_id in load_claims(path)
-
-
-def release_claim(path: Path, issue_id: str) -> None:
-    """No-op if `issue_id` isn't claimed."""
-    with locked_claims(path) as claims:
-        claims.pop(issue_id, None)

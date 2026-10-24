@@ -486,10 +486,6 @@ class HerdrClient:
             remaining = deadline - time.monotonic()
             time.sleep(min(max(poll_interval_s, 0.0), max(remaining, 0.0)))
 
-    def agent_get(self, target: str) -> AgentStatus | None:
-        body = self._call(["agent", "get", target])
-        return _extract_status(body)
-
     def agent_session_id(self, target: str) -> str | None:
         """Best-effort: the agent's underlying CLI session id (e.g. an opencode `ses_...`
         id) from `agent get`'s `agent_session.value`, or None on any CLI/shape failure —
@@ -577,29 +573,11 @@ class HerdrClient:
                 statuses[name] = status
         return statuses
 
-    def settled_agent_workspace(self, name: str) -> str | None:
-        """The workspace_id hosting registered agent `name`, if its status is settled
-        (idle/done). None when absent, still working, blocked, unknown, or status
-        unreadable — callers must never close a busy or human-blocked pane. Only
-        idle/done are considered settled (see SETTLED_AGENT_STATUSES); blocked/unknown
-        are sticky under cron and must not be reaped."""
-        # Names are unique only among live agents (plan-v1 empirical notes), so scan
-        # all entries: if any matching agent is live, blocked, unknown, or has an
-        # unreadable status, treat the whole name as not-settled and return None.
-        matched = [a for a in self._agent_list() if a.get("name") == name]
-        if not matched:
-            return None
-        for agent in matched:
-            if agent.get("agent_status") not in SETTLED_AGENT_STATUSES:
-                return None
-        # All matched entries are settled — return the first one's workspace.
-        return matched[0].get("workspace_id") or None
-
     def settled_agent_pane(self, name: str) -> str | None:
         """The pane_id hosting registered agent `name`, if its status is settled
         (idle/done). None when absent, still working, blocked, unknown, or status
-        unreadable. Narrower than settled_agent_workspace — reaping a single pane
-        preserves sibling tabs/panes the user may have opened to inspect the last run."""
+        unreadable. Reaping the pane rather than its workspace preserves sibling tabs/panes
+        the user may have opened to inspect the last run."""
         matched = [a for a in self._agent_list() if a.get("name") == name]
         if not matched:
             return None
@@ -683,9 +661,6 @@ class HerdrClient:
     def _agent_list(self) -> list[AgentEntry]:
         body = self._call(["agent", "list"], timeout_s=10)
         return _parse_agent_list(body)
-
-    def workspace_close(self, workspace_id: str) -> None:
-        self._call(["workspace", "close", workspace_id], timeout_s=10)
 
     def pane_close(self, pane_id: str) -> None:
         self._call(["pane", "close", pane_id], timeout_s=10)

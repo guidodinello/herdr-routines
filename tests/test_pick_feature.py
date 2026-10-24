@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from herdr_routines import pick_feature as pick_feature_module
-from herdr_routines.claims import claim_issue, load_claims
+from herdr_routines.claims import Claim, load_claims, locked_claims
 from herdr_routines.pick_feature import (
     Issue,
     IssueParseError,
@@ -37,6 +37,12 @@ area: cli
 
 {body}
 """
+
+
+def _claim(path: Path, issue_id: str, *, now: datetime | None = None) -> None:
+    """Seed a prior claim, as an earlier `--mark-in-progress` pick leaves it."""
+    with locked_claims(path) as claims:
+        claims[issue_id] = Claim(issue_id=issue_id, claimed_at=now or datetime.now(UTC))
 
 
 def _write_issue(
@@ -233,7 +239,7 @@ def test_claimed_issue_skipped_without_marking_again(
     _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
     _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
     claims_path = tmp_path / "claims.json"
-    claim_issue(claims_path, "001")
+    _claim(claims_path, "001")
 
     out = io.StringIO()
     code = run_pick_feature(issues_dir, out=out, claims_path=claims_path)
@@ -289,7 +295,7 @@ def test_pick_feature_reclaims_stale_in_progress(
     _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
     claims_path = tmp_path / "claims.json"
     claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
-    claim_issue(claims_path, "001", now=claimed_at)
+    _claim(claims_path, "001", now=claimed_at)
     monkeypatch.setattr(
         pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
     )
@@ -319,7 +325,7 @@ def test_pick_feature_skips_in_progress_with_open_pr(
     _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
     claims_path = tmp_path / "claims.json"
     claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
-    claim_issue(claims_path, "001", now=claimed_at)
+    _claim(claims_path, "001", now=claimed_at)
     monkeypatch.setattr(
         pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset({1})
     )
@@ -353,7 +359,7 @@ def test_pick_feature_skips_in_progress_inflight_run(
     _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
     claims_path = tmp_path / "claims.json"
     claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
-    claim_issue(claims_path, "001", now=claimed_at)
+    _claim(claims_path, "001", now=claimed_at)
     monkeypatch.setattr(
         pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
     )
@@ -405,7 +411,7 @@ def test_reclaimed_pick_is_surfaced(
     _write_issue(issues_dir, "001-foo.md", id="001", title="Foo", status="open")
     claims_path = tmp_path / "claims.json"
     claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
-    claim_issue(claims_path, "001", now=claimed_at)
+    _claim(claims_path, "001", now=claimed_at)
     monkeypatch.setattr(
         pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
     )
@@ -650,7 +656,7 @@ def test_select_and_claim_feature_returns_issue_and_reclaims(
     _write_issue(issues_dir, "002-bar.md", id="002", title="Bar", status="open")
     claims_path = tmp_path / "claims.json"
     claimed_at = datetime(2026, 9, 1, tzinfo=UTC)
-    claim_issue(claims_path, "001", now=claimed_at)
+    _claim(claims_path, "001", now=claimed_at)
     monkeypatch.setattr(
         pick_feature_module, "open_pr_issue_ids", lambda repo: frozenset()
     )

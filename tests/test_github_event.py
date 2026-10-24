@@ -351,12 +351,6 @@ class RecordingHerdrClient:
     def pane_close(self, pane_id: str) -> None:
         pass
 
-    def workspace_close(self, workspace_id: str) -> None:
-        pass
-
-    def settled_agent_workspace(self, name: str) -> Any:
-        return None
-
     def settled_agent_pane(self, name: str) -> Any:
         return None
 

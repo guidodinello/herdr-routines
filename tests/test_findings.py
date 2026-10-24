@@ -20,7 +20,6 @@ from herdr_routines.findings import (
     dispatch_pool,
     finding_id,
     ledger_path,
-    load_findings_manifest,
     load_findings_manifest_full,
     load_ledger,
     normalize_location,
@@ -114,7 +113,6 @@ def test_derived_id_collision_collapses_to_highest_severity(tmp_path: Path) -> N
             "type-health", "implicit-any-return", "app/Services/Invoice.php:212"
         ),
     )
-    assert load_findings_manifest(manifest) == list(parsed.findings)
 
     # A skill-supplied id is used verbatim (trimmed).
     supplied = _write_manifest(

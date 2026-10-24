@@ -184,7 +184,7 @@ def prepare_run(
             reclaimed=(),
         )
 
-    # 1. sync — the same primitive `sync-repo` and `ensure_repo` use. Deliberate even
+    # 1. sync — the same primitive `ensure_repo` uses. Deliberate even
     # though tick already synced at dispatch: that ran in tick's process on tick's
     # checkout, while the branch-off happens here, later, from a different checkout.
     try:

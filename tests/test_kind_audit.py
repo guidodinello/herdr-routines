@@ -30,7 +30,7 @@ from herdr_routines.findings import (
     LedgerEntry,
     finding_id,
     ledger_path,
-    load_findings_manifest,
+    load_findings_manifest_full,
     load_ledger,
     save_ledger,
 )
@@ -258,23 +258,23 @@ def test_manifest_validation_fails_closed(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
 
     # Never [] for an unverifiable manifest.
-    assert load_findings_manifest(tmp_path / "missing.json") is None
+    assert load_findings_manifest_full(tmp_path / "missing.json") is None
 
     bad = tmp_path / "bad.json"
     bad.write_text("{not json")
-    assert load_findings_manifest(bad) is None
+    assert load_findings_manifest_full(bad) is None
 
     _write_manifest(tmp_path, "r", [], check="c")
     version = tmp_path / "state" / "reports" / "r-findings.json"
     version.write_text(json.dumps({"version": 2, "check": "c", "findings": []}))
-    assert load_findings_manifest(version) is None
+    assert load_findings_manifest_full(version) is None
 
     malformed = _write_manifest(
         tmp_path,
         "r2",
         [{"kind": "k", "severity": "high", "summary": "missing location"}],
     )
-    assert load_findings_manifest(malformed) is None
+    assert load_findings_manifest_full(malformed) is None
 
     oversize = _write_manifest(
         tmp_path,
@@ -289,11 +289,13 @@ def test_manifest_validation_fails_closed(
             }
         ],
     )
-    assert load_findings_manifest(oversize) is None
+    assert load_findings_manifest_full(oversize) is None
 
     # A valid manifest with no findings is an empty list, not None.
     empty = _write_manifest(tmp_path, "r4", [])
-    assert load_findings_manifest(empty) == []
+    empty_manifest = load_findings_manifest_full(empty)
+    assert empty_manifest is not None
+    assert empty_manifest.findings == ()
 
     # The tick records the failure and dispatches nothing.
     job = _audit_job(tmp_path)

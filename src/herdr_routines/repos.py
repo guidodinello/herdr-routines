@@ -4,9 +4,9 @@
 Pure-subprocess: no Herdr dependency, no config writes.  ``ensure_repo`` is called at the top
 of ``runner.execute_run`` and gated-dispatch paths in ``tick.py`` so every worktree/tab
 creation starts from a known-good checkout — fetched+fast-forwarded to ``origin/<base>``
-regardless of whether the job's checkout is managed or a pre-existing local clone.  The
-``sync-repo`` CLI subcommand (``cli.py``) wraps ``_fetch_and_fast_forward`` directly for
-callers outside the job-dispatch path (e.g. the overnight pipeline launcher).
+regardless of whether the job's checkout is managed or a pre-existing local clone.
+``pipeline_prepare`` calls ``_fetch_and_fast_forward`` directly for the overnight
+pipeline's ``$REPO_PARENT``, which is outside the job-dispatch path.
 """
 
 from __future__ import annotations

@@ -12,9 +12,6 @@ from — it cannot rewrite them.
 Gate 3's lint widening (``ruff format --check .`` and ``ruff check .`` alongside
 pytest) is not a CLI stage and no prompt carries it any more: since issue 059 stage 5
 runs ``scripts/ci-check.sh`` (CI's own commands) in code before the PR, with a fix loop.
-``GATE3_LINT_TEST_CHECKS`` below only pins that the widened check set fails on a lint
-error even with green tests (test_gate3_fails_on_lint_error) — it is reused from the
-same ``run_checks`` machinery as ``auto_fix.py``.
 """
 
 from __future__ import annotations
@@ -27,13 +24,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from herdr_routines.auto_fix import (
-    GateOutcome,
     GhClient,
     is_trusted_author,
     repo_owner_and_name,
-    run_checks,
 )
-from herdr_routines.config import GateCheck
 
 # Bounds the CI-gate poll (issue 034): CI on this repo finishes in well under 2
 # minutes, so 10 minutes is generous headroom without letting a stuck check eat the
@@ -63,12 +57,6 @@ BLOCKING_TAG = "[blocking]"
 # Every unresolved thread must carry at least the original comment plus one reply.
 MIN_REPLIED_COMMENT_COUNT = 2
 
-GATE3_LINT_TEST_CHECKS: tuple[GateCheck, ...] = (
-    GateCheck(kind="command", command="uv run ruff format --check ."),
-    GateCheck(kind="command", command="uv run ruff check ."),
-    GateCheck(kind="command", command="uv run pytest -q"),
-)
-
 
 @dataclass(frozen=True, slots=True)
 class GateVerdict:
@@ -77,15 +65,6 @@ class GateVerdict:
 
     passed: bool
     reason: str | None = None
-
-
-def gate3_result(
-    cwd: str, *, runner: Callable[..., tuple[int, str, str]] | None = None
-) -> GateOutcome:
-    """Run the widened gate-3 command set (CI parity: both ruff invocations plus
-    pytest) and report pass/fail. Fails on a lint error even with a green pytest —
-    the original gate ran pytest alone and never saw PR #81's ruff-format breakage."""
-    return run_checks(GATE3_LINT_TEST_CHECKS, cwd=cwd, runner=runner)
 
 
 def remote_owner_and_repo(repo_path: Path) -> tuple[str, str]:
@@ -458,25 +437,6 @@ def run_gate1(
             passed=False, reason=f"spec is not committed on {branch}: {rel}"
         )
     return GateVerdict(passed=True)
-
-
-def _frontmatter_block(text: str) -> str | None:
-    """The YAML frontmatter block's text, or None when the file has none."""
-    if not text.startswith("---"):
-        return None
-    end = text.find("\n---", 3)
-    return None if end == -1 else text[3:end]
-
-
-def _frontmatter_field(text: str, field: str) -> str | None:
-    block = _frontmatter_block(text)
-    if block is None:
-        return None
-    for line in block.splitlines():
-        key, sep, value = line.partition(":")
-        if sep and key.strip() == field:
-            return value.strip().strip("\"'") or None
-    return None
 
 
 def run_gate2(spec: Path) -> GateVerdict:

@@ -221,15 +221,6 @@ def load_findings_manifest_full(path: Path) -> FindingsManifest | None:
     )
 
 
-def load_findings_manifest(path: Path) -> list[Finding] | None:
-    """``load_findings_manifest_full`` minus the duplicate bookkeeping, for callers
-    that only need the finding list."""
-    parsed = load_findings_manifest_full(path)
-    if parsed is None:
-        return None
-    return list(parsed.findings)
-
-
 # -- diff ---------------------------------------------------------------------
 
 

@@ -2,7 +2,7 @@
 pipeline launcher runs *before* any agent exists: sync, pick+claim, worktree+workspace,
 `state.json`.
 
-Real bare-origin git fixtures (copied from tests/test_sync_repo.py:38-67) so the sync is
+Real bare-origin git fixtures (copied from tests/test_repos.py) so the sync is
 a real fetch+fast-forward, and a fake HerdrClient so no `herdr` binary, server, or
 workspace is needed (AC 8: the sync/pick/state paths are Herdr-free, and the two call
 sites that do need it are injected).
@@ -53,7 +53,7 @@ RUN_ID = "20260930T050000Z"
 DEADLINE_EPOCH = 1_790_597_715
 
 
-# --- git fixtures (from tests/test_sync_repo.py) ------------------------------------------
+# --- git fixtures (from tests/test_repos.py) ---------------------------------------------
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -495,7 +495,7 @@ def test_pipeline_prepare_fails_loud_on_sync_error(
 ) -> None:
     """Acceptance criterion 3: a diverged `$REPO_PARENT` writes
     `## Outcome: failed (repo_sync_failed)` and stops before the pick — no claim, no
-    worktree, no agent. Same fixture shape as test_sync_repo.py's non-fast-forward test."""
+    worktree, no agent. Same fixture shape as test_repos.py's non-fast-forward test."""
     bare, parent, base = _parent_clone(tmp_path)
     _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
     # Local commit on the checkout ...
