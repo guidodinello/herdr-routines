@@ -107,11 +107,31 @@ systemctl --user enable --now herdr-routines-digest.timer
 systemctl --user enable --now herdr-routines-update.timer
 ```
 
-**Note on /tmp hygiene (issue 027):** `tick` now runs an age-based `/tmp` reap
-before every job dispatch (under the tick lock). On agent start failure, `df -h /tmp`
-is logged to the report tail and the `RunOutcome.diagnosis` field distinguishes
-`tmp_full` from quota `blocked`. Configure via `tmp_hygiene:` under `defaults:` or
-per-job in `jobs.yaml`/`jobs.d/` — see `jobs.example.yaml`.
+**Note on /tmp hygiene (issue 027):** every `tick` runs one age-based `/tmp` reap
+before it dispatches any job, under the tick lock. It removes top-level entries
+matching `.3cdc*` (files), `pytest-of-*`, `opencode` and `opencode-*` whose newest mtime
+anywhere in the tree is older than `max_age_s`. A reap error is logged and the tick
+carries on; it never blocks or fails dispatch. Configure it with `tmp_hygiene:` under
+`defaults:` (`defaults.yaml` in a `jobs.d/` layout):
+
+```yaml
+tmp_hygiene:
+  enabled: true    # false turns the tick reap off
+  max_age_s: 3600  # default: 1 hour
+  tmp_dir: /tmp    # default
+```
+
+No block means the reap runs with these defaults; only `enabled: false` turns it off.
+A per-job `tmp_hygiene:` still validates but is ignored, because the reap runs once per
+tick, not once per job. `herdr-routines tmp-hygiene [--dry-run]` runs the same reap by
+hand. On agent start failure, `df -h /tmp` is logged to the report tail and the
+`RunOutcome.diagnosis` field distinguishes `tmp_full` from quota `blocked`.
+
+The tick reap does not replace the `herdr-routines-tmp-sweep` timer described above.
+Keep both wherever you run that timer. The timer deletes opencode's
+`/tmp/.<16 hex>-<8 hex>.so` libraries, the files that filled the Pi on 2026-10-20, and
+the tick reap's `.3cdc*` glob does not match that name shape. The timer also keeps
+running when the tick timer is stopped or wedged.
 
 **Note on state-dir retention (issue 021):** nothing is collected unless you ask.
 `history.jsonl` rotation is opt-in via the `retention:` block (a rename at the end of

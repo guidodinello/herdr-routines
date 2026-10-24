@@ -311,7 +311,7 @@ DEFAULT_TRUSTED_REVIEW_AUTHORS: tuple[str, ...] = ("copilot-pull-request-reviewe
 
 
 @dataclass(frozen=True, slots=True)
-class TmphgieneConfig:
+class TmpHygieneConfig:
     """Configuration for /tmp age-based cleanup (issue 027)."""
 
     enabled: bool = True
@@ -473,8 +473,10 @@ class Job:
     # RuntimeMaxSec and the reconcile-staleness bound in tick._process_pipeline_job.
     # Required for kind: pipeline; unused for kind: routine (job.timeout_ms applies instead).
     deadline_ms: int | None = None
-    # Optional /tmp hygiene config (issue 027). None = use global defaults.
-    tmp_hygiene: TmphgieneConfig | None = None
+    # The `tmp_hygiene:` block as merged under this job (issue 027), kept for validation
+    # only. The tick's reap reads `RoutinesConfig.tmp_hygiene`; a per-job value is
+    # ignored because the reap runs once per tick, not per job.
+    tmp_hygiene: TmpHygieneConfig | None = None
     # Per-job retry for transient failures (issue 008): total extra attempts after
     # the first failure. 0 = no retries (default). NOT inheritable via defaults.yaml.
     retry_attempts: int = 0
@@ -555,6 +557,10 @@ class RoutinesConfig:
     # auto-fix, pipeline stage 7). A configured list replaces the default; the
     # authenticated `gh` user is always trusted on top of it.
     trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS
+    # /tmp reap run once at the start of every tick (issue 027), read from the
+    # `defaults:` block (`defaults.yaml` in a jobs.d/ layout). Absent = reap with the
+    # built-in defaults; `enabled: false` turns it off.
+    tmp_hygiene: TmpHygieneConfig = field(default_factory=TmpHygieneConfig)
 
     def job(self, name: str) -> Job | None:
         for j in self.jobs:
@@ -662,6 +668,13 @@ def _load_config_file(path: Path) -> RoutinesConfig:
             f"unknown key(s) under 'defaults': {sorted(unknown_defaults)}"
         )
 
+    raw_tmp_hygiene = raw_defaults.get("tmp_hygiene")
+    tmp_hygiene = (
+        _build_tmp_hygiene(raw_tmp_hygiene, "defaults")
+        if raw_tmp_hygiene is not None
+        else TmpHygieneConfig()
+    )
+
     raw_jobs = raw.get("jobs") or []
     if not isinstance(raw_jobs, list):
         raise ConfigError("'jobs' must be a list")
@@ -696,6 +709,7 @@ def _load_config_file(path: Path) -> RoutinesConfig:
         retention=retention,
         telegram_spawn=telegram_spawn,
         trusted_review_authors=trusted_review_authors,
+        tmp_hygiene=tmp_hygiene,
     )
 
 
@@ -729,6 +743,12 @@ def load_config_dir(path: Path) -> RoutinesConfig:
     if defaults_path.exists():
         raw_defaults = _load_yaml_or_error(defaults_path, kind="defaults")
         _validate_defaults_keys(raw_defaults, defaults_path)
+    raw_tmp_hygiene = raw_defaults.get("tmp_hygiene")
+    tmp_hygiene = (
+        _build_tmp_hygiene(raw_tmp_hygiene, str(defaults_path))
+        if raw_tmp_hygiene is not None
+        else TmpHygieneConfig()
+    )
 
     # --- load retention.yaml (optional, issue 021) -------------------------------
     retention_path = path / _RETENTION_FILENAME
@@ -824,6 +844,7 @@ def load_config_dir(path: Path) -> RoutinesConfig:
         retention=retention,
         telegram_spawn=telegram_spawn,
         trusted_review_authors=trusted_review_authors,
+        tmp_hygiene=tmp_hygiene,
     )
 
 
@@ -895,6 +916,31 @@ def _build_retention(raw: Mapping[str, object], label: str) -> Retention:
         history_max_age_days=_optional_positive_int("history_max_age_days"),
         reports_max_age_days=reports_max_age_days,
     )
+
+
+def _build_tmp_hygiene(raw: object, label: str) -> TmpHygieneConfig:
+    """Build a :class:`TmpHygieneConfig` from a parsed ``tmp_hygiene:`` mapping (issue
+    027). Omitted keys take the built-in defaults, so ``tmp_hygiene: {}`` reaps exactly as
+    an absent block does."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{label}: 'tmp_hygiene' must be a mapping or null")
+    unknown = set(raw) - {"enabled", "max_age_s", "tmp_dir"}
+    if unknown:
+        raise ConfigError(
+            f"{label}: 'tmp_hygiene' has unknown key(s): {sorted(unknown)}"
+        )
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{label}: 'tmp_hygiene.enabled' must be a boolean")
+    max_age_s = raw.get("max_age_s", DEFAULT_MAX_AGE_S)
+    if not isinstance(max_age_s, int) or isinstance(max_age_s, bool) or max_age_s <= 0:
+        raise ConfigError(
+            f"{label}: 'tmp_hygiene.max_age_s' must be a positive integer"
+        )
+    tmp_dir = raw.get("tmp_dir", DEFAULT_TMP_DIR)
+    if not isinstance(tmp_dir, str) or not tmp_dir:
+        raise ConfigError(f"{label}: 'tmp_hygiene.tmp_dir' must be a non-empty string")
+    return TmpHygieneConfig(enabled=enabled, max_age_s=max_age_s, tmp_dir=tmp_dir)
 
 
 def _build_trusted_review_authors(raw: object, label: str) -> tuple[str, ...]:
@@ -1589,36 +1635,15 @@ def _build_job(
         )
 
     # -- tmp_hygiene (issue 027) ---------------------------------------------------
+    # Validated per job so a bad value fails the job's own file, but only the
+    # defaults-level value is read (`RoutinesConfig.tmp_hygiene`): the reap runs once
+    # per tick, not once per job.
     tmp_hygiene_raw = merged.get("tmp_hygiene")
-    tmp_hygiene: TmphgieneConfig | None = None
-    if tmp_hygiene_raw is not None:
-        if not isinstance(tmp_hygiene_raw, dict):
-            raise ConfigError(f"{label}: 'tmp_hygiene' must be a mapping or null")
-        unknown_th = set(tmp_hygiene_raw) - {"enabled", "max_age_s", "tmp_dir"}
-        if unknown_th:
-            raise ConfigError(
-                f"{label}: 'tmp_hygiene' has unknown key(s): {sorted(unknown_th)}"
-            )
-        th_enabled = tmp_hygiene_raw.get("enabled", True)
-        if not isinstance(th_enabled, bool):
-            raise ConfigError(f"{label}: 'tmp_hygiene.enabled' must be a boolean")
-        th_max_age_s = tmp_hygiene_raw.get("max_age_s", DEFAULT_MAX_AGE_S)
-        if (
-            not isinstance(th_max_age_s, int)
-            or isinstance(th_max_age_s, bool)
-            or th_max_age_s <= 0
-        ):
-            raise ConfigError(
-                f"{label}: 'tmp_hygiene.max_age_s' must be a positive integer"
-            )
-        th_tmp_dir = tmp_hygiene_raw.get("tmp_dir", DEFAULT_TMP_DIR)
-        if not isinstance(th_tmp_dir, str) or not th_tmp_dir:
-            raise ConfigError(
-                f"{label}: 'tmp_hygiene.tmp_dir' must be a non-empty string"
-            )
-        tmp_hygiene = TmphgieneConfig(
-            enabled=th_enabled, max_age_s=th_max_age_s, tmp_dir=th_tmp_dir
-        )
+    tmp_hygiene = (
+        _build_tmp_hygiene(tmp_hygiene_raw, label)
+        if tmp_hygiene_raw is not None
+        else None
+    )
 
     # -- retry_attempts / retry_on (issue 008) ----------------------------------
     #
