@@ -2,16 +2,24 @@
 Description=Fast-forward the herdr-routines runner checkout once a night
 
 [Timer]
-# 21:30 UTC, pinned explicitly: an OnCalendar with no timezone suffix is read in the
+# 21:32:30 UTC, pinned explicitly: an OnCalendar with no timezone suffix is read in the
 # *system* zone, which is America/Montevideo on the Pi, so an unsuffixed value would
-# fire at 00:30 UTC. After the day's tick work and well before the night's feature
+# fire at 00:32 UTC. After the day's tick work and well before the night's feature
 # pipeline (02:00 local) takes the checkout's working tree for its own run: the job's
-# fast-forward (ensure_repo) and this one then agree, and a deferred update costs
-# nothing but a night.
-OnCalendar=*-*-* 21:30:00 UTC
-# A host that was asleep at 21:30 runs it on wake instead of skipping the night.
+# fast-forward (ensure_repo) and this one then agree.
+#
+# The :32:30 is deliberate: herdr-routines.timer ticks on *:0/5, and at 21:30:00 both
+# units started in the same second, so the update found the tick lock held and
+# deferred three nights running (2026-10-21..23). Half-way between two ticks is the
+# furthest point from either; self-update also retries a held lock for
+# TICK_LOCK_WAIT_S before it gives up.
+OnCalendar=*-*-* 21:32:30 UTC
+# A host that was asleep at 21:32 runs it on wake instead of skipping the night.
 Persistent=true
-AccuracySec=5min
+# Tight on purpose: systemd may fire anywhere in [OnCalendar, +AccuracySec] to
+# coalesce wakeups, and the 5min this used to be could slide the run straight back
+# onto the 21:35 tick. 30s matches herdr-routines.timer's own accuracy.
+AccuracySec=30s
 
 [Install]
 WantedBy=timers.target
