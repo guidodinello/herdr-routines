@@ -84,6 +84,17 @@ Pipeline work; no real-run evidence required.
   job acts on (`selector: oldest_unreviewed_pr`) and records the run `skipped` when
   there is nothing, instead of the agent choosing in prose and phase A's gate failing
   idle runs. → [`073`](docs/process/issues/073-routine-target-selectors.md)
+- **Manual `run` takes the scheduled path** — `herdr-routines run` skips
+  `fallback_model`, retry, history and notification, and dispatches `gated`/`review`
+  jobs as plain prompts. One shared dispatch function for the tick and `run`.
+  → [`074`](docs/process/issues/074-manual-run-parity.md)
+- **Triggers as job config** — phase C of 071: `trigger:` with cron, polled events and
+  on-request runs (Telegram `/job <name>`), each run recording what fired it.
+  → [`075`](docs/process/issues/075-triggers-as-job-config.md)
+- **`kind: review` as a routine with a selector** — the last review-only dispatch
+  (cross-repo search, several targets per run, per-repo checkouts) becomes a
+  multi-target selector plus routine fan-out.
+  → [`076`](docs/process/issues/076-review-kind-as-routine-with-selector.md)
 
 Earlier items, kept as issue files for history: plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
