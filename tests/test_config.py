@@ -1849,3 +1849,82 @@ def test_require_accessor_raises_naming_job_and_field(
         call(job)
     assert not issubclass(JobInvariantError, ConfigError)
     assert issubclass(JobInvariantError, RuntimeError)
+
+
+# -- verify (issue 071) ------------------------------------------------------------------
+
+_VERIFY_JOB = "name: a\ncron: '0 3 * * *'\nrepo: /repo/a\n"
+_VERIFY_REVIEW_JOB = "name: r\ncron: '0 3 * * *'\nkind: review\nselect: [author]\n"
+
+
+def test_verify_unknown_gate_rejected_and_inherits_from_defaults(
+    tmp_path: Path,
+) -> None:
+    jobs_dir = _make_jobs_d(
+        tmp_path,
+        {
+            "defaults.yaml": "verify: [report_wellformed]\n",
+            "a.yaml": _VERIFY_JOB,
+            "b.yaml": _VERIFY_JOB.replace("name: a", "name: b") + "verify: []\n",
+            "c.yaml": _VERIFY_JOB.replace("name: a", "name: c")
+            + "verify: [review_posted]\n",
+        },
+    )
+    jobs = {j.name: j for j in load_config(jobs_dir).jobs}
+    assert jobs["a"].verify == ("report_wellformed",)  # inherited
+    assert jobs["b"].verify == ()  # an explicit [] opts out
+    assert jobs["c"].verify == ("review_posted",)  # a job value replaces the default
+
+    # The directory loader reports a bad job file in `errors` instead of raising.
+    for bad in (
+        "verify: [nope]\n",
+        "verify: review_posted\n",
+        "verify: [review_posted, review_posted]\n",
+    ):
+        bad_dir = tmp_path / "bad"
+        bad_dir.mkdir(exist_ok=True)
+        (bad_dir / "a.yaml").write_text(_VERIFY_JOB + bad)
+        cfg = load_config_dir(bad_dir)
+        assert cfg.jobs == ()
+        assert any("verify" in err for err in cfg.errors), bad
+        (bad_dir / "a.yaml").unlink()
+
+
+def test_verify_on_a_kind_that_never_runs_gates(tmp_path: Path) -> None:
+    """An explicit `verify` on kind: review is an error; an inherited one is kept aside
+    (not silently dropped) so `validate` can name it."""
+    inherited = _make_jobs_d(
+        tmp_path / "i",
+        {
+            "defaults.yaml": "verify: [report_wellformed]\n",
+            "r.yaml": _VERIFY_REVIEW_JOB,
+        },
+    )
+    (job,) = load_config(inherited).jobs
+    assert job.verify == ()
+    assert job.ignored_verify == ("report_wellformed",)
+
+    explicit = _make_jobs_d(
+        tmp_path / "e", {"r.yaml": _VERIFY_REVIEW_JOB + "verify: [review_posted]\n"}
+    )
+    cfg = load_config_dir(explicit)
+    assert cfg.jobs == ()
+    assert any("only supported on kind: routine" in err for err in cfg.errors)
+
+
+def test_deploy_fitted_pr_review_example_declares_its_verify_gates(
+    tmp_path: Path,
+) -> None:
+    example = (
+        Path(__file__).resolve().parent.parent
+        / "deploy"
+        / "jobs.d"
+        / "fitted-pr-review.yaml"
+    )
+    (tmp_path / "fitted-pr-review.yaml").write_text(example.read_text())
+    cfg = load_config_dir(tmp_path)
+    assert cfg.errors == ()
+    job = cfg.job("fitted-pr-review")
+    assert job is not None
+    assert job.verify == ("review_posted", "report_wellformed")
+    assert job.prompt is not None and "Target: <owner>/<repo>#<number>" in job.prompt

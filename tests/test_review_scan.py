@@ -217,7 +217,11 @@ class ReviewGh:
             return list(self.raw_bodies[key])
         # The review worker posts with the owner's gh account, i.e. `user`.
         marker = review_marker("review-my-prs", key)
-        return [PostedBody(author=self.user, body=marker)] if key in self.posted else []
+        if key not in self.posted:
+            return []
+        # Posted by the agent during the run, so stamped now (the post-run gate, issue 071,
+        # only counts a review posted since the dispatch started).
+        return [PostedBody(author=self.user, body=marker, created_at=datetime.now(UTC))]
 
     def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
         self.repo_info_calls.append((owner, repo))
@@ -1138,6 +1142,46 @@ def test_review_verification_is_fail_closed(
     assert failed3 is True
     rec3 = _terminal(history, job.name)
     assert rec3.state == "failed"
+
+
+def test_kind_review_uses_review_posted_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 071: the post-condition is the shared `review_posted` gate, not a second
+    implementation. A stub verdict decides the disposition even though the fake agent
+    "posted", and the gate sees this candidate's target and per-target marker."""
+    from herdr_routines import verify
+    from herdr_routines.gates import GateVerdict
+
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    base = tmp_path / "repos"
+    origin, _checkout = _setup_repo(tmp_path, "acme", "widgets", "feature-x", base)
+    job = _review_job(tmp_path, repo=base)
+    info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
+    gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
+    client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
+    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    seen: list[verify.VerifyContext] = []
+
+    def stub_gate(ctx: verify.VerifyContext) -> GateVerdict:
+        seen.append(ctx)
+        return GateVerdict(passed=False, reason="review_not_posted")
+
+    monkeypatch.setattr(verify, "review_posted", stub_gate)
+    history = tmp_path / "state" / "history.jsonl"
+    _, failed = _run_cycle(job, history, gh, client, run_id="r1")
+
+    assert failed is True
+    assert len(seen) == 1
+    assert seen[0].target == verify.VerifyTarget("acme", "widgets", 1)
+    assert seen[0].marker == review_marker(job.name, "acme/widgets#1")
+    target_rec = [
+        r for r in read_job(history, job.name) if r.extra and r.extra.get("target_key")
+    ][-1]
+    assert target_rec.state == "failed"
+    assert target_rec.extra is not None
+    assert target_rec.extra["reason"] == "review_not_posted"
+    assert "verify" not in target_rec.extra
 
 
 # ---------------------------------------------------------------------------

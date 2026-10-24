@@ -1006,7 +1006,7 @@ def test_cmd_run_holds_the_tick_lock_while_the_job_runs(
     lock_path = _prepare_run_cli(tmp_path, monkeypatch)
     lock_free_during_run: list[bool] = []
 
-    def fake_execute_run(job, client, *, run_id):
+    def fake_execute_run(job, client, *, run_id, **_):
         with cli.tick_lock(lock_path) as acquired:
             lock_free_during_run.append(acquired)
         return RunOutcome(state="done", run_id=run_id)
@@ -1436,3 +1436,56 @@ def test_review_scan_truncated_modes_note(
     assert isinstance(data, list) and len(data) == 1
     assert "truncat" in captured.err.lower(), "the JSON path mirrors the note on stderr"
     assert "author" in captured.err
+
+
+def _validate_jobs_d(
+    tmp_path: Path, files: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> str:
+    tmp_path.mkdir(exist_ok=True)
+    jobs_dir = _make_jobs_d(tmp_path, files)
+    _cmd_validate(
+        argparse.Namespace(config=jobs_dir, systemd_unit=tmp_path / "x.service")
+    )
+    return capsys.readouterr().err
+
+
+def test_validate_warns_code_review_without_review_posted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    job = (
+        f"cron: '0 3 * * *'\nrepo: {repo}\n"
+        "prompt: run /code-review on the PR and write $ROUTINE_REPORT\n"
+    )
+    err = _validate_jobs_d(tmp_path / "w", {"a.yaml": "name: a\n" + job}, capsys)
+    assert "a: prompt runs /code-review but verify lacks review_posted" in err
+
+    err = _validate_jobs_d(
+        tmp_path / "ok",
+        {"a.yaml": "name: a\nverify: [review_posted]\n" + job},
+        capsys,
+    )
+    assert "review_posted" not in err
+
+
+def test_validate_warns_inherited_verify_on_non_routine_kind(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    err = _validate_jobs_d(
+        tmp_path,
+        {
+            "defaults.yaml": "verify: [report_wellformed]\n",
+            "r.yaml": "name: r\ncron: '0 3 * * *'\nkind: review\nselect: [author]\n",
+            "a.yaml": f"name: a\ncron: '0 3 * * *'\nrepo: {repo}\n"
+            "prompt: write $ROUTINE_REPORT\n",
+        },
+        capsys,
+    )
+    assert (
+        "r: inherits verify from defaults but kind review does not honor it yet "
+        "(issue 071 phase A)"
+    ) in err
+    assert "a: inherits verify" not in err
