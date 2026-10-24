@@ -48,7 +48,12 @@ from herdr_routines.history import (
     last_terminal_run,
     read_job,
 )
-from herdr_routines.issue_refinement import run_refine_issue
+from herdr_routines.issue_refinement import (
+    job_is_opencode_only,
+    run_check_issue,
+    run_loop_check,
+    run_refine_issue,
+)
 from herdr_routines.pick_feature import ReclaimedPick, run_pick_feature
 from herdr_routines.pipeline_prepare import (
     DEFAULT_ISSUES_DIR,
@@ -535,6 +540,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="also consider bullets that name an unmet gate (the job must then "
         "derive the missing decision itself)",
     )
+    # The job's later steps, enforced in code rather than prompt prose (issues
+    # 034/035 precedent): read the verdict off the exit code like `gate`.
+    refine_mode = p_refine.add_mutually_exclusive_group()
+    refine_mode.add_argument(
+        "--check-issue",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="instead of selecting: check a refined issue file's frontmatter "
+        "(id/title/status/priority/area, status: open); exit 1 lists the problems",
+    )
+    refine_mode.add_argument(
+        "--review-pass",
+        type=int,
+        default=None,
+        metavar="N",
+        help="instead of selecting: after reviewer pass N, decide whether the loop "
+        "runs another pass (exit 0) or stops (exit 1: consensus or the 3-pass cap); "
+        "requires --reviewer-reply",
+    )
+    p_refine.add_argument(
+        "--reviewer-reply",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="the reviewer's raw reply for --review-pass; its 'confidence:' line "
+        "is parsed here, not reported by the author",
+    )
     p_refine.set_defaults(handler=_cmd_refine_issue)
 
     p_review_scan = sub.add_parser(
@@ -908,6 +941,29 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                     f"{job.name}: prompt never mentions $ROUTINE_REPORT — the run will always "
                     f"fail with no_report; tell the agent to write its summary there"
                 )
+
+    # Issue 029: the issue-refinement job is opencode only, no Claude. Keyed on the
+    # prompt running the refinement selector rather than on the job name, so a
+    # renamed or copied refinement job is still covered. Soft, like the checks above.
+    for job in config.jobs:
+        if (
+            job.enabled
+            and job.prompt is not None
+            and "herdr-routines refine-issue" in job.prompt
+            and not job_is_opencode_only(
+                {
+                    "agent_kind": job.agent_kind,
+                    "model": job.model,
+                    "fallback_model": job.fallback_model,
+                }
+            )
+        ):
+            warnings.append(
+                f"{job.name}: runs `herdr-routines refine-issue` but is not opencode-only "
+                f"(agent_kind={job.agent_kind}, model={job.model}, "
+                f"fallback_model={job.fallback_model}) — issue 029 keeps the "
+                f"issue-refinement job off Claude"
+            )
 
     # Soft, exit-code-unchanged, same posture as the $ROUTINE_REPORT checks above: a
     # threshold this small is almost certainly a typo or a test, but rotation is
@@ -1494,6 +1550,19 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_refine_issue(args: argparse.Namespace) -> int:
+    if args.check_issue is not None:
+        return run_check_issue(args.check_issue)
+    if args.review_pass is not None:
+        if args.reviewer_reply is None:
+            print(
+                "refine-issue: --review-pass requires --reviewer-reply",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        return run_loop_check(args.review_pass, args.reviewer_reply)
+    if args.reviewer_reply is not None:
+        print("refine-issue: --reviewer-reply requires --review-pass", file=sys.stderr)
+        return EXIT_USAGE
     # Pure filesystem + one `gh pr list` — no HerdrClient, same posture as
     # pick-feature: this runs as the job's first step, before any reviewer session.
     return run_refine_issue(

@@ -8,12 +8,14 @@ the job file through the real config validator, and pipeline independence.
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
 import pytest
 import yaml
 
+from herdr_routines import cli
 from herdr_routines.config import ConfigError, _build_job
 from herdr_routines.issue_refinement import (
     ISSUE_REFINEMENT_CRON,
@@ -23,6 +25,7 @@ from herdr_routines.issue_refinement import (
     job_is_opencode_only,
     loop_should_continue,
     parse_parking_lot_bullets,
+    parse_reviewer_confidence,
     refinement_open_pr_slugs,
     run_refine_issue,
     select_next_bullet,
@@ -132,6 +135,17 @@ def test_issue_refinement_job_is_opencode_only() -> None:
     assert job_is_opencode_only({"agent_kind": "claude", "model": None}) is False
     assert (
         job_is_opencode_only({"agent_kind": "opencode", "model": "anthropic/claude"})
+        is False
+    )
+    # A Claude quota fallback is Claude too — the model a fallback run actually uses.
+    assert (
+        job_is_opencode_only(
+            {
+                "agent_kind": "opencode",
+                "model": "opencode/big-pickle",
+                "fallback_model": "anthropic/claude-sonnet",
+            }
+        )
         is False
     )
     with pytest.raises(ConfigError):
@@ -271,3 +285,222 @@ def test_is_covered_matches_slug_and_issue_title() -> None:
     assert is_covered(bullet, [], frozenset({bullet.slug})) is True
     assert is_covered(bullet, ["Unify routines + pipeline"], frozenset()) is True
     assert is_covered(bullet, ["Something unrelated"], frozenset()) is False
+
+
+# --- The code-enforced loop steps, through the real argparse -> handler path ---
+
+JOB_PATH = Path(__file__).parent.parent / "deploy" / "jobs.d" / "issue-refinement.yaml"
+
+GOOD_ISSUE = """---
+id: "999"
+title: Foo
+status: open
+priority: medium
+area: cli
+---
+
+## Description
+"""
+
+
+def _run_refine_cli(argv: list[str]) -> int:
+    """Parse with the real CLI parser and call the handler it selects — the same
+    path `uv run herdr-routines refine-issue ...` takes, minus `main`'s logging."""
+    args = cli._build_parser().parse_args(["refine-issue", *argv])
+    assert args.handler is cli._cmd_refine_issue
+    return int(args.handler(args))
+
+
+def _reply(tmp_path: Path, text: str) -> Path:
+    path = tmp_path / "review.txt"
+    path.write_text(text)
+    return path
+
+
+def test_parse_reviewer_confidence_reads_the_raw_reply() -> None:
+    assert parse_reviewer_confidence("confidence: high\nno gaps") == "high"
+    assert parse_reviewer_confidence("Preamble.\nConfidence: MEDIUM — x") == "medium"
+    assert parse_reviewer_confidence("looks fine to me") is None
+
+
+@pytest.mark.parametrize(
+    ("reply", "review_pass", "rc", "stderr_has"),
+    [
+        # Consensus on any pass stops the loop.
+        ("confidence: high\n", 1, 1, "consensus reached"),
+        # Not consensus, under the cap → run another pass.
+        ("confidence: medium\n- gap", 1, 0, "continue"),
+        ("confidence: low\n- gap", 2, 0, "continue"),
+        # A reply with no confidence line is not consensus — it burns a pass.
+        ("I think it's fine", 1, 0, "not stated"),
+        # Third pass without consensus → capped, whatever the author thinks.
+        ("confidence: medium\n- gap", 3, 1, "capped at 3"),
+        ("confidence: medium\n- gap", 4, 1, "capped at 3"),
+    ],
+)
+def test_refine_issue_review_pass_cli_enforces_cap_and_consensus(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    reply: str,
+    review_pass: int,
+    rc: int,
+    stderr_has: str,
+) -> None:
+    reply_path = _reply(tmp_path, reply)
+    argv = ["--review-pass", str(review_pass), "--reviewer-reply", str(reply_path)]
+    assert _run_refine_cli(argv) == rc
+    assert stderr_has in capsys.readouterr().err
+
+
+def test_refine_issue_review_pass_cli_usage_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Usage errors are 2 (nothing was checked), never 0 — the job must not read a
+    # bad call as "run another pass" or as "stop".
+    assert _run_refine_cli(["--review-pass", "1"]) == 2
+    assert "--reviewer-reply" in capsys.readouterr().err
+    assert _run_refine_cli(["--reviewer-reply", str(tmp_path / "r.txt")]) == 2
+    missing = tmp_path / "missing.txt"
+    assert (
+        _run_refine_cli(["--review-pass", "1", "--reviewer-reply", str(missing)]) == 2
+    )
+    reply_path = _reply(tmp_path, "confidence: medium")
+    assert (
+        _run_refine_cli(["--review-pass", "0", "--reviewer-reply", str(reply_path)])
+        == 2
+    )
+    # The two modes are mutually exclusive at the parser.
+    with pytest.raises(SystemExit):
+        cli._build_parser().parse_args(
+            ["refine-issue", "--check-issue", "x.md", "--review-pass", "1"]
+        )
+
+
+def test_refine_issue_check_issue_cli_accepts_a_valid_issue(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    issue = tmp_path / "999-foo.md"
+    issue.write_text(GOOD_ISSUE)
+    assert _run_refine_cli(["--check-issue", str(issue)]) == 0
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "stderr_has"),
+    [
+        (GOOD_ISSUE.replace("status: open", "status: done"), ["status must be 'open'"]),
+        (
+            GOOD_ISSUE.replace("priority: medium\n", "").replace("area: cli\n", ""),
+            ["missing or empty frontmatter key: priority", "area"],
+        ),
+        (GOOD_ISSUE.replace("status: open", "status:"), ["key: status"]),
+        ("# no frontmatter\n", ["no frontmatter"]),
+        ("---\nid: 1\n", ["never closed"]),
+        ("---\n- a\n- b\n---\n", ["not a YAML mapping"]),
+        ("---\nid: [unclosed\n---\n", ["not valid YAML"]),
+    ],
+)
+def test_refine_issue_check_issue_cli_lists_problems(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    text: str,
+    stderr_has: list[str],
+) -> None:
+    issue = tmp_path / "999-foo.md"
+    issue.write_text(text)
+    assert _run_refine_cli(["--check-issue", str(issue)]) == 1
+    err = capsys.readouterr().err
+    for needle in stderr_has:
+        assert needle in err
+
+
+def test_refine_issue_check_issue_cli_unreadable_file_is_usage(tmp_path: Path) -> None:
+    assert _run_refine_cli(["--check-issue", str(tmp_path / "nope.md")]) == 2
+
+
+def test_refine_issue_bare_still_selects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The new flags must not change the bare stage-0 call the prompt makes first."""
+    repo = tmp_path / "repo"
+    (repo / "docs" / "process" / "issues").mkdir(parents=True)
+    (repo / "ROADMAP.md").write_text(ROADMAP)
+    monkeypatch.setattr(
+        "herdr_routines.issue_refinement.refinement_open_pr_slugs",
+        lambda *_a: frozenset(),
+    )
+    assert _run_refine_cli(["--repo", str(repo)]) == 0
+    assert f"{PR_MARKER_PREFIX} unify-routines-pipeline" in capsys.readouterr().out
+
+
+def test_issue_refinement_prompt_runs_the_code_enforced_steps() -> None:
+    """The job prompt is the only caller of the two checks on the hosts: it must invoke
+    both, via `uv run`, with flags the real parser accepts."""
+    prompt = yaml.safe_load(JOB_PATH.read_text())["prompt"]
+    review_call = (
+        "uv run herdr-routines refine-issue --review-pass N "
+        "--reviewer-reply $ROUTINE_REPORT.review-N.txt"
+    )
+    check_call = (
+        "uv run herdr-routines refine-issue --check-issue "
+        "docs/process/issues/NNN-<slug>.md"
+    )
+    assert review_call in prompt
+    assert check_call in prompt
+    # The frontmatter check comes before the PR is opened.
+    assert prompt.index(check_call) < prompt.index("gh pr create")
+    # Both calls parse with the real CLI parser (placeholders filled in).
+    parser = cli._build_parser()
+    for call in (review_call, check_call):
+        argv = (
+            call.removeprefix("uv run herdr-routines ")
+            .replace("N ", "1 ")
+            .replace("-N.txt", "-1.txt")
+            .split()
+        )
+        assert parser.parse_args(argv).handler is cli._cmd_refine_issue
+
+
+def _validate_ns(config_path: Path, tmp_path: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        config=config_path, systemd_unit=tmp_path / "does-not-exist.service"
+    )
+
+
+def _write_refinement_jobs(tmp_path: Path, **overrides: str) -> Path:
+    data = yaml.safe_load(JOB_PATH.read_text())
+    data["repo"] = str(tmp_path)  # a git repo, so validate raises no repo problem
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    data.update(overrides)
+    jobs_d = tmp_path / "jobs.d"
+    jobs_d.mkdir()
+    (jobs_d / "issue-refinement.yaml").write_text(yaml.safe_dump(data))
+    return jobs_d
+
+
+def test_validate_stays_silent_for_the_real_issue_refinement_job(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = _write_refinement_jobs(tmp_path)
+    assert cli._cmd_validate(_validate_ns(config, tmp_path)) == 0
+    assert "not opencode-only" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"agent_kind": "claude", "model": "sonnet"},
+        {"model": "anthropic/claude-sonnet"},
+        {"fallback_model": "anthropic/claude-haiku"},
+    ],
+)
+def test_validate_warns_when_issue_refinement_job_uses_claude(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], overrides: dict[str, str]
+) -> None:
+    config = _write_refinement_jobs(tmp_path, **overrides)
+    # A warning, not an error: exit code unchanged, same posture as the
+    # $ROUTINE_REPORT checks.
+    assert cli._cmd_validate(_validate_ns(config, tmp_path)) == 0
+    assert "issue-refinement: runs `herdr-routines refine-issue` but is not " in (
+        capsys.readouterr().err
+    )

@@ -5,8 +5,10 @@ Product refinement: promote one ROADMAP.md *Parking Lot* idea into a buildable
 to merge. The author->reviewer loop itself is prompt-driven inside the job's
 opencode session (same architecture as the pipeline orchestrator — there is no
 Python stage/spawn loop in this repo, see ROADMAP's "Unify routines + pipeline"
-bullet). This module is only the deterministic part: *which* bullet to refine and
-whether it is already covered.
+bullet). This module is the deterministic part: *which* bullet to refine and whether it
+is already covered, plus the two checks the loop must pass through code rather
+than prompt prose (the issues 034/035 precedent) — the 3-pass cap / consensus
+decision and the refined issue's frontmatter.
 
 Pure filesystem + YAML + one batched ``gh`` call — no HerdrClient, no ``herdr``
 binary — mirroring ``pick_feature.py``'s "no Herdr server required" posture so it
@@ -66,6 +68,16 @@ _PR_MARKER_RE = re.compile(
 GH_TIMEOUT_SECONDS = 30
 FRONTMATTER_DELIM = "---"
 REQUIRED_FRONTMATTER = ("id", "title", "status", "priority", "area")
+
+# The reviewer is told to reply with one 'confidence: high|medium|low' line; the
+# loop check reads it off the raw reply so consensus is not the author's call.
+_CONFIDENCE_RE = re.compile(r"\bconfidence:\s*(high|medium|low)\b", re.IGNORECASE)
+
+# Exit codes for the code-enforced loop steps — the `gate` contract: 0 pass /
+# continue, 1 fail / stop (reason on stderr), 2 usage (nothing was checked).
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_USAGE = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,22 +159,37 @@ def existing_issue_titles(issues_dir: Path) -> list[str]:
     titles: list[str] = []
     for path in sorted(issues_dir.glob("*.md")):
         try:
-            text = path.read_text()
-        except OSError:
+            fm = read_frontmatter(path.read_text())
+        except (OSError, ValueError):
             continue
-        if not text.startswith(f"{FRONTMATTER_DELIM}\n"):
-            continue
-        _, _, rest = text.partition(f"{FRONTMATTER_DELIM}\n")
-        fm_text, sep, _ = rest.partition(f"\n{FRONTMATTER_DELIM}\n")
-        if not sep:
-            continue
-        try:
-            fm = yaml.safe_load(fm_text)
-        except yaml.YAMLError:
-            continue
-        if isinstance(fm, dict) and isinstance(fm.get("title"), str):
-            titles.append(fm["title"])
+        title = fm.get("title")
+        if isinstance(title, str):
+            titles.append(title)
     return titles
+
+
+def read_frontmatter(text: str) -> dict[str, object]:
+    """The leading ``---``-delimited YAML mapping of an issue file.
+
+    Raises ``ValueError`` naming what is wrong (no block, unterminated block,
+    invalid YAML, not a mapping) — ``existing_issue_titles`` skips such a file,
+    ``refine-issue --check-issue`` reports it.
+    """
+    if not text.startswith(f"{FRONTMATTER_DELIM}\n"):
+        raise ValueError(
+            f"no frontmatter: file does not start with '{FRONTMATTER_DELIM}'"
+        )
+    _, _, rest = text.partition(f"{FRONTMATTER_DELIM}\n")
+    fm_text, sep, _ = rest.partition(f"\n{FRONTMATTER_DELIM}\n")
+    if not sep:
+        raise ValueError(f"frontmatter is never closed by a '{FRONTMATTER_DELIM}' line")
+    try:
+        fm = yaml.safe_load(fm_text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"frontmatter is not valid YAML: {exc}") from exc
+    if not isinstance(fm, dict):
+        raise ValueError("frontmatter is not a YAML mapping")  # noqa: TRY004 — malformed input; both callers handle ValueError
+    return fm
 
 
 def refinement_open_pr_slugs(repo: Path) -> frozenset[str] | None:
@@ -278,6 +305,13 @@ def select_next_bullet(
     return None
 
 
+def parse_reviewer_confidence(reply: str) -> str | None:
+    """The first ``confidence: high|medium|low`` in a reviewer reply, lowercased;
+    ``None`` when the reviewer never gave one (treated as not-consensus)."""
+    match = _CONFIDENCE_RE.search(reply)
+    return match.group(1).lower() if match else None
+
+
 def loop_should_continue(iteration: int, reviewer_confidence: str) -> bool:
     """Whether the author->reviewer loop should run another pass.
 
@@ -307,11 +341,80 @@ def validate_issue_frontmatter(frontmatter: Mapping[str, object]) -> list[str]:
 
 
 def job_is_opencode_only(job_config: Mapping[str, object]) -> bool:
-    """True when the job runs opencode with no Claude anywhere."""
+    """True when the job runs opencode with no Claude anywhere — the author model
+    *and* the quota fallback, which is the model a fallback run actually uses."""
     if job_config.get("agent_kind") != "opencode":
         return False
-    model = str(job_config.get("model") or "")
-    return "claude" not in model.lower()
+    models = (job_config.get("model"), job_config.get("fallback_model"))
+    return not any("claude" in str(m or "").lower() for m in models)
+
+
+def run_check_issue(path: Path) -> int:
+    """Entry point behind ``refine-issue --check-issue``: the job's last step
+    before opening its PR (issue 029's frontmatter rule, in code rather than
+    prompt prose — the issues 034/035 precedent).
+
+    Exits 0 when the refined issue's frontmatter is valid, 1 with every problem
+    on stderr when it is not, 2 when the file cannot be read.
+    """
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        print(f"check-issue: cannot read {path}: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        problems = validate_issue_frontmatter(read_frontmatter(text))
+    except ValueError as exc:
+        problems = [str(exc)]
+    if not problems:
+        return EXIT_OK
+    print(f"check-issue failed: {path}", file=sys.stderr)
+    for problem in problems:
+        if problem in REQUIRED_FRONTMATTER:
+            problem = f"missing or empty frontmatter key: {problem}"
+        print(f"  - {problem}", file=sys.stderr)
+    return EXIT_FAILURE
+
+
+def run_loop_check(iteration: int, reply_path: Path) -> int:
+    """Entry point behind ``refine-issue --review-pass N --reviewer-reply FILE``:
+    after reviewer pass ``N`` (1-indexed), decide whether the author->reviewer
+    loop runs another pass.
+
+    The confidence is parsed from the reviewer's raw reply here, not reported by
+    the author, so neither consensus nor the ``MAX_ITERATIONS`` cap is the
+    author model's judgment. Exits 0 = run another pass, 1 = stop (stderr says
+    ``consensus reached`` or ``capped at N``), 2 = usage error.
+    """
+    if iteration < 1:
+        print(
+            f"loop-check: --review-pass must be >= 1, got {iteration}", file=sys.stderr
+        )
+        return EXIT_USAGE
+    try:
+        reply = reply_path.read_text()
+    except OSError as exc:
+        print(f"loop-check: cannot read {reply_path}: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    confidence = parse_reviewer_confidence(reply)
+    if loop_should_continue(iteration, confidence or ""):
+        print(
+            f"loop-check: continue — pass {iteration}/{MAX_ITERATIONS}, reviewer "
+            f"confidence: {confidence or 'not stated'}",
+            file=sys.stderr,
+        )
+        return EXIT_OK
+    if confidence == "high":
+        print(
+            f"loop-check: stop — consensus reached on pass {iteration}", file=sys.stderr
+        )
+    else:
+        print(
+            f"loop-check: stop — capped at {MAX_ITERATIONS} without consensus "
+            f"(last reviewer confidence: {confidence or 'not stated'})",
+            file=sys.stderr,
+        )
+    return EXIT_FAILURE
 
 
 def run_refine_issue(
