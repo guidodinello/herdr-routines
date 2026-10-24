@@ -35,7 +35,14 @@ ACCESSORS: dict[tuple[str, str], str] = {
 
 # Fields with no production read on purpose. Every entry needs a reason; a field read
 # nowhere for no reason is the bug this test exists to catch, so wire it or delete it.
-NOT_READ: dict[tuple[str, str], str] = {}
+NOT_READ: dict[tuple[str, str], str] = {
+    # Kept for validation of the merged `defaults:` block only; the tick's reap reads
+    # RoutinesConfig.tmp_hygiene (issue 027). Listed even though the shared name passes.
+    (
+        "Job",
+        "tmp_hygiene",
+    ): "validation only; the reap reads RoutinesConfig.tmp_hygiene",
+}
 
 
 def _is_package_path(node: ast.expr) -> bool:
