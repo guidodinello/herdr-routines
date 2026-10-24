@@ -829,7 +829,7 @@ def test_execute_run_reaps_previous_run_workspace_before_starting(
     assert client.calls.index("pane_close") < client.calls.index("worktree_create")
 
 
-def test_execute_run_leaves_other_panes_alone_when_no_stale_workspace(
+def test_execute_run_leaves_other_panes_alone_when_no_stale_pane(
     tmp_path: Path, _isolated_reports_dir: Path
 ) -> None:
     """No previous stale pane to reap pre-run, but the run still closes its own pane on
@@ -842,7 +842,7 @@ def test_execute_run_leaves_other_panes_alone_when_no_stale_workspace(
     assert client.closed_panes == ["w1:p1"]
 
 
-def test_execute_run_survives_stale_workspace_reap_errors(
+def test_execute_run_survives_stale_pane_reap_errors(
     tmp_path: Path, _isolated_reports_dir: Path
 ) -> None:
     """Failing to reap (e.g. server blip) must not abort the run — the worst case is the old
