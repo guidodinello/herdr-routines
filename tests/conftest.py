@@ -52,6 +52,17 @@ def _hermetic_tmp_diagnosis(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_state_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point the default state dir (history, reports) at the test's tmp dir.
+
+    Since issue 074 `herdr-routines run` writes history like a tick does, so a test that
+    drives `cli.main(["run", ...])` without pinning the state dir would append to the
+    developer's real `~/.local/state/herdr-routines/history.jsonl`. Tests that need a
+    specific location still set the variable themselves."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hide the host's global and system git config from every test.
 

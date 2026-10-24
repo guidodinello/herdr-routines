@@ -1,7 +1,7 @@
 ---
 id: "074"
 title: "Manual `herdr-routines run` takes the scheduled path: fallback, retry, history, and per-kind dispatch"
-status: open
+status: done
 priority: high
 area: scheduler
 ---

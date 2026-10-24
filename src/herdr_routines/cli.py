@@ -22,7 +22,7 @@ from pathlib import Path
 from logger import get_logger, init_logging
 
 import herdr_routines
-from herdr_routines import gc, reports_prune
+from herdr_routines import gc, reports_prune, tick
 from herdr_routines.auto_fix import RealGhClient, effective_trusted_authors
 from herdr_routines.config import (
     DEFAULT_REPORTS_MAX_AGE_DAYS,
@@ -43,8 +43,11 @@ from herdr_routines.gates import (
 from herdr_routines.gc import run_gc, run_gc_delete
 from herdr_routines.herdr import HerdrClient, HerdrCliError
 from herdr_routines.history import (
+    TRIGGER_MANUAL,
+    HistoryExtra,
     default_history_path,
     first_seen_at,
+    last_scheduled_terminal_run,
     last_terminal_run,
     read_job,
 )
@@ -86,18 +89,12 @@ from herdr_routines.runner import (
     DEFAULT_FAILURE_MARKERS,
     build_dry_run_argv,
     default_reports_dir,
-    execute_run,
     make_run_id,
 )
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.scheduled import build_scheduled_rows, render_scheduled
 from herdr_routines.self_update import default_state_path, run_self_update
 from herdr_routines.table import render_table
-from herdr_routines.target_selectors import (
-    SelectorContext,
-    SelectorFailed,
-    select_target,
-)
 from herdr_routines.telegram_spawn import alias_table, handle_spawn_message
 from herdr_routines.tick import (
     _build_pipeline_launch_argv,
@@ -105,12 +102,10 @@ from herdr_routines.tick import (
     launch_pipeline,
     pipeline_deadline_epoch,
     pipeline_report_path,
-    run_audit_now,
     run_tick,
     tick_lock,
 )
 from herdr_routines.tmp_hygiene import reap_tmp
-from herdr_routines.verify import VerifyTarget
 
 log = get_logger(__name__)
 
@@ -761,7 +756,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             timezone=job.timezone,
             catch_up_minutes=job.catch_up_minutes,
             now=now,
-            last_terminal=last,
+            last_terminal=last_scheduled_terminal_run(history_path, job.name),
             job_registered_at=first_seen_at(history_path, job.name) or now,
         )
         due_desc = {
@@ -1172,13 +1167,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     now = datetime.now(UTC)
 
-    if job.kind == "pipeline":
+    # A resumed pipeline run (`--run-id`) keeps the launch-only relaunch path: its history
+    # run_id already has a terminal record, so a new `running` one would never be reconciled.
+    if job.kind == "pipeline" and (args.dry_run or args.run_id):
         return _cmd_run_pipeline(job, args, now=now)
 
     run_id = args.run_id or make_run_id(job.name, now)
-
-    if job.kind == "audit" and not args.dry_run:
-        return _cmd_run_audit(job, run_id=run_id, now=now)
 
     if args.dry_run:
         for command in build_dry_run_argv(job, run_id=run_id):
@@ -1186,44 +1180,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     # A manual run shares the `rt-<job>` agent name and the repo checkout with the
-    # scheduled tick, so it takes the tick lock like `_cmd_run_audit` does.
+    # scheduled tick, so it takes the tick lock.
     with tick_lock(default_lock_path()) as acquired:
         if not acquired:
             log.error("%s: a tick is running; try again when it finishes", job.name)
             return 1
-        # Same pre-dispatch selector as a scheduled tick (issue 073). A manual run writes
-        # no history, so the skip and the failure are only logged.
-        gh: RealGhClient | None = None
-        target: VerifyTarget | None = None
-        if job.pick is not None:
-            gh = RealGhClient()
-            selected = select_target(
-                SelectorContext(
-                    job=job, gh=gh, trusted_review_authors=config.trusted_review_authors
-                )
-            )
-            if isinstance(selected, SelectorFailed):
-                log.error("%s: failed (selector_failed: %s)", job.name, selected.error)
-                return 1
-            if selected is None:
-                log.info("%s: skipped (no_target)", job.name)
-                return 0
-            target = selected
         log.info("%s: starting run %s", job.name, run_id)
-        client = HerdrClient()
-        outcome = execute_run(
+        # Same dispatch as a scheduled tick (issue 074): the schedule decision is the only
+        # thing skipped. Called through the module so tests can see the call.
+        summary, failed = tick.dispatch_occurrence(
             job,
-            client,
-            run_id=run_id,
+            default_history_path(),
+            tick.Occurrence(run_id, HistoryExtra(trigger=TRIGGER_MANUAL)),
+            client=HerdrClient(),
+            now=now,
             trusted_review_authors=config.trusted_review_authors,
-            gh=gh,
-            target=target,
         )
-    if outcome.state == "done":
-        log.info("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
-    else:
-        log.error("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
-    return 0 if outcome.state == "done" else 1
+    (log.error if failed else log.info)(summary)
+    return 1 if failed else 0
 
 
 def _cmd_spawn_from_telegram(args: argparse.Namespace) -> int:
@@ -1253,20 +1227,6 @@ def _print_reply(text: str) -> None:
     """Print the in-chat reply the bridge sends back; a dropped message prints nothing."""
     if text:
         print(text)
-
-
-def _cmd_run_audit(job: Job, *, run_id: str, now: datetime) -> int:
-    """kind: audit is not an execute_run job: it runs the audit, diff and fix phases.
-    Takes the tick lock so a manual run can never overlap the scheduled tick."""
-    with tick_lock(default_lock_path()) as acquired:
-        if not acquired:
-            log.error("%s: a tick is running; try again when it finishes", job.name)
-            return 1
-        summary, failed = run_audit_now(
-            job, default_history_path(), client=HerdrClient(), now=now, run_id=run_id
-        )
-    (log.error if failed else log.info)(summary)
-    return 1 if failed else 0
 
 
 def _cmd_run_pipeline(job: Job, args: argparse.Namespace, *, now: datetime) -> int:

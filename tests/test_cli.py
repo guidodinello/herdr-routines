@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from herdr_routines import cli
+from herdr_routines import cli, tick
 from herdr_routines.cli import _check_systemd_timeout, _cmd_validate, default_log_path
 from herdr_routines.config import GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append, rolled_path
@@ -701,7 +701,7 @@ def test_cmd_run_pipeline_never_calls_execute_run(
     def fail_execute_run(*a, **kw):
         raise AssertionError("execute_run must never be called for kind: pipeline")
 
-    monkeypatch.setattr(cli, "execute_run", fail_execute_run)
+    monkeypatch.setattr(tick, "execute_run", fail_execute_run)
 
     launched: list[list[str]] = []
 
@@ -709,7 +709,8 @@ def test_cmd_run_pipeline_never_calls_execute_run(
         launched.append(argv)
         return 0, "", ""
 
-    monkeypatch.setattr(cli, "launch_pipeline", fake_launch)
+    monkeypatch.setattr(tick, "launch_pipeline", fake_launch)
+    monkeypatch.setattr(tick, "ensure_repo", lambda job: job.repo)
 
     assert cli.main(["run", "nightly-pipeline"]) == 0
     assert len(launched) == 1
@@ -953,6 +954,13 @@ def test_pipeline_run_trusts_only_the_gh_user_when_config_is_unreadable(
 # -- tick lock: `tick` defers, manual `run` refuses, while another holder has it ---------
 
 
+class _NotifyingClient:
+    """The one HerdrClient call a manual run makes itself: the terminal notification."""
+
+    def notification_show(self, title, *, body=None, sound="none"):
+        pass
+
+
 def _prepare_run_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Config with one plain job `a` and the lock path under tmp_path; returns the lock path."""
     repo = tmp_path / "repo"
@@ -994,7 +1002,7 @@ def test_cmd_run_refuses_while_a_tick_holds_the_lock(
     def fail_execute_run(*a, **kw):
         raise AssertionError("execute_run must not run while a tick holds the lock")
 
-    monkeypatch.setattr(cli, "execute_run", fail_execute_run)
+    monkeypatch.setattr(tick, "execute_run", fail_execute_run)
     with cli.tick_lock(lock_path) as holder_acquired:
         assert holder_acquired
         assert cli.main(["run", "a"]) == 1
@@ -1011,8 +1019,8 @@ def test_cmd_run_holds_the_tick_lock_while_the_job_runs(
             lock_free_during_run.append(acquired)
         return RunOutcome(state="done", run_id=run_id)
 
-    monkeypatch.setattr(cli, "execute_run", fake_execute_run)
-    monkeypatch.setattr(cli, "HerdrClient", lambda: object())
+    monkeypatch.setattr(tick, "execute_run", fake_execute_run)
+    monkeypatch.setattr(cli, "HerdrClient", lambda: _NotifyingClient())
 
     assert cli.main(["run", "a"]) == 0
     assert lock_free_during_run == [False]
@@ -1368,7 +1376,7 @@ def test_review_scan_is_read_only_touches_nothing(
         raise AssertionError("review-scan must not run agents")
 
     monkeypatch.setattr(cli, "HerdrClient", _no_herdr)
-    monkeypatch.setattr(cli, "execute_run", _no_execute)
+    monkeypatch.setattr(tick, "execute_run", _no_execute)
 
     assert _code(lambda: cli.main(_scan_argv(config_path))) == 0
     captured = capsys.readouterr()

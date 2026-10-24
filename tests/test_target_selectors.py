@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from herdr_routines import cli, verify
+from herdr_routines import cli, tick, verify
 from herdr_routines.auto_fix import PostedBody, RealGhClient
 from herdr_routines.config import (
     VALID_TARGET_SELECTORS,
@@ -413,21 +413,21 @@ def test_manual_run_uses_selector(
 
     # No target: skipped, exit 0, nothing spawned.
     monkeypatch.setattr(
-        cli, "RealGhClient", lambda: FakeSelectorGh([_pr(5)], before={5: [_fresh()]})
+        tick, "RealGhClient", lambda: FakeSelectorGh([_pr(5)], before={5: [_fresh()]})
     )
     assert cli.main(argv) == 0
     assert scripted.calls == []
 
     # A selector error: failed, exit 1, nothing spawned.
     monkeypatch.setattr(
-        cli, "RealGhClient", lambda: FakeSelectorGh([_pr(5)], raise_on="pr_list")
+        tick, "RealGhClient", lambda: FakeSelectorGh([_pr(5)], raise_on="pr_list")
     )
     assert cli.main(argv) == 1
     assert scripted.calls == []
 
     # A target: it reaches the prompt and the gate, with no Target: line in the report.
     gh = FakeSelectorGh([_pr(5)], after={5: [_fresh()]})
-    monkeypatch.setattr(cli, "RealGhClient", lambda: gh)
+    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
     assert cli.main(argv) == 0
     assert "acme/widgets#5" in scripted.prompts[0]
     assert {p[2] for p in gh.probed} == {5}

@@ -30,6 +30,10 @@ TERMINAL_STATES: frozenset[TerminalState] = frozenset(get_args(TerminalState))
 NON_TERMINAL_STATES: frozenset[NonTerminalState] = frozenset(get_args(NonTerminalState))
 ALL_STATES: frozenset[HistoryState] = TERMINAL_STATES | NON_TERMINAL_STATES
 
+# `extra.trigger` on a record written by `herdr-routines run` (issue 074). A scheduled
+# record carries no `trigger` key at all, so a missing key means "the cron fired this".
+TRIGGER_MANUAL = "manual"
+
 
 def is_history_state(value: object) -> TypeIs[HistoryState]:
     return value in ALL_STATES
@@ -361,6 +365,38 @@ def last_terminal_run(path: Path, job_name: str) -> HistoryRecord | None:
         if record.state in TERMINAL_STATES:
             return record
     return None
+
+
+def _is_manual(record: HistoryRecord) -> bool:
+    return (record.extra or {}).get("trigger") == TRIGGER_MANUAL
+
+
+def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | None:
+    """Like `last_terminal_run`, but skipping terminal records of manual runs (issue 074):
+    `schedule.decide` feeds on this, so `herdr-routines run` never consumes the next cron
+    occurrence or shifts the missed-run window.
+
+    A terminal record is manual when it carries `trigger: manual` itself, or when the latest
+    `running` record before it with the same run_id does. The second clause covers the
+    terminals the gated / review / audit cycles write without knowing the trigger, and the
+    `interrupted_unknown` / pipeline-reconcile records, which reuse the run's run_id. "Latest
+    before it" keeps `run --run-id <scheduled run_id>` from un-counting that run's original
+    scheduled terminal record."""
+    manual_run_ids: set[str] = set()
+    scheduled: HistoryRecord | None = None
+    for record in read_job(path, job_name):
+        if record.state == "running" and record.run_id:
+            if _is_manual(record):
+                manual_run_ids.add(record.run_id)
+            else:
+                manual_run_ids.discard(record.run_id)
+        elif record.state in TERMINAL_STATES:
+            manual = _is_manual(record) or (
+                record.run_id is not None and record.run_id in manual_run_ids
+            )
+            if not manual:
+                scheduled = record
+    return scheduled
 
 
 def has_ever_been_seen(path: Path, job_name: str) -> bool:
