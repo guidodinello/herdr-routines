@@ -21,6 +21,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from herdr_routines.auto_fix import (
@@ -243,10 +244,11 @@ query($owner: String!, $repo: String!, $pr: Int!) {
     pullRequest(number: $pr) {
       reviewThreads(first: 50) {
         nodes {
+          id
           isResolved
           comments(first: 100) {
             totalCount
-            nodes { author { login } body }
+            nodes { author { login } body createdAt }
           }
         }
       }
@@ -257,6 +259,12 @@ query($owner: String!, $repo: String!, $pr: Int!) {
 
 
 @dataclass(frozen=True, slots=True)
+class ThreadComment:
+    author: str | None
+    created_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewThread:
     is_resolved: bool
     comment_count: int
@@ -264,6 +272,39 @@ class ReviewThread:
     # The root comment's author login; None when absent (a deleted account, or a
     # payload that did not ask for it).
     first_comment_author: str | None = None
+    # Issue 070: the thread's GraphQL id and its comments after the root, so a caller can
+    # ask "did the worker reply to *this* thread, and when". Empty/None when the payload
+    # did not carry them.
+    thread_id: str | None = None
+    replies: tuple[ThreadComment, ...] = ()
+
+
+def _parse_comment_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def has_reply(
+    thread: ReviewThread,
+    *,
+    trusted_authors: frozenset[str] | None = None,
+    since: datetime | None = None,
+) -> bool:
+    """The one definition of "this thread has been replied to" (issue 070). With no
+    filters it is gate 7's rule: the root comment plus at least one more. With
+    ``trusted_authors`` and ``since`` it asks for a reply from a trusted author created
+    at or after ``since``, so an older reply cannot satisfy a worker that wrote none."""
+    if trusted_authors is None and since is None:
+        return thread.comment_count >= MIN_REPLIED_COMMENT_COUNT
+    return any(
+        (trusted_authors is None or is_trusted_author(c.author, trusted_authors))
+        and (since is None or (c.created_at is not None and c.created_at >= since))
+        for c in thread.replies
+    )
 
 
 def _parse_review_threads(data: dict[str, object]) -> list[ReviewThread]:
@@ -290,6 +331,7 @@ def _parse_review_threads(data: dict[str, object]) -> list[ReviewThread]:
         )
         first_body = ""
         first_author: str | None = None
+        replies: list[ThreadComment] = []
         if isinstance(comment_nodes, list) and comment_nodes:
             first = comment_nodes[0]
             if isinstance(first, dict):
@@ -297,12 +339,28 @@ def _parse_review_threads(data: dict[str, object]) -> list[ReviewThread]:
                 author = first.get("author")
                 login = author.get("login") if isinstance(author, dict) else None
                 first_author = login if isinstance(login, str) and login else None
+            for reply in comment_nodes[1:]:
+                if not isinstance(reply, dict):
+                    continue
+                r_author = reply.get("author")
+                r_login = r_author.get("login") if isinstance(r_author, dict) else None
+                replies.append(
+                    ThreadComment(
+                        author=r_login
+                        if isinstance(r_login, str) and r_login
+                        else None,
+                        created_at=_parse_comment_time(reply.get("createdAt")),
+                    )
+                )
+        thread_id = node.get("id")
         result.append(
             ReviewThread(
                 is_resolved=bool(node.get("isResolved")),
                 comment_count=int(total_count) if isinstance(total_count, int) else 0,
                 first_comment_body=first_body,
                 first_comment_author=first_author,
+                thread_id=thread_id if isinstance(thread_id, str) else None,
+                replies=tuple(replies),
             )
         )
     return result
@@ -328,7 +386,7 @@ def evaluate_gate7(
             or is_trusted_author(t.first_comment_author, trusted_authors)
         )
     ]
-    unreplied = [t for t in unresolved if t.comment_count < MIN_REPLIED_COMMENT_COUNT]
+    unreplied = [t for t in unresolved if not has_reply(t)]
     blocking = [t for t in unresolved if BLOCKING_TAG in t.first_comment_body]
 
     if not unreplied and not blocking:
@@ -344,6 +402,16 @@ def evaluate_gate7(
     return GateVerdict(passed=False, reason="; ".join(reasons))
 
 
+def fetch_review_threads(
+    gh: GhClient, *, owner: str, repo: str, pr: int
+) -> list[ReviewThread]:
+    """Fetch and parse a PR's review threads via GraphQL. `gh api repos/.../threads`
+    404s (verified against a live PR) — GraphQL is the only route to per-thread
+    resolution state."""
+    data = gh.graphql(GATE7_REVIEW_THREADS_QUERY, owner=owner, repo=repo, pr=str(pr))
+    return _parse_review_threads(data)
+
+
 def run_gate7(
     gh: GhClient,
     *,
@@ -352,11 +420,8 @@ def run_gate7(
     pr: int,
     trusted_authors: frozenset[str] | None = None,
 ) -> GateVerdict:
-    """Fetch review threads via GraphQL and evaluate reply coverage. `gh api
-    repos/.../threads` 404s (verified against a live PR) — GraphQL is the only
-    route to per-thread resolution state."""
-    data = gh.graphql(GATE7_REVIEW_THREADS_QUERY, owner=owner, repo=repo, pr=str(pr))
-    threads = _parse_review_threads(data)
+    """Fetch review threads and evaluate reply coverage."""
+    threads = fetch_review_threads(gh, owner=owner, repo=repo, pr=pr)
     return evaluate_gate7(threads, trusted_authors=trusted_authors)
 
 

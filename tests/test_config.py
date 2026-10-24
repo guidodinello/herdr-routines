@@ -1890,6 +1890,21 @@ def test_verify_unknown_gate_rejected_and_inherits_from_defaults(
         (bad_dir / "a.yaml").unlink()
 
 
+def test_verify_rejects_the_gates_only_the_fix_worker_path_can_run(
+    tmp_path: Path,
+) -> None:
+    """Issue 070: `worktree_clean` and `pushed_or_replied` need a worktree and a dispatch
+    head that `execute_run` never has, so a job cannot list them (a config that could only
+    ever fail)."""
+    for gate in ("worktree_clean", "pushed_or_replied"):
+        bad_dir = tmp_path / gate
+        bad_dir.mkdir()
+        (bad_dir / "a.yaml").write_text(_VERIFY_JOB + f"verify: [{gate}]\n")
+        cfg = load_config_dir(bad_dir)
+        assert cfg.jobs == ()
+        assert any(gate in err and "fix-worker" in err for err in cfg.errors), gate
+
+
 def test_verify_on_a_kind_that_never_runs_gates(tmp_path: Path) -> None:
     """An explicit `verify` on kind: review is an error; an inherited one is kept aside
     (not silently dropped) so `validate` can name it."""

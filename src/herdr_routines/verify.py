@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,7 +28,7 @@ from herdr_routines.auto_fix import (
     is_trusted_author,
 )
 from herdr_routines.config import Job, VerifyGate
-from herdr_routines.gates import GateVerdict
+from herdr_routines.gates import GateVerdict, fetch_review_threads, has_reply
 
 log = logging.getLogger(__name__)
 
@@ -62,9 +63,10 @@ class VerifyTarget:
 
 @dataclass(frozen=True, slots=True)
 class VerifyContext:
-    """What the runner already knows when the agent has settled. There is deliberately no
-    worktree path: `execute_run` never learns it (herdr owns it), and the first gate that
-    needs one is issue 070's."""
+    """What the runner already knows when the agent has settled. `execute_run` never
+    learns a worktree path (herdr owns it), so the worktree and dispatch-time fields
+    below stay None there; issue 070's fix-worker gates are their only readers and fail
+    closed on None."""
 
     job: Job
     run_id: str
@@ -79,6 +81,12 @@ class VerifyContext:
     # when None.
     trusted_authors: frozenset[str] | None = None
     marker: str | None = None
+    # Issue 070, set by the gated fix-worker path only: the worktree the worker ran in,
+    # the PR head commit when it was dispatched, and the ids of the review threads its
+    # prompt listed (None when they could not be fetched).
+    worktree_path: Path | None = None
+    dispatch_head_sha: str | None = None
+    given_thread_ids: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +162,102 @@ def review_posted(ctx: VerifyContext) -> GateVerdict:
     return _fail(REASON_NOT_POSTED)
 
 
+REASON_LEFT_UNCOMMITTED = "worker_left_uncommitted_changes"
+REASON_PUSHED_NOTHING = "worker_pushed_nothing"
+REASON_WORKER_UNVERIFIED = "worker_verification_failed"
+_GIT_STATUS_TIMEOUT_S = 15
+
+
+def _dirty_paths(wt_path: Path) -> str:
+    """`git status --porcelain=v1` output; raises RuntimeError when git cannot answer."""
+    status = subprocess.run(
+        ["git", "-C", str(wt_path), "status", "--porcelain=v1"],
+        capture_output=True,
+        text=True,
+        timeout=_GIT_STATUS_TIMEOUT_S,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise RuntimeError(f"git status failed: {status.stderr.strip()}")
+    return status.stdout
+
+
+def worktree_status(wt_path: Path) -> tuple[bool, str]:
+    """``(clean, detail)`` for a worktree: the one definition of "has uncommitted
+    changes", shared by the reuse check and the `worktree_clean` gate. A git failure is
+    not clean."""
+    try:
+        dirty = _dirty_paths(wt_path)
+    except RuntimeError as e:
+        return False, str(e)
+    if dirty.strip():
+        return False, "worktree has uncommitted changes"
+    return True, ""
+
+
+def worktree_clean(ctx: VerifyContext) -> GateVerdict:
+    """Passes when the fix worker left no uncommitted changes in its worktree (issue
+    070). A dirty tree is the worker's own leftovers and would wedge every later
+    attempt on the same branch."""
+    if ctx.worktree_path is None:
+        return _fail("worktree_unknown")
+    try:
+        dirty = _dirty_paths(ctx.worktree_path)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+        log.warning("%s: worktree_clean probe failed: %s", ctx.job.name, e)
+        return _fail(REASON_WORKER_UNVERIFIED)
+    return _fail(REASON_LEFT_UNCOMMITTED) if dirty.strip() else GateVerdict(passed=True)
+
+
+def pushed_or_replied(ctx: VerifyContext) -> GateVerdict:
+    """Passes when the PR head moved since dispatch, or every review thread the worker
+    was given has a reply from a trusted author created since (issue 070). A worker that
+    answers "won't fix, because ..." has done its job without pushing; one that did
+    neither has not. An empty set of given threads proves nothing, so a CI-only fix
+    must push."""
+    target = ctx.target
+    if target is None or ctx.dispatch_head_sha is None:
+        return _fail(REASON_WORKER_UNVERIFIED)
+    try:
+        view = ctx.gh.pr_view(
+            owner=target.owner, repo=target.repo, number=target.number
+        )
+        head = view.get("headRefOid")
+        if not isinstance(head, str) or not head:
+            return _fail(REASON_WORKER_UNVERIFIED)
+        if head != ctx.dispatch_head_sha:
+            return GateVerdict(passed=True)
+        given = ctx.given_thread_ids
+        if not given:
+            return _fail(REASON_PUSHED_NOTHING)
+        trusted = ctx.trusted_authors
+        if trusted is None:
+            trusted = effective_trusted_authors(
+                ctx.trusted_review_authors, viewer_login=ctx.gh.api_user()
+            )
+        threads = {
+            t.thread_id: t
+            for t in fetch_review_threads(
+                ctx.gh, owner=target.owner, repo=target.repo, pr=target.number
+            )
+        }
+    except Exception as e:  # noqa: BLE001 — a probe failure is a failed gate, never a pass
+        log.warning("%s: pushed_or_replied probe failed: %s", ctx.job.name, e)
+        return _fail(REASON_WORKER_UNVERIFIED)
+
+    # Whole seconds, same as `review_posted`: GitHub stamps no sub-second part.
+    since = ctx.started_at.replace(microsecond=0)
+    replied = sum(
+        1
+        for thread_id in given
+        if (t := threads.get(thread_id)) is not None
+        and has_reply(t, trusted_authors=trusted, since=since)
+    )
+    if replied == len(given):
+        return GateVerdict(passed=True)
+    return _fail(REASON_PUSHED_NOTHING)
+
+
 def report_wellformed(ctx: VerifyContext) -> GateVerdict:
     """Fails an empty report and one with literal `\\n` escapes standing in for newlines
     (the #839 report). A cheap signal of a model that wrote the report without doing the
@@ -174,6 +278,8 @@ def report_wellformed(ctx: VerifyContext) -> GateVerdict:
 VERIFY_GATES: dict[VerifyGate, Callable[[VerifyContext], GateVerdict]] = {
     "review_posted": review_posted,
     "report_wellformed": report_wellformed,
+    "worktree_clean": worktree_clean,
+    "pushed_or_replied": pushed_or_replied,
 }
 
 

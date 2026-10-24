@@ -23,6 +23,7 @@ from logger import get_logger
 from herdr_routines import verify
 from herdr_routines.auto_fix import (
     EligiblePR,
+    GhClient,
     GithubEvent,
     PRInfo,
     RealGhClient,
@@ -46,7 +47,7 @@ from herdr_routines.auto_fix import (
     enrich_event_detail,
     event_worktree_slug,
     fetch_failing_checks,
-    fetch_thread_bodies,
+    fetch_fix_worker_threads,
     is_eligible,
     list_open_prs,
     poll_github_event,
@@ -61,6 +62,7 @@ from herdr_routines.config import (
     Job,
     JobInvariantError,
     RoutinesConfig,
+    VerifyGate,
 )
 from herdr_routines.findings import (
     Finding,
@@ -550,6 +552,8 @@ class _WorkerFailed:
     reason: str
     error: str | None
     pane_id: str | None = None
+    # Set for `worktree_reuse_not_clean` (issue 070): the dirty checkout the refusal names.
+    worktree_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,6 +567,8 @@ class _WorkerSettled:
     final_agent_status: AgentStatus | None
     session_id: str | None
     report_bytes: int = 0
+    # The worktree the worker ran in (issue 070), so the settle site can check it.
+    worktree_path: str | None = None
 
 
 _WorkerResult = _WorkerFailed | _WorkerSettled
@@ -1606,6 +1612,45 @@ def _process_event_target(
             client=client,
         )
 
+        # Same refusal rule as the pr path (issue 070): no agent ran, so it is a `skipped`
+        # that spends no attempt and leaves the event unseen to be re-checked next poll.
+        if (
+            isinstance(worker_outcome, _WorkerFailed)
+            and worker_outcome.reason == "worktree_reuse_not_clean"
+            and worker_outcome.worktree_path is not None
+        ):
+            wt = worker_outcome.worktree_path
+            first_detection = not _dirty_worktree_already_reported(
+                history_path, job.name, wt
+            )
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    run_id=run_id,
+                    extra=HistoryExtra(
+                        reason=worker_outcome.reason,
+                        error=worker_outcome.error,
+                        event_id=event.event_id,
+                        event_number=event.number,
+                        attempt=attempt,
+                        target=event_target,
+                        worktree_path=wt,
+                    ),
+                ),
+            )
+            if first_detection and _notify_gate(job, "failure"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} event {event.event_id} blocked",
+                    body=f"uncommitted changes in {wt}; rescue or discard by hand",
+                    sound="request",
+                )
+            skipped_count += 1
+            continue
+
         outcome_state: Literal["done", "failed"] = "failed"
         outcome_error: str | None = None
         outcome_report_path: str | None = None
@@ -1754,6 +1799,7 @@ def _dispatch_event_worker(
             return _WorkerFailed(
                 reason="worktree_reuse_not_clean",
                 error=f"existing worktree {existing_wt} for {event.head_ref}: {detail}",
+                worktree_path=str(existing_wt),
             )
         wt_path = existing_wt
     else:
@@ -2010,6 +2056,11 @@ def _process_pr_target(
     any_failed = False
     dispatched_count = 0
     skipped_count = skipped_over_cap
+    # Skips that are neither the cap nor the attempt budget (issue 070): a PR whose head
+    # could not be read, or whose worktree a human has to clean.
+    skipped_other = 0
+    # (PR number, worktree path, reason) of every dirty worktree left for a human.
+    dirty_worktrees: list[tuple[int, str, str]] = []
     for elig_pr in dispatched:
         attempt = attempt_count_for_pr(history_path, job.name, elig_pr.pr.number)
         if attempt >= job.max_attempts_per_target:
@@ -2042,10 +2093,35 @@ def _process_pr_target(
         if _pr_worker_is_live(client, job.name, elig_pr.pr.number):
             continue
 
+        # No head to measure the worker's push against: an agent run we could not verify
+        # would burn an attempt on an infrastructure gap, so do not start one (issue 070).
+        if elig_pr.pr.head_sha is None:
+            log.warning(
+                "%s: PR #%d skipped, head commit unknown",
+                job.name,
+                elig_pr.pr.number,
+            )
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    extra=HistoryExtra(
+                        reason="pr_head_unknown",
+                        pr_number=elig_pr.pr.number,
+                        attempt=attempt,
+                    ),
+                ),
+            )
+            skipped_other += 1
+            skipped_count += 1
+            continue
+
         failing_checks = fetch_failing_checks(
             gh, owner=owner, repo=repo_name, number=elig_pr.pr.number
         )
-        thread_bodies = fetch_thread_bodies(
+        thread_bodies, given_thread_ids = fetch_fix_worker_threads(
             gh,
             owner=owner,
             repo=repo_name,
@@ -2066,16 +2142,86 @@ def _process_pr_target(
             thread_bodies=thread_bodies,
         )
 
+        # A refusal that never launched an agent (issue 070) spent no attempt and is not
+        # a failure of this tick: record it `skipped`, tell a human once, and leave the
+        # tree exactly as it is.
+        if (
+            isinstance(worker_outcome, _WorkerFailed)
+            and worker_outcome.reason == "worktree_reuse_not_clean"
+            and worker_outcome.worktree_path is not None
+        ):
+            wt = worker_outcome.worktree_path
+            first_detection = not _dirty_worktree_already_reported(
+                history_path, job.name, wt
+            )
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    run_id=run_id,
+                    extra=HistoryExtra(
+                        reason=worker_outcome.reason,
+                        error=worker_outcome.error,
+                        pr_number=elig_pr.pr.number,
+                        headRefName=elig_pr.pr.head_ref,
+                        attempt=attempt,
+                        target="pr",
+                        worktree_path=wt,
+                    ),
+                ),
+            )
+            dirty_worktrees.append((elig_pr.pr.number, wt, worker_outcome.reason))
+            if first_detection and _notify_gate(job, "failure"):
+                _notify(
+                    client,
+                    f"herdr-routines: {job.name} PR #{elig_pr.pr.number} blocked",
+                    body=f"uncommitted changes in {wt}; rescue or discard by hand",
+                    sound="request",
+                )
+            skipped_other += 1
+            skipped_count += 1
+            continue
+
         agent_name = build_worker_agent_name(job.name, elig_pr.pr.number, run_id)
         outcome_state: Literal["done", "failed"] = "failed"
         outcome_reason: str | None = None
         outcome_error: str | None = None
         outcome_report_path: str | None = None
         outcome_agent_status: AgentStatus | None = None
+        verify_results: tuple[verify.VerifyResult, ...] = ()
         if isinstance(worker_outcome, _WorkerSettled):
             outcome_state = worker_outcome.state
             outcome_report_path = worker_outcome.report_path
             outcome_agent_status = worker_outcome.final_agent_status
+            if outcome_state == "done":
+                # `done` is the agent's word (issue 070): prove the worktree is clean and
+                # the PR changed before keeping it.
+                verify_results = _verify_fix_worker(
+                    job,
+                    gh=gh,
+                    run_id=run_id,
+                    now=now,
+                    owner=owner,
+                    repo=repo_name,
+                    pr=elig_pr.pr,
+                    worker=worker_outcome,
+                    given_thread_ids=given_thread_ids,
+                    trusted=trusted,
+                )
+                failed_gate = next((r for r in verify_results if not r.passed), None)
+                if failed_gate is not None:
+                    outcome_state = "failed"
+                    outcome_reason = failed_gate.reason
+                    if outcome_reason == verify.REASON_LEFT_UNCOMMITTED:
+                        dirty_worktrees.append(
+                            (
+                                elig_pr.pr.number,
+                                worker_outcome.worktree_path or "",
+                                outcome_reason,
+                            )
+                        )
         else:
             outcome_reason = worker_outcome.reason
             outcome_error = worker_outcome.error
@@ -2096,6 +2242,13 @@ def _process_pr_target(
             extra_record["reason"] = outcome_reason
         if outcome_error is not None:
             extra_record["error"] = outcome_error
+        if verify_results:
+            extra_record["verify"] = [
+                {"gate": r.gate, "passed": r.passed, "reason": r.reason}
+                for r in verify_results
+            ]
+        if isinstance(worker_outcome, _WorkerSettled) and worker_outcome.worktree_path:
+            extra_record["worktree_path"] = worker_outcome.worktree_path
         if outcome_state == "failed":
             log.warning(
                 "%s: PR #%d dispatch failed: reason=%s error=%s",
@@ -2136,11 +2289,18 @@ def _process_pr_target(
             f"- **Eligible**: {len(eligible)}",
             f"- **Dispatched**: {dispatched_count}",
             f"- **Skipped (cap)**: {skipped_over_cap}",
-            f"- **Skipped (attempts)**: {skipped_count - skipped_over_cap}",
+            f"- **Skipped (attempts)**: {skipped_count - skipped_over_cap - skipped_other}",
             "",
         ]
         for elig_pr in dispatched:
             report_lines.append(f"- PR #{elig_pr.pr.number}: {elig_pr.reason}")
+        if dirty_worktrees:
+            report_lines += ["", "## Uncommitted changes kept for a human"]
+            report_lines += [
+                f"- PR #{number}: {wt_path} ({why}) — not discarded; rescue or "
+                f"discard by hand"
+                for number, wt_path, why in dirty_worktrees
+            ]
         report_path.write_text("\n".join(report_lines) + "\n")
     except Exception as e:  # noqa: BLE001
         log.warning("%s: could not write aggregate report: %s", job.name, e)
@@ -2171,10 +2331,18 @@ def _process_pr_target(
 
     if any_failed:
         if _notify_gate(job, "failure"):
+            body = f"{dispatched_count} dispatched, {skipped_count} skipped"
+            left = [
+                wt_path
+                for _, wt_path, why in dirty_worktrees
+                if why == verify.REASON_LEFT_UNCOMMITTED
+            ]
+            if left:
+                body += f"; uncommitted changes kept at {', '.join(left)}"
             _notify(
                 client,
                 f"herdr-routines: {job.name} failed",
-                body=f"{dispatched_count} dispatched, {skipped_count} skipped",
+                body=body,
                 sound="request",
             )
         return summary, True
@@ -2668,18 +2836,7 @@ def _worktree_reuse_check(wt_path: Path) -> tuple[bool, str]:
     """Before pointing a fix worker at a worktree we didn't create ourselves, verify
     it has no uncommitted changes — an in-progress edit there (e.g. a still-running
     orchestrator) must not be clobbered by a fix worker starting concurrently."""
-    status = subprocess.run(
-        ["git", "-C", str(wt_path), "status", "--porcelain=v1"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    )
-    if status.returncode != 0:
-        return False, f"git status failed: {status.stderr.strip()}"
-    if status.stdout.strip():
-        return False, "worktree has uncommitted changes"
-    return True, ""
+    return verify.worktree_status(wt_path)
 
 
 def _cleanup_worktree(repo: Path, wt_path: Path) -> None:
@@ -2763,6 +2920,7 @@ def _dispatch_fix_worker(
             return _WorkerFailed(
                 reason="worktree_reuse_not_clean",
                 error=f"existing worktree {existing_wt} for {pr.head_ref}: {detail}",
+                worktree_path=str(existing_wt),
             )
         wt_path = existing_wt
     else:
@@ -2880,7 +3038,63 @@ def _dispatch_fix_worker(
         report_bytes=report_bytes,
         final_agent_status=settled_status,
         session_id=session_id,
+        worktree_path=str(wt_path),
     )
+
+
+# The post-settle gates a gated fix worker must pass to stay `done` (issue 070). Order is
+# precedence: when both fail the dirty tree is the recorded reason, because it is what
+# wedges every later attempt on the branch.
+_FIX_WORKER_GATES: tuple[VerifyGate, ...] = ("worktree_clean", "pushed_or_replied")
+# Reasons whose record carries a dirty worktree a human has to deal with.
+_DIRTY_WORKTREE_REASONS = frozenset(
+    {"worktree_reuse_not_clean", verify.REASON_LEFT_UNCOMMITTED}
+)
+
+
+def _verify_fix_worker(
+    job: Job,
+    *,
+    gh: GhClient,
+    run_id: str,
+    now: datetime,
+    owner: str,
+    repo: str,
+    pr: PRInfo,
+    worker: _WorkerSettled,
+    given_thread_ids: tuple[str, ...] | None,
+    trusted: frozenset[str],
+) -> tuple[verify.VerifyResult, ...]:
+    """Run `_FIX_WORKER_GATES` for a fix worker whose agent settled. The agent's `done`
+    is its word; these read the worktree and the PR."""
+    return verify.run_verify_gates(
+        _FIX_WORKER_GATES,
+        VerifyContext(
+            job=job,
+            run_id=run_id,
+            started_at=now,
+            report_path=Path(worker.report_path or ""),
+            gh=gh,
+            trusted_review_authors=(),
+            target=VerifyTarget(owner, repo, pr.number),
+            trusted_authors=trusted,
+            worktree_path=Path(worker.worktree_path) if worker.worktree_path else None,
+            dispatch_head_sha=pr.head_sha,
+            given_thread_ids=given_thread_ids,
+        ),
+    )
+
+
+def _dirty_worktree_already_reported(
+    history_path: Path, job_name: str, worktree_path: str
+) -> bool:
+    """Whether the latest record naming this worktree already reported it dirty (issue
+    070), so the first detection notifies a human and later ticks stay quiet. A clean
+    run there since makes the next dirty finding a new detection."""
+    for record in reversed(read_job(history_path, job_name)):
+        if record.extra and record.extra.get("worktree_path") == worktree_path:
+            return record.extra.get("reason") in _DIRTY_WORKTREE_REASONS
+    return False
 
 
 def _outcome_extra(
