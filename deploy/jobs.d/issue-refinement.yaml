@@ -11,6 +11,12 @@
 # this one job session: the job agent authors, then invokes a fresh independent
 # `opencode run` (different model) as the reviewer — no nested `herdr agent`
 # spawn, so this needs none of the pipeline's HERDR_ENV workspace plumbing.
+# The loop's two rules are code, not prose (issues 034/035 precedent): after each
+# review pass `refine-issue --review-pass N --reviewer-reply FILE` parses the
+# reviewer's confidence and enforces the 3-pass cap; before the PR
+# `refine-issue --check-issue PATH` validates the new issue's frontmatter. Both
+# answer by exit code like `gate`. `validate` warns if this job ever stops being
+# opencode-only.
 #
 # Output is a PR on head `auto/issue-refinement-<run_id>` (built from `name` by
 # runner.build_branch_name — NOT `auto/pipeline-*`, so issue 028's open-PR guard
@@ -54,22 +60,36 @@ prompt: |
      ROADMAP.md Parking Lot pointer for the idea ending
      ``→ [`NNN`](docs/process/issues/NNN-<slug>.md)``.
 
-  3. REVIEW LOOP — at most 3 passes. Independence is the point: each pass runs a
-     FRESH reviewer in its own session and a different model — never re-read your
-     own draft as the review.
+  3. REVIEW LOOP — the code decides when it ends (at most 3 passes). Independence
+     is the point: each pass runs a FRESH reviewer in its own session and a
+     different model — never re-read your own draft as the review. For pass N
+     (N = 1, 2, 3), save the reviewer's raw reply OUTSIDE the worktree (step 5
+     runs `git add -A`) to $ROUTINE_REPORT.review-N.txt:
        opencode run --dir . -m nvidia/moonshotai/kimi-k3 \
          "You are reviewing a draft issue file for herdr-routines. Read
           docs/process/issues/NNN-<slug>.md and compare it to the other files in
           docs/process/issues/. Judge whether it is buildable by a single worker
           and follows the conventions. DO NOT edit any files. Reply with one line
           'confidence: high' | 'confidence: medium' | 'confidence: low' followed
-          by the concrete gaps you would want fixed."
-     - `confidence: high` in the reply → consensus, leave the loop.
-     - otherwise apply the reviewer's notes to the draft and run another pass.
-     - after 3 passes without `confidence: high`, stop and carry the reviewer's
-       remaining notes into the PR body under a "## Open review notes" heading.
+          by the concrete gaps you would want fixed." \
+         > $ROUTINE_REPORT.review-N.txt
+     Then ALWAYS ask the loop check — do not judge consensus yourself:
+       uv run herdr-routines refine-issue --review-pass N --reviewer-reply $ROUTINE_REPORT.review-N.txt
+     - exit 0 → apply the reviewer's notes from that file to the draft and run
+       pass N+1.
+     - exit 1 → leave the loop. stderr says `consensus reached` or `capped at 3`;
+       record which. If capped, carry the reviewer's remaining notes into the PR
+       body under a "## Open review notes" heading.
+     - exit 2 → you called it wrong (missing/unreadable reply file); fix the
+       call, never skip it.
 
-  4. OPEN THE PR (never commit to main):
+  4. CHECK THE ISSUE FILE. After the loop's last edit and before any git command:
+       uv run herdr-routines refine-issue --check-issue docs/process/issues/NNN-<slug>.md
+     A non-zero exit lists the frontmatter problems on stderr: fix them and
+     re-run until it exits 0. If you cannot make it pass, write the problems to
+     $ROUTINE_REPORT and STOP — do not open the PR.
+
+  5. OPEN THE PR (never commit to main) — only after step 4 exited 0:
        git add -A
        git commit -m "docs: refine issue NNN — <title> (issue 029)"
        git push -u origin HEAD
@@ -78,9 +98,9 @@ prompt: |
 
        Refines-Parking-Lot: <slug>
 
-       Review loop: <N> pass(es); reviewer consensus: <reached | capped at 3>.
+       Review loop: <N> pass(es); reviewer consensus: <reached | capped at 3> (per the loop check).
        EOF
        )"
 
-  5. REPORT. Write to $ROUTINE_REPORT: the bullet picked, the new issue number,
+  6. REPORT. Write to $ROUTINE_REPORT: the bullet picked, the new issue number,
      the PR URL, the loop pass count, and whether consensus was reached.
