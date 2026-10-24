@@ -1,7 +1,7 @@
 ---
 id: "073"
 title: "Target selectors for routine jobs: code picks what to act on, and skips the run when there is nothing"
-status: open
+status: done
 priority: high
 area: scheduler
 ---
