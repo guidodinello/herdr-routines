@@ -279,9 +279,6 @@ class ReviewHerdrClient:
             self.on_prompt(text)
         return self.settle_status
 
-    def agent_read(self, target: str, *, lines: int = 200) -> str:
-        return ""
-
     def agent_read_visible(self, target: str, *, lines: int = 200) -> str:
         return ""
 

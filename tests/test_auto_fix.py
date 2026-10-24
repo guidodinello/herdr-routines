@@ -190,9 +190,6 @@ class FakeFullClient:
     ):
         return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
 
-    def agent_read(self, target, *, lines=200):
-        return ""
-
     def agent_read_visible(self, target, *, lines=200):
         return ""
 

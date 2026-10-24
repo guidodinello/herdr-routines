@@ -336,9 +336,6 @@ class RecordingHerdrClient:
         self.prompts.append(text)
         return "idle"
 
-    def agent_read(self, target: str, *, lines: int = 200) -> str:
-        return ""
-
     def agent_read_visible(self, target: str, *, lines: int = 200) -> str:
         return ""
 

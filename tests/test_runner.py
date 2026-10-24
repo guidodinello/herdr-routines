@@ -148,10 +148,6 @@ class ScriptedClient:
         # (WatchdogClient below) override this with a scripted poll loop.
         return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
 
-    def agent_read(self, target, *, lines=200):
-        self.calls.append("agent_read")
-        return "some tail output"
-
     def agent_read_visible(self, target, *, lines=200):
         self.calls.append("agent_read_visible")
         return self.visible_screen
@@ -803,7 +799,6 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
         "agent_interactive_ready",
         "agent_prompt_wait",
         "agent_prompt_wait_with_watchdog",
-        "agent_read",
         "agent_read_visible",
         "agent_session_id",
     ):
@@ -1502,9 +1497,8 @@ def test_success_tail_uses_visible_source_and_single_write(
         visible_screen="visible output only",
     )
     execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
-    # agent_read_visible must have been called (visible source), agent_read must not.
+    # agent_read_visible must have been called (visible source).
     assert "agent_read_visible" in client.calls
-    assert "agent_read" not in client.calls
     # Exactly one tail file produced.
     tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
     assert tail_path.exists()

@@ -83,7 +83,6 @@ class Issue:
     title: str
     status: str
     priority: str
-    area: str
     path: Path
     body: str
 
@@ -112,7 +111,6 @@ def parse_issue(path: Path) -> Issue:
         title=str(frontmatter["title"]),
         status=str(frontmatter["status"]),
         priority=str(frontmatter["priority"]),
-        area=str(frontmatter["area"]),
         path=path,
         body=body.strip(),
     )

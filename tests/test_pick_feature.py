@@ -81,7 +81,6 @@ def test_parse_issue_reads_frontmatter_and_body(issues_dir: Path) -> None:
         title="Foo",
         status="open",
         priority="medium",
-        area="cli",
         path=path,
         body="## Description\n\nFix the foo bug.",
     )

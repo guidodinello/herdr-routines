@@ -215,9 +215,6 @@ class FakeFullClient:
     ):
         return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
 
-    def agent_read(self, target, *, lines=200):
-        return ""
-
     def agent_read_visible(self, target, *, lines=200):
         return ""
 
@@ -333,9 +330,6 @@ class FakeClient:
                 screen_text="Free usage exceeded",
             )
         return self.agent_prompt_wait(target=target, text=text, timeout_ms=timeout_ms)
-
-    def agent_read(self, target, *, lines=200):
-        return ""
 
     def agent_read_visible(self, target, *, lines=200):
         return ""
@@ -934,9 +928,6 @@ class FakePrDispatchClient:
     ):
         self._registered[target] = "idle"
         return "idle"
-
-    def agent_read(self, target, *, lines=200):
-        return ""
 
     def agent_read_visible(self, target, *, lines=200):
         return ""
@@ -2113,9 +2104,6 @@ class FakeFixWorkerClient:
     ):
         return self.settle_status
 
-    def agent_read(self, target, *, lines=200):
-        return ""
-
     def agent_read_visible(self, target, *, lines=200):
         return ""
 
@@ -2793,10 +2781,6 @@ class TailTrackingFixClient:
         self.calls.append("agent_prompt_wait_with_watchdog")
         return "idle"
 
-    def agent_read(self, target, *, lines=200):
-        self.calls.append("agent_read")
-        return ""
-
     def agent_read_visible(self, target, *, lines=200):
         self.calls.append("agent_read_visible")
         return self.visible_screen
@@ -2851,7 +2835,6 @@ def test_pipeline_workers_capture_tail_before_close(
     assert client.read_visible_before_close is True
     # Visible source used, not recent-unwrapped.
     assert "agent_read_visible" in client.calls
-    assert "agent_read" not in client.calls
     assert "pane_close" in client.calls
 
 
