@@ -289,3 +289,194 @@ def test_parse_declared_target() -> None:
     assert parse_declared_target("x\nTarget: acme/widgets#839\n") is not None
     assert parse_declared_target("Target: acme/widgets#839 and more") is None
     assert parse_declared_target("Target: a/b#1\nTarget: a/b#1\n") is not None
+
+
+# -- issue 070: the fix-worker gates ---------------------------------------------------
+
+
+def _fix_worker_ctx(tmp_path: Path, gh: Any, **overrides: Any):
+    from herdr_routines.verify import VerifyContext, VerifyTarget
+
+    fields: dict[str, Any] = {
+        "job": make_job(tmp_path),
+        "run_id": "r",
+        "started_at": datetime(2026, 10, 21, 5, 0, tzinfo=UTC),
+        "report_path": tmp_path / "report.md",
+        "gh": gh,
+        "trusted_review_authors": (),
+        "target": VerifyTarget("acme", "widgets", 211),
+        "trusted_authors": frozenset({"testuser"}),
+        "worktree_path": tmp_path,
+        "dispatch_head_sha": "sha-before",
+        "given_thread_ids": ("t1",),
+    }
+    fields.update(overrides)
+    return VerifyContext(**fields)
+
+
+def test_worktree_clean_gate_reads_the_worktree(tmp_path: Path) -> None:
+    import subprocess
+
+    from herdr_routines.verify import worktree_clean
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True
+    )
+    gh = FakeVerifyGh()
+
+    assert worktree_clean(_fix_worker_ctx(tmp_path, gh, worktree_path=repo)).passed
+    (repo / "leftover.txt").write_text("x")
+    verdict = worktree_clean(_fix_worker_ctx(tmp_path, gh, worktree_path=repo))
+    assert (verdict.passed, verdict.reason) == (
+        False,
+        "worker_left_uncommitted_changes",
+    )
+
+    # Fails closed: no path, and a directory git cannot read, are never a pass.
+    assert worktree_clean(_fix_worker_ctx(tmp_path, gh, worktree_path=None)).reason == (
+        "worktree_unknown"
+    )
+    plain = tmp_path / "not-a-repo"
+    plain.mkdir()
+    unreadable = worktree_clean(_fix_worker_ctx(tmp_path, gh, worktree_path=plain))
+    assert (unreadable.passed, unreadable.reason) == (
+        False,
+        "worker_verification_failed",
+    )
+
+
+class _FixWorkerGh:
+    """pr_view / graphql / api_user for `pushed_or_replied`."""
+
+    def __init__(
+        self,
+        *,
+        head: object = "sha-before",
+        comments: dict[str, list[dict[str, Any]]] | None = None,
+        raise_on: str | None = None,
+    ) -> None:
+        self.head = head
+        self.comments = comments or {}
+        self.raise_on = raise_on
+
+    def api_user(self) -> str:
+        return "testuser"
+
+    def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
+        if self.raise_on == "pr_view":
+            raise RuntimeError("boom")
+        return {} if self.head is None else {"headRefOid": self.head}
+
+    def graphql(self, query: str, **variables: str) -> dict[str, object]:
+        if self.raise_on == "graphql":
+            raise RuntimeError("boom")
+        nodes = [
+            {
+                "id": tid,
+                "isResolved": True,
+                "comments": {"totalCount": len(c), "nodes": c},
+            }
+            for tid, c in self.comments.items()
+        ]
+        return {
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": nodes}}}}
+        }
+
+
+def _reply(login: str, at: str) -> dict[str, Any]:
+    return {"author": {"login": login}, "body": "r", "createdAt": at}
+
+
+_ROOT = _reply("testuser", "2026-10-21T04:00:00Z")
+
+
+@pytest.mark.parametrize(
+    ("gh", "overrides", "expected"),
+    [
+        pytest.param(_FixWorkerGh(head="sha-after"), {}, (True, None), id="head-moved"),
+        pytest.param(
+            _FixWorkerGh(),
+            {"given_thread_ids": ()},
+            (False, "worker_pushed_nothing"),
+            id="empty-given-set-needs-a-push",
+        ),
+        pytest.param(
+            _FixWorkerGh(),
+            {"given_thread_ids": None},
+            (False, "worker_pushed_nothing"),
+            id="thread-fetch-failed-needs-a-push",
+        ),
+        pytest.param(
+            _FixWorkerGh(
+                comments={"t1": [_ROOT, _reply("testuser", "2026-10-21T05:00:00Z")]}
+            ),
+            {},
+            (True, None),
+            id="fresh-trusted-reply",
+        ),
+        pytest.param(
+            _FixWorkerGh(
+                comments={"t1": [_ROOT, _reply("testuser", "2026-10-21T04:59:59Z")]}
+            ),
+            {},
+            (False, "worker_pushed_nothing"),
+            id="reply-before-dispatch",
+        ),
+        pytest.param(
+            _FixWorkerGh(
+                comments={"t1": [_ROOT, _reply("stranger", "2026-10-21T05:00:00Z")]}
+            ),
+            {},
+            (False, "worker_pushed_nothing"),
+            id="untrusted-reply",
+        ),
+        pytest.param(
+            _FixWorkerGh(comments={}),
+            {},
+            (False, "worker_pushed_nothing"),
+            id="given-thread-gone-from-the-pr",
+        ),
+        pytest.param(
+            _FixWorkerGh(raise_on="pr_view"),
+            {},
+            (False, "worker_verification_failed"),
+            id="pr-view-error",
+        ),
+        pytest.param(
+            _FixWorkerGh(raise_on="graphql"),
+            {},
+            (False, "worker_verification_failed"),
+            id="graphql-error",
+        ),
+        pytest.param(
+            _FixWorkerGh(head=None),
+            {},
+            (False, "worker_verification_failed"),
+            id="head-unreadable",
+        ),
+        pytest.param(
+            _FixWorkerGh(head="sha-after"),
+            {"dispatch_head_sha": None},
+            (False, "worker_verification_failed"),
+            id="no-dispatch-head",
+        ),
+        pytest.param(
+            _FixWorkerGh(head="sha-after"),
+            {"target": None},
+            (False, "worker_verification_failed"),
+            id="no-target",
+        ),
+    ],
+)
+def test_pushed_or_replied_gate(
+    tmp_path: Path,
+    gh: _FixWorkerGh,
+    overrides: dict[str, Any],
+    expected: tuple[bool, str | None],
+) -> None:
+    from herdr_routines.verify import pushed_or_replied
+
+    verdict = pushed_or_replied(_fix_worker_ctx(tmp_path, gh, **overrides))
+    assert (verdict.passed, verdict.reason) == expected

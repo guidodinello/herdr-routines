@@ -133,8 +133,8 @@ the report without doing the work. It is never a substitute for a real gate.
 
 ## Follow-ups (out of scope, file when this lands)
 
-- **Issue 070 as gates.** `worktree_clean` and `pushed_commit` (remote head moved
-  since dispatch) as registry entries, enabled on the `gated` fix-worker path. 070's
+- **Issue 070 as gates.** `worktree_clean` and `pushed_or_replied` (remote head moved
+  since dispatch, or every given thread answered; shipped by 070) as registry entries, enabled on the `gated` fix-worker path. 070's
   attempt-budget criterion stays in 070.
 - **Phase B: selectors.** Lift "what it acts on" out of the kinds into reusable,
   code-run selectors: `oldest_unreviewed_pr(repo)`, `my_prs`, `new_findings`,

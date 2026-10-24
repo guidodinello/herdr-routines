@@ -1,7 +1,7 @@
 ---
 id: "070"
 title: "babysit-prs records a fix worker as done when it left uncommitted changes, then wedges on them"
-status: open
+status: done
 priority: high
 area: pipeline
 ---
@@ -56,3 +56,16 @@ So there are two bugs:
 - Clean up the worktree that triggered this
   (`~/.herdr/worktrees/herdr-routines/auto-pipeline-20261021t050000z` on the Pi) by
   hand. Its edits are superseded by `387baab`, which merged in #211.
+
+## Implementation notes
+
+- Gates `worktree_clean` and `pushed_or_replied` (issue 071's registry) run on the PR
+  fix-worker settle in `_process_pr_target`. The head moving **or** a fresh trusted reply on
+  every thread the worker was given passes (the description's "or"; AC1's text names only
+  the head). Reasons are `worker_left_uncommitted_changes` / `worker_pushed_nothing`; a
+  failed probe is `worker_verification_failed`. They are not listable under `verify:`.
+- `worktree_reuse_not_clean` is recorded `skipped`, never counts (legacy `failed` records
+  stop counting), notifies once at the failure tier per worktree, and the tick report lists
+  the path under "Uncommitted changes kept for a human".
+- Follow-up: the same gates for event workers (`_process_event_target`). Only AC2 applies
+  there today: an `issues:opened` event has no head branch to compare.

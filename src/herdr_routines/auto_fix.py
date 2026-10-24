@@ -41,6 +41,20 @@ DEFAULT_PR_BASE = "main"
 # appends each time a PR exceeds max_attempts must not increment the counter,
 # otherwise a fixed-then-broken PR is permanently abandoned (review finding F).
 _COUNTABLE_STATES = frozenset({"done", "failed"})
+# A `failed` record that never launched an agent spent nothing (issue 070): the refusal
+# to reuse a dirty worktree must not walk a PR to max_attempts_exceeded. Legacy records
+# written as `failed` stop counting too.
+_UNCOUNTED_FAILURE_REASONS = frozenset({"worktree_reuse_not_clean"})
+
+
+def _is_countable_attempt(state: str, extra: object) -> bool:
+    if state not in _COUNTABLE_STATES:
+        return False
+    return not (
+        state == "failed"
+        and isinstance(extra, dict)
+        and extra.get("reason") in _UNCOUNTED_FAILURE_REASONS
+    )
 
 
 class GhClient(Protocol):
@@ -123,6 +137,9 @@ class PRInfo:
     head_ref: str
     author: str
     url: str
+    # The head commit when listed (issue 070): what a fix worker's push is measured
+    # against. None when the payload did not carry it.
+    head_sha: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +234,7 @@ class RealGhClient:
                 "--limit",
                 str(limit),
                 "--json",
-                "number,headRefName,author,url,labels,isCrossRepository,isDraft",
+                "number,headRefName,headRefOid,author,url,labels,isCrossRepository,isDraft",
             ]
         )
         if exit_code != 0:
@@ -242,10 +259,11 @@ class RealGhClient:
                 f"{owner}/{repo}",
                 # `state`/`url` for stage 5's gate 5 (issue 056 phase C), which has to
                 # confirm the PR it just opened is the live one on the right head;
-                # `comments`/`reviews` for gate 6's tier-label check. Both are additive:
+                # `comments`/`reviews` for gate 6's tier-label check, `headRefOid` for
+                # issue 070's "did the fix worker move the head". All are additive:
                 # `statusCheckRollup` is still there for the CI gate.
                 "--json",
-                "statusCheckRollup,headRefName,state,url,comments,reviews",
+                "statusCheckRollup,headRefName,headRefOid,state,url,comments,reviews",
             ]
         )
         if exit_code != 0:
@@ -554,6 +572,7 @@ def list_open_prs(
         login = _author_login(pr)
         num = pr.get("number")
         url = pr.get("url", "")
+        head_sha = pr.get("headRefOid")
         if not (
             isinstance(head, str)
             and head.startswith(branch_prefix)
@@ -566,7 +585,17 @@ def list_open_prs(
         if not isinstance(login, str):
             continue
         if login == author or is_trusted_author(login, trusted_authors):
-            result.append(PRInfo(number=num, head_ref=head, author=login, url=url))
+            result.append(
+                PRInfo(
+                    number=num,
+                    head_ref=head,
+                    author=login,
+                    url=url,
+                    head_sha=head_sha
+                    if isinstance(head_sha, str) and head_sha
+                    else None,
+                )
+            )
     return result
 
 
@@ -682,28 +711,29 @@ def _has_unresolved_threads(
     return bool(_trusted_unresolved_threads(data, trusted_authors))
 
 
-def fetch_thread_bodies(
+def fetch_fix_worker_threads(
     gh: GhClient,
     *,
     owner: str,
     repo: str,
     number: int,
     trusted_authors: frozenset[str],
-) -> str:
-    """Fetch the unresolved review threads from trusted authors for the prompt."""
+) -> tuple[str, tuple[str, ...] | None]:
+    """The prompt text for the unresolved trusted threads, plus their ids: exactly the
+    threads the worker is told to answer (issue 070's reply proof checks those, by id).
+    The ids are None when the fetch failed, so nothing is then provable by replying."""
     try:
         data = gh.graphql(
             _REVIEW_THREADS_QUERY, owner=owner, repo=repo, number=str(number)
         )
     except Exception as e:  # noqa: BLE001 — best-effort detail fetch must not raise
         log.warning("GraphQL reviewThreads query failed for PR %d: %s", number, e)
-        return "(could not fetch review threads)"
+        return "(could not fetch review threads)", None
 
-    bodies = [
-        f"  - Thread {thread_id}: {body[:200]}"
-        for thread_id, body in _trusted_unresolved_threads(data, trusted_authors)
-    ]
-    return "\n".join(bodies) if bodies else "(no unresolved threads)"
+    threads = _trusted_unresolved_threads(data, trusted_authors)
+    bodies = [f"  - Thread {thread_id}: {body[:200]}" for thread_id, body in threads]
+    text = "\n".join(bodies) if bodies else "(no unresolved threads)"
+    return text, tuple(thread_id for thread_id, _ in threads)
 
 
 def is_eligible(
@@ -746,7 +776,7 @@ def attempt_count_for_pr(history_path: Path, job_name: str, pr_number: int) -> i
     count = 0
     for r in records:
         if (
-            r.state in _COUNTABLE_STATES
+            _is_countable_attempt(r.state, r.extra)
             and r.extra
             and r.extra.get("pr_number") == pr_number
         ):
@@ -798,6 +828,12 @@ def build_fix_prompt(
 
         Do NOT modify files outside the scope of the CI failures or review comments.
         Bounded work: complete the fix and push, then stop.
+
+        Before you stop, check:
+        - `git status` is clean (nothing uncommitted left in this worktree)
+        - a code fix is committed and on `origin/{branch}`
+        - every review thread listed above has a reply ("won't fix, because ..." is a
+          valid reply)
     """)
 
 
@@ -1657,7 +1693,7 @@ def attempt_count_for_event(history_path: Path, job_name: str, event_id: str) ->
     count = 0
     for r in records:
         if (
-            r.state in _COUNTABLE_STATES
+            _is_countable_attempt(r.state, r.extra)
             and r.extra
             and r.extra.get("event_id") == event_id
         ):

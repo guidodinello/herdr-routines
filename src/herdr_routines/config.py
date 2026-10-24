@@ -98,8 +98,19 @@ VALID_JOB_KINDS: frozenset[JobKind] = frozenset(get_args(JobKind))
 # Post-run verify gates a job can list under `verify:` (issue 071). The registry of gate
 # functions lives in verify.py, which imports Job from here, so the closed name set is
 # defined here and a test pins the two to the same keys.
-VerifyGate = Literal["review_posted", "report_wellformed"]
+VerifyGate = Literal[
+    "review_posted",
+    "report_wellformed",
+    "worktree_clean",
+    "pushed_or_replied",
+]
 VALID_VERIFY_GATES: frozenset[VerifyGate] = frozenset(get_args(VerifyGate))
+# Gates the gated fix-worker path (issue 070) always runs itself. They need a worktree,
+# a dispatch-time head and the threads the worker was given, none of which `execute_run`
+# has, so a job cannot list them under `verify:`.
+FIX_WORKER_VERIFY_GATES: frozenset[VerifyGate] = frozenset(
+    {"worktree_clean", "pushed_or_replied"}
+)
 
 # Target selectors a routine job can name under `pick:` (issue 073): code chooses what the
 # run acts on before any agent starts. Same arrangement as the verify gates: the registry
@@ -1743,7 +1754,14 @@ def _build_job(
             if not isinstance(gate, str) or gate not in VALID_VERIFY_GATES:
                 raise ConfigError(
                     f"{label}: 'verify' contains unknown gate {gate!r} — "
-                    f"valid gates: {sorted(VALID_VERIFY_GATES)}"
+                    f"valid gates: "
+                    f"{sorted(VALID_VERIFY_GATES - FIX_WORKER_VERIFY_GATES)}"
+                )
+            if gate in FIX_WORKER_VERIFY_GATES:
+                raise ConfigError(
+                    f"{label}: 'verify' cannot list {gate!r} — the gated fix-worker "
+                    f"path runs it itself (issue 070); a routine has no worktree or "
+                    f"dispatch head to check"
                 )
         if len(set(verify_raw)) != len(verify_raw):
             raise ConfigError(f"{label}: 'verify' lists a gate more than once")

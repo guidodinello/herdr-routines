@@ -887,6 +887,7 @@ class EligiblePrGhClient:
             {
                 "number": 42,
                 "headRefName": "auto/fix-42",
+                "headRefOid": "sha-before",
                 "author": {"login": "testuser", "is_bot": False},
                 "isCrossRepository": False,
                 "url": "https://github.com/test/repo/pull/42",
@@ -957,6 +958,11 @@ def _register_and_run_auto_fix_job(
     config = RoutinesConfig(jobs=(job,))
     monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh_client)
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    # These tests pin notification policy, not the post-settle gates (issue 070), and the
+    # mocked subprocess has no real worktree for them to read.
+    monkeypatch.setattr(
+        "herdr_routines.tick._verify_fix_worker", lambda *args, **kwargs: ()
+    )
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -2221,7 +2227,11 @@ def test_dispatch_failure_records_reason(
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
 
     pr = PRInfo(
-        number=81, head_ref="auto/pipeline-20260904T050000Z", author="bot", url=""
+        number=81,
+        head_ref="auto/pipeline-20260904T050000Z",
+        author="bot",
+        url="",
+        head_sha="sha-before",
     )
     monkeypatch.setattr(
         "herdr_routines.tick.list_open_prs",
@@ -2343,7 +2353,11 @@ def test_dispatch_worker_result_history_record(
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
 
     pr = PRInfo(
-        number=81, head_ref="auto/pipeline-20260904T050000Z", author="bot", url=""
+        number=81,
+        head_ref="auto/pipeline-20260904T050000Z",
+        author="bot",
+        url="",
+        head_sha="sha-before",
     )
     monkeypatch.setattr(
         "herdr_routines.tick.list_open_prs",
@@ -2357,6 +2371,10 @@ def test_dispatch_worker_result_history_record(
     )
     monkeypatch.setattr(
         "herdr_routines.tick._dispatch_fix_worker", lambda **kwargs: worker_result
+    )
+    # The gates have their own tests; this one pins the record's shape for a settled worker.
+    monkeypatch.setattr(
+        "herdr_routines.tick._verify_fix_worker", lambda *args, **kwargs: ()
     )
 
     t0 = datetime.now(UTC).replace(microsecond=0)

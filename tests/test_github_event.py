@@ -1523,3 +1523,51 @@ def test_head_ref_check_that_cannot_run_is_a_retried_failure(
     assert reasons.count("head_ref_check_failed") == 2, "retried up to the budget"
     assert "invalid_head_ref" not in reasons
     assert "max_attempts_exceeded" in reasons
+
+
+# -- issue 070 AC 2: a dirty retained worktree is refused, not retried into the budget ----
+
+
+def test_event_worktree_reuse_not_clean_does_not_consume_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The event path shares the reuse refusal with the pr path: no agent ran, so it is a
+    `skipped` that spends no attempt (the budget here is 3, the refusals 4), leaves the
+    event unseen for the next poll, and tells a human once."""
+    from herdr_routines.auto_fix import attempt_count_for_event
+
+    repo = _init_repo(tmp_path)
+    _git("branch", EVENT_BRANCH, cwd=repo)
+    retained = tmp_path / "retained-worktree"
+    _git("worktree", "add", str(retained), EVENT_BRANCH, cwd=repo)
+    (retained / "leftover.txt").write_text("edited, never committed\n")
+
+    job = _make_event_job(repo)
+    gh = EventGhClient(events=True)
+    client = RecordingHerdrClient()
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(jobs=(job,))
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+
+    t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+    for i in range(1, 5):
+        run_tick(config, history_path, client=client, now=t0 + timedelta(minutes=i))  # type: ignore[arg-type]
+
+    refusals = [
+        r
+        for r in read_job(history_path, job.name)
+        if r.extra and r.extra.get("event_id") == EVENT_ID
+    ]
+    assert [(r.state, r.extra and r.extra["reason"]) for r in refusals] == [
+        ("skipped", "worktree_reuse_not_clean")
+    ] * 4
+    assert refusals[0].extra is not None
+    assert refusals[0].extra["worktree_path"] == str(retained)
+    assert client.prompts == []
+    assert attempt_count_for_event(history_path, job.name, EVENT_ID) == 0
+    blocked = [n for n in client.notifications if "blocked" in n[0]]
+    assert len(blocked) == 1
+    assert str(retained) in (blocked[0][1] or "")

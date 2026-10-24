@@ -21,7 +21,7 @@ from herdr_routines.auto_fix import (
     build_pr_agent_name,
     build_worker_agent_name,
     effective_trusted_authors,
-    fetch_thread_bodies,
+    fetch_fix_worker_threads,
     is_eligible,
     list_open_prs,
     repo_owner_and_name,
@@ -34,6 +34,12 @@ from herdr_routines.config import (
 )
 from herdr_routines.history import HistoryRecord, HistoryState, append, read_job
 from herdr_routines.tick import _WorkerSettled, run_tick
+
+
+def fetch_thread_bodies(gh: Any, **kwargs: Any) -> str:
+    """The prompt text half of `fetch_fix_worker_threads`."""
+    return fetch_fix_worker_threads(gh, **kwargs)[0]
+
 
 # The effective trusted set these tests run under: the authenticated user the fakes
 # report plus the default reviewer bot (what `effective_trusted_authors` builds).
@@ -1622,6 +1628,7 @@ def _pr_payload(
     payload: dict[str, object] = {
         "number": n,
         "headRefName": f"auto/fix-{n}",
+        "headRefOid": f"sha-{n}",
         "author": {"login": login, "is_bot": is_bot},
         "url": f"https://github.com/t/r/pull/{n}",
     }
@@ -1893,3 +1900,93 @@ def test_github_event_payload_is_mapping_str_object() -> None:
     assert dict_prompt == view_prompt
     assert "Bug report" in dict_prompt
     assert "auto/fix" in dict_prompt
+
+
+# -- issue 070 ---------------------------------------------------------------------------
+
+
+def test_list_open_prs_carries_the_head_commit() -> None:
+    gh = FakeGhClient(prs=[_pr_payload(1, "testuser")])
+    [pr] = list_open_prs(
+        gh,
+        owner="t",
+        repo="r",
+        branch_prefix="auto/",
+        author="testuser",
+        trusted_authors=TRUSTED,
+    )
+    assert pr.head_sha == "sha-1"
+
+    payload = _pr_payload(2, "testuser")
+    del payload["headRefOid"]
+    [no_sha] = list_open_prs(
+        FakeGhClient(prs=[payload]),
+        owner="t",
+        repo="r",
+        branch_prefix="auto/",
+        author="testuser",
+        trusted_authors=TRUSTED,
+    )
+    assert no_sha.head_sha is None
+
+
+def test_fix_worker_threads_returns_the_ids_the_prompt_lists() -> None:
+    gh = FakeGhClient(
+        review_threads={7: _threads_payload(_thread("testuser", "NOTE ONE"))},
+    )
+    text, ids = fetch_fix_worker_threads(
+        gh, owner="t", repo="r", number=7, trusted_authors=TRUSTED
+    )
+    assert "NOTE ONE" in text
+    assert ids is not None
+    assert all(f"Thread {thread_id}" in text for thread_id in ids)
+    assert len(ids) == 1
+
+
+def test_attempt_counters_skip_legacy_worktree_reuse_refusals(tmp_path: Path) -> None:
+    """AC 2 (issue 070): `failed` / `worktree_reuse_not_clean` records written before the
+    refusal became a skip no longer count for a PR or an event, while a failure that did
+    run an agent still does."""
+    from herdr_routines.auto_fix import attempt_count_for_event
+
+    history = tmp_path / "history.jsonl"
+    ts = datetime(2026, 10, 21, 6, 0, tzinfo=UTC)
+
+    def record(state: HistoryState, reason: str) -> None:
+        append(
+            history,
+            HistoryRecord(
+                ts=ts,
+                job="babysit-prs",
+                state=state,
+                extra={"pr_number": 211, "event_id": "evt-1", "reason": reason},
+            ),
+        )
+
+    record("failed", "worktree_reuse_not_clean")
+    record("failed", "worktree_reuse_not_clean")
+    assert attempt_count_for_pr(history, "babysit-prs", 211) == 0
+    assert attempt_count_for_event(history, "babysit-prs", "evt-1") == 0
+
+    record("failed", "agent_prompt_failed")
+    record("done", "gate_failed")
+    assert attempt_count_for_pr(history, "babysit-prs", 211) == 2
+    assert attempt_count_for_event(history, "babysit-prs", "evt-1") == 2
+
+
+def test_fix_prompt_ends_with_commit_push_checklist() -> None:
+    """AC 4 (issue 070, non-blocking): the checklist is a reminder only; the code check
+    is the `worktree_clean` / `pushed_or_replied` gates."""
+    prompt = build_fix_prompt(
+        pr_number=42,
+        branch="auto/fix-42",
+        failing_checks="",
+        thread_bodies="",
+        owner_repo="test/repo",
+        report_path="/tmp/report.md",
+    )
+    lines = prompt.strip().splitlines()
+    tail = lines[lines.index("Before you stop, check:") :]
+    assert "`git status` is clean" in tail[1]
+    assert "origin/auto/fix-42" in tail[2]
+    assert any("reply" in line for line in tail[3:])

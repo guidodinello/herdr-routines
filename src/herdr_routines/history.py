@@ -103,6 +103,7 @@ class HistoryExtra(TypedDict, total=False):
     resigned_commits: int
     reaped_stale_agent: bool
     verify: list[VerifyRecord]
+    worktree_path: str | None
     # reports and artifacts
     report: str | None
     report_path: str | None

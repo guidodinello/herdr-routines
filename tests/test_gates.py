@@ -17,6 +17,7 @@ from herdr_routines.gates import (
     evaluate_ci_checks,
     evaluate_commit_checks,
     evaluate_gate7,
+    has_reply,
     run_ci_gate,
     run_gate6,
     run_gate7,
@@ -689,3 +690,70 @@ def test_evaluate_gate7_scopes_to_trusted_authors_when_given() -> None:
     # A thread whose author is unknown is never in scope of a trusted-only check.
     ghost = [ReviewThread(is_resolved=False, comment_count=1, first_comment_body="x")]
     assert evaluate_gate7(ghost, trusted_authors=frozenset({"owner"})).passed is True
+
+
+# ---------------------------------------------------------------------------
+# has_reply — the one definition of "replied" shared with the fix-worker gate (issue 070)
+# ---------------------------------------------------------------------------
+
+
+def _threads_graphql(
+    *comments_per_thread: list[dict[str, object]],
+) -> dict[str, object]:
+    nodes = [
+        {
+            "id": f"t{i}",
+            "isResolved": False,
+            "comments": {"totalCount": len(comments), "nodes": comments},
+        }
+        for i, comments in enumerate(comments_per_thread)
+    ]
+    return {
+        "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": nodes}}}}
+    }
+
+
+def _c(login: str, at: str) -> dict[str, object]:
+    return {"author": {"login": login}, "body": "x", "createdAt": at}
+
+
+def test_parse_review_threads_fills_ids_and_replies() -> None:
+    from herdr_routines.gates import _parse_review_threads
+
+    [thread] = _parse_review_threads(
+        _threads_graphql(
+            [_c("alice", "2026-10-21T04:00:00Z"), _c("bot", "2026-10-21T05:00:00Z")]
+        )
+    )
+    assert thread.thread_id == "t0"
+    assert thread.comment_count == 2
+    assert [
+        (r.author, r.created_at.isoformat() if r.created_at else None)
+        for r in thread.replies
+    ] == [("bot", "2026-10-21T05:00:00+00:00")]
+
+
+def test_has_reply_without_filters_is_gate7s_count_rule() -> None:
+    assert has_reply(ReviewThread(False, 2, "x")) is True
+    assert has_reply(ReviewThread(False, 1, "x")) is False
+
+
+def test_has_reply_filters_on_trusted_author_and_freshness() -> None:
+    from datetime import UTC, datetime
+
+    from herdr_routines.gates import ThreadComment
+
+    since = datetime(2026, 10, 21, 5, 0, tzinfo=UTC)
+    trusted = frozenset({"me"})
+
+    def thread(*replies: ThreadComment) -> ReviewThread:
+        return ReviewThread(False, 1 + len(replies), "x", replies=replies)
+
+    fresh = ThreadComment("me", since)
+    assert has_reply(thread(fresh), trusted_authors=trusted, since=since) is True
+    stale = ThreadComment("me", since.replace(hour=4))
+    assert has_reply(thread(stale), trusted_authors=trusted, since=since) is False
+    stranger = ThreadComment("stranger", since)
+    assert has_reply(thread(stranger), trusted_authors=trusted, since=since) is False
+    undated = ThreadComment("me", None)
+    assert has_reply(thread(undated), trusted_authors=trusted, since=since) is False
