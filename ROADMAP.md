@@ -74,6 +74,11 @@ Pipeline work; no real-run evidence required.
   changes** — every retry is then refused on the dirty worktree, and each
   refusal uses up an attempt until the PR hits `max_attempts_exceeded` (PR #211).
   → [`070`](docs/process/issues/070-fix-worker-done-with-uncommitted-changes.md)
+- **Routine review jobs record done without checking the review landed** — the
+  fitted reviewers are plain `routine` jobs, so a non-empty report counts as success.
+  One run reported reviewing fitted #839 and posted nothing. `kind: review` already
+  verifies the review is on the PR; migrate them to it.
+  → [`071`](docs/process/issues/071-routine-review-jobs-verify-the-review-landed.md)
 
 Earlier items, kept as issue files for history: plugin manifest
 ([`001`](docs/process/issues/001-plugin-manifest.md), PR #29), worktree GC
