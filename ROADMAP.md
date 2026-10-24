@@ -335,4 +335,4 @@ files 2026-08-27.
 
 House rule: anything a plan document explicitly defers ("out of scope", "v2 item", "deferred
 to v1.5") gets a bullet here the day the plan lands, with its gate — so no deferred work lives
-only inside `docs/`.
+only inside `docs/`. → [`071`](docs/process/issues/071-missed-run-alert-in-the-digest.md)
