@@ -13,19 +13,21 @@ WorkingDirectory=%h/projects/herdr-routines
 Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Runs the OLD code, fast-forwards the checkout, then exercises the NEW code out of
 # process (`uv run --locked herdr-routines validate` in the checkout) and rolls back
-# with `git reset --keep` if it does not. Deferrals are silent and exit 0; a refusal
-# or a rollback exits 1 and notifies.
+# with `git reset --keep` if it does not. Deferrals exit 0 and are silent, except a
+# tick lock still held after the in-process wait, which notifies; a refusal or a
+# rollback exits 1 and notifies.
 ExecStart=%h/.local/bin/uv run --locked herdr-routines self-update
 
 # Finite, and sized so systemd cannot land a SIGTERM inside the window where the
 # checkout is at the new commit but the new code has not been proven. Budget as the
-# code actually issues calls: two bounded `uv run` children at up to 300s each, plus
+# code actually issues calls: up to 300s waiting for a held tick lock
+# (TICK_LOCK_WAIT_S, before anything is touched), two bounded `uv run` children at up to 300s each, plus
 # up to nine bounded git calls at 120s (rev-parse HEAD, rev-parse --abbrev-ref HEAD,
 # status --porcelain, fetch, rev-parse origin/main, merge --ff-only, rev-parse HEAD,
-# diff --name-only, rev-list --count), plus one gh query — about 1700s, inside the
-# 1800s below. A rollback adds `reset --keep` and two more reads, whose theoretical
+# diff --name-only, rev-list --count), plus one gh query — about 2000s, inside the
+# 2100s below. A rollback adds `reset --keep` and two more reads, whose theoretical
 # worst case is over the line; being SIGTERMed there is the fail-closed outcome this
 # bound exists for, and the next night's run re-reads HEAD rather than assuming the
 # update landed. A run that overruns is killed by systemd rather than wedging the
 # host.
-TimeoutStartSec=1800
+TimeoutStartSec=2100

@@ -667,7 +667,10 @@ def _cmd_tick(args: argparse.Namespace) -> int:
     lock_path = default_lock_path()
     with tick_lock(lock_path) as acquired:
         if not acquired:
-            # Another tick is already running — skip quietly, per docs/plan-v1.md §4.
+            # Another tick (or a manual `run`, or self-update) holds it — skip with
+            # rc 0, per docs/plan-v1.md §4. One INFO line so contention is visible in
+            # journalctl: a silent skip hid three nights of self-update collisions.
+            log.info("tick: skipped, tick lock %s is held", lock_path)
             return 0
         now = datetime.now(UTC)
         client = HerdrClient()
@@ -1738,7 +1741,8 @@ def _cmd_self_update(args: argparse.Namespace) -> int:
         state_path=default_state_path(),
     )
     # up_to_date and deferred are quiet by design (the handler logs them at info /
-    # warning inside the module); nothing here adds a second notification.
+    # warning inside the module, and notifies itself for the one loud deferral, a
+    # tick lock held past TICK_LOCK_WAIT_S); nothing here adds a second notification.
     log.info("self-update: %s (%s)", result.status, result.reason or "no reason")
     return result.exit_code
 

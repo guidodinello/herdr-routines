@@ -25,11 +25,13 @@ merge.
 
 **Normally you don't run this by hand at all** (issue 053):
 `herdr-routines-update.timer` fires `herdr-routines self-update` every night at
-21:30 UTC (the unit's `OnCalendar` pins `UTC`, so this is 18:30 on the Pi's
-`America/Montevideo`), which does steps 0-4 below automatically — CI check,
-fast-forward onto the gated commit, validate, `git reset --keep` rollback on
-failure — and defers silently when the tick lock is held, a `kind: pipeline` run is
-in flight, CI is not green, or the commit has already been rolled back once. The
+21:32:30 UTC (the unit's `OnCalendar` pins `UTC`, so this is 18:32 on the Pi's
+`America/Montevideo`; off the 5-minute tick boundary on purpose), which does steps
+0-4 below automatically — CI check, fast-forward onto the gated commit, validate,
+`git reset --keep` rollback on failure — and defers silently when a `kind: pipeline`
+run is in flight, CI is not green, or the commit has already been rolled back once.
+A held tick lock is retried for up to 5 minutes; one still held after that defers
+*with* a notification (`self-update deferred`). The
 steps below are still the procedure for the two cases it cannot cover: a **config
 schema migration** (below), and a host it has *refused* (dirty tree, not on
 `main`, detached HEAD, an unpushed hand-hotfix, or a checkout still sitting on a
@@ -43,8 +45,8 @@ ssh $HOST "cd ~/projects/herdr-routines && uv run herdr-routines self-update --d
 ```
 
 `--dry-run` fetches, checks CI and prints the `old..new` range and deploy diff, then
-stops before the fast-forward. It reports `deferred` (exit 0) — including under a held
-tick lock, which is correct and not a failure.
+stops before the fast-forward. It reports `deferred` (exit 0) — including under a
+tick lock held past the 5-minute wait, which is correct and not a failure.
 
 ## Steps
 

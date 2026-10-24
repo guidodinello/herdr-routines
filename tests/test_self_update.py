@@ -465,25 +465,64 @@ def test_self_update_refuses_dirty_or_diverged(tmp_path: Path) -> None:
 
 
 def test_self_update_respects_tick_lock(
-    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Criterion 5. A real flock is taken on the temp lock path; the command must be a
-    complete no-op — not merely "does not move HEAD", but performs no git call at
-    all."""
+    """Criterion 5. A real flock is taken on the temp lock path and held past the
+    wait; the command must be a complete no-op — not merely "does not move HEAD", but
+    performs no git call at all — and, having spent the whole wait, it says so: a
+    WARNING and a notification, because the next try is 24h away (2026-10-21..23)."""
     old = sandbox.head()
     sandbox.push("NEW.md", "new\n", "add NEW.md")
 
     git_calls = _record_git_calls(monkeypatch)
 
-    with _held_flock(sandbox.lock_path):
+    slept: list[float] = []
+    with _held_flock(sandbox.lock_path), caplog.at_level("WARNING"):
         notify = Recorder()
-        result = sandbox.run(notify=notify)
+        result = sandbox.run(notify=notify, sleep=slept.append)
 
     assert result.status == "deferred"
+    assert result.exit_code == 0
     assert "lock" in (result.reason or "")
     assert git_calls.calls == []
     assert sandbox.head() == old
-    assert notify.calls == []
+    # It waited the whole bound, in polls, before giving up.
+    assert sum(slept) == self_update.TICK_LOCK_WAIT_S
+    assert "tick lock held" in caplog.text
+    assert [r.levelname for r in caplog.records if "deferred" in r.message] == [
+        "WARNING"
+    ]
+    assert len(notify.calls) == 1
+    title, body = notify.calls[0]
+    assert "deferred" in title
+    assert str(sandbox.lock_path) in (body or "")
+
+
+def test_self_update_waits_out_a_briefly_held_tick_lock(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 2026-10-21..23 collision: the update timer and a tick started in the same
+    second, the tick held the lock for ~8s, and the update deferred for 24h. A lock
+    released within the wait must be taken and the update must land."""
+    sandbox.push("NEW.md", "new\n", "add NEW.md")
+    sandbox.lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(sandbox.lock_path, os.O_CREAT | os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    slept: list[float] = []
+
+    def tick_finishes(seconds: float) -> None:
+        # The concurrent tick ends during the first poll interval.
+        if not slept:
+            os.close(fd)
+        slept.append(seconds)
+
+    notify = Recorder()
+    result = sandbox.run(notify=notify, sleep=tick_finishes)
+
+    assert result.status == "updated"
+    assert slept == [self_update.TICK_LOCK_POLL_S]
+    assert sandbox.head() == sandbox.head(sandbox.work)
+    assert not any("deferred" in title for title, _body in notify.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -624,11 +663,11 @@ def test_self_update_units_and_docs_are_shipped() -> None:
     assert "[Install]" not in digest_text
 
     # `UTC` is pinned explicitly: an OnCalendar with no suffix is read in the
-    # *system* zone, which is America/Montevideo on the Pi, so the docs' "21:30 UTC"
-    # would otherwise be 21:30 local.
-    assert "OnCalendar=*-*-* 21:30:00 UTC" in timer_text
+    # *system* zone, which is America/Montevideo on the Pi, so the docs' "21:32:30
+    # UTC" would otherwise be 21:32 local.
+    assert "OnCalendar=*-*-* 21:32:30 UTC" in timer_text
     assert "Persistent=true" in timer_text
-    assert "AccuracySec=5min" in timer_text
+    assert "AccuracySec=30s" in timer_text
     assert "WantedBy=timers.target" in timer_text
 
     readme = (REPO_ROOT / "deploy" / "README.md").read_text()
@@ -875,10 +914,12 @@ def test_self_update_dry_run_makes_no_git_change(sandbox: Sandbox) -> None:
     assert result.old == old
     assert result.new == new
 
-    # The lock applies to a dry run too.
+    # The lock applies to a dry run too — and stays quiet: no notification.
     with _held_flock(sandbox.lock_path):
-        result = sandbox.run(dry_run=True, notify=Recorder())
+        notify = Recorder()
+        result = sandbox.run(dry_run=True, notify=notify, sleep=lambda _s: None)
     assert result.status == "deferred"
+    assert notify.calls == []
 
 
 # ---------------------------------------------------------------------------

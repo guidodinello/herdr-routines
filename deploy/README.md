@@ -35,17 +35,19 @@ Edit `--timezone` in the unit's `ExecStart` (default in the example is
 `America/Montevideo`) to your own; drop `--notify` to only print to the service log.
 
 `herdr-routines-update.{timer,service}` is a fourth unit pair, and the one that keeps this
-checkout current (issue 053). It runs once a night at 21:30 UTC — the unit's
+checkout current (issue 053). It runs once a night at 21:32:30 UTC — the unit's
 `OnCalendar` pins `UTC` explicitly, so it does not follow the host's
-`America/Montevideo`, where that hour is 18:30. `ExecStart` is
+`America/Montevideo`, where that hour is 18:32 — half-way between two 5-minute
+ticks, because at 21:30 it collided with one and deferred. `ExecStart` is
 `uv run herdr-routines self-update`, which fast-forwards **this** checkout to
 `origin/main` — but only onto the exact commit the CI gate was asked about, and only
 after the new code has validated this host's live config *out of process*; if that
 validate fails the checkout goes back to where it was with `git reset --keep` and a
 notification. It reports (and applies) nothing under `deploy/` — unit changes are
-reported in the notification and installed by hand, per this file. Deferrals (tick
-lock held, a pipeline run in flight, a red or pending CI, a commit already rolled
-back) are silent and exit 0; refusals (dirty tree, not on `main`, detached HEAD, a
+reported in the notification and installed by hand, per this file. Deferrals (a pipeline run in flight, a red or pending CI, a commit already rolled
+back) are silent and exit 0. A held tick lock is retried for up to 5 minutes first;
+if it is *still* held the run defers (exit 0) with a WARNING and a notification,
+since that is a night lost; refusals (dirty tree, not on `main`, detached HEAD, a
 checkout still sitting on a commit that failed validation) notify and exit 1.
 Preview it any time without touching the checkout:
 

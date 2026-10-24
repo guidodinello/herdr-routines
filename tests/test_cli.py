@@ -965,17 +965,23 @@ def _prepare_run_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def test_cmd_tick_returns_zero_without_running_when_the_lock_is_held(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """The skip is rc 0 but not silent: one INFO line naming the lock, so contention
+    (a self-update or manual `run` colliding with the tick) shows in journalctl."""
     lock_path = _prepare_run_cli(tmp_path, monkeypatch)
 
     def fail_run_tick(*a, **kw):
         raise AssertionError("run_tick must not run while another tick holds the lock")
 
     monkeypatch.setattr(cli, "run_tick", fail_run_tick)
-    with cli.tick_lock(lock_path) as holder_acquired:
+    with cli.tick_lock(lock_path) as holder_acquired, caplog.at_level("INFO"):
         assert holder_acquired
         assert cli.main(["tick"]) == 0
+    skips = [r for r in caplog.records if "lock" in r.message and "skip" in r.message]
+    assert len(skips) == 1
+    assert skips[0].levelname == "INFO"
+    assert str(lock_path) in skips[0].getMessage()
 
 
 def test_cmd_run_refuses_while_a_tick_holds_the_lock(
@@ -1263,7 +1269,7 @@ def test_review_scan_human_output_sorted_dispositions_and_note(
     assert keys == sorted(keys)
     assert len(set(keys)) == 6
     for number, disposition in _MIXED_DISPOSITIONS.items():
-        (line,) = [line for line in lines if f"acme/alpha#{number}" in line]
+        (line,) = (line for line in lines if f"acme/alpha#{number}" in line)
         assert "author" in line, "select_mode must be on the line"
         assert "skipped" not in line, "no generic 'skipped' disposition"
         hits = {

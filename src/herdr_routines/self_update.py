@@ -32,7 +32,10 @@ decision in here, and all three come from that incident:
   nothing there is how this command's reason for existing is defeated.
 - **Fail closed, exit 0.** Anything unverifiable — a tick lock held, an open
   pipeline run, a red or pending or unqueryable CI state, a missing `uv` — defers
-  quietly and leaves the host exactly as it was.
+  quietly and leaves the host exactly as it was. The one deferral that is *not*
+  quiet is the tick lock still being held after `TICK_LOCK_WAIT_S`: the timer fires
+  once a night, so giving up on a lock is giving up for 24h, and three nights of
+  that (2026-10-21..23) left the runner 9 commits behind with nobody told.
 
 The command runs from the *already imported* old code and exercises the new code out
 of process, so a commit that does not even import is data to roll back rather than a
@@ -42,7 +45,7 @@ of those seams, and is exercised for real in `tests/test_self_update.py`.
 
 Sequence (spec 20260929T050000Z, `### Sequence`):
 
-    1. tick_lock                       not acquired -> deferred,  rc 0
+    1. tick_lock     not acquired within TICK_LOCK_WAIT_S -> deferred + notify, rc 0
     2. pipeline_run_open               open run     -> deferred,  rc 0
     3. repo_state       unreadable HEAD / dirty / not <base> / detached
                                                         -> refused,  rc 1
@@ -69,7 +72,9 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -98,6 +103,16 @@ GIT_TIMEOUT_S = 120
 # git merge window: two `uv run` invocations at up to VALIDATE_TIMEOUT_S each, plus
 # up to five bounded git calls, plus one `gh` call, plus slack.
 VALIDATE_TIMEOUT_S = 300
+# How long to keep retrying a held tick lock before deferring. A tick holds it for
+# seconds (~8s on the Pi), so a timer that lands on a tick boundary — 21:30 UTC is
+# one, and it deferred three nights running on exactly that — is a transient
+# collision, not a reason to wait another 24h. Five minutes rides out any ordinary
+# tick, including one that dispatches a job, while a lock still held after that is
+# almost certainly a long `herdr-routines run <job>` (which holds it for the whole
+# run): that is worth a notification, not an open-ended wait inside a unit with a
+# finite TimeoutStartSec. Polled rather than a blocking flock so the bound is ours.
+TICK_LOCK_WAIT_S = 300
+TICK_LOCK_POLL_S = 5
 
 
 class Notify(Protocol):
@@ -424,6 +439,29 @@ def record_rejected(
     )
 
 
+@contextmanager
+def _wait_for_tick_lock(
+    lock_path: Path, *, wait_s: float, sleep: Callable[[float], None]
+) -> Generator[bool]:
+    """`tick_lock`, retried every TICK_LOCK_POLL_S for up to *wait_s* seconds.
+    Yields True holding the lock, or False once the bound is spent. The bound is
+    counted in polls rather than read off a clock so a test's `sleep` alone drives
+    it."""
+    polls = max(0, int(wait_s // TICK_LOCK_POLL_S))
+    for attempt in range(polls + 1):
+        with tick_lock(lock_path) as acquired:
+            if acquired or attempt == polls:
+                yield acquired
+                return
+        if attempt == 0:
+            log.info(
+                "self-update: tick lock %s held; retrying for up to %ss",
+                lock_path,
+                wait_s,
+            )
+        sleep(TICK_LOCK_POLL_S)
+
+
 # ---------------------------------------------------------------------------
 # results
 # ---------------------------------------------------------------------------
@@ -525,6 +563,8 @@ def run_self_update(
     dry_run: bool = False,
     runner: Runner = subprocess.run,
     uv_resolver: Callable[[], str | None] = resolve_uv,
+    lock_wait_s: float = TICK_LOCK_WAIT_S,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> SelfUpdateResult:
     """Fast-forward *checkout* to origin/<base> after proving the new commit is
     green and that the new code accepts the host's live config; roll back if it does
@@ -537,10 +577,25 @@ def run_self_update(
     notification. It reports `deferred` (exit 0) rather than inventing a sixth
     status, and a `--dry-run` under a held tick lock reports `deferred` too, which is
     correct and is said in `--help` so the manual runbook path is not confusing.
+
+    A held tick lock is retried for `lock_wait_s` (see TICK_LOCK_WAIT_S) before
+    deferring, and a deferral that survives the wait notifies — unlike every other
+    deferral, it is the one that recurs nightly without anything else changing.
     """
-    with tick_lock(lock_path) as acquired:
+    with _wait_for_tick_lock(lock_path, wait_s=lock_wait_s, sleep=sleep) as acquired:
         if not acquired:
-            return _deferred("tick lock held", checkout)
+            reason = f"tick lock held for over {lock_wait_s:g}s"
+            result = _deferred(reason, checkout)
+            if not dry_run:
+                notify(
+                    f"herdr-routines: self-update deferred ({checkout})",
+                    body=(
+                        f"{reason} ({lock_path}) — no update tonight; the timer "
+                        "fires again tomorrow. A lock held this long is usually a "
+                        "manual `herdr-routines run <job>` still in progress."
+                    ),
+                )
+            return result
 
         open_job = pipeline_run_open(config, history_path)
         if open_job is not None:
