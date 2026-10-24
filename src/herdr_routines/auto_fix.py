@@ -54,8 +54,11 @@ class GhClient(Protocol):
         self, *, owner: str, repo: str, state: str, limit: int
     ) -> list[dict[str, object]]:
         """Return open PRs with number, headRefName, author, url, labels (labels are
-        what a `github_event` `prs:labels` poll matches on) and isCrossRepository (a
-        fork PR is never auto-fixed, see `list_open_prs`)."""
+        what a `github_event` `prs:labels` poll matches on), isCrossRepository (a
+        fork PR is never auto-fixed, see `list_open_prs`) and isDraft / author.is_bot
+        (what the `oldest_unreviewed_pr` selector filters on; absent reads as false).
+        Raises ``RuntimeError`` when gh fails or answers with something that is not a
+        PR list — "could not list" must never read as "no open PRs"."""
         ...
 
     def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
@@ -214,17 +217,18 @@ class RealGhClient:
                 "--limit",
                 str(limit),
                 "--json",
-                "number,headRefName,author,url,labels,isCrossRepository",
+                "number,headRefName,author,url,labels,isCrossRepository,isDraft",
             ]
         )
         if exit_code != 0:
             raise RuntimeError(f"gh pr list failed: {stderr.strip()}")
         try:
             payload = json.loads(stdout)
-        except json.JSONDecodeError:
-            return []
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"gh pr list returned undecodable JSON: {e}") from e
         if not isinstance(payload, list):
-            return []
+            # RuntimeError like every other "gh could not answer" (callers catch that).
+            raise RuntimeError("gh pr list returned a non-list payload")  # noqa: TRY004
         return [p for p in payload if isinstance(p, dict)]
 
     def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:

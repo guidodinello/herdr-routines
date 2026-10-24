@@ -22,6 +22,7 @@ from pathlib import Path
 
 from herdr_routines.auto_fix import (
     GhClient,
+    PostedBody,
     effective_trusted_authors,
     is_trusted_author,
 )
@@ -52,6 +53,11 @@ class VerifyTarget:
     owner: str
     repo: str
     number: int
+
+    @property
+    def ref(self) -> str:
+        """`<owner>/<repo>#<n>`, the form `$ROUTINE_TARGET` and `extra.target` carry."""
+        return f"{self.owner}/{self.repo}#{self.number}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +102,16 @@ def _fail(reason: str) -> GateVerdict:
     return GateVerdict(passed=False, reason=reason)
 
 
+def is_trusted_review(
+    posted: PostedBody, *, marker: str, trusted: frozenset[str]
+) -> bool:
+    """The one definition of "this body is a review" (issue 073): a trusted author's body
+    carrying the review marker. `review_posted` adds a freshness bound on top; the
+    `oldest_unreviewed_pr` selector uses it as is, so "reviewed" cannot drift between the
+    two."""
+    return marker in posted.body and is_trusted_author(posted.author, trusted)
+
+
 def review_posted(ctx: VerifyContext) -> GateVerdict:
     """Passes when the target PR carries a review or comment from a trusted author that
     was posted at or after the run's start and carries the review marker. The freshness
@@ -130,8 +146,7 @@ def review_posted(ctx: VerifyContext) -> GateVerdict:
     since = ctx.started_at.replace(microsecond=0)
     for posted in bodies:
         if (
-            marker in posted.body
-            and is_trusted_author(posted.author, trusted)
+            is_trusted_review(posted, marker=marker, trusted=trusted)
             and posted.created_at is not None
             and posted.created_at >= since
         ):
