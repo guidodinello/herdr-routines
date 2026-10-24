@@ -241,11 +241,21 @@ def run_tick(
     evaluated."""
     # /tmp hygiene preamble (issue 027): best-effort reap under tick.lock, never fails
     # the tick. Runs before job dispatch so leaked agent .so files and pytest artifacts
-    # are cleaned before any new agent spawn.
-    try:
-        reap_tmp()
-    except Exception as e:  # noqa: BLE001
-        log.warning("tmp hygiene reap failed (continuing): %s", e)
+    # are cleaned before any new agent spawn. Configured from `defaults:` only.
+    tmp_hygiene = config.tmp_hygiene
+    if tmp_hygiene.enabled:
+        try:
+            reaped = reap_tmp(
+                tmp_dir=Path(tmp_hygiene.tmp_dir), max_age_s=tmp_hygiene.max_age_s
+            )
+            log.info(
+                "tmp hygiene: removed %d, skipped %d fresh, %d errors",
+                reaped.removed,
+                reaped.skipped_fresh,
+                reaped.errors,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("tmp hygiene reap failed (continuing): %s", e)
 
     summaries: list[str] = []
     any_job_failed = False

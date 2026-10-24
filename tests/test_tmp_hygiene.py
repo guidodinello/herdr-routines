@@ -6,24 +6,31 @@ Covers all acceptance criteria from spec v2:
 3. test_tmp_hygiene_keeps_tmp_under_threshold
 4. test_tmp_hygiene_diagnosis_distinguishes_disk_full
 5. test_tmp_hygiene_narrow_patterns
-6. test_tmp_hygiene_dry_run_and_tick_preamble
-7. test_tmp_hygiene_config_and_docs
+6. test_tmp_hygiene_dry_run_and_tick_preamble, plus test_tick_reap_* driving run_tick
+7. test_tmp_hygiene_config_and_docs, test_tmp_hygiene_defaults_block_reaches_routines_config
 """
 
 from __future__ import annotations
 
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from herdr_routines import tick as tick_mod
 from herdr_routines import tmp_hygiene
 from herdr_routines.config import (
+    ConfigError,
+    RoutinesConfig,
+    TmpHygieneConfig,
     load_config,
 )
+from herdr_routines.tick import TickOutcome, run_tick
 from herdr_routines.tmp_hygiene import reap_tmp
+from tests.test_tick import FakeClient, make_job
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -329,26 +336,115 @@ def test_tmp_hygiene_dry_run_and_tick_preamble(tmp_path: Path) -> None:
     assert old_so.exists(), "dry_run must not delete"
     assert old_pytest.exists(), "dry_run must not delete"
 
-    # Verify tick preamble is best-effort: monkeypatch reap_tmp to raise
-    from herdr_routines import tick as tick_mod
-
-    def broken_reap(**kwargs):
-        raise OSError("simulated failure")
-
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(tick_mod, "reap_tmp", broken_reap)
-
-    # run_tick calls reap_tmp at preamble — it must not crash the tick.
-    # We don't need a real config/client for this; the preamble fires before jobs.
-    # Just verify the import works and the try/except is in place by calling the
-    # function directly — the test_tick.py suite covers the full integration.
-
-    # Restore for the assertion below
-    monkeypatch.undo()
-
-    # The real function still works
+    # The real function still deletes once dry_run is off
     r = reap_tmp(tmp_dir=tmp_dir, max_age_s=3600)
     assert r.removed == 2
+
+
+# ---------------------------------------------------------------------------
+# 6b. Tick wiring: run_tick reaps with the defaults-level tmp_hygiene config
+# ---------------------------------------------------------------------------
+
+_TICK_NOW = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+
+def _run_tick_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: RoutinesConfig
+) -> TickOutcome:
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    return run_tick(
+        config,
+        tmp_path / "state" / "history.jsonl",
+        client=FakeClient(),  # type: ignore[arg-type]
+        now=_TICK_NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_age_s", "file_age_s", "expect_removed"),
+    [
+        # Both cases flip relative to the built-in 3600s default: a tick that ignored the
+        # config would keep the 30-min-old file and delete the 2h-old one.
+        (600, 1800, True),
+        (10800, 7200, False),
+    ],
+)
+def test_tick_reaps_with_configured_max_age_and_tmp_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_age_s: int,
+    file_age_s: int,
+    expect_removed: bool,
+) -> None:
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    leaked = tmp_dir / ".3cdcABCDEF01234567-00000001.so"
+    leaked.write_text("leaked")
+    old_time = time.time() - file_age_s
+    os.utime(leaked, (old_time, old_time))
+    config = RoutinesConfig(
+        jobs=(make_job(tmp_path, cron="0 3 * * *"),),
+        tmp_hygiene=TmpHygieneConfig(max_age_s=max_age_s, tmp_dir=str(tmp_dir)),
+    )
+
+    outcome = _run_tick_with(tmp_path, monkeypatch, config)
+
+    assert leaked.exists() is not expect_removed
+    assert outcome.summaries == ("a: registered",)
+
+
+def test_tick_reap_disabled_leaves_tmp_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    leaked = _make_old_file(tmp_dir, ".3cdcABCDEF01234567-00000001.so")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(tick_mod, "reap_tmp", lambda **kw: calls.append(kw))
+    config = RoutinesConfig(
+        tmp_hygiene=TmpHygieneConfig(enabled=False, tmp_dir=str(tmp_dir))
+    )
+
+    _run_tick_with(tmp_path, monkeypatch, config)
+
+    assert calls == []
+    assert leaked.exists()
+
+
+def test_tick_reap_absent_config_uses_builtin_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No `tmp_hygiene:` block means "reap with the defaults", not "off" — the behaviour
+    deploy/README.md documents. Recorded, never run: the default tmp_dir is the real /tmp."""
+    calls: list[dict[str, object]] = []
+
+    def record(**kw: object) -> tmp_hygiene.ReapResult:
+        calls.append(kw)
+        return tmp_hygiene.ReapResult()
+
+    monkeypatch.setattr(tick_mod, "reap_tmp", record)
+
+    _run_tick_with(tmp_path, monkeypatch, RoutinesConfig())
+
+    assert calls == [{"tmp_dir": Path("/tmp"), "max_age_s": 3600}]
+
+
+def test_tick_reap_failure_does_not_block_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_reap(**kw: object) -> tmp_hygiene.ReapResult:
+        raise OSError("simulated failure")
+
+    monkeypatch.setattr(tick_mod, "reap_tmp", broken_reap)
+    config = RoutinesConfig(
+        jobs=(make_job(tmp_path, cron="0 3 * * *"),),
+        tmp_hygiene=TmpHygieneConfig(tmp_dir=str(tmp_path / "tmp")),
+    )
+
+    outcome = _run_tick_with(tmp_path, monkeypatch, config)
+
+    assert outcome.summaries == ("a: registered",)
+    assert outcome.any_job_failed is False
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +517,43 @@ jobs:
     tmp_config_path.write_text(bad_text3)
     with pytest.raises(Exception, match="boolean"):
         load_config(tmp_config_path)
+
+
+def test_tmp_hygiene_defaults_block_reaches_routines_config(
+    tmp_config_path: Path, tmp_path: Path
+) -> None:
+    """The tick reads `RoutinesConfig.tmp_hygiene`, resolved from `defaults:` in the
+    legacy file and from `defaults.yaml` in a jobs.d/ layout."""
+    tmp_config_path.write_text(
+        """
+version: 1
+defaults:
+  tmp_hygiene:
+    max_age_s: 600
+    tmp_dir: /var/tmp
+jobs:
+  - name: test-job
+    cron: "0 3 * * *"
+    repo: /tmp
+"""
+    )
+    assert load_config(tmp_config_path).tmp_hygiene == TmpHygieneConfig(
+        enabled=True, max_age_s=600, tmp_dir="/var/tmp"
+    )
+
+    jobs_d = tmp_path / "jobs.d"
+    jobs_d.mkdir()
+    (jobs_d / "defaults.yaml").write_text("tmp_hygiene:\n  enabled: false\n")
+    (jobs_d / "test-job.yaml").write_text('cron: "0 3 * * *"\nrepo: /tmp\n')
+    assert load_config(jobs_d).tmp_hygiene == TmpHygieneConfig(enabled=False)
+
+    # Absent block = reap with the built-in defaults.
+    (jobs_d / "defaults.yaml").write_text("timezone: UTC\n")
+    assert load_config(jobs_d).tmp_hygiene == TmpHygieneConfig()
+
+    (jobs_d / "defaults.yaml").write_text("tmp_hygiene:\n  max_age_s: 0\n")
+    with pytest.raises(ConfigError, match="positive integer"):
+        load_config(jobs_d)
 
 
 # ---------------------------------------------------------------------------
