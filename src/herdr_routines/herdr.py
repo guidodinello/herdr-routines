@@ -489,7 +489,7 @@ class HerdrClient:
     def agent_session_id(self, target: str) -> str | None:
         """Best-effort: the agent's underlying CLI session id (e.g. an opencode `ses_...`
         id) from `agent get`'s `agent_session.value`, or None on any CLI/shape failure —
-        same best-effort contract as agent_read/agent_read_visible. Callers capture this
+        same best-effort contract as agent_read_visible. Callers capture this
         before closing a settled run's pane so a human can later resume and inspect the
         conversation (`herdr agent start ... -s <session_id>`) without the pane/process
         needing to stay resident just for that purpose (pane-lifecycle v2 for routine
@@ -510,25 +510,12 @@ class HerdrClient:
             return None
         return value or None
 
-    def agent_read(self, target: str, *, lines: int = 200) -> str:
-        args = [
-            "agent",
-            "read",
-            target,
-            "--source",
-            "recent-unwrapped",
-            "--lines",
-            str(lines),
-        ]
-        exit_code, stdout, _stderr = self.runner([self.bin_path, *args], timeout_s=30)
-        return stdout if exit_code == 0 else ""
-
     def agent_read_visible(self, target: str, *, lines: int = 200) -> str:
-        """agent_read against the currently-rendered viewport (`--source visible`). While an
+        """`herdr agent read` against the currently-rendered viewport (`--source visible`). While an
         agent is unsettled herdr rejects recent-unwrapped reads with agent_not_idle — observed
         live 2026-08-23 ("alternate-screen history can only be captured by scrolling while
         idle") — and failure-path agents are definitionally unsettled, so post-mortem screen
-        capture needs this variant. Same best-effort contract as agent_read: "" on any
+        capture needs the viewport rather than recent-unwrapped. Best-effort: "" on any
         failure."""
         args = [
             "agent",

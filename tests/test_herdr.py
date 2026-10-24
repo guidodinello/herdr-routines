@@ -606,14 +606,6 @@ def test_notification_show_includes_sound_and_optional_body() -> None:
     assert "--body" in argv and "see report" in argv
 
 
-def test_agent_read_returns_empty_string_on_failure_rather_than_raising() -> None:
-    """agent_read is diagnostic/best-effort (docs/plan-v1.md §6 layer 2) — a failure here must
-    not blow up the run, just yield nothing to attach to the report."""
-    runner = FakeRunner([(1, "", "some error")])
-    client = HerdrClient(runner=runner)
-    assert client.agent_read("rt-a") == ""
-
-
 def test_agent_read_visible_builds_expected_argv() -> None:
     """Failure-path screen capture reads the live viewport (--source visible): herdr rejects
     recent-unwrapped while an agent is unsettled (agent_not_idle, observed 2026-08-23)."""
@@ -627,7 +619,8 @@ def test_agent_read_visible_builds_expected_argv() -> None:
 
 
 def test_agent_read_visible_returns_empty_string_on_failure() -> None:
-    """Same best-effort contract as agent_read: "" on any failure, never a raise."""
+    """agent_read_visible is diagnostic/best-effort (docs/plan-v1.md §6 layer 2): "" on any
+    failure, never a raise, so a failed capture cannot blow up the run."""
     runner = FakeRunner([(1, "", "some error")])
     client = HerdrClient(runner=runner)
     assert client.agent_read_visible("rt-a") == ""
@@ -990,7 +983,7 @@ def test_agent_session_id_parses_value_and_builds_expected_argv() -> None:
 
 
 def test_agent_session_id_returns_none_on_failure_rather_than_raising() -> None:
-    """Best-effort, same contract as agent_read/agent_read_visible — a failure here must not
+    """Best-effort, same contract as agent_read_visible — a failure here must not
     block the run or the pane close that follows it."""
     runner = FakeRunner([(1, "", "some error")])
     client = HerdrClient(runner=runner)

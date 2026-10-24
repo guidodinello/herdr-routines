@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 lint() {
   uv run ruff format --check .
   uv run ruff check .
+  uv run vulture
 }
 typecheck() {
   uv run mypy
