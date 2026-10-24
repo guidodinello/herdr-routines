@@ -975,6 +975,27 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                     f"fail with no_report; tell the agent to write its summary there"
                 )
 
+    # Issue 071: a `verify` the job inherited but its kind does not honor would otherwise
+    # be dropped without a word; and a prompt that runs /code-review with no
+    # `review_posted` gate is done on the agent's word, the #839 incident.
+    for job in config.jobs:
+        if job.ignored_verify:
+            warnings.append(
+                f"{job.name}: inherits verify from defaults but kind {job.kind} does "
+                f"not honor it yet (issue 071 phase A)"
+            )
+        if (
+            job.enabled
+            and job.kind == "routine"
+            and job.prompt is not None
+            and "/code-review" in job.prompt
+            and "review_posted" not in job.verify
+        ):
+            warnings.append(
+                f"{job.name}: prompt runs /code-review but verify lacks review_posted — "
+                f"the run is done on the agent's word (issue 071)"
+            )
+
     # Issue 029: the issue-refinement job is opencode only, no Claude. Keyed on the
     # prompt running the refinement selector rather than on the job name, so a
     # renamed or copied refinement job is still covered. Soft, like the checks above.
@@ -1161,7 +1182,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 1
         log.info("%s: starting run %s", job.name, run_id)
         client = HerdrClient()
-        outcome = execute_run(job, client, run_id=run_id)
+        outcome = execute_run(
+            job,
+            client,
+            run_id=run_id,
+            trusted_review_authors=config.trusted_review_authors,
+        )
     if outcome.state == "done":
         log.info("%s: %s (%s)", job.name, outcome.state, outcome.reason or "ok")
     else:

@@ -14,12 +14,13 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, assert_never
 
 from logger import get_logger
 
+from herdr_routines import verify
 from herdr_routines.auto_fix import (
     EligiblePR,
     GithubEvent,
@@ -46,7 +47,6 @@ from herdr_routines.auto_fix import (
     event_worktree_slug,
     fetch_failing_checks,
     fetch_thread_bodies,
-    has_trusted_marker,
     is_eligible,
     list_open_prs,
     poll_github_event,
@@ -89,6 +89,7 @@ from herdr_routines.history import (
     HistoryExtra,
     HistoryRecord,
     HistoryState,
+    VerifyRecord,
     append,
     find_stale_running,
     first_seen_at,
@@ -129,6 +130,7 @@ from herdr_routines.runner import (
 )
 from herdr_routines.schedule import Decision, decide
 from herdr_routines.tmp_hygiene import reap_tmp
+from herdr_routines.verify import VerifyContext, VerifyTarget
 
 log = get_logger(__name__)
 
@@ -2949,6 +2951,11 @@ def _outcome_extra(outcome: RunOutcome) -> HistoryExtra:
         extra["resigned_commits"] = outcome.resigned_commits
     if outcome.reaped_stale_agent:
         extra["reaped_stale_agent"] = True
+    if outcome.verify:
+        extra["verify"] = [
+            VerifyRecord(gate=r.gate, passed=r.passed, reason=r.reason)
+            for r in outcome.verify
+        ]
     return extra
 
 
@@ -3115,7 +3122,9 @@ def _process_job(
         ),
     )
 
-    outcome = execute_run(job, client, run_id=run_id)
+    outcome = execute_run(
+        job, client, run_id=run_id, trusted_review_authors=trusted_review_authors
+    )
     used_fallback = False
     attempt = 0  # 0 = first try
 
@@ -3161,7 +3170,10 @@ def _process_job(
             )
             run_id = fallback_run_id
             outcome = execute_run(
-                replace(job, model=job.fallback_model), client, run_id=run_id
+                replace(job, model=job.fallback_model),
+                client,
+                run_id=run_id,
+                trusted_review_authors=trusted_review_authors,
             )
 
         # Check if this outcome is eligible for a retry attempt
@@ -3211,7 +3223,9 @@ def _process_job(
                 ),
             ),
         )
-        outcome = execute_run(job, client, run_id=run_id)
+        outcome = execute_run(
+            job, client, run_id=run_id, trusted_review_authors=trusted_review_authors
+        )
 
     # Terminal record for final outcome (last retry or first attempt if no retries)
     final_extra = _outcome_extra(outcome)
@@ -4443,6 +4457,8 @@ def _dispatch_review_target(
         substitute_prompt,
     )
 
+    # Real clock, not the tick's `now`: the gate compares it with GitHub's timestamps.
+    dispatch_started = datetime.now(UTC)
     attempt = attempt_count_for_target(history_path, job.name, cand.target_key)
     h6 = review_target_hash(job.name, cand.target_key)
     report_path = default_reports_dir() / f"auto-review-{run_id}-{h6}.md"
@@ -4652,22 +4668,27 @@ def _dispatch_review_target(
     # A review retains no branch: remove the worktree on both success and failure.
     _cleanup_worktree(checkout, wt_path)
 
-    # Post-condition (the gate analogue): re-read the PR and require the marker.
-    bodies = gh.pr_review_bodies(
-        owner=cand.owner, repo=cand.repo_name, number=cand.number
-    )
-    if bodies is None:
-        disposition, verified, reason = (
-            "review_verification_failed",
-            False,
-            "review_verification_failed",
+    # Post-condition: the shared `review_posted` verify gate (issue 071) re-reads the PR
+    # and requires a trusted author's marker posted since this dispatch started. Its
+    # failure reasons are the dispositions this path has always recorded.
+    verdict = verify.review_posted(
+        VerifyContext(
+            job=job,
+            run_id=run_id,
+            started_at=dispatch_started,
+            report_path=report_path,
+            gh=gh,
+            trusted_review_authors=(),
+            target=VerifyTarget(cand.owner, cand.repo_name, cand.number),
+            trusted_authors=trusted_authors,
+            marker=review_marker(job.name, cand.target_key),
         )
-    elif has_trusted_marker(
-        bodies, review_marker(job.name, cand.target_key), trusted_authors
-    ):
+    )
+    if verdict.passed:
         disposition, verified, reason = "dispatched", True, None
     else:
-        disposition, verified, reason = "review_not_posted", False, "review_not_posted"
+        disposition = reason = verdict.reason or "review_not_posted"
+        verified = False
 
     append(
         history_path,

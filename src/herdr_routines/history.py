@@ -52,6 +52,14 @@ def default_history_path() -> Path:
     return Path.home() / ".local" / "state" / "herdr-routines" / "history.jsonl"
 
 
+class VerifyRecord(TypedDict):
+    """One post-run verify gate's result as recorded under `extra.verify` (issue 071)."""
+
+    gate: str
+    passed: bool
+    reason: str | None
+
+
 class HistoryExtra(TypedDict, total=False):
     """Every key a writer puts in a record's `extra`, merged into the JSONL line after
     the core fields. Write-side schema only: a record read back from disk carries
@@ -90,6 +98,7 @@ class HistoryExtra(TypedDict, total=False):
     nudged: bool
     resigned_commits: int
     reaped_stale_agent: bool
+    verify: list[VerifyRecord]
     # reports and artifacts
     report: str | None
     report_path: str | None

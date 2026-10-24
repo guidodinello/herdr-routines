@@ -14,7 +14,8 @@ from functools import partial
 from pathlib import Path
 from typing import Final, Literal, TypedDict
 
-from herdr_routines.config import Job
+from herdr_routines.auto_fix import GhClient, RealGhClient
+from herdr_routines.config import DEFAULT_TRUSTED_REVIEW_AUTHORS, Job
 from herdr_routines.herdr import (
     AGENT_STATUS_BLOCKED,
     AGENT_STATUS_UNKNOWN,
@@ -27,6 +28,7 @@ from herdr_routines.herdr import (
 )
 from herdr_routines.repos import ensure_repo
 from herdr_routines.signing import ResignError, resign_unsigned_branch
+from herdr_routines.verify import VerifyContext, VerifyResult, run_verify_gates
 from herdr_routines.wait_loop import (
     PROMPT_RETRY_DELAYS_S,
     WATCHDOG_POLL_INTERVAL_S,
@@ -414,6 +416,7 @@ class RunOutcome:
     visible_tail: str | None = (
         None  # issue 007: captured visible screen for blocked notification
     )
+    verify: tuple[VerifyResult, ...] = ()  # issue 071: post-run verify gate results
 
 
 def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
@@ -551,7 +554,14 @@ def _start_agent_reaping_stale_collision(
         return True
 
 
-def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
+def execute_run(
+    job: Job,
+    client: HerdrClient,
+    *,
+    run_id: str,
+    gh: GhClient | None = None,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
+) -> RunOutcome:
     """Runs one job to completion (or failure) against a real or faked HerdrClient. Never
     raises — every failure mode is captured in the returned RunOutcome so `tick.py` can always
     write a terminal history record. (A `job.model` unsupported for `job.agent_kind` would raise
@@ -872,10 +882,41 @@ def execute_run(job: Job, client: HerdrClient, *, run_id: str) -> RunOutcome:
             **common,
         )
 
+    # Post-run verify gates (issue 071): the report is the agent's word, the gates are
+    # what proves it. Only after the no_report check, so a missing report keeps its own
+    # reason; the gh client is built only for a job that lists a gate.
+    verify_results: tuple[VerifyResult, ...] = ()
+    if job.verify:
+        verify_results = run_verify_gates(
+            job.verify,
+            VerifyContext(
+                job=job,
+                run_id=run_id,
+                started_at=started_at,
+                report_path=report_path,
+                gh=gh if gh is not None else RealGhClient(),
+                trusted_review_authors=trusted_review_authors,
+            ),
+        )
+    failed_gate = next((r for r in verify_results if not r.passed), None)
+    if failed_gate is not None:
+        # Not retryable (verify_failed:* is outside VALID_RETRY_REASONS): a retry could
+        # post a second review, the same duplicate-side-effect risk as issue 032.
+        return RunOutcome(
+            state="failed",
+            reason=f"verify_failed:{failed_gate.gate}",
+            session_id=session_id,
+            nudged=nudged,
+            resigned_commits=resigned_commits,
+            verify=verify_results,
+            **common,
+        )
+
     return RunOutcome(
         state="done",
         session_id=session_id,
         nudged=nudged,
         resigned_commits=resigned_commits,
+        verify=verify_results,
         **common,
     )

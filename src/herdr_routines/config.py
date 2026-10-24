@@ -95,6 +95,12 @@ VALID_NOTIFY_POLICIES: frozenset[NotifyPolicy] = frozenset(get_args(NotifyPolicy
 JobKind = Literal["routine", "gated", "pipeline", "audit", "review"]
 VALID_JOB_KINDS: frozenset[JobKind] = frozenset(get_args(JobKind))
 
+# Post-run verify gates a job can list under `verify:` (issue 071). The registry of gate
+# functions lives in verify.py, which imports Job from here, so the closed name set is
+# defined here and a test pins the two to the same keys.
+VerifyGate = Literal["review_posted", "report_wellformed"]
+VALID_VERIFY_GATES: frozenset[VerifyGate] = frozenset(get_args(VerifyGate))
+
 # Recognized values for a kind: review job's `select` list (issue 055). "author" is the
 # default-worthy one; "review_requested" is opt-in because it puts the routine in someone
 # else's PR queue.
@@ -152,6 +158,7 @@ _DEFAULTS_ALLOWED_KEYS = frozenset(
         "fallback_model",
         "tmp_hygiene",
         "notify_policy",
+        "verify",
     }
 )
 
@@ -273,6 +280,7 @@ _JOB_DEFAULTS = {
     "tmp_hygiene": None,
     "retry_attempts": 0,
     "retry_on": None,
+    "verify": None,
     # kind: audit (issue 057). None for every other kind.
     "audit": None,
     "max_findings_per_dispatch": 10,
@@ -505,6 +513,13 @@ class Job:
     # Opt in to reviewing `auto/*` (pipeline-owned) branches too; default off so a
     # pipeline PR is never reviewed twice.
     include_auto_branches: bool = False
+    # Post-run verify gates (issue 071), run by `runner.execute_run` after the agent settles
+    # with a report; any failure makes the run `failed` (`verify_failed:<gate>`). Only a
+    # routine job honors it. Inheritable via defaults.yaml; an explicit `[]` opts out.
+    verify: tuple[VerifyGate, ...] = ()
+    # The `verify` a non-routine job inherited from defaults.yaml and does not honor. Kept
+    # so `validate` can say so instead of dropping it silently.
+    ignored_verify: tuple[VerifyGate, ...] = ()
 
     @property
     def agent_name(self) -> str:
@@ -1696,6 +1711,34 @@ def _build_job(
             stacklevel=2,
         )
 
+    # -- verify (issue 071) ------------------------------------------------------------
+    #
+    # Like the kind rules above, an explicit per-job `verify` on a kind that never reaches
+    # `execute_run` is rejected, while an inherited one is kept aside as `ignored_verify`
+    # (a shared defaults.yaml must not invalidate every gated/audit job).
+    verify_raw = merged["verify"]
+    verify: tuple[VerifyGate, ...] = ()
+    if verify_raw is not None:
+        if not isinstance(verify_raw, list):
+            raise ConfigError(f"{label}: 'verify' must be null or a list of gate names")
+        for gate in verify_raw:
+            if not isinstance(gate, str) or gate not in VALID_VERIFY_GATES:
+                raise ConfigError(
+                    f"{label}: 'verify' contains unknown gate {gate!r} — "
+                    f"valid gates: {sorted(VALID_VERIFY_GATES)}"
+                )
+        if len(set(verify_raw)) != len(verify_raw):
+            raise ConfigError(f"{label}: 'verify' lists a gate more than once")
+        verify = tuple(verify_raw)
+    ignored_verify: tuple[VerifyGate, ...] = ()
+    if kind != "routine" and verify:
+        if "verify" in raw_job:
+            raise ConfigError(
+                f"{label}: 'verify' is only supported on kind: routine "
+                f"(kind: {kind} does not run post-run gates yet, issue 071)"
+            )
+        ignored_verify, verify = verify, ()
+
     return Job(
         name=name,
         enabled=enabled,
@@ -1732,4 +1775,6 @@ def _build_job(
         fix_prompt=fix_prompt,
         select=select,
         include_auto_branches=include_auto_branches,
+        verify=verify,
+        ignored_verify=ignored_verify,
     )

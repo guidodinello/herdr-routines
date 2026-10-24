@@ -16,6 +16,7 @@ import subprocess
 import textwrap
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, assert_never
 
@@ -101,7 +102,7 @@ class GhClient(Protocol):
     ) -> list[PostedBody] | None:
         """The PR's posted review bodies **and** issue comments, concatenated (one
         ``gh pr view --json comments,reviews`` call), each with its author so callers
-        can count only what a trusted author posted. Returns ``None`` on any failure;
+        can count only what a trusted author posted, and when it was posted. Returns ``None`` on any failure;
         every caller treats ``None`` as *unverified*, never as "empty"."""
         ...
 
@@ -156,6 +157,10 @@ class PostedBody:
 
     author: str | None
     body: str
+    # When the body was posted: a review's `submittedAt` or a comment's `createdAt`. None
+    # when GitHub gave none (a pending review) or it did not parse, which the post-run
+    # `review_posted` gate treats as "not fresh" (issue 071).
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,7 +377,10 @@ class RealGhClient:
         if not isinstance(payload, dict):
             return None
         bodies: list[PostedBody] = []
-        for surface in ("reviews", "comments"):
+        for surface, stamp_key in (
+            ("reviews", "submittedAt"),
+            ("comments", "createdAt"),
+        ):
             items = payload.get(surface, [])
             if not isinstance(items, list):
                 continue
@@ -386,6 +394,7 @@ class RealGhClient:
                         PostedBody(
                             author=login if isinstance(login, str) else None,
                             body=body,
+                            created_at=_parse_timestamp(item.get(stamp_key)),
                         )
                     )
         return bodies
@@ -482,6 +491,17 @@ def is_trusted_author(login: object, trusted: frozenset[str]) -> bool:
     A missing or empty login — a deleted ("ghost") account comes back as ``author:
     null`` — is never trusted."""
     return isinstance(login, str) and bool(login) and login.casefold() in trusted
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    """A GitHub ISO-8601 timestamp (``2026-10-24T01:04:56Z``), or None when absent or
+    unparseable."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _author_login(node: Mapping[str, object]) -> object:

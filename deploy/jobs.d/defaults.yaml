@@ -33,3 +33,10 @@ timezone: America/Montevideo
 #                                          # including progress notes mid-dispatch.
 #                                          # Independent of on_missed, which keeps its own
 #                                          # meaning.
+# verify: [report_wellformed] # optional (issue 071): post-run gates every routine job
+#                                          # runs before it is recorded `done`; a failed gate
+#                                          # makes the run `failed` (verify_failed:<gate>).
+#                                          # Gates: review_posted, report_wellformed. A job's
+#                                          # own `verify` replaces this list; `verify: []`
+#                                          # opts out. Only kind: routine honors it (other
+#                                          # kinds warn in `validate`). See fitted-pr-review.yaml.
