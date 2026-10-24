@@ -580,19 +580,23 @@ def run_self_update(
 
     A held tick lock is retried for `lock_wait_s` (see TICK_LOCK_WAIT_S) before
     deferring, and a deferral that survives the wait notifies — unlike every other
-    deferral, it is the one that recurs nightly without anything else changing.
+    deferral, it is the one that recurs nightly without anything else changing. A
+    dry run does not wait: it is a preview a human is watching, and an immediate
+    `deferred` is the answer `--help` promises them.
     """
-    with _wait_for_tick_lock(lock_path, wait_s=lock_wait_s, sleep=sleep) as acquired:
+    wait_s = 0 if dry_run else lock_wait_s
+    with _wait_for_tick_lock(lock_path, wait_s=wait_s, sleep=sleep) as acquired:
         if not acquired:
-            reason = f"tick lock held for over {lock_wait_s:g}s"
+            reason = f"tick lock held for over {wait_s:g}s"
             result = _deferred(reason, checkout)
             if not dry_run:
                 notify(
                     f"herdr-routines: self-update deferred ({checkout})",
                     body=(
-                        f"{reason} ({lock_path}) — no update tonight; the timer "
-                        "fires again tomorrow. A lock held this long is usually a "
-                        "manual `herdr-routines run <job>` still in progress."
+                        f"{reason} ({lock_path}) — no update this run; the timer "
+                        "tries again the next night. A lock held this long is "
+                        "usually a manual `herdr-routines run <job>` still in "
+                        "progress."
                     ),
                 )
             return result

@@ -914,11 +914,14 @@ def test_self_update_dry_run_makes_no_git_change(sandbox: Sandbox) -> None:
     assert result.old == old
     assert result.new == new
 
-    # The lock applies to a dry run too — and stays quiet: no notification.
+    # The lock applies to a dry run too — immediately (no wait: a human is watching
+    # a preview) and quietly (no notification).
+    slept: list[float] = []
     with _held_flock(sandbox.lock_path):
         notify = Recorder()
-        result = sandbox.run(dry_run=True, notify=notify, sleep=lambda _s: None)
+        result = sandbox.run(dry_run=True, notify=notify, sleep=slept.append)
     assert result.status == "deferred"
+    assert slept == []
     assert notify.calls == []
 
 
