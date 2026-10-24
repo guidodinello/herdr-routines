@@ -12,13 +12,11 @@ from collections.abc import Sequence
 from herdr_routines.auto_fix import GhClient, PostedBody, RealGhClient, ReviewSearch
 from herdr_routines.gates import (
     BLOCKING_TAG,
-    GATE3_LINT_TEST_CHECKS,
     GATE_STAGE_CHOICES,
     ReviewThread,
     evaluate_ci_checks,
     evaluate_commit_checks,
     evaluate_gate7,
-    gate3_result,
     run_ci_gate,
     run_gate6,
     run_gate7,
@@ -101,48 +99,6 @@ class FakeGhClient:
 
     def repo_info(self, *, owner: str, repo: str) -> dict[str, object] | None:
         return None
-
-
-def _fake_runner(exit_codes: dict[str, int]):
-    def runner(argv: list[str], *, timeout_s: float) -> tuple[int, str, str]:
-        command = " ".join(argv)
-        for prefix, code in exit_codes.items():
-            if command.startswith(prefix):
-                return code, "", "" if code == 0 else f"{prefix}: failed"
-        return 0, "", ""
-
-    return runner
-
-
-# ---------------------------------------------------------------------------
-# Gate 3 (issue 034 acceptance criterion 1) — lint widening stays prompt text,
-# but the widened check set itself is pinned here.
-# ---------------------------------------------------------------------------
-
-
-def test_gate3_fails_on_lint_error() -> None:
-    runner = _fake_runner(
-        {
-            "uv run ruff format --check .": 1,
-            "uv run ruff check .": 0,
-            "uv run pytest -q": 0,
-        }
-    )
-    result = gate3_result(".", runner=runner)
-    assert result.passed is False
-
-
-def test_gate3_passes_when_all_green() -> None:
-    runner = _fake_runner(
-        {
-            "uv run ruff format --check .": 0,
-            "uv run ruff check .": 0,
-            "uv run pytest -q": 0,
-        }
-    )
-    result = gate3_result(".", runner=runner)
-    assert result.passed is True
-    assert len(GATE3_LINT_TEST_CHECKS) == 3
 
 
 # ---------------------------------------------------------------------------

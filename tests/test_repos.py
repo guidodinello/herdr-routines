@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 import pytest
 
 from herdr_routines.config import Job
+from herdr_routines.pick_feature import parse_issue, run_pick_feature
 from herdr_routines.repos import ensure_repo
 
 
@@ -388,3 +390,128 @@ def test_repo_url_review_tiers_present() -> None:
     assert "blocking" in text.lower()
     assert "non-blocking" in text.lower()
     assert "confidence:" in text.lower()
+
+
+# --- Issue 041: an out-of-tree claim never wedges the parent clone's sync ---
+
+ISSUE_TEMPLATE = """---
+id: "001"
+title: Some issue
+status: {status}
+priority: medium
+area: cli
+---
+
+## Description
+
+Do the thing.
+"""
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, f"git {args} failed: {proc.stderr}"
+    return proc
+
+
+def test_done_flip_still_rides_the_pr(tmp_path: Path) -> None:
+    """Acceptance criterion 4 (issue 041): the implementer's `status: done` commit,
+    carried by the PR and landing atomically on merge, is untouched by this fix —
+    it still fast-forwards into the parent clone like any other upstream commit."""
+    bare = tmp_path / "bare.git"
+    _init_bare_git_repo(bare)
+    base = _detect_bare_default_branch(bare)
+
+    parent = tmp_path / "parent"
+    subprocess.run(
+        ["git", "clone", str(bare), str(parent)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    issues_dir = parent / "docs" / "process" / "issues"
+    issues_dir.mkdir(parents=True)
+    (issues_dir / "001-foo.md").write_text(ISSUE_TEMPLATE.format(status="open"))
+    _git(parent, "config", "user.email", "test@test.com")
+    _git(parent, "config", "user.name", "Test")
+    _git(parent, "add", "docs")
+    _git(parent, "commit", "-m", "add issue 001")
+    _git(parent, "push")
+
+    # The implementer's PR, committed and merged directly to main.
+    impl = tmp_path / "impl"
+    subprocess.run(
+        ["git", "clone", str(bare), str(impl)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    _git(impl, "config", "user.email", "test@test.com")
+    _git(impl, "config", "user.name", "Test")
+    (impl / "docs" / "process" / "issues" / "001-foo.md").write_text(
+        ISSUE_TEMPLATE.format(status="done")
+    )
+    _git(impl, "add", "docs")
+    _git(impl, "commit", "-m", "fix: close issue 001")
+    _git(impl, "push")
+
+    ensure_repo(make_job(tmp_path, repo=parent, repository=None, base=base))
+    assert parse_issue(issues_dir / "001-foo.md").status == "done"
+
+
+def test_repo_sync_ff_after_pick_and_merge(tmp_path: Path) -> None:
+    """Acceptance criterion 2 (issue 041): a pick with `--mark-in-progress`
+    followed by the implementing PR's merge must not wedge the repo sync — the
+    parent clone has no uncommitted edit left to collide with the incoming
+    `status: done` commit."""
+    bare = tmp_path / "bare.git"
+    _init_bare_git_repo(bare)
+    base = _detect_bare_default_branch(bare)
+
+    parent = tmp_path / "parent"
+    subprocess.run(
+        ["git", "clone", str(bare), str(parent)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    issues_dir = parent / "docs" / "process" / "issues"
+    issues_dir.mkdir(parents=True)
+    (issues_dir / "001-foo.md").write_text(ISSUE_TEMPLATE.format(status="open"))
+    _git(parent, "config", "user.email", "test@test.com")
+    _git(parent, "config", "user.name", "Test")
+    _git(parent, "add", "docs")
+    _git(parent, "commit", "-m", "add issue 001")
+    _git(parent, "push")
+
+    # pick-feature --mark-in-progress against the parent clone: must claim
+    # out-of-tree and leave the working tree clean.
+    claims_path = tmp_path / "claims.json"
+    code = run_pick_feature(
+        issues_dir, mark=True, out=io.StringIO(), claims_path=claims_path
+    )
+    assert code == 0
+    status = _git(parent, "status", "--porcelain")
+    assert status.stdout == ""
+
+    # The implementing PR merges the done flip straight to main.
+    impl = tmp_path / "impl"
+    subprocess.run(
+        ["git", "clone", str(bare), str(impl)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    _git(impl, "config", "user.email", "test@test.com")
+    _git(impl, "config", "user.name", "Test")
+    (impl / "docs" / "process" / "issues" / "001-foo.md").write_text(
+        ISSUE_TEMPLATE.format(status="done")
+    )
+    _git(impl, "add", "docs")
+    _git(impl, "commit", "-m", "fix: close issue 001")
+    _git(impl, "push")
+
+    ensure_repo(make_job(tmp_path, repo=parent, repository=None, base=base))
+    assert parse_issue(issues_dir / "001-foo.md").status == "done"

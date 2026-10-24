@@ -174,14 +174,8 @@ class FakeFullClient:
     def agent_interactive_ready(self, target):
         return True
 
-    def settled_agent_workspace(self, name):
-        return None
-
     def settled_agent_pane(self, name):
         return None
-
-    def workspace_close(self, workspace_id):
-        pass
 
     def pane_close(self, pane_id):
         pass
@@ -1791,8 +1785,7 @@ def test_run_checks_runner_param_is_callable_contract(tmp_path: Path) -> None:
     ``runner: Callable[..., tuple[int, str, str]] | None = None`` with ``Callable``
     imported from ``collections.abc``; ``_default_runner`` keeps that exact signature
     and the ``runner = _default_runner`` fallback wiring is untouched; an injected
-    runner (as ``gates.py``'s ``gate3_result`` already injects) still drives the
-    checks."""
+    runner still drives the checks."""
     import ast
     import inspect
     from collections.abc import Callable

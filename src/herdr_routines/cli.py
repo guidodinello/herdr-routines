@@ -71,7 +71,6 @@ from herdr_routines.reports_prune import (
     prune_reports,
     prune_rolled_history,
 )
-from herdr_routines.repos import _fetch_and_fast_forward
 from herdr_routines.review_scan import (
     Candidate,
     Classification,
@@ -411,19 +410,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="report what would be removed without mutating",
     )
     p_tmp_hygiene.set_defaults(handler=_cmd_tmp_hygiene)
-
-    p_sync_repo = sub.add_parser(
-        "sync-repo",
-        help="fetch+fast-forward a checkout to origin/<base> (for callers outside "
-        "tick.py/runner.py, e.g. the overnight pipeline launcher)",
-    )
-    p_sync_repo.add_argument(
-        "--path", type=Path, required=True, help="checkout to fetch+fast-forward"
-    )
-    p_sync_repo.add_argument(
-        "--base", default="main", help="branch to fast-forward to (default: main)"
-    )
-    p_sync_repo.set_defaults(handler=_cmd_sync_repo)
 
     p_prepare = sub.add_parser(
         "pipeline-prepare",
@@ -1393,19 +1379,6 @@ def _cmd_tmp_hygiene(args: argparse.Namespace) -> int:
         print(
             f"removed: {result.removed}, fresh (skipped): {result.skipped_fresh}, errors: {result.errors}"
         )
-    return 0
-
-
-def _cmd_sync_repo(args: argparse.Namespace) -> int:
-    # Pure git, no HerdrClient — same primitive ensure_repo (repos.py) uses for every
-    # job's checkout, exposed here for callers outside the tick.py/runner.py dispatch
-    # path (issue 030: the overnight pipeline launcher's $REPO_PARENT).
-    try:
-        _fetch_and_fast_forward(args.path, base=args.base)
-    except (RuntimeError, OSError) as e:
-        log.error("sync-repo failed for %s: %s", args.path, e)
-        return 1
-    log.info("sync-repo: %s up to date with origin/%s", args.path, args.base)
     return 0
 
 

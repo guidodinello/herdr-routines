@@ -59,7 +59,6 @@ class ScriptedClient:
         pane_id: str = "w1:p1",
         agent_status: str | None = "idle",
         interactive_ready: bool = True,
-        stale_workspace: str | None = None,
         stale_pane: str | None = None,
         write_report_at: Path | None = None,
         report_content: str = "# Report\n\nFindings.\n",
@@ -72,11 +71,7 @@ class ScriptedClient:
         self.pane_id = pane_id
         self.agent_status = agent_status
         self.interactive_ready = interactive_ready
-        # stale_pane is the new primary; stale_workspace kept for backwards-compat in tests
-        if stale_pane is None and stale_workspace is not None:
-            stale_pane = stale_workspace
         self.stale_pane = stale_pane
-        self.stale_workspace = stale_workspace
         self.write_report_at = write_report_at
         self.report_content = report_content
         self.raise_on = raise_on
@@ -85,7 +80,6 @@ class ScriptedClient:
         self.sticky_pane = sticky_pane
         self.agent_start_collides_once = agent_start_collides_once
         self.calls: list[str] = []
-        self.closed_workspaces: list[str] = []
         self.closed_panes: list[str] = []
         self.started_with_model: str | None = None
 
@@ -95,23 +89,11 @@ class ScriptedClient:
             raise HerdrCliError("boom", exit_code=1)
         return self.pane_id
 
-    def settled_agent_workspace(self, name):
-        self.calls.append("settled_agent_workspace")
-        if self.raise_on == "settled_agent_workspace":
-            raise HerdrCliError("boom", exit_code=1)
-        return self.stale_workspace
-
     def settled_agent_pane(self, name):
         self.calls.append("settled_agent_pane")
         if self.raise_on == "settled_agent_pane":
             raise HerdrCliError("boom", exit_code=1)
-        if self.raise_on == "settled_agent_workspace":
-            raise HerdrCliError("boom", exit_code=1)
         return self.stale_pane
-
-    def workspace_close(self, workspace_id):
-        self.calls.append("workspace_close")
-        self.closed_workspaces.append(workspace_id)
 
     def pane_close(self, pane_id):
         self.calls.append("pane_close")
@@ -813,9 +795,7 @@ def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
     """Ensures ScriptedClient's protocol above doesn't silently drift from HerdrClient's real
     method signatures."""
     for name in (
-        "settled_agent_workspace",
         "settled_agent_pane",
-        "workspace_close",
         "pane_close",
         "worktree_create",
         "tab_create",
@@ -860,7 +840,6 @@ def test_execute_run_leaves_other_panes_alone_when_no_stale_workspace(
     client = ScriptedClient(stale_pane=None, write_report_at=report_path)
     execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
     assert client.closed_panes == ["w1:p1"]
-    assert "workspace_close" not in client.calls
 
 
 def test_execute_run_survives_stale_workspace_reap_errors(
@@ -889,7 +868,6 @@ def test_execute_run_does_not_reap_in_root_mode(
     assert outcome.state == "done"
     assert "settled_agent_pane" not in client.calls
     assert "pane_close" not in client.calls
-    assert "workspace_close" not in client.calls
     # Nothing is ever closed for a root-mode job, so there's nothing to resume-and-inspect —
     # capturing a session id would just be a wasted call.
     assert "agent_session_id" not in client.calls

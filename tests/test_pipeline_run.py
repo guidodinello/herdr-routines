@@ -5,7 +5,7 @@ Two things are deliberately *not* faked here, because faking them would make the
 tests assert the fake rather than the code:
 
 - **git**. Gates 1, 2 and 4 and stage 4's `git push -u` all run against a real
-  bare-origin fixture (`_init_bare_git_repo`, borrowed from `test_sync_repo.py` /
+  bare-origin fixture (`_init_bare_git_repo`, borrowed from `test_repos.py` /
   `test_pipeline_prepare.py`), through the same injectable `runner` seam
   `auto_fix.run_checks` already exposes. `rg` runs for real the same way, so
   `gate3_test_names`'s fixed-string search is exercised for real too.
@@ -1244,7 +1244,6 @@ def test_stages_table_matches_the_prompt_files_on_disk() -> None:
     for spec in STAGES:
         if spec.model is None:
             assert spec.prompt_file is None
-            assert spec.isolation == "none"
             continue
         assert spec.prompt_file is not None
         prompt = prompts_dir / spec.prompt_file
