@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, assert_never
+from typing import Protocol, assert_never
 
 from herdr_routines.config import (
     DEFAULT_TRUSTED_REVIEW_AUTHORS,
@@ -26,7 +26,7 @@ from herdr_routines.config import (
     GateCheckKind,
 )
 from herdr_routines.findings import Finding
-from herdr_routines.history import read_job
+from herdr_routines.history import HistoryState, read_job
 
 log = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ _COUNTABLE_STATES = frozenset({"done", "failed"})
 _UNCOUNTED_FAILURE_REASONS = frozenset({"worktree_reuse_not_clean"})
 
 
-def _is_countable_attempt(state: str, extra: object) -> bool:
+def _is_countable_attempt(state: HistoryState, extra: object) -> bool:
     if state not in _COUNTABLE_STATES:
         return False
     return not (
@@ -1040,7 +1040,7 @@ _REVIEW_COUNTABLE_FAILURES = frozenset(
 _REVIEW_COUNTABLE_PREFIXES = ("unsettled_status_",)
 
 
-def _review_attempt_consumed(state: str, reason: object) -> bool:
+def _review_attempt_consumed(state: HistoryState, reason: object) -> bool:
     if state in ("done", "interrupted_unknown"):
         return True
     return (
@@ -1552,22 +1552,22 @@ def poll_github_event(
         data = gh.graphql(gql, owner=owner, repo=repo)
         nodes = _graphql_nodes(data, "data", "repository", "pullRequests", "nodes")
         result = []
-        for pr in nodes:
-            if not isinstance(pr, dict) or not _event_matches(pr, match):
+        for node in nodes:
+            if not isinstance(node, dict) or not _event_matches(node, match):
                 continue
-            if not is_same_repo_pr(pr):
+            if not is_same_repo_pr(node):
                 continue
-            number = pr.get("number")
+            number = node.get("number")
             if not isinstance(number, int):
                 continue
-            rollup = pr.get("statusCheckRollup")
+            rollup = node.get("statusCheckRollup")
             failing = (
                 isinstance(rollup, dict) and rollup.get("state") in FAILING_CI_STATES
             )
             if not failing:
                 continue
-            title = pr.get("title")
-            head_ref = pr.get("headRefName")
+            title = node.get("title")
+            head_ref = node.get("headRefName")
             result.append(
                 GithubEvent(
                     event_id=f"evt-ci-{number}",
@@ -1575,7 +1575,7 @@ def poll_github_event(
                     title=title if isinstance(title, str) else "",
                     head_ref=head_ref if isinstance(head_ref, str) else None,
                     label=None,
-                    payload=pr,
+                    payload=node,
                 )
             )
         return result
@@ -1641,7 +1641,7 @@ def poll_github_event(
     return []
 
 
-def _graphql_nodes(data: object, *path: str) -> list[Any]:
+def _graphql_nodes(data: object, *path: str) -> list[object]:
     """Walk a nested GraphQL response down ``path`` and return the node list, or an
     empty list when any hop is missing/wrong-shaped. Keeps the poll parsers free of
     the repeated isinstance ladder."""

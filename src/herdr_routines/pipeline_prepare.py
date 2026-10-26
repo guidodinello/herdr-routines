@@ -29,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 from logger import get_logger
 
@@ -372,7 +372,7 @@ def _ensure_shared_workspace(client: HerdrClient, *, cwd: str, label: str) -> st
     return client.workspace_create(cwd=cwd, label=label, env=SHARED_WORKSPACE_ENV)
 
 
-def write_state_json(path: Path, payload: dict[str, Any]) -> None:
+def write_state_json(path: Path, payload: dict[str, object]) -> None:
     """Atomic write: tmpfile in the *same directory* (so `os.replace` is a same-filesystem
     rename, not a copy), then the rename. A reader therefore never observes a partially
     written `state.json` (G-9), and a failure part-way leaves no file at `path` at all.

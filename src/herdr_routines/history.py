@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, TypedDict, TypeIs, get_args
+from typing import Literal, TypedDict, TypeIs, get_args
 
 from logger import get_logger
 
@@ -176,7 +176,7 @@ class HistoryRecord:
     extra: Mapping[str, object] | None = None
 
     def to_json_line(self) -> str:
-        payload: dict[str, Any] = {
+        payload: dict[str, object] = {
             "ts": self.ts.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "job": self.job,
             "state": self.state,

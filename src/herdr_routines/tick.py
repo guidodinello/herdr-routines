@@ -372,8 +372,11 @@ def _process_audit_job(
 # sample keeps one bad night from bloating every history line.
 _AUDIT_SUPPRESSED_ID_CAP = 20
 
+# The closed set of notification kinds `_notify_gate` understands (see its docstring).
+NotificationKind = Literal["failure", "finding", "success", "progress"]
+
 # gate -> notification kind (see _notify_gate's four-tier policy).
-_AUDIT_GATE_NOTIFY_KIND = {
+_AUDIT_GATE_NOTIFY_KIND: dict[str, NotificationKind] = {
     "baseline": "finding",
     "fix_dispatched": "finding",
     "suppressed": "finding",
@@ -3651,7 +3654,9 @@ def _run_routine(
         if outcome.reaped_stale_agent:
             notes.append("force-closed a prior run's blocked agent (issue 051)")
         done_body = "; ".join(notes) or None
-        gate = "finding" if (used_fallback or outcome.reaped_stale_agent) else "success"
+        gate: NotificationKind = (
+            "finding" if (used_fallback or outcome.reaped_stale_agent) else "success"
+        )
         if _notify_gate(job, gate):
             _notify(
                 client, f"herdr-routines: {job.name} done", body=done_body, sound="done"
@@ -4288,7 +4293,7 @@ def _notify(
         log.warning("%s: notification failed: %s", title, e)
 
 
-def _notify_gate(job: Job, kind: str) -> bool:
+def _notify_gate(job: Job, kind: NotificationKind) -> bool:
     """Whether a `job.notify_policy`-governed notification of *kind* should actually be
     sent (issue 009). *kind* is one of:
 
