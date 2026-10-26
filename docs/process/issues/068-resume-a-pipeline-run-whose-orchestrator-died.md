@@ -1,7 +1,7 @@
 ---
 id: "068"
 title: "Resume a pipeline run whose orchestrator died"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
