@@ -20,7 +20,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, TypedDict, get_args
+from typing import Literal, TypedDict, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -806,7 +806,7 @@ def load_config_dir(path: Path) -> RoutinesConfig:
 
     # --- load defaults.yaml (optional) -------------------------------------------
     defaults_path = path / "defaults.yaml"
-    raw_defaults: dict[str, Any] = {}
+    raw_defaults: dict[str, object] = {}
     if defaults_path.exists():
         raw_defaults = _load_yaml_or_error(defaults_path, kind="defaults")
         _validate_defaults_keys(raw_defaults, defaults_path)
@@ -855,10 +855,6 @@ def load_config_dir(path: Path) -> RoutinesConfig:
             raw_job = _load_yaml_or_error(job_file, kind="job")
         except ConfigError as e:
             errors.append(str(e))
-            continue
-
-        if not isinstance(raw_job, dict):
-            errors.append(f"{job_file}: job file must be a mapping")
             continue
 
         # --- filename / name contract -------------------------------------------
@@ -928,7 +924,7 @@ def _load_yaml_document(path: Path) -> object:
         raise ConfigError(f"{path}: YAML syntax error: {e}") from e
 
 
-def _load_yaml_or_error(path: Path, *, kind: str) -> dict[str, Any]:
+def _load_yaml_or_error(path: Path, *, kind: str) -> dict[str, object]:
     """Read and parse a single YAML file that must hold a mapping.  Raises
     :class:`ConfigError` with the file name embedded for clear diagnostics.  *kind*
     ("defaults" | "retention" | "job") only shapes the error message."""

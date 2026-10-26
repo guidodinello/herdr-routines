@@ -138,8 +138,6 @@ def parse_spawn_command(text: str) -> SpawnCommand | None:
     (no alias, extra tokens, an unknown verb, an ill-shaped alias or model) returns None:
     a loose parse would spawn the wrong checkout, or hand a flag-like or shell-like token
     to the launcher (spec criterion 1/6)."""
-    if not isinstance(text, str):
-        return None
     parts = text.split()
     if not 2 <= len(parts) <= 4 or parts[0] not in _COMMAND_VERBS:
         return None
