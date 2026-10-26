@@ -71,6 +71,9 @@ disallow_untyped_decorators = true
 warn_return_any = true
 strict_equality = true
 extra_checks = true
+# Beyond --strict: catch isinstance/None checks the declared types already make dead.
+warn_unreachable = true
+enable_error_code = ["redundant-expr"]
 
 [tool.vulture]
 # src/ only, never tests/: a helper that only tests call must show up as unused, which is the
