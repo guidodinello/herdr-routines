@@ -217,6 +217,24 @@ considered met). One-liner index; full detail in the issue file.
   `auto_fix` runner seam and `GithubEvent.payload`, left over from the type-health
   audit. →
   [`065`](docs/process/issues/065-type-remaining-any-boundaries.md)
+- **Runner seam as a `Protocol`** — five modules type the subprocess runner as
+  `Callable[..., X]`, which hides each parameter list from mypy. →
+  [`081`](docs/process/issues/081-runner-seam-protocol.md)
+- **Review select mode as a `Literal`** — config validates it, then every
+  consumer gets a plain `str`. →
+  [`082`](docs/process/issues/082-review-select-mode-literal.md)
+- **Typed Telegram spawn aliases** — the consumer re-stringifies and re-defaults
+  a validated `WorkspaceMode`. →
+  [`083`](docs/process/issues/083-telegram-alias-typed-record.md)
+- **Close `_WorkerFailed.reason`** — a plain `str` that retry-attempt counting
+  compares against string constants. →
+  [`084`](docs/process/issues/084-worker-failed-reason-literal.md)
+- **Is 0 valid for timeouts and worker limits?** — four config fields accept 0
+  while their siblings require a positive value. →
+  [`085`](docs/process/issues/085-config-zero-valued-limits.md)
+- **Enforce `search_prs`'s 100-result ceiling** — the bound lives only in a
+  comment. →
+  [`086`](docs/process/issues/086-search-prs-limit-bound.md)
 
 ## Later
 
