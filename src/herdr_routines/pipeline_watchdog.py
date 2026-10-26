@@ -1,6 +1,6 @@
 """Pipeline stall watchdog (issue 031): detects an overnight pipeline whose orchestrator
 died silently (no crash report, `docs/pipeline/orchestrator-prompt.md`'s documented G-4
-gap) and kills the worker it left running, unattended, past the run's own deadline.
+gap) and, where safe, resumes it once before reporting.
 
 Design notes (see the issue for the full incident writeup):
 
@@ -13,7 +13,8 @@ Design notes (see the issue for the full incident writeup):
   reboot kills the orchestrator *and* its `systemd-run` launcher unit outright, so the
   run is definitively over — waiting out its 7h deadline just delays the failure
   notification (real incident: 2026-09-07 run, host rebooted 16 min in, watchdog only
-  reaped it 7.5h later).
+  reaped it 7.5h later). A rebooted run still goes through the resume path when it is
+  otherwise eligible.
 - Otherwise a run is only touched when **both** hold: `now > deadline_epoch + grace`
   (30 min grace so this never races a live orchestrator that is itself draining an
   in-flight `--wait` and about to write its own partial report at deadline,
@@ -28,18 +29,24 @@ Design notes (see the issue for the full incident writeup):
   (`validate_stage_sessions`): a run whose `state.json` `stage_sessions` are fabricated
   placeholders, reused across stages, or missing entries did not run its stages in
   independent sessions, and any PR it produced is single-session work.
-- On a stall: kill any live `pl-<N>-<run_id>` agent (`herdr pane close` on its pane —
-  verified empirically 2026-09-03 against a live `herdr` server: closing a pane running
-  a foreground child kills that child's process group, not just the UI — see the issue
-  PR description for the transcript), write a terminal report distinguishing this from
-  a normal stage-7 report, and fire the same notification channel routine job failures
-  already use.
-- Never resumes or retries. Kill + report only.
+- On a stall: try **one** automatic resume before reporting when the run is resumable
+  (issue 068). Eligibility needs `repo_parent`, `artifact_paths.report`, a positive
+  original budget and a matching `running` history record; `resume_count` is capped at
+  `MAX_PIPELINE_RESUMES`. On resume the watchdog appends a fresh `running` record
+  first, closes stale worker panes (`herdr pane close` — verified empirically 2026-09-03
+  against a live `herdr` server: closing a pane running a foreground child kills that
+  child's process group, not just the UI), rewrites `state.json` atomically, then
+  registers a resume unit. When the run is not resumable it kills any live
+  `pl-<N>-<run_id>` agent, writes a terminal report distinguishing this from a normal
+  stage-7 report, and fires the same notification channel routine job failures already
+  use.
+- At most `MAX_PIPELINE_RESUMES` automatic resumes total (tracked by `resume_count`);
+  after that it falls back to kill-and-report.
 
 Deliberately **not** wired through `tick.py`'s job-dispatch model: every job there
 issues an agent prompt (`_process_job`/`_process_gated_job`/`_process_pipeline_job`
-family); this sweep issues no prompt and spawns nothing; it is a maintenance script,
-same posture as `gc.py`. Scheduled instead via its own systemd timer
+family); this sweep issues no prompt and only relaunches an already-prepared run
+through its launcher, so it stays a maintenance script, same posture as `gc.py`. Scheduled instead via its own systemd timer
 (`deploy/systemd/herdr-routines-watchdog.{timer,service}`) that runs `herdr-routines
 pipeline-watchdog` directly, the same "cron-triggered systemd unit runs a CLI
 subcommand" shape `herdr-routines.timer` already uses for `tick`.
@@ -58,8 +65,8 @@ from pathlib import Path
 from logger import get_logger
 
 from herdr_routines.herdr import HerdrClient, HerdrCliError
-from herdr_routines.history import read_all
-from herdr_routines.pipeline_prepare import write_terminal_report
+from herdr_routines.history import HistoryRecord, append, read_all
+from herdr_routines.pipeline_prepare import write_state_json, write_terminal_report
 from herdr_routines.pipeline_stages import STAGES, StageSpec
 
 log = get_logger(__name__)
@@ -90,6 +97,14 @@ STATE_JSON_NAME = "state.json"
 # regardless of how far its 7h deadline still is. The slop absorbs clock skew and the
 # write-then-boot edge.
 BOOT_SLOP_SECONDS = 60
+
+# At most one automatic resume per run (issue 068): a run that dies twice stops
+# burning nights and falls back to a human-visible report.
+MAX_PIPELINE_RESUMES = 1
+
+# Extra time on the resumed unit's RuntimeMaxSec beyond the recomputed budget, so the
+# orchestrator's own deadline handling always wins the race with systemd's kill.
+RESUME_UNIT_MARGIN_S = 10 * 60
 
 # Real opencode session ids are `ses_` + 20+ alphanumerics, all distinct across stages
 # (each stage is its own fresh session — design.md G-17). Anything shorter, containing a
@@ -224,7 +239,8 @@ class WatchdogAction:
     run_id: str
     killed_agents: tuple[str, ...]
     stage_killed: int | None
-    report_path: Path
+    report_path: Path | None
+    resumed: bool = False
 
 
 def default_worktrees_root(repo_name: str = "herdr-routines") -> Path:
@@ -566,6 +582,269 @@ def _notify(client: HerdrClient, title: str, *, body: str | None) -> None:
         log.warning("%s: notification failed: %s", title, e)
 
 
+def launch_resume(argv: list[str], *, timeout_s: float = 30.0) -> tuple[int, str, str]:
+    """Module-level seam for registering the resumed run's systemd unit (monkeypatched
+    in tests like `tick.launch_pipeline`)."""
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout_s, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return 124, "", str(e)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _read_state_json(path: Path) -> dict[str, object] | None:
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+@dataclass(frozen=True, slots=True)
+class _ResumePlan:
+    repo_parent: Path
+    report_path: Path
+    matching: HistoryRecord
+    budget_ms: int
+    new_deadline: int
+    resume_count: int
+    unit_name: str
+    resumed_from: str | None
+
+
+def _resume_plan(
+    raw_state: Mapping[str, object],
+    run: InflightRun,
+    recorded_history: Sequence[HistoryRecord],
+    *,
+    now: datetime,
+) -> tuple[_ResumePlan | None, str | None]:
+    """Everything a safe automatic resume needs, or why this run is not eligible.
+
+    Never guesses: an old `state.json` without `repo_parent` (pre-issue-068) and a manual
+    run without tick's `running` history record are both ineligible, not resumed with a
+    default.
+    """
+    repo_parent = raw_state.get("repo_parent")
+    if not isinstance(repo_parent, str) or not repo_parent:
+        return None, "missing repo_parent in state.json"
+    artifacts = raw_state.get("artifact_paths")
+    report = artifacts.get("report") if isinstance(artifacts, dict) else None
+    if not isinstance(report, str) or not report:
+        return None, "missing artifact_paths.report in state.json"
+    resume_count = raw_state.get("resume_count")
+    if not isinstance(resume_count, int) or isinstance(resume_count, bool):
+        resume_count = 0
+    if resume_count >= MAX_PIPELINE_RESUMES:
+        return None, (
+            f"resume_count cap reached (resume_count={resume_count}, "
+            f"MAX_PIPELINE_RESUMES={MAX_PIPELINE_RESUMES})"
+        )
+    matching = next(
+        (
+            rec
+            for rec in recorded_history
+            if rec.state == "running"
+            and (rec.extra or {}).get("pipeline_run_id") == run.run_id
+        ),
+        None,
+    )
+    if matching is None:
+        return None, "no running history record for this run"
+    recorded_deadline = (matching.extra or {}).get("deadline_epoch")
+    if not isinstance(recorded_deadline, int) or isinstance(recorded_deadline, bool):
+        recorded_deadline = run.deadline_epoch
+    budget_ms = (recorded_deadline - int(matching.ts.timestamp())) * 1000
+    if budget_ms <= 0:
+        return None, f"non-positive original budget ({budget_ms} ms)"
+    old_unit = (matching.extra or {}).get("unit")
+    return (
+        _ResumePlan(
+            repo_parent=Path(repo_parent),
+            report_path=Path(report),
+            matching=matching,
+            budget_ms=budget_ms,
+            new_deadline=int(now.timestamp()) + budget_ms // 1000,
+            resume_count=resume_count + 1,
+            unit_name=f"{PIPELINE_UNIT_PREFIX}{run.run_id}-r{now.strftime('%H%M%S')}",
+            resumed_from=old_unit if isinstance(old_unit, str) else None,
+        ),
+        None,
+    )
+
+
+def _resume_argv(plan: _ResumePlan, run: InflightRun) -> list[str]:
+    return [
+        "systemd-run",
+        "--user",
+        "--collect",
+        f"--unit={plan.unit_name}",
+        "-p",
+        f"RuntimeMaxSec={plan.budget_ms // 1000 + RESUME_UNIT_MARGIN_S}",
+        "/bin/bash",
+        str(plan.repo_parent / "scripts" / "pipeline-launch.sh"),
+        "--run-id",
+        run.run_id,
+        "--repo-parent",
+        str(plan.repo_parent),
+        "--report",
+        str(plan.report_path),
+        "--state-json",
+        str(run.state_path),
+        "--resume",
+        "--deadline-epoch",
+        str(plan.new_deadline),
+        "--agent-name",
+        "pipeline-resume",
+        "--wait-timeout-ms",
+        str(plan.budget_ms),
+    ]
+
+
+def _resume_run(
+    client: HerdrClient,
+    run: InflightRun,
+    *,
+    raw_state: Mapping[str, object],
+    recorded_history: Sequence[HistoryRecord],
+    history_path: Path,
+    reports_dir: Path,
+    heartbeat_dir: Path,
+    host_rebooted: bool,
+    now: datetime,
+) -> tuple[WatchdogAction | None, str | None]:
+    """Try the one allowed resume. Returns (action, reason): `(None, reason)` means not
+    eligible and the caller falls through to kill-and-report."""
+    plan, reason = _resume_plan(raw_state, run, recorded_history, now=now)
+    if plan is None:
+        return None, reason
+    try:
+        panes = (
+            client.pipeline_agent_panes(run.run_id)
+            if host_rebooted
+            else client.live_pipeline_agent_panes(run.run_id)
+        )
+    except HerdrCliError as e:
+        log.warning("%s: could not list agents, skipping this cycle: %s", run.run_id, e)
+        return None, None
+
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=plan.matching.job,
+            state="running",
+            run_id=plan.matching.run_id,
+            extra={
+                "pipeline_run_id": run.run_id,
+                "report": str(plan.report_path),
+                "unit": plan.unit_name,
+                "deadline_epoch": plan.new_deadline,
+                "resume_count": plan.resume_count,
+                "resumed_from": plan.resumed_from,
+            },
+        ),
+    )
+
+    killed_agents: dict[str, str] = {}
+    for name, pane_id in panes.items():
+        try:
+            client.pane_close(pane_id)
+            killed_agents[name] = pane_id
+        except HerdrCliError as e:
+            log.warning(
+                "%s: could not close pane %s for %s: %s",
+                run.run_id,
+                pane_id,
+                name,
+                e,
+            )
+
+    state_payload = dict(raw_state)
+    state_payload["deadline_epoch"] = plan.new_deadline
+    state_payload["resume_count"] = plan.resume_count
+    state_payload["resumed_at"] = now.isoformat()
+    try:
+        write_state_json(run.state_path, state_payload)
+    except OSError as e:
+        log.warning("%s: failed to rewrite state for resume: %s", run.run_id, e)
+
+    stage_killed = next(
+        (
+            s
+            for s in (_stage_from_agent_name(n, run.run_id) for n in killed_agents)
+            if s is not None
+        ),
+        None,
+    )
+    rc, stdout, stderr = launch_resume(_resume_argv(plan, run))
+    if rc != 0:
+        heartbeat_last_line = _heartbeat_last_line(
+            heartbeat_log_path(heartbeat_dir, run.run_id)
+        )
+        report_path = reports_dir / f"pipeline-{run.run_id}.md"
+        lines = [
+            "watchdog_killed: false",
+            f"host_rebooted_mid_run: {'true' if host_rebooted else 'false'}",
+            "stage_killed: none",
+            f"last_known_stage: {run.current_stage if run.current_stage is not None else 'unknown'}",
+            f"stage_sessions_issue: {run.stage_sessions_issue or 'none'}",
+            f"deadline_epoch: {plan.new_deadline}",
+            f"checked_at: {now.isoformat()}",
+            f"killed_agents: {', '.join(sorted(killed_agents)) or 'none'}",
+            f"heartbeat_last_line: {heartbeat_last_line or 'none found'}",
+            f"resume_attempt_rc: {rc}",
+            f"resume_attempt_stderr: {(stderr.strip() or stdout.strip()) or 'none'}",
+            "",
+            (
+                "The run was eligible for its one automatic resume, but registering "
+                "the resume unit failed. A human should restart it once the cause is "
+                "fixed."
+            ),
+        ]
+        write_terminal_report(
+            report_path,
+            run_id=run.run_id,
+            outcome="failed (resume_failed)",
+            lines=lines,
+            title="watchdog report",
+        )
+        _notify(
+            client,
+            f"herdr-routines: pipeline {run.run_id} resume failed",
+            body=f"resume launch failed (rc {rc}); see {report_path}",
+        )
+        return (
+            WatchdogAction(
+                run_id=run.run_id,
+                killed_agents=tuple(sorted(killed_agents)),
+                stage_killed=stage_killed,
+                report_path=report_path,
+                resumed=False,
+            ),
+            None,
+        )
+
+    _notify(
+        client,
+        f"herdr-routines: pipeline {run.run_id} stalled, resuming",
+        body=f"resumed from stage {run.current_stage} (unit {plan.unit_name}); "
+        f"budget {plan.budget_ms // 1000}s",
+    )
+    return (
+        WatchdogAction(
+            run_id=run.run_id,
+            killed_agents=tuple(sorted(killed_agents)),
+            stage_killed=stage_killed,
+            report_path=None,
+            resumed=True,
+        ),
+        None,
+    )
+
+
 def _reap_stalled_run(
     client: HerdrClient,
     run: InflightRun,
@@ -574,6 +853,7 @@ def _reap_stalled_run(
     heartbeat_dir: Path,
     now: datetime,
     boot_epoch: float | None,
+    history_path: Path | None = None,
 ) -> WatchdogAction | None:
     """One run's share of the sweep: None when it is healthy, spared, or can't be listed
     this cycle; otherwise the action taken."""
@@ -594,6 +874,31 @@ def _reap_stalled_run(
         )
         return None
     host_rebooted = _host_rebooted_after_last_state_write(run, boot_epoch=boot_epoch)
+
+    # One automatic resume attempt (issue 068) before the terminal path. A missing
+    # history file means no tick-launched run can be identified, so nothing is resumable.
+    raw_state = _read_state_json(run.state_path)
+    recorded_history = read_all(history_path) if history_path is not None else []
+    resume_reason: str | None = None
+    if raw_state is not None and history_path is not None:
+        resumed_action, resume_reason = _resume_run(
+            client,
+            run,
+            raw_state=raw_state,
+            recorded_history=recorded_history,
+            history_path=history_path,
+            reports_dir=reports_dir,
+            heartbeat_dir=heartbeat_dir,
+            host_rebooted=host_rebooted,
+            now=now,
+        )
+        if resumed_action is not None:
+            return resumed_action
+        if resume_reason is None:
+            return None
+    elif raw_state is not None:
+        resume_reason = "history missing, so no running record for this run"
+
     killed_agents: dict[str, str] = {}
     try:
         # A worker left running is closed only while `working`: a `blocked` one is
@@ -632,6 +937,9 @@ def _reap_stalled_run(
         now=now,
         host_rebooted=host_rebooted,
     )
+    if resume_reason is not None:
+        with report_path.open("a") as handle:
+            handle.write(f"\nresume_fallback_reason: {resume_reason}\n")
     stage_killed = next(
         (
             s
@@ -698,6 +1006,7 @@ def run_watchdog(
                 heartbeat_dir=heartbeat_dir,
                 now=now,
                 boot_epoch=boot_epoch,
+                history_path=history_path,
             )
         except Exception:  # one run's failure, of any kind, must not abort the sweep
             log.exception("%s: watchdog failed for this run; continuing", run.run_id)

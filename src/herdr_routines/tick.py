@@ -3870,6 +3870,8 @@ def _classify_pipeline_outcome(report_text: str) -> tuple[HistoryState, str | No
     if status.startswith("partial"):
         return "failed", "partial_deadline"
     if status.startswith("failed"):
+        if "resume_failed" in status:
+            return "failed", "resume_failed"
         if "watchdog" in status:
             return "failed", "watchdog_killed"
         if "quota_exhausted" in status:
