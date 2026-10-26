@@ -183,6 +183,11 @@ def _write(worktree: Path, files: dict[str, str]) -> None:
 def _write_and_commit(worktree: Path, files: dict[str, str], message: str) -> None:
     _write(worktree, files)
     _git(worktree, "add", "-A")
+    staged = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--cached", "--quiet"], check=False
+    )
+    if staged.returncode == 0:
+        return
     _git(worktree, "commit", "-m", message)
 
 
