@@ -400,7 +400,7 @@ def commit_ci_state(gh: GhClient, *, owner: str, repo: str, sha: str) -> GateVer
         checks = gh.commit_check_runs(owner=owner, repo=repo, sha=sha)
     except Exception as e:  # noqa: BLE001 - any gh failure means "cannot confirm green"
         return GateVerdict(passed=False, reason=f"check runs unqueryable: {e}")
-    return evaluate_commit_checks([c for c in checks if isinstance(c, dict)])
+    return evaluate_commit_checks(checks)
 
 
 # ---------------------------------------------------------------------------

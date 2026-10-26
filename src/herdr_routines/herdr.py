@@ -587,7 +587,7 @@ class HerdrClient:
                 continue
             status = agent.get("agent_status")
             pane_id = agent.get("pane_id")
-            if status in STICKY_AGENT_STATUSES and status is not None and pane_id:
+            if status in STICKY_AGENT_STATUSES and pane_id:
                 return pane_id, status
         return None
 
