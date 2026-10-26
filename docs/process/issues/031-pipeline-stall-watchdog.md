@@ -91,3 +91,5 @@ this doesn't dispatch through `tick.py`'s job model).
   resource leak on top of being a stalled PR, and the existing G-4 "morning
   checklist" only ever covered noticing a missing report, never reaping the
   orphaned process.
+- **2026-10-26**: narrowed scope — the watchdog now attempts one automatic
+  resume before kill-and-report (issue 068), capped by `resume_count`.
