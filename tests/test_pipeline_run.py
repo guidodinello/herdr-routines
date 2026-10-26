@@ -817,6 +817,82 @@ def test_gate_6_fails_closed_when_the_gh_user_cannot_be_read(
 
 
 # ---------------------------------------------------------------------------
+# 2b. current_stage only advances once its gate has passed (issue 068 part 1)
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_run_does_not_advance_current_stage_before_its_gate(
+    prepared: PipelineFixture,
+) -> None:
+    """Issue 068: the session id is read right after the agent settles, and the old code
+    committed `current_stage=spec.stage` together with it — *before* the gate. A crash (or
+    an automatic watchdog resume, which makes replay the normal path) between that commit
+    and the post-gate commit would leave state.json claiming a stage is done when its gate
+    never ran. The stage marker must move only at the post-gate commit; the session id is
+    still recorded early."""
+    client = _client()
+
+    def rename_one_delete_the_other(wt: Path, text: str) -> None:
+        _write_and_commit(
+            wt,
+            {
+                "tests/test_thing.py": _test_file(("test_renamed_thing",)),
+                "src/thing.py": "THING = 1\n",
+            },
+            "feat: the thing, and tidy the tests",
+        )
+
+    client.hooks[4] = rename_one_delete_the_other
+
+    outcome, _cl, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "gate_4_failed"
+    state = prepared.state()
+    # Gate 3 passed, gate 4 did not: the resume point is the last gate-passed stage ...
+    assert state["current_stage"] == 3
+    # ... while the stage's real session id is recorded, so a resume can still reuse it.
+    assert state["stage_sessions"]["4"] == SESSION_IDS[4]
+
+    # A second run against the same state must prompt the failed stage again, not skip
+    # it — and must not barrel on to stage 5 (no PR opens before gate 4 passes).
+    second = _client()
+    second_outcome, second_client, second_gh = _run(prepared, client=second)
+
+    assert second_outcome.outcome == "failed"
+    assert [target for target, _text in second_client.prompts] == [
+        f"pl-4-{RUN_ID}".lower()
+    ]
+    assert second_gh.created == []
+
+
+def test_pipeline_run_starts_after_the_last_gate_passed_stage(
+    prepared: PipelineFixture,
+) -> None:
+    """Issue 068: with `current_stage = 4` and the matching session ids already in
+    state.json, a resumed run starts at stage 5 and never replays stages 1-4."""
+    state = prepared.state()
+    state["current_stage"] = 4
+    state["stage_sessions"] = {str(n): SESSION_IDS[n] for n in (1, 2, 3, 4)}
+    # What a real mid-run state.json also carries: stage 4's recorded base, which
+    # stage 5's PR body needs to disclose implementer test edits.
+    state["stage_bases"] = {
+        "4": _git(prepared.worktree, "rev-parse", "HEAD").stdout.strip()
+    }
+    prepared.state_json.write_text(json.dumps(state, indent=2, sort_keys=True))
+
+    outcome, client, gh = _run(prepared, client=_client())
+
+    assert outcome.outcome == "ok", outcome
+    delivered = [target for target, _text in client.prompts]
+    for stage in (1, 2, 3, 4):
+        assert f"pl-{stage}-{RUN_ID}".lower() not in delivered
+    # Stage 5 needs no agent; the prompts that did go out are only the review stages.
+    assert delivered == [f"pl-6-{RUN_ID}".lower(), f"pl-7-{RUN_ID}".lower()]
+    assert len(gh.created) == 1
+
+
+# ---------------------------------------------------------------------------
 # 3. the heartbeat advances on every poll, from inside the wait loop
 # ---------------------------------------------------------------------------
 
