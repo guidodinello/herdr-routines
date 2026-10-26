@@ -942,11 +942,14 @@ class ResumeFixture:
         return NOW_TS + self.budget_ms // 1000
 
 
+_DEFAULT_REPO_PARENT = object()
+
+
 def _resume_candidate(
     tmp_path: Path,
     *,
     budget_seconds: int = 3600,
-    repo_parent: str | None = None,
+    repo_parent: str | None | object = _DEFAULT_REPO_PARENT,
     resume_count: int = 0,
     with_history: bool = True,
 ) -> ResumeFixture:
@@ -960,10 +963,16 @@ def _resume_candidate(
     heartbeat_dir = tmp_path / "tmp"
     heartbeat_dir.mkdir(parents=True, exist_ok=True)
     repo_parent_path = tmp_path / "parent"
+    if repo_parent is _DEFAULT_REPO_PARENT:
+        repo_parent = str(repo_parent_path)
+    assert repo_parent is None or isinstance(repo_parent, str)
     report_path = reports_dir / f"pipeline-{RUN_ID}.md"
     recorded_deadline = int(ORIGINAL_TS.timestamp()) + budget_seconds
     history_path = tmp_path / "history.jsonl"
-    extra: dict = {"artifact_paths": {"report": str(report_path)}}
+    extra: dict = {
+        "artifact_paths": {"report": str(report_path)},
+        "resume_count": resume_count,
+    }
     if repo_parent is not None:
         extra["repo_parent"] = repo_parent
     write_state_json(
