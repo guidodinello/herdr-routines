@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Final, Literal, TypedDict
+from typing import Final, Literal, NotRequired, TypedDict
 
 from herdr_routines.auto_fix import GhClient, RealGhClient
 from herdr_routines.config import DEFAULT_TRUSTED_REVIEW_AUTHORS, Job
@@ -91,11 +91,19 @@ DEFAULT_FAILURE_MARKERS: tuple[str, ...] = ("Free usage exceeded",)
 NUDGE_TIMEOUT_MS = 120_000
 
 
-def diagnose_tmp() -> dict[str, str | bool]:
+class TmpDiagnosis(TypedDict):
+    """The /tmp diagnosis shape `diagnose_tmp` fills and the tail file formats."""
+
+    tmp_full: bool
+    df_tmp: NotRequired[str]
+    du_tmp: NotRequired[str]
+
+
+def diagnose_tmp() -> TmpDiagnosis:
     """Best-effort /tmp disk diagnosis for agent start failures (issue 027).
     Returns dict with df_tmp, du_tmp, tmp_full keys. Never raises — the df call is
     bounded by a 5s timeout and the size tally is a bounded filesystem walk."""
-    diagnosis: dict[str, str | bool] = {"tmp_full": False}
+    diagnosis: TmpDiagnosis = {"tmp_full": False}
     try:
         proc = subprocess.run(
             ["df", "-h", "/tmp"],
@@ -356,9 +364,7 @@ def substitute_prompt(
     return resolved
 
 
-def _best_effort_tmp_diagnosis(
-    reports_dir: Path, run_id: str
-) -> dict[str, str | bool] | None:
+def _best_effort_tmp_diagnosis(reports_dir: Path, run_id: str) -> TmpDiagnosis | None:
     """Best-effort /tmp diagnosis appended to the tail file. Returns None on total failure
     so RunOutcome.diagnosis stays clean."""
     try:
@@ -434,7 +440,7 @@ class RunOutcome:
     resigned_commits: int = (
         0  # unsigned commits on the pushed branch, re-signed after run
     )
-    diagnosis: dict[str, str | bool] | None = None  # issue 027: /tmp disk diagnosis
+    diagnosis: TmpDiagnosis | None = None  # issue 027: /tmp disk diagnosis
     reaped_stale_agent: bool = (
         False  # issue 051: force-closed a prior run's blocked agent
     )

@@ -37,7 +37,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Literal, TextIO, TypeIs
 
 import yaml
 
@@ -68,6 +68,14 @@ _PR_MARKER_RE = re.compile(
 GH_TIMEOUT_SECONDS = 30
 FRONTMATTER_DELIM = "---"
 REQUIRED_FRONTMATTER = ("id", "title", "status", "priority", "area")
+
+ReviewerConfidence = Literal["high", "medium", "low"]
+
+
+def is_reviewer_confidence(value: str) -> TypeIs[ReviewerConfidence]:
+    """Narrow a lowercased confidence word to the closed set the regex allows."""
+    return value in ("high", "medium", "low")
+
 
 # The reviewer is told to reply with one 'confidence: high|medium|low' line; the
 # loop check reads it off the raw reply so consensus is not the author's call.
@@ -311,11 +319,14 @@ def select_next_bullet(
     return None
 
 
-def parse_reviewer_confidence(reply: str) -> str | None:
+def parse_reviewer_confidence(reply: str) -> ReviewerConfidence | None:
     """The first ``confidence: high|medium|low`` in a reviewer reply, lowercased;
     ``None`` when the reviewer never gave one (treated as not-consensus)."""
     match = _CONFIDENCE_RE.search(_MARKDOWN_EMPHASIS_RE.sub("", reply))
-    return match.group(1).lower() if match else None
+    if not match:
+        return None
+    value = match.group(1).lower()
+    return value if is_reviewer_confidence(value) else None
 
 
 def loop_should_continue(iteration: int, reviewer_confidence: str) -> bool:

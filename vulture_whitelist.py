@@ -11,10 +11,14 @@ from herdr_routines.herdr import AgentEntry, WorkspaceWorktree
 from herdr_routines.history import HistoryExtra
 from herdr_routines.issue_refinement import ISSUE_REFINEMENT_CRON
 from herdr_routines.pipeline_stages import stage_families
+from herdr_routines.runner import TmpDiagnosis
 
 # TypedDict keys: written and read through ["key"] / .get("key"), which vulture cannot see.
 AgentEntry.agent_status  # set in _parse_agent_list, read via agent.get("agent_status")
 WorkspaceWorktree.checkout_path  # set in _parse_workspace_list, read in pipeline_prepare
+TmpDiagnosis.tmp_full  # set in diagnose_tmp, read by its callers via diagnosis["tmp_full"]
+TmpDiagnosis.df_tmp
+TmpDiagnosis.du_tmp
 HistoryExtra.phase  # every HistoryExtra key below is written via extra={...} by a run path
 HistoryExtra.trigger
 HistoryExtra.reaped_agents
