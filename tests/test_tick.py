@@ -3045,6 +3045,15 @@ def test_pipeline_skip_reason_does_not_reopen_a_retry() -> None:
     )
 
 
+def test_tick_classifies_resume_failed() -> None:
+    """Issue 068: a resume attempt whose launcher unit failed to register gets its own
+    history reason, so the morning line says what actually happened — not
+    `orchestrator_failed`, and not `watchdog_killed` (no worker was killed on this
+    path)."""
+    state, reason = _classify_pipeline_outcome("## Outcome: failed (resume_failed)\n")
+    assert (state, reason) == ("failed", "resume_failed")
+
+
 # -- reaping a dead run's agents that herdr restored after a reboot (2026-10-01) ---------
 
 

@@ -25,7 +25,7 @@ import json
 import os
 import subprocess
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -256,6 +256,12 @@ def prepare_run(
     # 4. state.json — the exact key set the prompt's example used, plus `feature_source`
     # (which the prompt required in prose but omitted from its own example).
     state_path = Path(worktree.path) / "state.json"
+    # Absolute, because the watchdog derives the resume's prompts dir as
+    # `<repo_parent>/docs/pipeline/stages` from this file alone and deliberately never
+    # loads tick's config or guesses from the worktree (issue 068).
+    repo_parent_value = (
+        str(repo_parent) if repo_parent.is_absolute() else str(repo_parent.resolve())
+    )
     try:
         _write_state_json(
             state_path,
@@ -267,6 +273,11 @@ def prepare_run(
                 "branch": worktree.branch,
                 "shared_workspace": workspace_id,
                 "deadline_epoch": deadline_epoch,
+                "repo_parent": repo_parent_value,
+                # Starts at zero so the watchdog's single-attempt cap has a counter to
+                # move; a state file without it is from before resume existed and is
+                # simply not resumed (it lacks `repo_parent` too).
+                "resume_count": 0,
                 "feature_source": _feature_source(picked.issue.path, repo_parent),
                 "artifact_paths": {
                     "spec": str(
@@ -372,7 +383,7 @@ def _ensure_shared_workspace(client: HerdrClient, *, cwd: str, label: str) -> st
     return client.workspace_create(cwd=cwd, label=label, env=SHARED_WORKSPACE_ENV)
 
 
-def write_state_json(path: Path, payload: dict[str, object]) -> None:
+def write_state_json(path: Path, payload: Mapping[str, object]) -> None:
     """Atomic write: tmpfile in the *same directory* (so `os.replace` is a same-filesystem
     rename, not a copy), then the rename. A reader therefore never observes a partially
     written `state.json` (G-9), and a failure part-way leaves no file at `path` at all.

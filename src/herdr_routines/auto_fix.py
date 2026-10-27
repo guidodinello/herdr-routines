@@ -18,7 +18,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, assert_never
+from typing import Literal, Protocol, assert_never
 
 from herdr_routines.config import (
     DEFAULT_TRUSTED_REVIEW_AUTHORS,
@@ -188,7 +188,7 @@ class EligiblePR:
     """A PR confirmed eligible for auto-fix."""
 
     pr: PRInfo
-    reason: str  # "ci_failure", "unresolved_threads", or "both"
+    reason: Literal["ci_failure", "unresolved_threads", "both"]
 
 
 class RealGhClient:
@@ -566,8 +566,6 @@ def list_open_prs(
 
     result: list[PRInfo] = []
     for pr in raw:
-        if not isinstance(pr, dict):
-            continue
         head = pr.get("headRefName", "")
         login = _author_login(pr)
         num = pr.get("number")
@@ -1498,8 +1496,6 @@ def poll_github_event(
         )
         result: list[GithubEvent] = []
         for pr in raw:
-            if not isinstance(pr, dict):
-                continue
             number = pr.get("number")
             if not isinstance(number, int) or not _event_matches(pr, match):
                 continue
@@ -1689,8 +1685,6 @@ def enrich_event_detail(
         log.warning(
             "gh pr view %d failed for new event %s: %s", event.number, event.event_id, e
         )
-        return event
-    if not isinstance(view, dict):
         return event
     title = view.get("title")
     head_ref = view.get("headRefName")

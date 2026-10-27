@@ -857,10 +857,6 @@ def load_config_dir(path: Path) -> RoutinesConfig:
             errors.append(str(e))
             continue
 
-        if not isinstance(raw_job, dict):
-            errors.append(f"{job_file}: job file must be a mapping")
-            continue
-
         # --- filename / name contract -------------------------------------------
         stem = job_file.stem
         if not NAME_RE.match(stem):

@@ -1587,11 +1587,13 @@ def _run_agent_stage(
     # stage can depend on it (spec §5). This has to come AFTER the prompt: opencode
     # creates its session on the first prompt, so a just-started agent reports no
     # `agent_session` at all (measured on the Pi 2026-10-08; reading it before the
-    # prompt failed every run's stage 1 as `session_id_unreadable`). `current_stage`
-    # is committed together with the id so the watchdog's in-flight
-    # `validate_stage_sessions` never sees a reached stage without its session, and a
-    # same-RUN_ID relaunch redoes an interrupted stage rather than skipping it. An id
-    # that cannot be read still aborts: writing a placeholder is exactly what made
+    # prompt failed every run's stage 1 as `session_id_unreadable`). The id is committed
+    # alone, deliberately: `current_stage` is the *resume point*, so it may only move at
+    # the post-gate commit below (issue 068). A crash between these two writes then
+    # replays this stage rather than skipping a gate it never checked. The watchdog's
+    # in-flight `validate_stage_sessions` is unaffected — it requires sessions up to
+    # `current_stage`, so an extra id for a not-yet-gate-passed stage is not missing. An
+    # id that cannot be read still aborts: writing a placeholder is exactly what made
     # G-17's gate necessary in the first place.
     try:
         session_id = client.agent_session_id(agent_name)
@@ -1607,7 +1609,6 @@ def _run_agent_stage(
 
     state.commit(
         state_json,
-        current_stage=spec.stage,
         stage_sessions={**state.stage_sessions, str(spec.stage): session_id},
     )
     return pane_id, note

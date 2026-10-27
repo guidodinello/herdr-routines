@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, assert_never
+from typing import Final, Literal, assert_never
 
 from logger import get_logger
 
@@ -372,11 +372,11 @@ def _process_audit_job(
 # sample keeps one bad night from bloating every history line.
 _AUDIT_SUPPRESSED_ID_CAP = 20
 
-# The closed set of notification kinds `_notify_gate` understands (see its docstring).
-NotificationKind = Literal["failure", "finding", "success", "progress"]
+AuditGate = Literal["baseline", "fix_dispatched", "suppressed", "passed", "failed"]
+NotifyKind = Literal["progress", "success", "failure", "finding"]
 
 # gate -> notification kind (see _notify_gate's four-tier policy).
-_AUDIT_GATE_NOTIFY_KIND: dict[str, NotificationKind] = {
+_AUDIT_GATE_NOTIFY_KIND: Final[dict[AuditGate, NotifyKind]] = {
     "baseline": "finding",
     "fix_dispatched": "finding",
     "suppressed": "finding",
@@ -390,7 +390,7 @@ def _render_audit_report(
     job_name: str,
     run_id: str,
     check: str,
-    gate: str,
+    gate: AuditGate,
     manifest: FindingsManifest,
     diff: FindingDiff,
     dispatched_ids: list[str],
@@ -937,6 +937,7 @@ def _diff_and_fix(
     dispatched_ids: list[str] = []
     suppressed_ids: list[str] = []
     adopted = 0
+    gate: AuditGate
 
     if cold and job.adopt_baseline:
         # Adopt the current report as the baseline and dispatch nothing. An empty report
@@ -3654,7 +3655,7 @@ def _run_routine(
         if outcome.reaped_stale_agent:
             notes.append("force-closed a prior run's blocked agent (issue 051)")
         done_body = "; ".join(notes) or None
-        gate: NotificationKind = (
+        gate: NotifyKind = (
             "finding" if (used_fallback or outcome.reaped_stale_agent) else "success"
         )
         if _notify_gate(job, gate):
@@ -3875,6 +3876,8 @@ def _classify_pipeline_outcome(report_text: str) -> tuple[HistoryState, str | No
     if status.startswith("partial"):
         return "failed", "partial_deadline"
     if status.startswith("failed"):
+        if "resume_failed" in status:
+            return "failed", "resume_failed"
         if "watchdog" in status:
             return "failed", "watchdog_killed"
         if "quota_exhausted" in status:
@@ -4293,7 +4296,7 @@ def _notify(
         log.warning("%s: notification failed: %s", title, e)
 
 
-def _notify_gate(job: Job, kind: NotificationKind) -> bool:
+def _notify_gate(job: Job, kind: NotifyKind) -> bool:
     """Whether a `job.notify_policy`-governed notification of *kind* should actually be
     sent (issue 009). *kind* is one of:
 
