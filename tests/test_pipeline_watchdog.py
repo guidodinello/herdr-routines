@@ -8,15 +8,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from herdr_routines import pipeline_watchdog
 from herdr_routines.herdr import HerdrCliError
-from herdr_routines.history import HistoryRecord, append
+from herdr_routines.history import HistoryRecord, append, read_all
 from herdr_routines.pipeline_watchdog import (
     DEADLINE_GRACE_SECONDS,
     HEARTBEAT_STALE_SECONDS,
@@ -892,3 +895,421 @@ def test_run_watchdog_continues_after_one_run_raises(tmp_path: Path) -> None:
     assert client.closed_panes == ["w1:p1"]
     assert (reports_dir / f"pipeline-{good_run}.md").exists()
     assert not (reports_dir / f"pipeline-{bad_run}.md").exists()
+
+
+# -- issue 068: one automatic resume attempt in the sweep --------------------------------
+
+
+NOW_TS = int(NOW.timestamp())
+ORIGINAL_TS = datetime(2026, 9, 3, 10, 0, 0, tzinfo=UTC)  # the original launch
+JOB = "feature-pipeline"
+AGENT_NAME = f"pl-6-{RUN_ID}".lower()
+
+
+def _launch_record(*, deadline_epoch: int) -> HistoryRecord:
+    """Tick's `running` record at the original launch: it is what makes the run
+    resume-eligible (job name + original budget) and what the recorded deadline comes
+    from. `ts` two hours before NOW, so the original wall budget is positive."""
+    return HistoryRecord(
+        ts=ORIGINAL_TS,
+        job=JOB,
+        state="running",
+        run_id=f"{JOB}-{RUN_ID}",
+        extra={"pipeline_run_id": RUN_ID, "deadline_epoch": deadline_epoch},
+    )
+
+
+@dataclass
+class ResumeFixture:
+    worktrees_root: Path
+    reports_dir: Path
+    heartbeat_dir: Path
+    history_path: Path
+    state_path: Path
+    repo_parent: Path
+    report_path: Path
+    recorded_deadline: int
+    resume_count: int
+    with_history: bool
+    with_repo_parent: bool
+
+    @property
+    def budget_ms(self) -> int:
+        return (self.recorded_deadline - int(ORIGINAL_TS.timestamp())) * 1000
+
+    @property
+    def new_deadline(self) -> int:
+        return NOW_TS + self.budget_ms // 1000
+
+
+_DEFAULT_REPO_PARENT = object()
+
+
+def _resume_candidate(
+    tmp_path: Path,
+    *,
+    budget_seconds: int = 3600,
+    repo_parent: str | None | object = _DEFAULT_REPO_PARENT,
+    resume_count: int = 0,
+    with_history: bool = True,
+) -> ResumeFixture:
+    """A stalled run that is otherwise resume-eligible: unit inactive (autouse), stale
+    heartbeat, tick's recorded deadline + `running` record on file, `repo_parent` and
+    `artifact_paths.report` in state.json. Everything eligibility needs except good
+    fortune. `repo_parent=None` (or "") and `with_history=False` are the knobs the
+    ineligible-cases test turns."""
+    worktrees_root = tmp_path / "worktrees"
+    reports_dir = tmp_path / "reports"
+    heartbeat_dir = tmp_path / "tmp"
+    heartbeat_dir.mkdir(parents=True, exist_ok=True)
+    repo_parent_path = tmp_path / "parent"
+    if repo_parent is _DEFAULT_REPO_PARENT:
+        repo_parent = str(repo_parent_path)
+    assert repo_parent is None or isinstance(repo_parent, str)
+    report_path = reports_dir / f"pipeline-{RUN_ID}.md"
+    recorded_deadline = int(ORIGINAL_TS.timestamp()) + budget_seconds
+    history_path = tmp_path / "history.jsonl"
+    extra: dict = {
+        "artifact_paths": {"report": str(report_path)},
+        "resume_count": resume_count,
+    }
+    if repo_parent is not None:
+        extra["repo_parent"] = repo_parent
+    write_state_json(
+        worktrees_root,
+        deadline_epoch=recorded_deadline if with_history else NOW_TS - 3600,
+        extra=extra,
+    )
+    write_heartbeat(
+        heartbeat_dir,
+        RUN_ID,
+        mtime=NOW.timestamp() - HEARTBEAT_STALE_SECONDS - 60,
+        text="stage 6 poll 11:58:50Z\n",
+    )
+    if with_history:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        append(history_path, _launch_record(deadline_epoch=recorded_deadline))
+    state_path = pipeline_watchdog.pipeline_state_json_path(worktrees_root, RUN_ID)
+    assert state_path is not None
+    return ResumeFixture(
+        worktrees_root=worktrees_root,
+        reports_dir=reports_dir,
+        heartbeat_dir=heartbeat_dir,
+        history_path=history_path,
+        state_path=state_path,
+        repo_parent=repo_parent_path,
+        report_path=report_path,
+        recorded_deadline=recorded_deadline,
+        resume_count=resume_count,
+        with_history=with_history,
+        with_repo_parent=repo_parent is not None,
+    )
+
+
+class OrderRecordingClient(FakeWatchdogClient):
+    """Records the sweep's actions as they happen, and — at the moment a pane is
+    closed — how many `running` history records for this run are already on disk. That
+    is exactly where issue 068's record-before-kill order is observable: tick must never
+    see an in-flight gap between the dead record and the fresh one, so the fresh
+    `running` record exists in the file *before* the kill."""
+
+    def __init__(
+        self,
+        *args: Any,
+        history_path: Path | None = None,
+        events: list[tuple[object, ...]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.history_path = history_path
+        self.events = events if events is not None else []
+
+    def pane_close(self, pane_id: str) -> None:
+        running_records = 0
+        if self.history_path is not None and self.history_path.exists():
+            running_records = sum(
+                1
+                for r in read_all(self.history_path)
+                if r.state == "running"
+                and (r.extra or {}).get("pipeline_run_id") == RUN_ID
+            )
+        self.events.append(("close", pane_id, running_records))
+        super().pane_close(pane_id)
+
+
+def _argv_value(argv: list[str], flag: str) -> str:
+    return argv[argv.index(flag) + 1]
+
+
+def _patch_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[tuple[object, ...]],
+    *,
+    rc: int = 0,
+    stdout: str = "",
+    stderr: str = "",
+) -> list[list[str]]:
+    """The `launch_resume` seam, monkeypatched like `tick.launch_pipeline`."""
+    launched: list[list[str]] = []
+
+    def fake_launch(argv: list[str], **_kwargs: Any) -> tuple[int, str, str]:
+        argv = list(argv)
+        launched.append(argv)
+        events.append(("launch", argv))
+        return rc, stdout, stderr
+
+    monkeypatch.setattr(pipeline_watchdog, "launch_resume", fake_launch, raising=False)
+    return launched
+
+
+def test_run_watchdog_resumes_a_stalled_run_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """issue 068: a stalled, unit-inactive run with a usable `repo_parent`, a zero
+    `resume_count`, tick's `running` history record and a positive original wall budget
+    is resumed instead of killed-and-reported: fresh `running` history record first (so
+    tick never sees an in-flight gap), panes killed second, state.json rewritten
+    atomically third, the resume unit registered last — and no terminal report."""
+    fx = _resume_candidate(tmp_path)
+    events: list[tuple[object, ...]] = []
+    client = OrderRecordingClient(
+        panes_by_run={RUN_ID: {AGENT_NAME: "w1:p1"}},
+        history_path=fx.history_path,
+        events=events,
+    )
+    launched = _patch_launch(monkeypatch, events)
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=fx.worktrees_root,
+        reports_dir=fx.reports_dir,
+        heartbeat_dir=fx.heartbeat_dir,
+        history_path=fx.history_path,
+        now=NOW,
+        boot_epoch=0,
+    )
+
+    # One resume attempt, and the action says so — no report, `resumed is True`.
+    assert len(actions) == 1
+    action = actions[0]
+    assert action.run_id == RUN_ID
+    assert action.resumed is True
+    assert action.report_path is None
+    assert action.killed_agents == (AGENT_NAME,)
+    assert not fx.report_path.exists()
+    assert len(client.notifications) == 1
+    title, body, _sound = client.notifications[0]
+    assert "resum" in f"{title} {body}".lower()
+
+    # Order: the fresh `running` record is already on disk when the first pane is
+    # closed (original record + fresh record = 2), and the launch comes after the kill.
+    assert [e[0] for e in events] == ["close", "launch"]
+    assert events[0] == ("close", "w1:p1", 2)
+
+    # state.json, rewritten atomically (tmpfile + rename): later deadline, the cap
+    # counter moved once, a `resumed_at` marker, and nothing else disturbed.
+    state = json.loads(fx.state_path.read_text())
+    assert state["deadline_epoch"] == fx.new_deadline
+    assert state["resume_count"] == 1
+    assert state["resumed_at"] == NOW.isoformat()
+    assert state["repo_parent"] == str(fx.repo_parent)
+    assert state["artifact_paths"] == {"report": str(fx.report_path)}
+    assert [p.name for p in fx.state_path.parent.iterdir()] == ["state.json"]
+
+    # The fresh history record carries the new deadline/unit/counter before the kill.
+    records = read_all(fx.history_path)
+    fresh = records[-1]
+    assert fresh.state == "running"
+    assert fresh.job == JOB
+    assert fresh.ts == NOW
+    extra = fresh.extra or {}
+    assert extra.get("pipeline_run_id") == RUN_ID
+    assert extra.get("deadline_epoch") == fx.new_deadline
+    assert extra.get("resume_count") == 1
+    assert "resumed_from" in extra
+    assert str(fx.report_path) in str(extra)
+
+    # The resume unit, exactly the launcher in resume mode: same run/state/report,
+    # prompts dir derivable from `repo_parent`, the budget reset (not the negative
+    # remainder), RuntimeMaxSec with the margin on top.
+    assert len(launched) == 1
+    argv = launched[0]
+    assert argv[0] == "systemd-run"
+    assert "--user" in argv
+    assert "--collect" in argv
+    unit = next(a for a in argv if a.startswith("--unit="))
+    assert re.fullmatch(rf"--unit=herdr-pipeline-{RUN_ID}-r\d{{6}}", unit)
+    runtime = argv.index("-p")
+    budget_s = fx.budget_ms // 1000
+    assert argv[runtime + 1] == (
+        f"RuntimeMaxSec={budget_s + pipeline_watchdog.RESUME_UNIT_MARGIN_S}"
+    )
+    bash = argv.index("/bin/bash")
+    assert argv[bash + 1] == str(fx.repo_parent / "scripts" / "pipeline-launch.sh")
+    assert _argv_value(argv, "--run-id") == RUN_ID
+    assert _argv_value(argv, "--repo-parent") == str(fx.repo_parent)
+    assert _argv_value(argv, "--report") == str(fx.report_path)
+    assert _argv_value(argv, "--state-json") == str(fx.state_path)
+    assert "--resume" in argv
+    assert _argv_value(argv, "--deadline-epoch") == str(fx.new_deadline)
+    assert _argv_value(argv, "--agent-name")
+    assert _argv_value(argv, "--wait-timeout-ms") == str(fx.budget_ms)
+
+
+@pytest.mark.parametrize(
+    ("kw", "reason_pattern"),
+    [
+        pytest.param({"repo_parent": None}, "repo_parent", id="repo_parent_missing"),
+        pytest.param({"repo_parent": ""}, "repo_parent", id="repo_parent_empty"),
+        pytest.param(
+            {"with_history": False},
+            "running record|no .*history|history .*missing",
+            id="no_running_history_record",
+        ),
+        pytest.param(
+            {"resume_exhausted": True},
+            "resume_count",
+            id="resume_exhausted",
+        ),
+        pytest.param(
+            {"budget_seconds": 0},
+            "budget",
+            id="budget_non_positive",
+        ),
+    ],
+)
+def test_run_watchdog_falls_back_to_kill_and_report_for_each_ineligible_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kw: dict[str, Any],
+    reason_pattern: str,
+) -> None:
+    """Every run the watchdog cannot safely resume stays kill-and-report, naming why in
+    the report — and the launcher is never called. The exhausted-resume variant must
+    carry an explicit `resume_count`/`resume_attempted` line so a second dead night is
+    not mistaken for a first-time stall that somehow resumed nothing."""
+    resolved = dict(kw)
+    if resolved.pop("resume_exhausted", None):
+        resolved["resume_count"] = pipeline_watchdog.MAX_PIPELINE_RESUMES
+    fx = _resume_candidate(tmp_path, **resolved)
+    before = json.loads(fx.state_path.read_text())
+    events: list[tuple[object, ...]] = []
+    client = OrderRecordingClient(
+        panes_by_run={RUN_ID: {AGENT_NAME: "w1:p1"}}, events=events
+    )
+    launched = _patch_launch(monkeypatch, events)
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=fx.worktrees_root,
+        reports_dir=fx.reports_dir,
+        heartbeat_dir=fx.heartbeat_dir,
+        history_path=fx.history_path if fx.with_history else None,
+        now=NOW,
+        boot_epoch=0,
+    )
+
+    assert launched == []
+    assert len(actions) == 1
+    action = actions[0]
+    assert action.resumed is False
+    assert action.report_path is not None
+    report_text = action.report_path.read_text()
+    assert "## Outcome: failed (watchdog" in report_text
+    # The ineligibility reason is visible in the report, not only in a log line.
+    assert re.search(reason_pattern, report_text, re.IGNORECASE)
+    # The state file is untouched: no half-applied resume.
+    assert json.loads(fx.state_path.read_text()) == before
+
+
+def test_run_watchdog_resume_launch_failure_is_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resume unit that failed to register ends the sweep the old way: a terminal
+    report carrying the launch rc and stderr, `resumed=False`, and — because the report
+    now exists — the run no longer looks in-flight to tick (the fresh `running` record
+    does not make it a ghost)."""
+    fx = _resume_candidate(tmp_path)
+    events: list[tuple[object, ...]] = []
+    client = OrderRecordingClient(
+        panes_by_run={RUN_ID: {AGENT_NAME: "w1:p1"}},
+        history_path=fx.history_path,
+        events=events,
+    )
+    launched = _patch_launch(
+        monkeypatch, events, rc=1, stdout="", stderr="boom: cannot start unit"
+    )
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=fx.worktrees_root,
+        reports_dir=fx.reports_dir,
+        heartbeat_dir=fx.heartbeat_dir,
+        history_path=fx.history_path,
+        now=NOW,
+        boot_epoch=0,
+    )
+
+    assert len(launched) == 1
+    assert len(actions) == 1
+    action = actions[0]
+    assert action.resumed is False
+    assert action.report_path is not None
+    report_text = action.report_path.read_text()
+    assert "## Outcome: failed (resume_failed)" in report_text
+    assert re.search(r"rc[\"': =]+1", report_text)
+    assert "boom: cannot start unit" in report_text
+    # Not in-flight: with the terminal report on disk, the next sweep (and tick) skips it.
+    assert (
+        find_inflight_runs(
+            fx.worktrees_root,
+            fx.reports_dir,
+            recorded_pipeline_deadlines(fx.history_path),
+        )
+        == []
+    )
+
+
+def test_run_watchdog_resumes_after_host_reboot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reboot is an unambiguous death, but the rest of the resume contract is the
+    same: the rebooted run's restored panes are closed first (the reboot check's own
+    cleanup, working *and* blocked panes), and the sweep then attempts the resume — no
+    reboot special-case out of resuming."""
+    fx = _resume_candidate(tmp_path)
+    # The state write is what a reboot postdates: mtime 30 min before now, booted 5 min ago.
+    os.utime(fx.state_path, (NOW_TS - 1800, NOW_TS - 1800))
+    restored = {
+        f"pl-1-{RUN_ID.lower()}": "w6E:p1",
+        f"pl-5-{RUN_ID.lower()}": "w6E:p4",
+    }
+    events: list[tuple[object, ...]] = []
+    client = OrderRecordingClient(
+        blocked_panes_by_run={RUN_ID: restored},
+        history_path=fx.history_path,
+        events=events,
+    )
+    launched = _patch_launch(monkeypatch, events)
+
+    actions = run_watchdog(
+        client=client,  # type: ignore[arg-type]
+        worktrees_root=fx.worktrees_root,
+        reports_dir=fx.reports_dir,
+        heartbeat_dir=fx.heartbeat_dir,
+        history_path=fx.history_path,
+        now=NOW,
+        boot_epoch=float(NOW_TS) - 300,
+    )
+
+    assert len(actions) == 1
+    assert actions[0].resumed is True
+    assert actions[0].report_path is None
+    # Reboot cleanup ran (close all restored panes), and the resume was still attempted.
+    assert sorted(client.closed_panes) == sorted(restored.values())
+    assert len(launched) == 1
+    assert "--resume" in launched[0]
+    assert not fx.report_path.exists()
+    # Closes first, launch last — the record-before-kill order still holds.
+    assert [e[0] for e in events][: len(restored)] == ["close"] * len(restored)
+    assert events[-1][0] == "launch"

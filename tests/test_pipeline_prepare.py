@@ -10,6 +10,7 @@ sites that do need it are injected).
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -425,6 +426,39 @@ def test_pipeline_prepare_prints_resolved_values(
         "STATE_JSON",
     ], f"expected all seven KEY=VALUE lines on stdout, got: {captured.out!r}"
     assert "INFO" not in captured.out and "pipeline-prepare:" not in captured.out
+
+
+# --- issue 068 part 2: state.json carries the resume inputs ------------------------------
+
+
+def test_pipeline_prepare_writes_repo_parent_and_resume_count(
+    tmp_path: Path, no_open_prs: None
+) -> None:
+    """Issue 068: the watchdog must derive the stage prompts dir from `state.json`
+    alone — it records worktree, branch, spec, report and deadline but not where the
+    prompts live, and it deliberately does not load tick's config. Prepare already
+    receives `repo_parent`; it writes it (absolute) plus a zeroed `resume_count` so the
+    watchdog's single-attempt cap has something to count from. An old state file without
+    `repo_parent` simply makes a run not resumable — the path is never guessed from the
+    worktree."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+    client = FakeHerdr(tmp_path / "worktrees")
+
+    result = prepare_run(
+        **_prepare_kwargs(tmp_path, parent=parent, base=base, client=client)
+    )
+
+    assert result.outcome == "ok"
+    assert result.state_path is not None
+    state_path = client.created_worktrees[0] / "state.json"
+    state = json.loads(state_path.read_text())
+    recorded = state["repo_parent"]
+    # The exact `--repo-parent` value, absolute so the prompts-dir derivation
+    # `<repo_parent>/docs/pipeline/stages` works from anywhere the watchdog runs.
+    assert recorded == str(parent)
+    assert Path(recorded).is_absolute()
+    assert state["resume_count"] == 0
 
 
 # --- AC 2: a night with an empty backlog costs a report and nothing else ---------------

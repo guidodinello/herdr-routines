@@ -28,7 +28,7 @@ usage() {
 Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-name NAME
                            [--agent-kind KIND] [--model MODEL] [--prompt-file PATH]
                            [--wait-timeout-ms MS] [--deadline-epoch EPOCH]
-                           [--failure-marker TEXT]...
+                           [--failure-marker TEXT]... [--resume] [--state-json PATH]
 
   --run-id           bare UTC timestamp, e.g. 20260905T020000Z (fits the pl-<N>-<run_id>
                       worker agent-name cap once "pl-N-" is prepended)
@@ -47,6 +47,10 @@ Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-n
                       DEFAULT_FAILURE_MARKERS). Two consecutive sightings of the same
                       marker resume that stage on its fallback model instead of waiting
                       out the stage's timeout.
+  --resume           resume an existing run: skip pipeline-prepare and use the state
+                      file given by --state-json (the watchdog's relaunch path, issue
+                      068)
+  --state-json       path to the existing state.json in --resume mode
 
   Accepted and ignored, kept only because tick still passes them (phase B):
   --agent-name, --agent-kind, --model, --prompt-file, --wait-timeout-ms
@@ -64,6 +68,8 @@ REPO_PARENT=""
 REPORT=""
 AGENT_NAME=""
 FAILURE_MARKERS=()
+RESUME=0
+STATE_JSON_EXPLICIT=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -77,6 +83,8 @@ while [ $# -gt 0 ]; do
     --wait-timeout-ms) WAIT_TIMEOUT_MS="$2"; shift 2 ;;
     --deadline-epoch) DEADLINE_EPOCH="$2"; shift 2 ;;
     --failure-marker) FAILURE_MARKERS+=("$2"); shift 2 ;;
+    --resume) RESUME=1; shift ;;
+    --state-json) STATE_JSON_EXPLICIT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) echo "pipeline-launch.sh: unknown argument: $1" >&2; usage ;;
   esac
@@ -110,48 +118,58 @@ echo "=== launch at $(date -Is), run_id=$RUN_ID agent=$AGENT_NAME ==="
 
 cd "$REPO_PARENT" || exit 1
 
-# Pre-flight in code (issue 054 phase A), BEFORE any agent exists: sync the parent clone,
-# pick+claim the feature, create the shared worktree+workspace and write state.json. On
-# success it prints the resolved values as KEY=VALUE on stdout, which go into the
-# orchestrator's prompt header below instead of being computed by a model. `uv run` is
-# required — herdr-routines is not a standalone binary on the pipeline hosts (issue 050).
-#
-# Exit codes: 0 prepared, 3 nothing to build (a healthy night with an empty backlog),
-# 1 sync/setup failure, 2 usage. 3 is distinct from 1 on purpose so this branch can skip
-# the agent quietly instead of reporting a break. Both non-zero paths already have their
-# terminal report written at $REPORT (tick reconciles from there), so add nothing here.
-#
-# stdout only: stderr is already redirected into $LOG above, and merging it in would
-# splice log text into a KEY=VALUE stream about to be appended to the prompt.
-PREPARE_OUT=$(uv run herdr-routines pipeline-prepare \
-  --run-id "$RUN_ID" --repo-parent "$REPO_PARENT" --report "$REPORT" \
-  --deadline-epoch "$DEADLINE_EPOCH") ; PREPARE_RC=$?
-if [ "$PREPARE_RC" -ne 0 ]; then
-  echo "=== pipeline-prepare exited $PREPARE_RC; report already at $REPORT, no agent started ==="
-  if [ "$PREPARE_RC" -eq 3 ]; then
-    exit 0   # a skip is a successful skip
+# Resume mode (issue 068): the state file already exists and the feature is claimed, so
+# the pre-flight would only re-pick. The watchdog supplies the exact state path.
+if [ "$RESUME" -eq 1 ]; then
+  if [ -z "$STATE_JSON_EXPLICIT" ]; then
+    echo "pipeline-launch.sh: --resume requires --state-json" >&2
+    usage
   fi
-  exit "$PREPARE_RC"
-fi
-echo "=== prepared values for run_id=$RUN_ID ==="
-echo "$PREPARE_OUT"
+  STATE_JSON="$STATE_JSON_EXPLICIT"
+else
+  # Pre-flight in code (issue 054 phase A), BEFORE any agent exists: sync the parent clone,
+  # pick+claim the feature, create the shared worktree+workspace and write state.json. On
+  # success it prints the resolved values as KEY=VALUE on stdout, which go into the
+  # orchestrator's prompt header below instead of being computed by a model. `uv run` is
+  # required — herdr-routines is not a standalone binary on the pipeline hosts (issue 050).
+  #
+  # Exit codes: 0 prepared, 3 nothing to build (a healthy night with an empty backlog),
+  # 1 sync/setup failure, 2 usage. 3 is distinct from 1 on purpose so this branch can skip
+  # the agent quietly instead of reporting a break. Both non-zero paths already have their
+  # terminal report written at $REPORT (tick reconciles from there), so add nothing here.
+  #
+  # stdout only: stderr is already redirected into $LOG above, and merging it in would
+  # splice log text into a KEY=VALUE stream about to be appended to the prompt.
+  PREPARE_OUT=$(uv run herdr-routines pipeline-prepare \
+    --run-id "$RUN_ID" --repo-parent "$REPO_PARENT" --report "$REPORT" \
+    --deadline-epoch "$DEADLINE_EPOCH") ; PREPARE_RC=$?
+  if [ "$PREPARE_RC" -ne 0 ]; then
+    echo "=== pipeline-prepare exited $PREPARE_RC; report already at $REPORT, no agent started ==="
+    if [ "$PREPARE_RC" -eq 3 ]; then
+      exit 0   # a skip is a successful skip
+    fi
+    exit "$PREPARE_RC"
+  fi
+  echo "=== prepared values for run_id=$RUN_ID ==="
+  echo "$PREPARE_OUT"
 
-# `pipeline-run` owns the stage loop from here (issue 056 phase B): the workspace, the
-# orchestrator agent, the prompt assembly, the bash marker-poll loop and the settle
-# check are all gone, because each was a hand-maintained duplicate of something Python
-# already does -- and the two duplicates had already drifted. The script is now a
-# pre-flight wrapper with one call and a last-resort report backstop.
-#
-# `pipeline-prepare` emits machine-parsed KEY=VALUE lines on stdout. Everything phase B
-# needs from it is already in the state file it wrote -- worktree, branch, shared
-# workspace, feature source, issue id, deadline_epoch, artifact paths -- so only that
-# file's path has to cross the shell boundary. Passing the rest as flags would mean
-# re-deriving them here (and get `deadline_epoch` wrong, since this script and tick can
-# briefly be different versions of the repo -- see the DEADLINE_EPOCH fallback above).
-STATE_JSON=$(printf '%s\n' "$PREPARE_OUT" | sed -n 's/^STATE_JSON=//p' | head -n 1)
-if [ -z "$STATE_JSON" ]; then
-  echo "=== pipeline-prepare emitted no STATE_JSON (run_id=$RUN_ID); cannot run stages ==="
-  exit 1
+  # `pipeline-run` owns the stage loop from here (issue 056 phase B): the workspace, the
+  # orchestrator agent, the prompt assembly, the bash marker-poll loop and the settle
+  # check are all gone, because each was a hand-maintained duplicate of something Python
+  # already does -- and the two duplicates had already drifted. The script is now a
+  # pre-flight wrapper with one call and a last-resort report backstop.
+  #
+  # `pipeline-prepare` emits machine-parsed KEY=VALUE lines on stdout. Everything phase B
+  # needs from it is already in the state file it wrote -- worktree, branch, shared
+  # workspace, feature source, issue id, deadline_epoch, artifact paths -- so only that
+  # file's path has to cross the shell boundary. Passing the rest as flags would mean
+  # re-deriving them here (and get `deadline_epoch` wrong, since this script and tick can
+  # briefly be different versions of the repo -- see the DEADLINE_EPOCH fallback above).
+  STATE_JSON=$(printf '%s\n' "$PREPARE_OUT" | sed -n 's/^STATE_JSON=//p' | head -n 1)
+  if [ -z "$STATE_JSON" ]; then
+    echo "=== pipeline-prepare emitted no STATE_JSON (run_id=$RUN_ID); cannot run stages ==="
+    exit 1
+  fi
 fi
 
 PROMPTS_DIR="$REPO_PARENT/docs/pipeline/stages"

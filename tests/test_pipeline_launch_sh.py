@@ -11,6 +11,7 @@ script hardcodes its own PATH rather than trusting the caller's.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -137,6 +138,7 @@ def _run_launcher(
     prepare_values: str = PREPARED_VALUES,
     pipeline_run_rc: int = 0,
     pipeline_run_writes_report: bool = False,
+    resume_state_json: Path | None = None,
 ) -> tuple[Path, Path]:
     """Runs the real launcher script against the fake herdr CLI above. Returns
     (report_path, call_log_path)."""
@@ -206,6 +208,8 @@ def _run_launcher(
         argv += ["--failure-marker", marker]
     if deadline_epoch is not None:
         argv += ["--deadline-epoch", deadline_epoch]
+    if resume_state_json is not None:
+        argv += ["--resume", "--state-json", str(resume_state_json)]
     subprocess.run(argv, env=env, timeout=60, check=False)
     return report_path, call_log
 
@@ -392,3 +396,67 @@ def test_launcher_runs_pipeline_run_and_stages_dir_is_complete(tmp_path: Path) -
             assert spec.model is None
             continue
         assert (stages_dir / spec.prompt_file).is_file(), spec.prompt_file
+
+
+# -- issue 068: the launcher's --resume mode -----------------------------------------------
+
+
+def _write_resume_state(tmp_path: Path, repo_parent: Path) -> Path:
+    """The state file a resume is handed. All it needs for this test is to exist and to
+    sit where the flags say it does."""
+    state_json = tmp_path / "home" / "wt" / "state.json"
+    state_json.parent.mkdir(parents=True, exist_ok=True)
+    state_json.write_text(
+        json.dumps(
+            {
+                "run_id": "T000000000000",
+                "current_stage": 4,
+                "repo_parent": str(repo_parent),
+            }
+        )
+    )
+    return state_json
+
+
+def test_launcher_resume_skips_prepare_and_uses_state_json(tmp_path: Path) -> None:
+    """issue 068: `--resume --state-json PATH` is the watchdog's relaunch path. The
+    state file exists and the feature is claimed, so the pre-flight must be skipped
+    entirely; `pipeline-run` gets that exact state file and the prompts dir derived from
+    `--repo-parent` the same way the normal path derives it."""
+    state_json = _write_resume_state(tmp_path, tmp_path / "repo")
+
+    _report_path, call_log = _run_launcher(
+        tmp_path, settle_status="idle", resume_state_json=state_json
+    )
+
+    log = call_log.read_text()
+    # No pre-flight: state exists, feature claimed — prepare would just re-pick.
+    assert "pipeline-prepare" not in log
+    assert "pipeline-run" in log
+    argv = Path(f"{call_log}.run-argv").read_text().splitlines()
+    index = argv.index("--state-json")
+    # The handed-over state file is used verbatim, not re-derived from prepare output.
+    assert argv[index + 1] == str(state_json)
+    prompts = argv.index("--prompts-dir")
+    assert argv[prompts + 1] == str(tmp_path / "repo" / "docs" / "pipeline" / "stages")
+
+
+def test_launcher_resume_forwards_failure_markers_and_stub(tmp_path: Path) -> None:
+    """Resume mode keeps the launcher's only two remaining run-side opinions exactly as
+    the normal path holds them: each failure marker reaches `pipeline-run` as ONE argv
+    entry, and a pipeline-run that exits without writing a report (killed before it got
+    there) is backstopped with a failed-outcome stub — that is the whole reason the
+    launch lives in this script rather than the watchdog."""
+    state_json = _write_resume_state(tmp_path, tmp_path / "repo")
+
+    report_path, call_log = _run_launcher(
+        tmp_path,
+        settle_status="idle",
+        resume_state_json=state_json,
+        failure_markers=("Custom quota wall", "Rate limited"),
+    )
+
+    assert _pipeline_run_marker_args(call_log) == ["Custom quota wall", "Rate limited"]
+    report_text = report_path.read_text()
+    assert "## Outcome: failed" in report_text
+    assert "stub" in report_text.lower()

@@ -1815,7 +1815,13 @@ def _cmd_pipeline_watchdog(args: argparse.Namespace) -> int:
         history_path=default_history_path(),
     )
     for action in actions:
-        if action.killed_agents:
+        if action.resumed:
+            log.warning(
+                "pipeline-watchdog: %s stalled, resumed (killed %s), no report yet",
+                action.run_id,
+                ", ".join(action.killed_agents) or "no agents",
+            )
+        elif action.killed_agents:
             log.warning(
                 "pipeline-watchdog: %s stalled, killed %s (stage %s), report at %s",
                 action.run_id,

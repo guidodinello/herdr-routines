@@ -256,6 +256,12 @@ def prepare_run(
     # 4. state.json — the exact key set the prompt's example used, plus `feature_source`
     # (which the prompt required in prose but omitted from its own example).
     state_path = Path(worktree.path) / "state.json"
+    # Absolute, because the watchdog derives the resume's prompts dir as
+    # `<repo_parent>/docs/pipeline/stages` from this file alone and deliberately never
+    # loads tick's config or guesses from the worktree (issue 068).
+    repo_parent_value = (
+        str(repo_parent) if repo_parent.is_absolute() else str(repo_parent.resolve())
+    )
     try:
         _write_state_json(
             state_path,
@@ -267,6 +273,11 @@ def prepare_run(
                 "branch": worktree.branch,
                 "shared_workspace": workspace_id,
                 "deadline_epoch": deadline_epoch,
+                "repo_parent": repo_parent_value,
+                # Starts at zero so the watchdog's single-attempt cap has a counter to
+                # move; a state file without it is from before resume existed and is
+                # simply not resumed (it lacks `repo_parent` too).
+                "resume_count": 0,
                 "feature_source": _feature_source(picked.issue.path, repo_parent),
                 "artifact_paths": {
                     "spec": str(
