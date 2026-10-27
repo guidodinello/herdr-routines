@@ -1,7 +1,7 @@
 ---
 id: "072"
 title: "Missed-run alert in the digest"
-status: open
+status: done
 priority: medium
 area: infra
 ---
