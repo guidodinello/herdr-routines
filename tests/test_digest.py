@@ -12,7 +12,7 @@ import pytest
 from herdr_routines.cli import main
 from herdr_routines.config import load_config
 from herdr_routines.digest import build_digest, digest_now, render_digest
-from herdr_routines.history import HistoryRecord, append
+from herdr_routines.history import HistoryRecord, HistoryState, append
 
 
 def write_config(
@@ -370,3 +370,252 @@ def test_digest_cli_include_disabled_flag(
     assert "active" in out
     # disabled marker present
     assert "disabled" in out.lower()
+
+
+# --- issue 072: missed-run alerts in the digest ---
+
+# The feature is deliberately not implemented yet: `missed_runs` / `MissedRow` are
+# imported *inside* each test below so that these tests fail for the right reason
+# (AttributeError on the missing function) while the pre-existing tests in this
+# file stay green and untouched.
+
+SECTION_HEADER = "missed runs (should have run, didn't):"
+
+
+def _missed_runs(config, history_path, *, now):
+    from herdr_routines.digest import missed_runs
+
+    return missed_runs(config, history_path, now=now)
+
+
+def _cron_row(
+    history_path: Path, job: str, ts: datetime, state: HistoryState, trigger: str | None
+) -> None:
+    extra = {"trigger": trigger} if trigger is not None else None
+    append(
+        history_path,
+        HistoryRecord(
+            ts=ts,
+            job=job,
+            state=state,
+            run_id=f"{job}-{ts:%Y%m%dT%H%M}",
+            extra=extra,
+        ),
+    )
+
+
+def test_missed_run_renders_in_its_own_section(tmp_path: Path) -> None:
+    """Acceptance 1: an enabled job whose last scheduled terminal run is stale beyond
+    grace appears in a separate 'missed runs' section carrying the last terminal
+    state, when, the expected occurrence and the overdue amount."""
+    config = load_config(write_config(tmp_path, ["nightly"]))
+    history_path = tmp_path / "history.jsonl"
+    reports_dir = tmp_path / "reports"
+
+    # Last scheduled terminal run: done at the 2026-09-01 03:00 occurrence.
+    _cron_row(
+        history_path, "nightly", datetime(2026, 9, 1, 3, 5, tzinfo=UTC), "done", "cron"
+    )
+
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=UTC)  # five 03:00 occurrences missed
+    missed = _missed_runs(config, history_path, now=now)
+
+    assert len(missed) == 1
+    row = missed[0]
+    assert row.name == "nightly"
+    assert row.expected == datetime(2026, 9, 6, 3, 0, tzinfo=UTC)
+    assert row.last_state == "done"
+    assert row.last_ts == datetime(2026, 9, 1, 3, 5, tzinfo=UTC)
+    assert row.late == now - datetime(2026, 9, 6, 3, 0, tzinfo=UTC)
+
+    text = digest_now(config, history_path, reports_dir, timezone="UTC", now=now)
+    assert SECTION_HEADER in text
+    alert = text.split(SECTION_HEADER)[1]
+    assert "nightly: last terminal done at 2026-09-01 03:05" in alert
+    assert "expected by 2026-09-06 03:00" in alert
+    assert "overdue" in alert
+
+
+def test_disabled_jobs_are_never_missed(tmp_path: Path) -> None:
+    """Acceptance 2: a disabled job with a stale terminal state produces no missed-run
+    alert regardless of --include-disabled (which only affects the per-job rows)."""
+    config = load_config(write_config(tmp_path, ["stale"], enabled={"stale": False}))
+    history_path = tmp_path / "history.jsonl"
+    reports_dir = tmp_path / "reports"
+    _cron_row(
+        history_path,
+        "stale",
+        datetime(2026, 9, 1, 3, 5, tzinfo=UTC),
+        "done",
+        "cron",
+    )
+
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=UTC)
+    assert _missed_runs(config, history_path, now=now) == []
+
+    text = digest_now(
+        config,
+        history_path,
+        reports_dir,
+        timezone="UTC",
+        now=now,
+        include_disabled=True,
+    )
+    assert SECTION_HEADER not in text
+
+
+def test_missed_job_line_is_unchecked_and_additive(tmp_path: Path) -> None:
+    """Acceptance 3: the per-job line for a missed job is unchanged (still its terminal
+    state, not rewritten as failed, not moved into any failure grouping); the missed
+    alert is additive and visually separate."""
+    config = load_config(write_config(tmp_path, ["nightly"]))
+    history_path = tmp_path / "history.jsonl"
+    reports_dir = tmp_path / "reports"
+    _cron_row(
+        history_path, "nightly", datetime(2026, 9, 1, 3, 5, tzinfo=UTC), "done", "cron"
+    )
+
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=UTC)
+    text = digest_now(config, history_path, reports_dir, timezone="UTC", now=now)
+
+    per_job = "- nightly: done at 2026-09-01 03:05 UTC"
+    assert per_job in text  # unchanged line
+    assert SECTION_HEADER in text
+    job_lines = [ln for ln in text.splitlines() if ln.startswith("- nightly")]
+    assert job_lines.count(per_job) == 1  # exactly one unchanged per-job line
+    # nothing before the missed section rewrites or regroups the missed job as failed
+    pre_section = text.split(SECTION_HEADER)[0]
+    assert "nightly: failed" not in pre_section
+    assert "expected by" not in pre_section
+
+
+def test_recent_terminal_run_within_grace_is_never_missed(tmp_path: Path) -> None:
+    """Acceptance 4: detection is read-only; an enabled job with a recent terminal
+    state within grace digests exactly as before and writes nothing anywhere."""
+    config = load_config(write_config(tmp_path, ["nightly"]))
+    history_path = tmp_path / "history.jsonl"
+    reports_dir = tmp_path / "reports"
+    reports_dir.mkdir()
+    _cron_row(
+        history_path, "nightly", datetime(2026, 9, 6, 7, 30, tzinfo=UTC), "done", "cron"
+    )
+    (reports_dir / "nightly-20260906T0730.md").write_text("# nightly\n")
+
+    history_before = history_path.read_bytes()
+    listing_before = sorted(p.name for p in tmp_path.rglob("*"))
+
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=UTC)
+    assert _missed_runs(config, history_path, now=now) == []
+
+    rows = build_digest(config, history_path, reports_dir)
+    unchanged = render_digest(rows, timezone="UTC", now=now)
+    assert "- nightly: done at 2026-09-06 07:30 UTC" in unchanged
+    assert SECTION_HEADER not in unchanged
+
+    # no new state store, no records written by detection
+    listing_after = sorted(p.name for p in tmp_path.rglob("*"))
+    assert listing_after == listing_before
+    assert history_path.read_bytes() == history_before
+
+
+def test_never_run_jobs_are_conservative(tmp_path: Path) -> None:
+    """Acceptance 5: never-seen jobs never alert; freshly-seen (registered inside one
+    cycle) jobs don't alert; a seen job with one full cycle beyond grace since
+    first-seen alerts with the explicit 'never run (expected by ...)' phrasing."""
+    history_path = tmp_path / "history.jsonl"
+
+    # (a) unseen job: no history at all -> benign, no alert
+    config_unseen = load_config(write_config(tmp_path, ["neverheardof"]))
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=UTC)
+    assert _missed_runs(config_unseen, history_path, now=now) == []
+
+    # (b) freshly seen: registered 07:30, after the day's 03:00 occurrence — no
+    #     occurrence exists after first-seen yet, so a mere half hour of age cannot
+    #     fire a false alert
+    config_fresh = load_config(write_config(tmp_path, ["fresh"]))
+    append(
+        history_path,
+        HistoryRecord(
+            ts=datetime(2026, 9, 6, 7, 30, tzinfo=UTC), job="fresh", state="registered"
+        ),
+    )
+    assert _missed_runs(config_fresh, history_path, now=now) == []
+
+    # (c) seen and overdue: registered 2026-09-01 12:00; daily 03:00 occurrences
+    #     since; the most recent (2026-09-06 03:00) is 5h stale — beyond grace
+    config_overdue = load_config(write_config(tmp_path, ["ghost"]))
+    append(
+        history_path,
+        HistoryRecord(
+            ts=datetime(2026, 9, 1, 12, 0, tzinfo=UTC), job="ghost", state="registered"
+        ),
+    )
+    missed = _missed_runs(config_overdue, history_path, now=now)
+    assert len(missed) == 1
+    assert missed[0].name == "ghost"
+    assert missed[0].last_state is None
+    assert missed[0].last_ts is None
+    assert missed[0].expected == datetime(2026, 9, 6, 3, 0, tzinfo=UTC)
+
+    text = digest_now(
+        config_overdue,
+        history_path,
+        tmp_path / "reports",
+        timezone="UTC",
+        now=now,
+    )
+    assert SECTION_HEADER in text
+    assert "ghost: never run (expected by 2026-09-06 03:00" in text
+
+
+def test_off_schedule_runs_do_not_hide_a_missed_cron(tmp_path: Path) -> None:
+    """Acceptance 6: manual/event/request runs do not satisfy (or shift) the expected
+    window — 'I ran it by hand' must not suppress the missed-cron alert."""
+    config = load_config(write_config(tmp_path, ["nightly"]))
+    history_path = tmp_path / "history.jsonl"
+    reports_dir = tmp_path / "reports"
+    _cron_row(
+        history_path, "nightly", datetime(2026, 9, 1, 3, 5, tzinfo=UTC), "done", "cron"
+    )
+    # off-schedule manual run, completed recently — tempting but not a cron run
+    _cron_row(
+        history_path,
+        "nightly",
+        datetime(2026, 9, 6, 4, 0, tzinfo=UTC),
+        "done",
+        "manual",
+    )
+
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=UTC)
+    missed = _missed_runs(config, history_path, now=now)
+
+    assert len(missed) == 1
+    assert missed[0].name == "nightly"
+    # anchored on the scheduled terminal run, not the manual one
+    assert missed[0].last_ts == datetime(2026, 9, 1, 3, 5, tzinfo=UTC)
+
+    text = digest_now(config, history_path, reports_dir, timezone="UTC", now=now)
+    assert SECTION_HEADER in text
+
+
+def test_running_job_is_not_missed(tmp_path: Path) -> None:
+    """Acceptance 7: a job with a live run in flight is not flagged missed."""
+    config = load_config(write_config(tmp_path, ["nightly"]))
+    history_path = tmp_path / "history.jsonl"
+    reports_dir = tmp_path / "reports"
+    _cron_row(
+        history_path, "nightly", datetime(2026, 9, 1, 3, 5, tzinfo=UTC), "done", "cron"
+    )
+    # a run started minutes ago, no terminal record yet
+    _cron_row(
+        history_path,
+        "nightly",
+        datetime(2026, 9, 6, 7, 55, tzinfo=UTC),
+        "running",
+        "cron",
+    )
+
+    now = datetime(2026, 9, 6, 8, 0, tzinfo=UTC)
+    assert _missed_runs(config, history_path, now=now) == []
+    text = digest_now(config, history_path, reports_dir, timezone="UTC", now=now)
+    assert SECTION_HEADER not in text
