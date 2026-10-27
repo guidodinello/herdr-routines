@@ -1,4 +1,4 @@
-# Spec v1 — 20261027T050000Z
+# Spec v2 — 20261027T050000Z
 
 Issue: `docs/process/issues/072-missed-run-alert-in-the-digest.md`
 (medium, infra). Claimed for this run.
@@ -134,31 +134,37 @@ the failure sequence. `cli._cmd_digest` is unchanged — it already calls
 1. [blocking] An enabled job whose schedule says it should have run by digest
    time but whose last scheduled terminal run is stale beyond grace appears in
    a separate "missed runs (should have run, didn't)" section with the last
-   terminal state, when, expected occurrence and overdue amount — confidence:
+   terminal state, when, expected occurrence and overdue amount. — confidence:
    high — Test: test_missed_run_renders_in_its_own_section
 2. [blocking] Disabled jobs never produce missed-run alerts, regardless of
-   `--include-disabled` — confidence: high — Test:
+   `--include-disabled`. — confidence: high — Test:
    test_disabled_jobs_are_never_missed
 3. [blocking] The per-job line for a missed job is unchanged (not rewritten as
    failed, not moved into any failure grouping); the missed alert is additive
-   and visually separate — confidence: high — Test:
+   and visually separate. — confidence: high — Test:
    test_missed_job_line_is_unchecked_and_additive
 4. [blocking] Detection reads only history, reports and job config; no new
    state store, no records written; enabled jobs with recent terminal states
-   digest exactly as before (existing tests green unchanged) — confidence:
+   digest exactly as before (existing tests green unchanged). — confidence:
    high — Test: test_recent_terminal_run_within_grace_is_never_missed
 5. [non-blocking] For never-run enabled jobs the alert names the expectation
    explicitly ("never run (expected by …)") and only fires after one full
    cycle beyond grace since first-seen; never-seen jobs stay benign "never
-   run" — confidence: high — Test:
-   test_never_run_jobs_are_conservative
-   (one test covering: unseen job no alert, freshly-seen job no alert, seen
-   and overdue job alerts with the "never run" phrasing)
+   run" (one test covering: unseen job no alert, freshly-seen job no alert,
+   seen and overdue job alerts with the "never run" phrasing). — confidence:
+   high — Test: test_never_run_jobs_are_conservative
 6. [non-blocking] Off-schedule runs (manual/event/request) do not satisfy the
-   expected window — confidence: medium — Test:
+   expected window. — confidence: medium — Test:
    test_off_schedule_runs_do_not_hide_a_missed_cron
-7. [non-blocking] A job with a live run in flight is not flagged missed —
+7. [non-blocking] A job with a live run in flight is not flagged missed. —
    confidence: medium — Test: test_running_job_is_not_missed
+
+## Changelog v1→v2
+
+- Added `## Acceptance criteria`: seven numbered items (blocking/non-blocking
+  with confidence tiers), each ending `Test: <name>`.
+- Kept the v1 title numbering consistent with the new version (spec header now
+  v2); no changes to Problem, Approach, Files touched, or Risks content.
 
 ## Review
 
