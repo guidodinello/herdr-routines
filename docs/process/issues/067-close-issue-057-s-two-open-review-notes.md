@@ -1,7 +1,7 @@
 ---
 id: "067"
 title: "Close issue 057's two open review notes: the write-ahead layering and the audit record shape"
-status: open
+status: done
 priority: low
 area: infra
 ---
