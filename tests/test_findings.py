@@ -215,39 +215,85 @@ def test_diff_orders_by_severity_for_the_cap() -> None:
 # -- AC 9 ---------------------------------------------------------------------------
 
 
-def test_ledger_write_ahead_consumes_budget_on_failed_dispatch(
+def test_apply_diff_spends_budget_for_exactly_the_dispatched_ids(
     tmp_path: Path,
 ) -> None:
-    ledger = Ledger(job="j", entries={})
+    """Layer 1 (pure, `findings.apply_diff`) of the write-ahead trio: only the budget
+    arithmetic, no dispatch and no disk I/O — that layer has neither. The tick-level
+    ordering (ledger on disk before the fix worker is dispatched) lives in
+    test_kind_audit.py::test_ledger_is_on_disk_before_the_fix_worker_is_dispatched, and
+    the failure side in test_audit_dispatch.py::test_failed_fix_dispatch_still_consumes_budget."""
+    ledger = Ledger(
+        job="j",
+        entries={
+            # An untouched finding with history to preserve.
+            "f0": _entry(
+                location="z.php",
+                severity="low",
+                attempts=2,
+                last_dispatched_run="run0",
+                queued=False,
+            ),
+            # One already at its attempt cap: candidate, but not dispatched here.
+            "f3": _entry(
+                location="c.php",
+                severity="low",
+                attempts=3,
+                last_dispatched_run="run0",
+                queued=False,
+            ),
+        },
+    )
     findings = [
         Finding("f1", "k", "high", "a.php", "s"),
         Finding("f2", "k", "high", "b.php", "s"),
+        Finding("f3", "k", "low", "c.php", "s"),
+        Finding("f0", "k", "low", "z.php", "s"),
     ]
     diff = diff_findings(findings, ledger, check="c")
 
-    # Only f1 is dispatched; f2 (suppressed/over cap) must stay untouched.
+    # Only f1 and f2 are dispatched; f3 (at its cap) and f0 (over cap) stay untouched.
     written = apply_diff(
         ledger,
         diff,
         now=NOW,
         run_id="run1",
-        queued_ids=["f1", "f2"],
-        dispatched_ids=["f1"],
+        queued_ids=["f1", "f2", "f3"],
+        dispatched_ids=["f1", "f2"],
     )
     assert written.entries["f1"].attempts == 1
     assert written.entries["f1"].last_dispatched_run == "run1"
-    assert written.entries["f2"].attempts == 0
-    assert written.entries["f2"].last_dispatched_run is None
+    assert written.entries["f1"].queued is True
+    assert written.entries["f2"].attempts == 1
+    assert written.entries["f2"].last_dispatched_run == "run1"
+    assert written.entries["f2"].queued is True
+    # Non-dispatched: attempts and their previous last_dispatched_run are kept.
+    assert written.entries["f3"].attempts == 3
+    assert written.entries["f3"].last_dispatched_run == "run0"
+    assert written.entries["f3"].queued is True
+    assert written.entries["f0"].attempts == 2
+    assert written.entries["f0"].last_dispatched_run == "run0"
+    # queued is preserved for ids the caller did not queue.
+    assert written.entries["f0"].queued is False
 
     # The increment survives a save/load round trip. That the tick saves it *before*
     # dispatching is pinned through the real tick by
-    # test_audit_dispatch.py::test_failed_fix_dispatch_still_consumes_budget (issue 058).
+    # test_kind_audit.py::test_ledger_is_on_disk_before_the_fix_worker_is_dispatched.
     path = tmp_path / "ledger.json"
     save_ledger(path, written)
     reloaded = load_ledger(path)
     assert reloaded is not None
     assert reloaded.entries["f1"].attempts == 1
-    assert reloaded.entries["f2"].attempts == 0
+    assert reloaded.entries["f1"].last_dispatched_run == "run1"
+    assert reloaded.entries["f1"].queued is True
+    assert reloaded.entries["f2"].attempts == 1
+    assert reloaded.entries["f2"].last_dispatched_run == "run1"
+    assert reloaded.entries["f2"].queued is True
+    assert reloaded.entries["f3"].attempts == 3
+    assert reloaded.entries["f3"].last_dispatched_run == "run0"
+    assert reloaded.entries["f0"].attempts == 2
+    assert reloaded.entries["f0"].last_dispatched_run == "run0"
+    assert reloaded.entries["f0"].queued is False
 
 
 def test_unfixed_findings_stay_in_the_dispatch_pool(tmp_path: Path) -> None:

@@ -651,3 +651,22 @@ it.*
   reason to wait for real ledger data before scoping it.
 - **2026-10-10:** phase A merged (PR #156). Phase B filed as
   [058](058-audit-fix-worker.md) from criteria 17-22.
+- **2026-10-28:** review notes (a) the write-ahead ordering (ledger saved before
+  the fix worker is dispatched, hand-off written only after the worker settles)
+  and (b) the audit history record shape were closed by
+  [067](067-close-issue-057-s-two-open-review-notes.md) without reopening this
+  issue. Layering is pinned by
+  `tests/test_findings.py::test_apply_diff_spends_budget_for_exactly_the_dispatched_ids`
+  (pure `apply_diff`), `tests/test_kind_audit.py::test_ledger_is_on_disk_before_the_fix_worker_is_dispatched`
+  (tick ordering), and
+  `tests/test_audit_dispatch.py::test_failed_fix_dispatch_still_consumes_budget`
+  (failure side). The record shape is pinned by
+  `tests/test_kind_audit.py::test_audit_gate_set_is_closed`,
+  `tests/test_kind_audit.py::test_audit_state_gate_pairings_match_the_design_table`,
+  `tests/test_kind_audit.py::test_audit_extra_key_sets_are_per_path`,
+  `tests/test_kind_audit.py::test_audit_counts_agree`,
+  `tests/test_kind_audit.py::test_suppressed_count_is_true_while_ids_are_capped`,
+  and `tests/test_kind_audit.py::test_audit_records_never_move_consecutive_base_gate_failures`;
+  the shipped dispatch set remains pinned by
+  `tests/test_kind_audit.py::test_report_and_extra_record_the_full_dispatch_set`.
+  Status stays `done`; acceptance criteria unchanged.

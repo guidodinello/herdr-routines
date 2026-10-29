@@ -484,6 +484,12 @@ def test_audit_does_not_change_existing_job_dispatch(
 
 
 def test_failed_fix_dispatch_still_consumes_budget(repo: Path, tmp_path: Path) -> None:
+    """Layer 3 (failure side) of the write-ahead trio: a dispatch that fails has still
+    consumed its attempt, because the ledger was saved first. The other two layers:
+    the pure arithmetic in
+    test_findings.py::test_apply_diff_spends_budget_for_exactly_the_dispatched_ids and
+    the tick-level ordering in
+    test_kind_audit.py::test_ledger_is_on_disk_before_the_fix_worker_is_dispatched."""
     history = tmp_path / "history.jsonl"
     client = _FakeHerdr(
         _auditor([_finding(1)]), fail_start=lambda name: "-gate" in name
