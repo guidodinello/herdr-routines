@@ -1213,7 +1213,7 @@ def test_stage_fallbacks_stay_off_zen_and_keep_the_review_independent() -> None:
     assert all(not s.fallback_model.startswith("opencode/") for s in agent_stages)  # type: ignore[union-attr]
     # Whichever model writes the code, the reviewer's family is a different one.
     assert not stage_families(by_stage[6]) & stage_families(by_stage[4])
-    assert stage_families(by_stage[6]) == {"nvidia"}
+    assert stage_families(by_stage[6]) == {"zhipu", "nvidia"}
 
 
 def test_test_author_model_is_independent_of_implementer() -> None:
@@ -1358,7 +1358,7 @@ def test_stages_declare_the_documented_models_and_timeouts() -> None:
     assert by_stage[3].fallback_model == REVIEWER_FALLBACK_MODEL
     assert by_stage[4].model == "opencode/big-pickle"
     assert by_stage[5].model is None
-    assert by_stage[6].model == "opencode/nemotron-3-ultra-free"
+    assert by_stage[6].model == "opencode/glm-5.3-flash-free"
     # The reviewer is never the implementer's model (independent review).
     assert by_stage[6].model != by_stage[4].model
     assert by_stage[7].reuses_stage == 4

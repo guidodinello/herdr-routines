@@ -83,7 +83,8 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > `muse-spark-1.3-contributor-free` by 2026-10-18): stages 1–3
 > `opencode/glm-5.3-flash-free` (the stage-3 test author falls back to the
 > OpenRouter nemotron model, never to stage 4's families), stages 4/7 `opencode/big-pickle`,
-> stage 6 `opencode/nemotron-3-ultra-free` (a different family from the implementer).
+> stage 6 `opencode/glm-5.3-flash-free` (a different family from the implementer;
+> `nemotron-3-ultra-free` was withdrawn by 2026-10-29).
 > `MODEL_FAMILY` declares each model's family and a test checks the independence rules. `pipeline-prepare`
 > fails the night before claiming an issue if `opencode models` no longer lists one.
 > Each agent stage also has a `fallback_model` off Zen (authors `nvidia/moonshotai/kimi-k3`,
