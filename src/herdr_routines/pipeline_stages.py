@@ -36,8 +36,8 @@ class StageSpec:
 # 2026-10-10. kimi-k3 is not deepseek (big-pickle's upstream that night) nor nemotron,
 # so a fallback implementer is still a different family from stage 6's reviewer.
 AUTHOR_FALLBACK_MODEL = "nvidia/moonshotai/kimi-k3"
-# The reviewer's own family on another provider: independence from the author is about
-# the model family, which a provider switch does not change.
+# Off Zen and outside every author family: independence from the author is about the
+# model family, which a provider switch does not change.
 REVIEWER_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 
 # Which family each configured model belongs to. Spelled out rather than matched on a
@@ -49,7 +49,6 @@ MODEL_FAMILY: dict[str, str] = {
     "opencode/glm-5.3-flash-free": "zhipu",
     "opencode/big-pickle": "zen-router",
     AUTHOR_FALLBACK_MODEL: "moonshot",
-    "opencode/nemotron-3-ultra-free": "nvidia",
     REVIEWER_FALLBACK_MODEL: "nvidia",
 }
 
@@ -129,8 +128,10 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec(
         stage=6,
         # A different model family from stage 4's implementer, so the review is
-        # independent.
-        model="opencode/nemotron-3-ultra-free",
+        # independent. Zen withdrew nemotron-3-ultra-free by 2026-10-29; glm had the
+        # highest accepted-finding rate of the free reviewers on fitted's babysit-prs
+        # leaderboard (95%, 2026-10-30). Not deepseek: big-pickle has routed to it.
+        model="opencode/glm-5.3-flash-free",
         prompt_file="stage-6.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
