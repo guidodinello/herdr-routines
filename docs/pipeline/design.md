@@ -91,8 +91,8 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > reviewer `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`): when a stage's session ends
 > in a provider `APIError`, or the failure-marker watchdog sees Zen's quota text, `pipeline-run`
 > reruns the stage once in a fresh session on the fallback, told to pick up any partial work in
-> the worktree. It never resumes the failed session: opencode keeps that session's model and
-> ignores `-m`, and herdr reports the resumed agent `blocked` on arrival. The job's own `fallback_model` is unused for
+> the worktree. It never resumes the failed session, because a resumed session keeps the model it
+> was created on and opencode ignores `-m` (see the stage 7 note below). The job's own `fallback_model` is unused for
 > `kind: pipeline`: tick does not relaunch a `quota_exhausted` run.
 
 Stage rules copied from spec §3: tests before code (stage 3 done = every
@@ -258,6 +258,10 @@ Mechanically solved — same `herdr` CLI calls `src/herdr_routines/herdr.py` +
 Each worker gets a unique agent name `pl-<stage>-<run_id>` (Herdr cap
 `[a-z][a-z0-9_-]{0,31}`, unique among live agents — `docs/plan-v1.md:71`),
 **except stage 7 which reuses the stage-4 session via close-then-resume-by-session-id (G-16)** via `herdr agent start pl-7-<run_id> --kind opencode --pane <fresh_pane> -- -m <model> -s <session_id>` where `<session_id>` is `pl-4`'s `agent_session.value` (`-s <session_id>` empirically verified 2026-08-25, true resume not fork; `agent_session.value` on resumed agent matched original). This preserves code context per G-11 without keeping the `pl-4` pane open idle from stage 4 through stage 7 — close a worker's pane as soon as its stage's gate passes (G-16), and reopen the one needed later by `-s <session_id>` against a fresh pane. Alternative fresh `pl-7-<run_id>` seeded with `git diff main...HEAD` + `gh pr view --comments` remains the fallback if context burn or cross-model `-s` becomes an issue (open question 3).
+
+**A resumed session keeps its own model** (measured on the Pi 2026-11-01, opencode 1.19.0 + herdr 0.8.2): with `-s <session_id>`, opencode ignores `-m <model>`, and the next turn runs on the session's stored model, as the session export shows. So stage 7 and the CI fix rounds run on whatever model finished stage 4. Normally that is stage 4's own model, which is also stage 7's. After a stage 4 fallback, it is the fallback model.
+
+**Resume needs a clean skill directory.** A dangling `~/.claude/skills/<name>/SKILL.md` symlink makes opencode show a "Failed to parse skill" popup on resume (a fresh start doesn't show it), and herdr reads the popup as `blocked` and refuses the prompt. Five such links, left behind when skills were removed from the dotfiles repo, broke every stage 7 and CI fix round on the Pi until 2026-11-01. If resumes go `blocked`, check first with `find ~/.claude/skills -xtype l`.
 
 ## Gates in v1 (orchestrator-supervised, machine-checkable forms — audit gap 2)
 

@@ -312,9 +312,9 @@ class FakeHerdr:
         self._prompted.add(target)
         stage = int(target.split("-")[1])
         if resumed in self._errored:
-            # Measured on the Pi 2026-11-01 (run 20261031T050000Z's stage 3): an agent
-            # resumed onto a session whose last turn errored is `blocked` before any
-            # prompt, and opencode never runs the prompt it is sent.
+            # A resume keeps the session's stored model (opencode ignores `-m`, measured
+            # on the Pi 2026-11-01), so resuming a session whose model just failed only
+            # fails again. Modelled as `blocked` without running the prompt.
             return "blocked"
         try:
             status = self._prompt(stage, target, text, on_poll)
