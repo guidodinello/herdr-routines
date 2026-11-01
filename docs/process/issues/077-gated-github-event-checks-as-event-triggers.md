@@ -1,7 +1,7 @@
 ---
 id: "077"
 title: "Move `gated` jobs' `github_event` checks onto `trigger.event`"
-status: open
+status: done
 priority: low
 area: scheduler
 ---
