@@ -1192,6 +1192,21 @@ def _event_target(check: GateCheck) -> str:
     return "issue" if check.query == "issues:opened" else "pr"
 
 
+def _event_trigger_for(job: Job) -> tuple[GateCheck | None, bool]:
+    """The job's event trigger, and whether it is a gated `github_event` check moved onto
+    the trigger path (issue 077).
+
+    `load_config` sets `trigger_event` for such a job; a directly-built `Job` may still
+    carry only the check, so infer it here too. The second element is True only for the
+    migrated form: it keeps 014's per-event budget and skips the cron path, since the
+    check *is* the gate."""
+    if job.kind == "gated":
+        for check in job.checks or ():
+            if check.kind == "github_event":
+                return (job.trigger_event or check), True
+    return job.trigger_event, False
+
+
 def _resolve_event_owner_repo(job: Job, check: GateCheck) -> tuple[str, str]:
     """owner/repo for the event poll: the check's explicit `repo:` when set, else the
     job's managed-clone `repository:` URL, else the job repo's `origin` remote. Raises
@@ -3033,9 +3048,14 @@ def _fire_triggers(
     The cron trigger goes first: a due occurrence dispatches and the event poll waits for
     the next tick, so one tick starts at most one run per job. A cron that is not due, or
     missed, falls through to the event trigger. A job with neither fires nothing and writes
-    nothing: a request-only job is never reported missed."""
+    nothing: a request-only job is never reported missed.
+
+    A gated job whose `github_event` check *is* its gate (issue 077) takes the event path
+    every tick: its cron no longer has a gate to evaluate, and the moved check keeps
+    014's poll-and-fire behaviour."""
+    event_trigger, event_is_gate = _event_trigger_for(job)
     cron_summary: str | None = None
-    if job.cron is not None:
+    if not event_is_gate and job.cron is not None:
         last = last_scheduled_terminal_run(history_path, job.name)
         registered_at = first_seen_at(history_path, job.name) or now
         result = decide(
@@ -3106,7 +3126,7 @@ def _fire_triggers(
         else:
             cron_summary = f"{job.name}: not due"
 
-    if job.trigger_event is None:
+    if event_trigger is None:
         return cron_summary or f"{job.name}: not due (request only)", False
 
     event_summary, failed = _poll_event_trigger(
@@ -3153,7 +3173,26 @@ def _poll_event_trigger(
     event. A failed run is retried by its own `retry_on` / `fallback_model`, not here.
     Every record this writes without a run_id carries `trigger: event`, so none of them
     counts toward `schedule.decide`. A poll failure fails closed (never "no events") and
-    pages once per outage, not every tick."""
+    pages once per outage, not every tick.
+
+    A gated job whose `github_event` check was moved here (issue 077) keeps 014's whole
+    poll path instead: per-event attempt budget, baseline adoption, head-ref validation
+    and its `gate=passed/failed` record shapes. It is the same `_process_event_target`
+    014 ran on the cron, now reached from the single trigger entry point."""
+    event_trigger, event_is_gate = _event_trigger_for(job)
+    if event_is_gate:
+        if event_trigger is None:
+            raise RuntimeError(f"{job.name}: no event trigger configured")
+        return _process_event_target(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            run_id=make_run_id(job.name, now),
+            check=event_trigger,
+            trusted_review_authors=trusted_review_authors,
+        )
+
     check = job.trigger_event
     if check is None:
         raise RuntimeError(f"{job.name}: no event trigger configured")
@@ -3378,27 +3417,14 @@ def _gated_cycle(
     trusted_review_authors: tuple[str, ...],
 ) -> tuple[str, bool]:
     """One occurrence of a gated job, after the schedule guards: record `running`, then
-    route to the event / pr / base target. The tick and `run` both land here (issue 074)."""
-    checks = job.require_checks()
+    route to the pr / base target. The tick and `run` both land here (issue 074). A
+    `github_event` check no longer dispatches here: it is the job's trigger (issue 077),
+    so the poll in `_poll_event_trigger` runs `_process_event_target` instead."""
+    job.require_checks()
     target = job.require_target()
     run_id = occ.run_id
 
     _append_running(job, history_path, occ, now=now)
-
-    # github_event (issue 014) is a poll predicate: same schedule guards as every
-    # gated job, but its "gate" is a diff against last-seen event IDs rather than a
-    # pr/base fix path — the event itself decides, so it routes to its own target.
-    for check in checks:
-        if check.kind == "github_event":
-            return _process_event_target(
-                job,
-                history_path,
-                client=client,
-                now=now,
-                run_id=run_id,
-                check=check,
-                trusted_review_authors=trusted_review_authors,
-            )
 
     if target == "pr":
         return _process_pr_target(

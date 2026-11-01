@@ -1602,11 +1602,22 @@ def _build_job(
                 f"{label}: 'trigger.event' is not supported {spelled} "
                 "(no single checkout to poll against)"
             )
-        if any(c.kind == "github_event" for c in checks or ()):
-            raise ConfigError(
-                f"{label}: 'trigger.event' cannot be combined with a github_event "
-                "check (both track last_seen_event_ids for the job)"
-            )
+    # -- gated `github_event` sugar (issue 077) -----------------------------------------
+    #
+    # A gated job whose checks are all github_event already means "poll this and fire on
+    # a matching event": load it onto `trigger.event`, the one mechanism, instead of
+    # keeping a second poll path that writes the same watermark. The check stays on
+    # `checks` so `validate`'s timeout budget still sees the poll; the tick skips the
+    # cron path for such a job (the check is the gate).
+    if kind == "gated" and checks:
+        event_checks = [c for c in checks if c.kind == "github_event"]
+        if event_checks:
+            if trigger_event is not None:
+                raise ConfigError(
+                    f"{label}: 'trigger.event' cannot be combined with a "
+                    "github_event check (both track last_seen_event_ids for the job)"
+                )
+            trigger_event = event_checks[0]
 
     # -- kind: audit (issue 057 Phase A) ------------------------------------------------
     #
