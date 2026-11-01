@@ -96,7 +96,8 @@ Pipeline work; no real-run evidence required.
   multi-target selector plus routine fan-out.
   → [`076`](docs/process/issues/076-review-kind-as-routine-with-selector.md)
 - **Gated `github_event` checks as `trigger.event`** — one event mechanism instead of
-  two; keep 014's attempt budget and 070's rules.
+  two: such a job loads as `trigger.event` (config sugar), polls every tick, and keeps
+  014's per-event attempt budget plus 070's dirty-worktree rule.
   → [`077`](docs/process/issues/077-gated-github-event-checks-as-event-triggers.md)
 - **Verify gates for event fix workers** — 070 covered PR targets only.
   → [`078`](docs/process/issues/078-verify-gates-for-event-fix-workers.md)
@@ -270,7 +271,8 @@ gated on an unmade design decision say so in their file's `gate:`.
   prune. → [`021`](docs/process/issues/021-log-rotation.md)
 - **API / webhook trigger** — PR #162, 2026-10-15. Shipped as the
   poll-based `github_event` gate check (`prs:labels` | `issues:opened` |
-  `ci:failed`), generalizing issue 015's gh-api polling; no listener, no tunnel. →
+  `ci:failed`), generalizing issue 015's gh-api polling; no listener, no tunnel.
+  Since 077 the gated check form loads as `trigger.event`. →
   [`014`](docs/process/issues/014-api-webhook-trigger.md)
 - **Docker image for trivial multi-host setup** — PTY-in-container worry
   resolved; waits on a secret-injection + image-architecture decision, and no

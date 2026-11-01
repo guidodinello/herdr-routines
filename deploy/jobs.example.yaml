@@ -93,11 +93,13 @@ jobs:
     start_timeout_ms: 120000
     on_missed: log
 
-  # event-triggered job (issue 014): `github_event` is a poll predicate, same shape as
-  # pr_health — `cron` is the poll cadence, not the event. Each tick reads `gh` and diffs
-  # the returned event IDs against `last_seen_event_ids`; a new matching event dispatches
-  # one worker (capped by max_workers_per_tick), a clean poll costs only the read-only
-  # `gh api` call. No listener, no tunnel, no inbound reachability. v1 closed `query` set:
+  # event-triggered job (issues 014 / 075 / 077): a gated job whose only check is
+  # `github_event` is loaded as `trigger.event` — the check *is* the gate. Each tick reads
+  # `gh` and diffs the returned event IDs against `last_seen_event_ids`; a new matching
+  # event dispatches one worker (capped by max_workers_per_tick), a clean poll costs only
+  # the read-only `gh api` call. No listener, no tunnel, no inbound reachability. `cron`
+  # is accepted for compatibility with the pre-077 spelling but no longer gates the poll.
+  # v1 closed `query` set:
   # prs:labels | issues:opened | ci:failed; `match` accepts label/branch/author.
   # The first successful `issues:opened` poll adopts the issues already open as a
   # baseline and dispatches nothing; prs:labels and ci:failed fire on the first poll.
@@ -107,7 +109,7 @@ jobs:
   # `match.author` matches exactly that login instead.
   - name: on-ready-for-agent-pr
     enabled: true
-    cron: "*/10 * * * *" # poll cadence (every 10 min), not the event itself
+    cron: "*/10 * * * *" # legacy 014 spelling; the check polls every tick
     repo: /home/guido/projects/herdr-routines
     workspace: worktree
     base: main
@@ -169,6 +171,9 @@ jobs:
   #   # An event run is started after a due cron occurrence, at most one run per tick.
   #   # `request: true` alone makes a job that never fires on its own and is never
   #   # reported missed; `herdr-routines run <name>` works on any job regardless.
+  #   # The pre-077 `kind: gated` + `checks: [github_event]` spelling is equivalent: it
+  #   # loads as this event trigger, keeps 014's per-event attempt budget, and no longer
+  #   # polls only when its cron fires.
 
 # telegram_spawn: # optional (issue 024): cold-start a session from a cold Telegram
 #   # message. The bridge's poller calls `herdr-routines spawn-from-telegram` (or the
