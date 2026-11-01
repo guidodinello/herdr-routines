@@ -1432,12 +1432,13 @@ def _prompt_with_fallback(
     clock: Callable[[], float],
 ) -> tuple[str, _StageStatus, str | None]:
     """Prompt `spec`'s agent (resuming `session_id` if given) and, when its model failed
-    mid-call, resume the same session once on `spec.fallback_model`. Returns (pane id,
-    settled status, report line when the fallback ran).
+    mid-call, run the same prompt once more in a fresh session on `spec.fallback_model`.
+    Returns (pane id, settled status, report line when the fallback ran).
 
-    Shared by a stage's own run and by a CI fix round, so "resume the implementer's
-    session" is one mechanism, not two. The pane is left open for the caller: it has to
-    read the session id from it, and closes it once its gate has passed."""
+    Shared by a stage's own run and by a CI fix round, so "fall back to another model"
+    is one mechanism, not two. The pane is left open for the caller: it has to read the
+    session id from it (the fallback's own, when it ran), and closes it once its gate
+    has passed."""
     model = spec.model
     if model is None:
         raise ValueError(f"stage {spec.stage}: model=None has no agent to prompt")
@@ -1476,25 +1477,26 @@ def _prompt_with_fallback(
         else (None, None)
     )
     if spec.fallback_model and failed_session and provider_error:
-        # Resume the same session rather than start a fresh one: the failed model
-        # usually left edits in the shared worktree, and a new session dropped onto
-        # half-done work it has no memory of would redo or undo it. The same id is
-        # also what stage 7 resumes, so the implementer's record stays one session.
+        # A fresh session, never a resume of the failed one. Resuming it (`-m <fallback>
+        # -s <failed id>`) never worked: reproduced on the Pi 2026-11-01 against run
+        # 20261031T050000Z's stage 3, opencode 1.19.0 keeps the session's own model and
+        # ignores `-m`, and herdr reports the resumed agent `blocked` before any prompt,
+        # because the session's last turn is the one that errored. Every fallback from
+        # 20261024 to 20261031 settled `blocked` that way. Partial work survives in the
+        # shared worktree, so the preamble points the new session at it.
         _close_pane(client, pane_id)
         note = (
             f"stage {spec.stage}: {model} failed ({provider_error}); "
-            f"resumed its session on {spec.fallback_model}"
+            f"retried in a fresh session on {spec.fallback_model}"
         )
         log.warning("pipeline %s: %s", run_id, note)
         try:
-            # No failure markers: they are Zen's quota text, the fallbacks are off Zen
-            # by construction, and a resumed session can re-render its own history —
-            # the primary's "Free usage exceeded" included — which two polls would read
-            # as the fallback's own wedge and kill it seconds in.
+            # No failure markers: they are Zen's quota text, and the fallbacks are off
+            # Zen by construction.
             pane_id, status = attempt(
                 model=spec.fallback_model,
-                session_id=failed_session,
-                text=FALLBACK_CONTINUE_PROMPT,
+                session_id=None,
+                text=f"{FALLBACK_PREAMBLE}\n\n{text}",
                 markers=(),
             )
         except _Abort as abort:
@@ -1675,15 +1677,14 @@ def _start_and_prompt(
     return pane_id, status
 
 
-# Sent to a stage's session after it is resumed on `StageSpec.fallback_model`. The
-# session already holds the stage's real prompt and everything done so far, so this only
-# has to say why the model changed and that the task is unchanged.
-FALLBACK_CONTINUE_PROMPT = (
-    "Your previous model call failed with a provider error or ran out of quota, and "
-    "this session has been "
-    "resumed on a different model. Continue the same task from where it stopped: check "
-    "the worktree (`git status`, `git diff`) for what is already done, then finish the "
-    "stage exactly as originally instructed."
+# Prepended to a stage's prompt when it is retried in a fresh session on
+# `StageSpec.fallback_model`. The failed model may have left edits or commits in the
+# shared worktree, and the new session has no memory of them.
+FALLBACK_PREAMBLE = (
+    "A previous attempt at this task, on a different model, failed with a provider "
+    "error or ran out of quota part-way through. It may have left work in this "
+    "worktree: check `git status`, `git diff` and `git log` first, keep what is "
+    "correct, and finish the task below exactly as instructed."
 )
 
 

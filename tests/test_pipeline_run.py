@@ -39,7 +39,7 @@ from herdr_routines.gates import GATE_STAGE_CHOICES, PR_GATE_STAGES, gate3_test_
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.pipeline_run import (
     CI_FIX_PROMPT,
-    FALLBACK_CONTINUE_PROMPT,
+    FALLBACK_PREAMBLE,
     RunOutcome,
     _pr_body,
     _session_api_error,
@@ -230,6 +230,9 @@ class FakeHerdr:
         self.polls = 0
         self._next_pane = 0
         self._resumed: dict[str, str] = {}
+        self._fresh_starts: dict[str, int] = {}
+        # Sessions whose last turn failed (a quota kill or a non-idle settle).
+        self._errored: set[str] = set()
         self._prompted: set[str] = set()
         self._pane_cwd: dict[str, str] = {}
         self._agent_cwd: dict[str, str] = {}
@@ -273,8 +276,14 @@ class FakeHerdr:
             # here is what makes stage 6's recorded id stage 3's id, which is the whole
             # point of G-16's close-then-resume.
             self._resumed[name] = session_id
+        else:
+            self._resumed.pop(name, None)
+            self._fresh_starts[name] = self._fresh_starts.get(name, 0) + 1
 
     def agent_session_id(self, target: str) -> str | None:
+        return self._session_of(target)
+
+    def _session_of(self, target: str) -> str | None:
         # opencode creates its session on the first prompt: a just-started agent reports
         # no `agent_session` at all (measured on the Pi 2026-10-08). A fake that answered
         # right after `agent_start` is what hid a stage loop reading the id too early.
@@ -284,7 +293,9 @@ class FakeHerdr:
             return self._resumed[target]
         for stage, session_id in self.session_ids.items():
             if target.lower() == f"pl-{stage}-{RUN_ID}".lower():
-                return session_id
+                starts = self._fresh_starts.get(target, 1)
+                # A second fresh start under the same name is a new opencode session.
+                return session_id if starts <= 1 else f"{session_id}fb{starts}"
         return None
 
     def agent_prompt_wait_with_watchdog(
@@ -297,8 +308,30 @@ class FakeHerdr:
         on_poll: Callable[[str], str | None] | None = None,
     ) -> str:
         self.prompts.append((target, text))
+        resumed = self._resumed.get(target)
         self._prompted.add(target)
         stage = int(target.split("-")[1])
+        if resumed in self._errored:
+            # Measured on the Pi 2026-11-01 (run 20261031T050000Z's stage 3): an agent
+            # resumed onto a session whose last turn errored is `blocked` before any
+            # prompt, and opencode never runs the prompt it is sent.
+            return "blocked"
+        try:
+            status = self._prompt(stage, target, text, on_poll)
+        except PromptWatchdogKilled:
+            self._errored.add(self._session_of(target) or "")
+            raise
+        if status != "idle":
+            self._errored.add(self._session_of(target) or "")
+        return status
+
+    def _prompt(
+        self,
+        stage: int,
+        target: str,
+        text: str,
+        on_poll: Callable[[str], str | None] | None,
+    ) -> str:
         self.work(stage, text, Path(self._agent_cwd[target]))
         screens = self.screens.get(stage, [""])
         for index in range(self.polls_per_stage):
@@ -335,7 +368,7 @@ class FakeHerdr:
                 {f"src/fix_{self.fix_rounds}.py": "FIXED = True\n"},
                 f"fix: ci round {self.fix_rounds}",
             )
-        elif stage == 4 and text != FALLBACK_CONTINUE_PROMPT:
+        elif stage == 4:
             _write_and_commit(
                 worktree, {"src/thing.py": "THING = 1\n"}, "feat: the thing"
             )
@@ -982,27 +1015,29 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_quota_marker
     """A quota wedge is a stage-level fallback, like a provider error. It used to end the
     run for tick to relaunch with `fallback_model`, which the launcher ignored, so the
     relaunch reran every stage on the same exhausted Zen models."""
-    # Stage 2's screen shows the marker on every poll of every attempt, the way a
-    # resumed session re-rendering its own history could. The fallback still finishes,
-    # which only holds if its attempt is not watched for Zen's quota text.
+    # Stage 2's screen shows the marker on every poll of every attempt. The fallback
+    # still finishes, which only holds if its attempt is not watched for Zen's quota
+    # text.
     client = _client(screens={2: [QUOTA_SCREEN]})
 
     outcome, client, _gh = _run(prepared, client=client)
 
     assert outcome.outcome == "ok", outcome
     stage2 = [c for c in client.started if c["name"] == f"pl-2-{RUN_ID}".lower()]
+    # A fresh session, never `-s` on the failed one: that resume is `blocked` on arrival.
     assert [(c["model"], c["session_id"]) for c in stage2] == [
         ("opencode/glm-5.3-flash-free", None),
-        (AUTHOR_FALLBACK_MODEL, SESSION_IDS[2]),
+        (AUTHOR_FALLBACK_MODEL, None),
     ]
-    # The wedged pane is closed before its session is resumed in a new one.
+    # The wedged pane is closed before the fallback starts in a new one.
     assert stage2[0]["pane_id"] in client.closed_panes
     stage2_prompts = [t for n, t in client.prompts if n == f"pl-2-{RUN_ID}".lower()]
-    assert stage2_prompts[1] == FALLBACK_CONTINUE_PROMPT
-    assert prepared.state()["stage_sessions"]["2"] == SESSION_IDS[2]
+    assert stage2_prompts[1] == f"{FALLBACK_PREAMBLE}\n\n{stage2_prompts[0]}"
+    # The stage records the session that finished it, not the one that failed.
+    assert prepared.state()["stage_sessions"]["2"] == f"{SESSION_IDS[2]}fb2"
     report_text = prepared.report.read_text()
     assert "quota exhausted" in report_text
-    assert f"resumed its session on {AUTHOR_FALLBACK_MODEL}" in report_text
+    assert f"retried in a fresh session on {AUTHOR_FALLBACK_MODEL}" in report_text
 
 
 def test_pipeline_run_quota_marker_fails_the_run_when_the_session_is_unreadable(
@@ -1088,7 +1123,8 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_provider_err
 ) -> None:
     """Run 20261010T050000Z: Zen 400'd stage 3 mid-implementation, herdr settled the
     pane `blocked`, and the night ended `stage_blocked`. A provider error is now one
-    resume of the same session on the stage's fallback model, not the end of the run."""
+    retry of the stage in a fresh session on its fallback model, not the end of the
+    run."""
     export = ErrorsOnce(SESSION_IDS[4])
     client = _client(settles={4: ["blocked", "idle"]})
 
@@ -1098,18 +1134,19 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_provider_err
     stage3 = [c for c in client.started if c["name"] == f"pl-4-{RUN_ID}".lower()]
     assert [(c["model"], c["session_id"]) for c in stage3] == [
         ("opencode/big-pickle", None),
-        (AUTHOR_FALLBACK_MODEL, SESSION_IDS[4]),
+        (AUTHOR_FALLBACK_MODEL, None),
     ]
-    # The resume is told why the model changed, not re-sent the whole stage prompt.
+    # The fresh session gets the whole stage prompt, told to pick up partial work.
     stage3_prompts = [t for n, t in client.prompts if n == f"pl-4-{RUN_ID}".lower()]
-    assert stage3_prompts[1] == FALLBACK_CONTINUE_PROMPT
-    # One session for the implement stage either way, so stage 7 still resumes the work
-    # it did.
-    assert prepared.state()["stage_sessions"]["4"] == SESSION_IDS[4]
-    assert prepared.state()["stage_sessions"]["7"] == SESSION_IDS[4]
+    assert stage3_prompts[1] == f"{FALLBACK_PREAMBLE}\n\n{stage3_prompts[0]}"
+    # Stage 7 resumes the session that finished the implementation: its last turn is
+    # healthy, unlike the failed one's.
+    fallback_session = f"{SESSION_IDS[4]}fb2"
+    assert prepared.state()["stage_sessions"]["4"] == fallback_session
+    assert prepared.state()["stage_sessions"]["7"] == fallback_session
     report_text = prepared.report.read_text()
     assert "## Outcome: ok" in report_text
-    assert f"resumed its session on {AUTHOR_FALLBACK_MODEL}" in report_text
+    assert f"retried in a fresh session on {AUTHOR_FALLBACK_MODEL}" in report_text
     assert "400: Bad Request" in report_text
 
 
@@ -1141,11 +1178,11 @@ def test_pipeline_run_falls_back_when_a_provider_error_settles_idle(
     outcome, client, _gh = _run(prepared, session_export=ErrorsOnce(SESSION_IDS[4]))
 
     assert outcome.outcome == "ok", outcome
-    resumed = [c for c in client.started if c["model"] == AUTHOR_FALLBACK_MODEL]
-    assert [(c["name"], c["session_id"]) for c in resumed] == [
-        (f"pl-4-{RUN_ID}".lower(), SESSION_IDS[4])
+    fallback = [c for c in client.started if c["model"] == AUTHOR_FALLBACK_MODEL]
+    assert [(c["name"], c["session_id"]) for c in fallback] == [
+        (f"pl-4-{RUN_ID}".lower(), None)
     ]
-    assert "resumed its session on" in prepared.report.read_text()
+    assert "retried in a fresh session on" in prepared.report.read_text()
 
 
 def test_pipeline_run_keeps_its_never_raises_contract_when_the_session_is_unreadable(
@@ -1183,7 +1220,7 @@ def test_pipeline_run_reports_the_fallback_when_it_also_fails(
     assert outcome.reason == "stage_blocked"
     assert len([c for c in client.started if c["name"].startswith("pl-4-")]) == 2
     report_text = prepared.report.read_text()
-    assert f"resumed its session on {AUTHOR_FALLBACK_MODEL}" in report_text
+    assert f"retried in a fresh session on {AUTHOR_FALLBACK_MODEL}" in report_text
 
 
 @pytest.mark.parametrize(
