@@ -1477,13 +1477,11 @@ def _prompt_with_fallback(
         else (None, None)
     )
     if spec.fallback_model and failed_session and provider_error:
-        # A fresh session, never a resume of the failed one. Resuming it (`-m <fallback>
-        # -s <failed id>`) never worked: reproduced on the Pi 2026-11-01 against run
-        # 20261031T050000Z's stage 3, opencode 1.19.0 keeps the session's own model and
-        # ignores `-m`, and herdr reports the resumed agent `blocked` before any prompt,
-        # because the session's last turn is the one that errored. Every fallback from
-        # 20261024 to 20261031 settled `blocked` that way. Partial work survives in the
-        # shared worktree, so the preamble points the new session at it.
+        # A fresh session, never a resume of the failed one. On resume (`-m <fallback>
+        # -s <failed id>`) opencode 1.19.0 ignores `-m` and keeps the session's stored
+        # model (measured on the Pi 2026-11-01), so a resume would retry the very model
+        # that just failed. Partial work survives in the shared worktree, so the
+        # preamble points the new session at it.
         _close_pane(client, pane_id)
         note = (
             f"stage {spec.stage}: {model} failed ({provider_error}); "
