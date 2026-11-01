@@ -90,7 +90,9 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > Each agent stage also has a `fallback_model` off Zen (authors `nvidia/moonshotai/kimi-k3`,
 > reviewer `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`): when a stage's session ends
 > in a provider `APIError`, or the failure-marker watchdog sees Zen's quota text, `pipeline-run`
-> resumes that session once on the fallback. The job's own `fallback_model` is unused for
+> reruns the stage once in a fresh session on the fallback, told to pick up any partial work in
+> the worktree. It never resumes the failed session: opencode keeps that session's model and
+> ignores `-m`, and herdr reports the resumed agent `blocked` on arrival. The job's own `fallback_model` is unused for
 > `kind: pipeline`: tick does not relaunch a `quota_exhausted` run.
 
 Stage rules copied from spec §3: tests before code (stage 3 done = every
