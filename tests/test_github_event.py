@@ -46,10 +46,10 @@ from herdr_routines.auto_fix import (
 from herdr_routines.config import ConfigError, GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.tick import (
+    _verify_event_worker,
     _WorkerFailed,
     _WorkerResult,
     _WorkerSettled,
-    _verify_event_worker,
     run_tick,
 )
 
