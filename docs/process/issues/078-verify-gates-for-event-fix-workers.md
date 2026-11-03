@@ -1,7 +1,7 @@
 ---
 id: "078"
 title: "Verify gates for event-target fix workers"
-status: open
+status: done
 priority: low
 area: scheduler
 ---
