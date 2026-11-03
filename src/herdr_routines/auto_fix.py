@@ -1418,7 +1418,11 @@ class GithubEvent:
 
     `is_issue` distinguishes an `issues:opened` event (an issue number, no head ref)
     from a PR-backed event, so detail enrichment and history `target` never treat an
-    issue as a PR."""
+    issue as a PR.
+
+    `head_sha` is the PR head commit captured by `enrich_event_detail` at dispatch time
+    (issue 078): the settle gates compare it to the PR's current head to prove a push.
+    It stays None for issue events and when `pr_view` could not report it."""
 
     event_id: str
     number: int
@@ -1427,6 +1431,7 @@ class GithubEvent:
     label: str | None
     payload: Mapping[str, object]
     is_issue: bool = False
+    head_sha: str | None = None
 
 
 def _label_names(labels: object) -> list[str]:
@@ -1688,6 +1693,7 @@ def enrich_event_detail(
         return event
     title = view.get("title")
     head_ref = view.get("headRefName")
+    head_sha = view.get("headRefOid")
     return GithubEvent(
         event_id=event.event_id,
         number=event.number,
@@ -1696,6 +1702,7 @@ def enrich_event_detail(
         label=event.label,
         payload=event.payload,
         is_issue=event.is_issue,
+        head_sha=head_sha if isinstance(head_sha, str) and head_sha else event.head_sha,
     )
 
 
