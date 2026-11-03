@@ -1,4 +1,4 @@
-# Spec v1 — Issue 078: Verify gates for event-target fix workers
+# Spec v2 — Issue 078: Verify gates for event-target fix workers
 
 Run: `20261103T050000Z` · Issue: `docs/process/issues/078-verify-gates-for-event-fix-workers.md` (priority: low, area: scheduler)
 Related: 070 (done — PR-path gates), 071 (gate registry), 077 (done — event trigger path exists).
@@ -86,13 +86,61 @@ Gateway details:
 - `tests/test_config.py` — registry/literal pin test updates for the new gate name
   (non-listable set).
 
-## Acceptance criteria (from the issue)
+## Acceptance criteria
 
-1. [blocking] An event worker that settles `done` without its query's required action is
-   recorded `failed` with the gate's reason.
-   `test_event_fix_worker_done_without_effect_recorded_failed`
-2. [blocking] A failing event worker's record keeps its own reason.
-   `test_event_worker_failure_reason_preserved`
+1. [blocking] (confidence: high) An event-target worker that settles `done` without its
+   query's required action (no push of the head branch, no reply/comment, no linked PR)
+   is recorded `failed` with that gate's reason (e.g. `worker_pushed_nothing`), and the
+   event is *not* added to the `handled` watermark so the next tick retries within
+   `max_attempts_per_target`. Test: test_event_fix_worker_done_without_effect_recorded_failed
+2. [blocking] (confidence: high) A failing event worker's record keeps its own reason:
+   `_WorkerFailed` outcomes carry `worker_outcome.reason` (e.g. `agent_start_failed`)
+   instead of the hardcoded `gate_failed`; a gate-failed `done` carries the gate's
+   reason plus the `error` field, matching the PR path (tick.py:2119,
+   tick.py:2134-2137). Test: test_event_worker_failure_reason_preserved
+3. [blocking] (confidence: high) For `prs:labels` and `ci:failed`, a `done` event
+   worker passes exactly the 070 gate set (`worktree_clean` + `pushed_or_replied`) —
+   `worktree_path` returned by `_dispatch_event_worker` is used by `worktree_clean`,
+   and `GithubEvent.head_sha` (captured from `enrich_event_detail`'s `pr_view`)
+   is passed as `dispatch_head_sha`. Test: test_prs_labels_event_worker_done_gates_pass
+4. [blocking] (confidence: high) For `issues:opened`, a `done` event worker passes the
+   new `commented_or_linked` gate when a PR linked to/created against the issue is
+   found since run start. Test: test_issues_opened_event_worker_done_via_linked_pr
+5. [blocking] (confidence: high) For `issues:opened`, a `done` event worker also passes
+   `commented_or_linked` when a new comment by a trusted author is posted on the issue
+   since run start (whole-second truncation vs `started_at`, same as 070's probes).
+   Test: test_issues_opened_event_worker_done_via_comment
+6. [blocking] (confidence: high) `commented_or_linked` semantics: registered in
+   `VERIFY_GATES` (verify.py:285), added to `VerifyGate`/`VALID_VERIFY_GATES`, and in
+   the **non-listable** set so no job can list it under `verify:`; a gh probe
+   failure is a failed gate — never a pass and never a crash. Test:
+   test_commented_or_linked_gate_probe_failure
+7. [non-blocking] (confidence: medium) A gate-failed `done` due to dirty worktree
+   (`worker_left_uncommitted_changes`) joins the dirty-worktree first-detection
+   report/notification the same way the PR path does. Test:
+   test_event_worker_dirty_worktree_reported
+
+Confidence rationale: items 1-6 are direct probes of behaviour specified in Approach
+against shapes already exercised by existing tests (`test_pushed_or_replied_gate`,
+test_verify.py:473); 7 depends on report plumbing integration, hence medium.
+
+## Changelog v1→v2
+
+- Renamed title Spec v1 → Spec v2.
+- Replaced the two-bullet "Acceptance criteria (from the issue)" section with a
+  numbered `## Acceptance criteria` section: every item carries a
+  `blocking`/`non-blocking` tier, a `confidence:` tier, a single exact `Test: <name>`
+  terminator, and acquires the previously implicit watermark/retry and error-field
+  details from Approach (items 1-2 absorb both v1 issue ACs).
+- Added derived acceptance criteria 3-7 covering the `prs:labels`/`ci:failed` gate
+  pass-path, both `issues:opened` pass-shapes (linked PR, comment), the
+  `commented_or_linked` registration/non-listable/probe-failure contract, and the
+  dirty-worktree report hook — previously described only in Approach and "Files
+  touched" without named tests.
+- Named the tests formerly described hand-wavingly in Files touched ("a `prs:labels`
+  done case", "an `issues:opened` case passing via linked PR and via comment") as
+  items 3-5's exact test names.
+- No changes to Problem, Approach, Files touched, Risks, or Verification.
 
 ## Risks
 
