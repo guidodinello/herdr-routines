@@ -509,6 +509,10 @@ class _WorkerSettled:
     report_bytes: int = 0
     # The worktree the worker ran in (issue 070), so the settle site can check it.
     worktree_path: str | None = None
+    # The PR head captured at dispatch (issue 078), so `pushed_or_replied` can tell
+    # whether the worker moved it. None for issue events and when enrichment could not
+    # read it (the gate then fails closed).
+    dispatch_head_sha: str | None = None
 
 
 _WorkerResult = _WorkerFailed | _WorkerSettled
@@ -1405,42 +1409,72 @@ def _process_event_target(
             _notify(client, f"herdr-routines: {job.name} done", sound="done")
         return f"{job.name}: done (no new events)", False
 
-    dispatchable = new_events[: job.max_workers_per_tick]
-    skipped_over_cap = len(new_events) - len(dispatchable)
-
     dispatched_count = 0
     skipped_count = 0
     any_failed = False
-    for event in dispatchable:
-        attempt = attempt_count_for_event(history_path, job.name, event.event_id)
-        if attempt >= job.max_attempts_per_target:
-            append(
-                history_path,
-                HistoryRecord(
-                    ts=now,
-                    job=job.name,
-                    state="skipped",
-                    run_id=run_id,
-                    extra=HistoryExtra(
-                        reason="max_attempts_exceeded",
-                        event_id=event.event_id,
-                        event_number=event.number,
-                        attempt=attempt,
-                        target=event_target,
-                    ),
-                ),
-            )
-            if _notify_gate(job, "failure"):
-                _notify(
-                    client,
-                    f"herdr-routines: {job.name} skipped",
-                    body=f"max_attempts_exceeded for {event.event_id}",
-                    sound="request",
-                )
-            skipped_count += 1
-            handled.add(event.event_id)
-            continue
 
+    # A budget-exhausted event is reported once and spends no dispatch slot (issue 078):
+    # unlike before, the first exhaustion is never added to the watermark, so it must not
+    # starve the events behind it on later ticks.
+    attempts = {
+        e.event_id: attempt_count_for_event(history_path, job.name, e.event_id)
+        for e in new_events
+    }
+    # One pass over the job's history for every exhausted event this tick, instead of
+    # re-scanning the whole file once per budget-exhausted event (issue 078).
+    exhausted_reported: set[str] = set()
+    for record in read_job(history_path, job.name):
+        extra = record.extra
+        event_id = extra.get("event_id") if extra else None
+        if (
+            extra is not None
+            and extra.get("reason") == "max_attempts_exceeded"
+            and isinstance(event_id, str)
+        ):
+            exhausted_reported.add(event_id)
+    candidates: list[GithubEvent] = []
+    for event in new_events:
+        attempt = attempts[event.event_id]
+        if attempt >= job.max_attempts_per_target:
+            # The budget tapped out (issue 078): the event stays out of the `handled`
+            # watermark — a gated failure is never written off as seen — and is retried
+            # no further because every later tick lands here. Report the exhaustion
+            # once; repeating the same record and notification every tick would only
+            # bury the first one.
+            if event.event_id not in exhausted_reported:
+                append(
+                    history_path,
+                    HistoryRecord(
+                        ts=now,
+                        job=job.name,
+                        state="skipped",
+                        run_id=run_id,
+                        extra=HistoryExtra(
+                            reason="max_attempts_exceeded",
+                            event_id=event.event_id,
+                            event_number=event.number,
+                            attempt=attempt,
+                            target=event_target,
+                        ),
+                    ),
+                )
+                exhausted_reported.add(event.event_id)
+                if _notify_gate(job, "failure"):
+                    _notify(
+                        client,
+                        f"herdr-routines: {job.name} skipped",
+                        body=f"max_attempts_exceeded for {event.event_id}",
+                        sound="request",
+                    )
+            skipped_count += 1
+            continue
+        candidates.append(event)
+
+    dispatchable = candidates[: job.max_workers_per_tick]
+    skipped_over_cap = len(candidates) - len(dispatchable)
+
+    for event in dispatchable:
+        attempt = attempts[event.event_id]
         detailed = enrich_event_detail(gh, event, owner=owner, repo=repo_name)
         # The head ref is GitHub data that becomes a `git worktree add` argument and a
         # worktree lookup key, so it must be a well-formed branch name first. Checked
@@ -1545,21 +1579,62 @@ def _process_event_target(
             continue
 
         outcome_state: Literal["done", "failed"] = "failed"
+        outcome_reason: str | None = None
         outcome_error: str | None = None
         outcome_report_path: str | None = None
         outcome_agent_status: AgentStatus | None = None
+        verify_results: tuple[verify.VerifyResult, ...] = ()
         if isinstance(worker_outcome, _WorkerSettled):
             outcome_state = worker_outcome.state
             outcome_report_path = worker_outcome.report_path
             outcome_agent_status = worker_outcome.final_agent_status
+            if outcome_state == "done":
+                # `done` is the agent's word (issue 078, mirroring 070's PR path): prove
+                # the query's required action happened before keeping it.
+                verify_results = _verify_event_worker(
+                    job,
+                    gh=gh,
+                    run_id=run_id,
+                    now=now,
+                    owner=owner,
+                    repo=repo_name,
+                    query=check.query,
+                    event=detailed,
+                    worker=worker_outcome,
+                    trusted_review_authors=trusted_review_authors,
+                )
+                failed_gate = next((r for r in verify_results if not r.passed), None)
+                if failed_gate is not None:
+                    outcome_state = "failed"
+                    outcome_reason = failed_gate.reason
+                    if (
+                        outcome_reason == verify.REASON_LEFT_UNCOMMITTED
+                        and worker_outcome.worktree_path is not None
+                    ):
+                        wt = worker_outcome.worktree_path
+                        if not _dirty_worktree_already_reported(
+                            history_path, job.name, wt
+                        ) and _notify_gate(job, "failure"):
+                            _notify(
+                                client,
+                                f"herdr-routines: {job.name} event "
+                                f"{event.event_id} blocked",
+                                body=(
+                                    f"uncommitted changes in {wt}; "
+                                    "rescue or discard by hand"
+                                ),
+                                sound="request",
+                            )
         else:
+            # Keep the worker's own reason (issue 078): the PR path already does
+            # (tick.py:_process_pr_target) instead of the old hardcoded `gate_failed`.
+            outcome_reason = worker_outcome.reason
             outcome_error = worker_outcome.error
 
         extra_record = HistoryExtra(
             event_id=event.event_id,
             event_number=event.number,
             attempt=attempt,
-            reason="gate_failed",
             fix_worker_agent=agent_name,
             pane_id=worker_outcome.pane_id,
             report_path=outcome_report_path,
@@ -1567,8 +1642,25 @@ def _process_event_target(
             final_agent_status=outcome_agent_status,
             target=event_target,
         )
+        if outcome_reason is not None:
+            extra_record["reason"] = outcome_reason
         if outcome_error is not None:
             extra_record["error"] = outcome_error
+        if verify_results:
+            extra_record["verify"] = [
+                {"gate": r.gate, "passed": r.passed, "reason": r.reason}
+                for r in verify_results
+            ]
+        if isinstance(worker_outcome, _WorkerSettled) and worker_outcome.worktree_path:
+            extra_record["worktree_path"] = worker_outcome.worktree_path
+        if outcome_state == "failed":
+            log.warning(
+                "%s: event %s dispatch failed: reason=%s error=%s",
+                job.name,
+                event.event_id,
+                outcome_reason,
+                outcome_error,
+            )
 
         append(
             history_path,
@@ -1826,6 +1918,8 @@ def _dispatch_event_worker(
         report_path=str(report_path) if report_written else None,
         final_agent_status=settled_status,
         session_id=session_id,
+        worktree_path=str(wt_path),
+        dispatch_head_sha=event.head_sha,
     )
 
 
@@ -2939,10 +3033,57 @@ def _dispatch_fix_worker(
 # precedence: when both fail the dirty tree is the recorded reason, because it is what
 # wedges every later attempt on the branch.
 _FIX_WORKER_GATES: tuple[VerifyGate, ...] = ("worktree_clean", "pushed_or_replied")
+# What proves an event worker's `done` per `github_event` query (issue 078). A PR-shaped
+# event uses 070's gate set; an issue has no head branch, so the work shipping means a
+# comment on it or a PR linked to it. The config loader's query set is closed, so a
+# missing key is a programming error, not a query we can safely guess a gate set for:
+# `_verify_event_worker` raises rather than silently applying another query's gates.
+_EVENT_WORKER_GATES: dict[str, tuple[VerifyGate, ...]] = {
+    "prs:labels": _FIX_WORKER_GATES,
+    "ci:failed": _FIX_WORKER_GATES,
+    "issues:opened": ("worktree_clean", "commented_or_linked"),
+}
 # Reasons whose record carries a dirty worktree a human has to deal with.
 _DIRTY_WORKTREE_REASONS = frozenset(
     {"worktree_reuse_not_clean", verify.REASON_LEFT_UNCOMMITTED}
 )
+
+
+def _verify_event_worker(
+    job: Job,
+    *,
+    gh: GhClient,
+    run_id: str,
+    now: datetime,
+    owner: str,
+    repo: str,
+    query: str | None,
+    event: GithubEvent,
+    worker: _WorkerSettled,
+    trusted_review_authors: tuple[str, ...],
+) -> tuple[verify.VerifyResult, ...]:
+    """Run the query's settle gates for an event worker whose agent said `done`. The
+    agent's word is not proof: these read the worktree and the PR/issue (issue 078)."""
+    if query is None or query not in _EVENT_WORKER_GATES:
+        raise ValueError(
+            f"{job.name}: no settle gates defined for github_event query {query!r}"
+        )
+    gates = _EVENT_WORKER_GATES[query]
+    return verify.run_verify_gates(
+        gates,
+        VerifyContext(
+            job=job,
+            run_id=run_id,
+            started_at=now,
+            report_path=Path(worker.report_path or ""),
+            gh=gh,
+            trusted_review_authors=trusted_review_authors,
+            target=VerifyTarget(owner, repo, event.number),
+            worktree_path=Path(worker.worktree_path) if worker.worktree_path else None,
+            dispatch_head_sha=worker.dispatch_head_sha,
+            given_thread_ids=None,
+        ),
+    )
 
 
 def _verify_fix_worker(

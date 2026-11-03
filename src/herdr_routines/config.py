@@ -107,13 +107,15 @@ VerifyGate = Literal[
     "report_wellformed",
     "worktree_clean",
     "pushed_or_replied",
+    "commented_or_linked",
 ]
 VALID_VERIFY_GATES: frozenset[VerifyGate] = frozenset(get_args(VerifyGate))
-# Gates the gated fix-worker path (issue 070) always runs itself. They need a worktree,
-# a dispatch-time head and the threads the worker was given, none of which `execute_run`
-# has, so a job cannot list them under `verify:`.
+# Gates the gated fix-worker path (issues 070, 078) always runs itself. They need a
+# worktree, a dispatch-time head, the threads the worker was given, or a gh probe of the
+# event's issue, none of which `execute_run` has, so a job cannot list them under
+# `verify:`.
 FIX_WORKER_VERIFY_GATES: frozenset[VerifyGate] = frozenset(
-    {"worktree_clean", "pushed_or_replied"}
+    {"worktree_clean", "pushed_or_replied", "commented_or_linked"}
 )
 
 # Target selectors a routine job can name under `pick:` (issue 073): code chooses what the

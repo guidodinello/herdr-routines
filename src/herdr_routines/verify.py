@@ -265,6 +265,126 @@ def pushed_or_replied(ctx: VerifyContext) -> GateVerdict:
     return _fail(REASON_PUSHED_NOTHING)
 
 
+# The issue detail `commented_or_linked` probes (issue 078): the comment list and the
+# timeline cross-references/connected PRs. One read, so an `issues:opened` worker's pass
+# is a single gh call. No `search(` in the query — it is an issue read, not a search.
+# `last` (not `first`) takes the newest 100 of each connection: GitHub returns these
+# connections oldest-first, and the gate only cares about items created after run start.
+_ISSUE_EFFECT_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      comments(last: 100) {
+        nodes { author { login } createdAt }
+      }
+      timelineItems(last: 100, itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]) {
+        nodes {
+          __typename
+          createdAt
+          ... on CrossReferencedEvent {
+            source { __typename ... on PullRequest { number } }
+          }
+          ... on ConnectedEvent {
+            subject { __typename ... on PullRequest { number } }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _event_timestamp(value: object) -> datetime | None:
+    """A GitHub ISO-8601 timestamp (``2026-10-24T01:04:56Z``), or None when absent or
+    unparseable. Same shape `auto_fix` reads, kept local so a probing gate never raises
+    on a malformed reply."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _at_or_after(value: object, since: datetime) -> bool:
+    """Whether ``value`` is a timestamp at/after ``since``. A naive stamp (a fake or a
+    shape missing its zone) is read in ``since``'s zone rather than raising."""
+    ts = _event_timestamp(value)
+    if ts is None:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=since.tzinfo)
+    return ts >= since
+
+
+def _graphql_nodes(value: object) -> list[object]:
+    """The ``nodes`` list of a GraphQL connection, or an empty list when the shape is
+    missing or wrong (a shapeless reply never reads as a pass)."""
+    if not isinstance(value, dict):
+        return []
+    nodes = value.get("nodes")
+    return nodes if isinstance(nodes, list) else []
+
+
+def commented_or_linked(ctx: VerifyContext) -> GateVerdict:
+    """Passes when an `issues:opened` worker left evidence the work shipped (issue 078):
+    a new comment by a trusted author on the issue since the run started, or a PR
+    cross-referenced/connected to the issue since then. Either proves the prompt's
+    branch-and-open-a-PR instruction was followed. A probe failure is a failed gate,
+    never a pass."""
+    target = ctx.target
+    if target is None:
+        return _fail(REASON_WORKER_UNVERIFIED)
+    try:
+        trusted = ctx.trusted_authors
+        if trusted is None:
+            trusted = effective_trusted_authors(
+                ctx.trusted_review_authors, viewer_login=ctx.gh.api_user()
+            )
+        payload = ctx.gh.graphql(
+            _ISSUE_EFFECT_QUERY,
+            owner=target.owner,
+            repo=target.repo,
+            number=str(target.number),
+        )
+    except Exception as e:  # noqa: BLE001 — a probe failure is a failed gate, never a pass
+        log.warning("%s: commented_or_linked probe failed: %s", ctx.job.name, e)
+        return _fail(REASON_WORKER_UNVERIFIED)
+
+    repository = payload.get("data")
+    repository = repository.get("repository") if isinstance(repository, dict) else None
+    issue = repository.get("issue") if isinstance(repository, dict) else None
+    if not isinstance(issue, dict):
+        return _fail(REASON_WORKER_UNVERIFIED)
+
+    # Whole seconds, same as `review_posted`/`pushed_or_replied`: GitHub stamps no
+    # sub-second part, so a comment in the run's first second must not compare earlier.
+    since = ctx.started_at.replace(microsecond=0)
+
+    for node in _graphql_nodes(issue.get("comments")):
+        if not isinstance(node, dict) or not _at_or_after(node.get("createdAt"), since):
+            continue
+        author = node.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        if is_trusted_author(login, trusted):
+            return GateVerdict(passed=True)
+
+    for node in _graphql_nodes(issue.get("timelineItems")):
+        if not isinstance(node, dict) or not _at_or_after(node.get("createdAt"), since):
+            continue
+        if node.get("__typename") == "CrossReferencedEvent":
+            source = node.get("source")
+        elif node.get("__typename") == "ConnectedEvent":
+            source = node.get("subject")
+        else:
+            continue
+        if isinstance(source, dict) and source.get("__typename") == "PullRequest":
+            return GateVerdict(passed=True)
+
+    return _fail(REASON_WORKER_UNVERIFIED)
+
+
 def report_wellformed(ctx: VerifyContext) -> GateVerdict:
     """Fails an empty report and one with literal `\\n` escapes standing in for newlines
     (the #839 report). A cheap signal of a model that wrote the report without doing the
@@ -287,6 +407,7 @@ VERIFY_GATES: dict[VerifyGate, Callable[[VerifyContext], GateVerdict]] = {
     "report_wellformed": report_wellformed,
     "worktree_clean": worktree_clean,
     "pushed_or_replied": pushed_or_replied,
+    "commented_or_linked": commented_or_linked,
 }
 
 

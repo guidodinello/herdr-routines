@@ -12,7 +12,12 @@ import pytest
 
 from herdr_routines import cli
 from herdr_routines.auto_fix import PostedBody, RealGhClient
-from herdr_routines.config import VALID_VERIFY_GATES, RoutinesConfig
+from herdr_routines.config import (
+    FIX_WORKER_VERIFY_GATES,
+    VALID_VERIFY_GATES,
+    ConfigError,
+    RoutinesConfig,
+)
 from herdr_routines.history import read_job
 from herdr_routines.runner import execute_run
 from herdr_routines.tick import run_tick
@@ -480,3 +485,82 @@ def test_pushed_or_replied_gate(
 
     verdict = pushed_or_replied(_fix_worker_ctx(tmp_path, gh, **overrides))
     assert (verdict.passed, verdict.reason) == expected
+
+
+# -- issue 078: the `commented_or_linked` gate ----------------------------------------
+
+
+class _CommentedOrLinkedGh:
+    """The gh seam `commented_or_linked` reads: the viewer and an issue detail
+    (comment nodes + timeline cross-references)."""
+
+    def __init__(
+        self,
+        *,
+        raise_on: set[str] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.raise_on = raise_on or set()
+        self.payload = payload
+
+    def api_user(self) -> str:
+        if "api_user" in self.raise_on:
+            raise RuntimeError("gh auth failed")
+        return "testuser"
+
+    def graphql(self, query: str, **variables: str) -> dict[str, object]:
+        if "graphql" in self.raise_on:
+            raise RuntimeError("boom")
+        if self.payload is not None:
+            return self.payload
+        return {
+            "data": {
+                "repository": {
+                    "issue": {
+                        "comments": {"nodes": []},
+                        "timelineItems": {"nodes": []},
+                    }
+                }
+            }
+        }
+
+
+def test_commented_or_linked_gate_probe_failure(tmp_path: Path) -> None:
+    """Issue 078: `commented_or_linked` is registered (`VERIFY_GATES` +
+    `VALID_VERIFY_GATES`) but non-listable — no job can name it under `verify:` —
+    and a gh probe failure is a failed gate, never a pass and never a crash."""
+    from herdr_routines.config import load_config
+
+    assert "commented_or_linked" in VERIFY_GATES
+    assert "commented_or_linked" in VALID_VERIFY_GATES
+    assert "commented_or_linked" in FIX_WORKER_VERIFY_GATES
+
+    config_path = tmp_path / "jobs.yaml"
+    config_path.write_text(
+        f"version: 1\njobs:\n  - name: a\n    cron: '0 3 * * *'\n"
+        f"    repo: {tmp_path}\n    prompt: p\n    verify: [commented_or_linked]\n"
+    )
+    with pytest.raises(ConfigError, match="cannot list"):
+        load_config(config_path)
+
+    from herdr_routines.verify import VerifyContext, VerifyTarget
+
+    fields: dict[str, Any] = {
+        "job": make_job(tmp_path),
+        "run_id": "r",
+        "started_at": datetime(2026, 10, 23, 5, 0, tzinfo=UTC),
+        "report_path": tmp_path / "report.md",
+        "trusted_review_authors": (),
+        "target": VerifyTarget("acme", "widgets", 31),
+        "trusted_authors": frozenset({"testuser"}),
+    }
+    context = VerifyContext(gh=_CommentedOrLinkedGh(), **fields)  # type: ignore[arg-type]
+
+    verdict = VERIFY_GATES["commented_or_linked"](context)
+    assert (verdict.passed, verdict.reason) == (False, "worker_verification_failed")
+
+    # An unreadable/shapeless reply is a probe failure too: not a pass, not a crash.
+    verdict = VERIFY_GATES["commented_or_linked"](
+        VerifyContext(gh=_CommentedOrLinkedGh(payload={}), **fields)  # type: ignore[arg-type]
+    )
+    assert verdict.passed is False
