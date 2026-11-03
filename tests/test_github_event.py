@@ -35,6 +35,7 @@ import pytest
 import yaml
 
 from herdr_routines.auto_fix import (
+    GithubEvent,
     PostedBody,
     ReviewSearch,
     build_event_fix_prompt,
@@ -44,7 +45,13 @@ from herdr_routines.auto_fix import (
 )
 from herdr_routines.config import ConfigError, GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append, read_job
-from herdr_routines.tick import _WorkerFailed, _WorkerResult, _WorkerSettled, run_tick
+from herdr_routines.tick import (
+    _WorkerFailed,
+    _WorkerResult,
+    _WorkerSettled,
+    _verify_event_worker,
+    run_tick,
+)
 
 SPEC_PATH = (
     Path(__file__).resolve().parent.parent
@@ -136,7 +143,7 @@ def _make_event_job(repo: Path, **overrides: Any) -> Job:
         catch_up_minutes=120,
         timezone="UTC",
         on_missed="log",
-        checks=(GateCheck(kind="github_event"),),
+        checks=(GateCheck(kind="github_event", query="prs:labels"),),
         target="pr",
         max_workers_per_tick=1,
         max_attempts_per_target=3,
@@ -2019,3 +2026,41 @@ def test_event_worker_dirty_worktree_reported(
         if "uncommitted changes" in f"{n[0]} {n[1]}".lower()
     ]
     assert len(dirty) == 1
+
+
+def test_verify_event_worker_rejects_unmapped_query(tmp_path: Path) -> None:
+    """Issue 078 review: an unmapped query is a programming error, never a silent
+    fallback to the PR gates (which would fail an issue-shaped event on a missing
+    head SHA). The config loader's query set is closed, so this is unreachable via
+    a job file; a direct call proves the loud-failure contract."""
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo)
+    worker = _WorkerSettled(
+        state="done",
+        pane_id="p",
+        report_path=None,
+        final_agent_status="idle",
+        session_id=None,
+    )
+    event = GithubEvent(
+        event_id="evt-unknown",
+        number=9,
+        title="Unknown",
+        head_ref=None,
+        label=None,
+        payload={},
+        is_issue=True,
+    )
+    with pytest.raises(ValueError, match="no settle gates defined"):
+        _verify_event_worker(
+            job,
+            gh=cast(Any, object()),
+            run_id="r",
+            now=datetime(2026, 10, 13, 5, 0, tzinfo=UTC),
+            owner="test",
+            repo="repo",
+            query="issues:closed",
+            event=event,
+            worker=worker,
+            trusted_review_authors=(),
+        )

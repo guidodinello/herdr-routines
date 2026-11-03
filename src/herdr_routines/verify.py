@@ -268,14 +268,16 @@ def pushed_or_replied(ctx: VerifyContext) -> GateVerdict:
 # The issue detail `commented_or_linked` probes (issue 078): the comment list and the
 # timeline cross-references/connected PRs. One read, so an `issues:opened` worker's pass
 # is a single gh call. No `search(` in the query — it is an issue read, not a search.
+# `last` (not `first`) takes the newest 100 of each connection: GitHub returns these
+# connections oldest-first, and the gate only cares about items created after run start.
 _ISSUE_EFFECT_QUERY = """
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
-      comments(first: 100) {
+      comments(last: 100) {
         nodes { author { login } createdAt }
       }
-      timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]) {
+      timelineItems(last: 100, itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT]) {
         nodes {
           __typename
           createdAt

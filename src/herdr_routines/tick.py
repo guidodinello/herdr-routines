@@ -1420,6 +1420,18 @@ def _process_event_target(
         e.event_id: attempt_count_for_event(history_path, job.name, e.event_id)
         for e in new_events
     }
+    # One pass over the job's history for every exhausted event this tick, instead of
+    # re-scanning the whole file once per budget-exhausted event (issue 078).
+    exhausted_reported: set[str] = set()
+    for record in read_job(history_path, job.name):
+        extra = record.extra
+        event_id = extra.get("event_id") if extra else None
+        if (
+            extra is not None
+            and extra.get("reason") == "max_attempts_exceeded"
+            and isinstance(event_id, str)
+        ):
+            exhausted_reported.add(event_id)
     candidates: list[GithubEvent] = []
     for event in new_events:
         attempt = attempts[event.event_id]
@@ -1429,13 +1441,7 @@ def _process_event_target(
             # no further because every later tick lands here. Report the exhaustion
             # once; repeating the same record and notification every tick would only
             # bury the first one.
-            already_reported = any(
-                r.extra
-                and r.extra.get("reason") == "max_attempts_exceeded"
-                and r.extra.get("event_id") == event.event_id
-                for r in read_job(history_path, job.name)
-            )
-            if not already_reported:
+            if event.event_id not in exhausted_reported:
                 append(
                     history_path,
                     HistoryRecord(
@@ -1452,6 +1458,7 @@ def _process_event_target(
                         ),
                     ),
                 )
+                exhausted_reported.add(event.event_id)
                 if _notify_gate(job, "failure"):
                     _notify(
                         client,
@@ -3028,8 +3035,9 @@ def _dispatch_fix_worker(
 _FIX_WORKER_GATES: tuple[VerifyGate, ...] = ("worktree_clean", "pushed_or_replied")
 # What proves an event worker's `done` per `github_event` query (issue 078). A PR-shaped
 # event uses 070's gate set; an issue has no head branch, so the work shipping means a
-# comment on it or a PR linked to it. Unknown queries fall back to the PR set, which
-# fails closed (a missing head sha is `worker_verification_failed`).
+# comment on it or a PR linked to it. The config loader's query set is closed, so a
+# missing key is a programming error, not a query we can safely guess a gate set for:
+# `_verify_event_worker` raises rather than silently applying another query's gates.
 _EVENT_WORKER_GATES: dict[str, tuple[VerifyGate, ...]] = {
     "prs:labels": _FIX_WORKER_GATES,
     "ci:failed": _FIX_WORKER_GATES,
@@ -3056,7 +3064,11 @@ def _verify_event_worker(
 ) -> tuple[verify.VerifyResult, ...]:
     """Run the query's settle gates for an event worker whose agent said `done`. The
     agent's word is not proof: these read the worktree and the PR/issue (issue 078)."""
-    gates = _EVENT_WORKER_GATES.get(query or "prs:labels", _FIX_WORKER_GATES)
+    if query is None or query not in _EVENT_WORKER_GATES:
+        raise ValueError(
+            f"{job.name}: no settle gates defined for github_event query {query!r}"
+        )
+    gates = _EVENT_WORKER_GATES[query]
     return verify.run_verify_gates(
         gates,
         VerifyContext(
