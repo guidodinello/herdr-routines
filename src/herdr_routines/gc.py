@@ -43,7 +43,7 @@ PIPELINE_WORKTREE_GLOB = "auto-pipeline-*"
 PIPELINE_STATE_JSON_NAME = "state.json"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Row:
     branch: str
     worktree_exists: bool
@@ -73,7 +73,7 @@ def collectible(row: Row, older_than_days: int) -> bool:
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Orphan:
     """A worktree-parent-dir entry `git worktree list` doesn't know about (issue 045).
 
@@ -332,7 +332,7 @@ def detect_base(repo: Path) -> str:
 GH_MERGED_PR_LIMIT = 500
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MergedPr:
     """One merged PR as ``gh`` reports it: the commit its head branch ended on and when
     it merged. ``head_oid`` is None when ``gh`` did not report one, which can vouch for

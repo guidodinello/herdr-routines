@@ -98,7 +98,7 @@ class VerifyContext:
 
 @dataclass(frozen=True, slots=True)
 class VerifyResult:
-    gate: str
+    gate: VerifyGate
     passed: bool
     reason: str | None
 
