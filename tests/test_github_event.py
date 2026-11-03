@@ -1571,3 +1571,436 @@ def test_event_worktree_reuse_not_clean_does_not_consume_attempt(
     blocked = [n for n in client.notifications if "blocked" in n[0]]
     assert len(blocked) == 1
     assert str(retained) in (blocked[0][1] or "")
+
+
+# -- issue 078: verified gates for event-target fix workers ----------------------
+#
+# Maps 1:1 to the `## Acceptance criteria` in
+# `docs/pipeline/runs/20261103T050000Z/spec.md` (spec v2). `done` is the agent's
+# word here too: a settled event worker must prove its query's required action
+# (push/reply for a PR event, a comment or linked PR for an issue event) before it
+# stays `done`, and a failure keeps its own reason. Worktrees are real git trees
+# here (`_gated_ticks` does not stub `subprocess`), so the gates see them.
+
+
+class _HeadShaGh(EventGhClient):
+    """EventGhClient whose `pr_view` also reports `headRefOid` — what
+    `enrich_event_detail` captures as the dispatch head for the settle gates.
+    `shas` is consumed one per `pr_view` call; once empty, the last sha repeats
+    (a PR head does not move on its own)."""
+
+    def __init__(self, shas: list[str], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.shas = list(shas)
+        self.current_sha = shas[0]
+
+    def _next_sha(self) -> str:
+        if self.shas:
+            self.current_sha = self.shas.pop(0)
+        return self.current_sha
+
+    def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
+        self.calls.append(f"pr_view:{number}")
+        if "pr_view" in self.raise_on:
+            raise RuntimeError("gh pr view failed")
+        if not self.events or number != EVENT_NUMBER:
+            return {}
+        return {
+            "statusCheckRollup": [{"name": "ci", "state": "SUCCESS"}],
+            "headRefName": EVENT_BRANCH,
+            "title": EVENT_TITLE,
+            "labels": [{"name": EVENT_LABEL}],
+            "headRefOid": self._next_sha(),
+        }
+
+
+class _DirtyWorktreeClient(RecordingHerdrClient):
+    """The worker's agent run edits files it never commits: every worktree under
+    repo/.worktrees is dirty when the agent settles."""
+
+    def __init__(self, repo: Path) -> None:
+        super().__init__()
+        self.repo = repo
+
+    def agent_prompt_wait_with_watchdog(
+        self,
+        *,
+        target: str,
+        text: str,
+        timeout_ms: int,
+        poll_interval_s: float = 30.0,
+        on_poll: Any = None,
+    ) -> str:
+        self.prompts.append(text)
+        worktrees = self.repo / ".worktrees"
+        if worktrees.is_dir():
+            for wt in worktrees.iterdir():
+                if wt.is_dir():
+                    (wt / "leftover.txt").write_text("edited, never committed\n")
+        return "idle"
+
+
+class _IssueOutcomeGh(ScriptedIssueGh):
+    """`issues:opened` search + the issue detail the `commented_or_linked` gate
+    reads: comment nodes and timeline cross-references for the polled issue, the
+    real GraphQL shapes (__typename / createdAt / source). Serves the issue shape
+    for any read that is not the `search(` poll."""
+
+    def __init__(
+        self,
+        numbers: list[int],
+        *,
+        comments: list[dict[str, object]],
+        cross_refs: list[dict[str, object]],
+    ) -> None:
+        super().__init__(numbers)
+        self.comments = comments
+        self.cross_refs = cross_refs
+
+    def graphql(self, query: str, **variables: str) -> dict[str, object]:
+        self._maybe_raise("graphql")
+        if "search(" not in query:
+            return {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "comments": {"nodes": list(self.comments)},
+                            "timelineItems": {"nodes": list(self.cross_refs)},
+                        }
+                    }
+                }
+            }
+        return super().graphql(query, **variables)
+
+    def pr_view(self, *, owner: str, repo: str, number: int) -> dict[str, object]:
+        self.calls.append(f"pr_view:{number}")
+        if "pr_view" in self.raise_on:
+            raise RuntimeError("gh pr view failed")
+        return {
+            "title": f"Linked {number}",
+            "headRefName": f"link-{number}",
+            "headRefOid": f"sha-{number}",
+        }
+
+
+def _gated_ticks(
+    job: Job,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gh: EventGhClient,
+    client: RecordingHerdrClient,
+) -> tuple[Path, Any]:
+    """Register on one tick, then a `tick(minute)` callable for later ticks. Real
+    `git` subprocess calls: the settle gates read real worktrees."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    config = RoutinesConfig(jobs=(job,))
+    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
+    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
+
+    def tick(minute: int) -> Any:
+        return run_tick(
+            config,
+            history_path,
+            client=client,  # type: ignore[arg-type]
+            now=t0 + timedelta(minutes=minute),
+        )
+
+    return history_path, tick
+
+
+def _gate_attempt_records(history_path: Path, job_name: str) -> list[HistoryRecord]:
+    return [
+        r
+        for r in read_job(history_path, job_name)
+        if r.extra and "fix_worker_agent" in r.extra
+    ]
+
+
+def test_event_fix_worker_done_without_effect_recorded_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC1: a `prs:labels` event worker settles done having neither pushed the
+    head branch nor replied — it is recorded failed with the gate's reason, and
+    the event stays out of the watermark so the next tick retries it within
+    `max_attempts_per_target`."""
+    repo = _init_repo(tmp_path)
+    _git("branch", EVENT_BRANCH, cwd=repo)
+    job = _make_event_job(repo)
+    gh = _HeadShaGh(["sha-before"])
+    client = RecordingHerdrClient()
+    history_path, tick = _gated_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    for minute in (1, 2, 3, 4):
+        tick(minute)
+
+    attempts = _gate_attempt_records(history_path, job.name)
+    assert len(client.tab_creates) == 3, "three retries within the budget, then skip"
+    assert [(a.state, a.extra["reason"]) for a in attempts] == [
+        ("failed", "worker_pushed_nothing")
+    ] * 3
+    verdicts = {
+        v["gate"]: (v["passed"], v["reason"])
+        for v in attempts[0].extra["verify"]  # type: ignore[index]
+    }
+    assert verdicts == {
+        "worktree_clean": (True, None),
+        "pushed_or_replied": (False, "worker_pushed_nothing"),
+    }
+
+    # The event never joins the `handled` watermark, so it keeps being retried.
+    watermark = {
+        e
+        for r in read_job(history_path, job.name)
+        if r.extra and r.extra.get("last_seen_event_ids")
+        for e in r.extra["last_seen_event_ids"]
+    }
+    assert EVENT_ID not in watermark
+
+    # Until the per-event budget taps out, which is a `skipped` + notify, not a
+    # record that pretends the work shipped.
+    [skipped] = [
+        r
+        for r in read_job(history_path, job.name)
+        if r.state == "skipped"
+        and r.extra
+        and r.extra.get("reason") == "max_attempts_exceeded"
+    ]
+    assert skipped.extra is not None and skipped.extra.get("event_id") == EVENT_ID
+
+
+def test_event_worker_failure_reason_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC2: a failing event worker's record keeps its own reason — a
+    `_WorkerFailed` carries `worker_outcome.reason` (never the hardcoded
+    `gate_failed`), and a gate-failed `done` carries the failing gate's reason."""
+    repo = _init_repo(tmp_path)
+    job = _make_event_job(repo)
+    client = RecordingHerdrClient()
+
+    monkeypatch.setattr(
+        "herdr_routines.tick._dispatch_event_worker",
+        lambda **kwargs: _WorkerFailed(
+            reason="agent_start_failed", error="boom", pane_id="p1"
+        ),
+    )
+    history_path, tick = _gated_ticks(
+        job, tmp_path, monkeypatch, _HeadShaGh(["sha-before"]), client
+    )
+    tick(1)
+    [record] = _gate_attempt_records(history_path, job.name)
+    assert record.state == "failed"
+    assert record.extra is not None
+    assert record.extra.get("reason") == "agent_start_failed"
+    assert record.extra.get("error") == "boom"
+    assert record.extra.get("reason") != "gate_failed"
+
+    monkeypatch.setattr(
+        "herdr_routines.tick._dispatch_event_worker",
+        lambda **kwargs: _WorkerSettled(
+            state="done",
+            pane_id="p2",
+            report_path=None,
+            final_agent_status="idle",
+            session_id=None,
+            worktree_path=str(repo),
+        ),
+    )
+    tick(2)
+    [record] = _gate_attempt_records(history_path, job.name)[1:]
+    assert record.state == "failed"
+    assert record.extra is not None
+    # The event carries `prs:labels`' gate set, and `pushed_or_replied` fails with
+    # the missing dispatch head — that gate's reason is the record's reason.
+    assert {v["gate"]: (v["passed"], v["reason"]) for v in record.extra["verify"]} == {
+        "worktree_clean": (True, None),
+        "pushed_or_replied": (False, "worker_verification_failed"),
+    }
+    assert record.extra.get("reason") == "worker_verification_failed"
+    assert record.extra.get("reason") != "gate_failed"
+
+
+def test_prs_labels_event_worker_done_gates_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3: for `prs:labels`, a done event worker passes exactly the 070 gate set —
+    the worktree `_dispatch_event_worker` returns is what `worktree_clean` reads,
+    and the head sha `enrich_event_detail`'s `pr_view` reported at dispatch is
+    passed as `dispatch_head_sha` (here the head moved since, so
+    `pushed_or_replied` passes)."""
+    repo = _init_repo(tmp_path)
+    _git("branch", EVENT_BRANCH, cwd=repo)
+    job = _make_event_job(repo)
+    gh = _HeadShaGh(["sha-before", "sha-after"])
+    client = RecordingHerdrClient()
+    history_path, tick = _gated_ticks(job, tmp_path, monkeypatch, gh, client)
+
+    tick(1)
+
+    attempts = _gate_attempt_records(history_path, job.name)
+    assert len(attempts) == 1 and len(client.tab_creates) == 1
+    record = attempts[0]
+    assert record.state == "done"
+    assert record.extra is not None
+    # A clean done is not a gate failure: no reason, the PR mirror's worktree.
+    assert record.extra.get("reason") is None
+    assert record.extra.get("worktree_path") == str(
+        repo / ".worktrees" / f"event-{EVENT_ID}"
+    )
+    assert [(v["gate"], v["passed"]) for v in record.extra["verify"]] == [
+        ("worktree_clean", True),
+        ("pushed_or_replied", True),
+    ]
+
+    # A passed event joins the watermark: the re-poll dispatches nothing.
+    tick(2)
+    assert len(client.tab_creates) == 1
+    terminal = read_job(history_path, job.name)[-1]
+    assert terminal.extra is not None
+    assert EVENT_ID in terminal.extra.get("last_seen_event_ids", [])
+
+
+def _issue_ticks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gh: _IssueOutcomeGh,
+) -> tuple[Path, Any, _IssueOutcomeGh, Job]:
+    """The `issues:opened` shape: register, adopt an empty baseline on the first
+    poll, return the `tick(minute)` callable, the fake (so the test can add the
+    issue between polls) and the job."""
+    repo = _init_repo(tmp_path)
+    job = _issue_job(repo)
+    client = RecordingHerdrClient()
+    history_path, tick = _gated_ticks(job, tmp_path, monkeypatch, gh, client)
+    tick(1)  # first poll: empty baseline adopted, nothing dispatched
+    assert client.tab_creates == []
+    return history_path, tick, gh, job
+
+
+def test_issues_opened_event_worker_done_via_linked_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC4: for `issues:opened`, a done event worker passes the new
+    `commented_or_linked` gate when a PR cross-referenced the issue since run
+    start — the prompt told the worker to branch and open a PR, and the link
+    proves the work shipped."""
+    # A cross-reference stamped at the tick's own second: after run start.
+    gh = _IssueOutcomeGh(
+        numbers=[],
+        comments=[],
+        cross_refs=[
+            {
+                "__typename": "CrossReferencedEvent",
+                "createdAt": "2026-10-13T05:02:00Z",
+                "source": {"__typename": "PullRequest", "number": 12},
+            }
+        ],
+    )
+    history_path, tick, gh, job = _issue_ticks(tmp_path, monkeypatch, gh)
+
+    gh.numbers = [9]
+    tick(2)
+
+    attempts = _gate_attempt_records(history_path, job.name)
+    [record] = attempts
+    assert record.state == "done"
+    assert record.extra is not None
+    assert record.extra.get("reason") is None
+    assert {(v["gate"], v["passed"]) for v in record.extra["verify"]} == {
+        ("worktree_clean", True),
+        ("commented_or_linked", True),
+    }
+    terminal = read_job(history_path, job.name)[-1]
+    assert terminal.extra is not None
+    assert "evt-issue-9" in terminal.extra.get("last_seen_event_ids", [])
+
+
+def test_issues_opened_event_worker_done_via_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC5: for `issues:opened`, a done event worker also passes
+    `commented_or_linked` when a new comment from a trusted author lands on the
+    issue since run start (whole-second timestamps, GitHub's stamp has none)."""
+    gh = _IssueOutcomeGh(
+        numbers=[],
+        comments=[
+            {
+                "author": {"login": "testuser"},
+                "body": "Fixed by the PR I just opened.",
+                "createdAt": "2026-10-13T05:02:00Z",
+            }
+        ],
+        cross_refs=[],
+    )
+    history_path, tick, gh, job = _issue_ticks(tmp_path, monkeypatch, gh)
+
+    gh.numbers = [9]
+    tick(2)
+
+    attempts = _gate_attempt_records(history_path, job.name)
+    [record] = attempts
+    assert record.state == "done"
+    assert record.extra is not None
+    assert record.extra.get("reason") is None
+    assert {(v["gate"], v["passed"]) for v in record.extra["verify"]} == {
+        ("worktree_clean", True),
+        ("commented_or_linked", True),
+    }
+    terminal = read_job(history_path, job.name)[-1]
+    assert terminal.extra is not None
+    assert "evt-issue-9" in terminal.extra.get("last_seen_event_ids", [])
+
+
+def test_event_worker_dirty_worktree_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC7 (non-blocking): a gate-failed done caused by uncommitted changes is a
+    first detection — reported and notified like the PR path — and a later tick
+    is quiet about the same tree instead of re-notifying forever."""
+    repo = _init_repo(tmp_path)
+    _git("branch", EVENT_BRANCH, cwd=repo)
+    job = _make_event_job(repo)
+    gh = _HeadShaGh(["sha-before"])
+    client = _DirtyWorktreeClient(repo)
+    history_path, tick = _gated_ticks(job, tmp_path, monkeypatch, gh, client)
+    wt_path = repo / ".worktrees" / f"event-{EVENT_ID}"
+
+    tick(1)
+    [record] = _gate_attempt_records(history_path, job.name)
+    assert record.state == "failed"
+    assert record.extra is not None
+    assert record.extra.get("reason") == "worker_left_uncommitted_changes"
+    assert record.extra.get("worktree_path") == str(wt_path)
+    failing = {v["gate"]: (v["passed"], v["reason"]) for v in record.extra["verify"]}
+    assert failing["worktree_clean"] == (False, "worker_left_uncommitted_changes")
+
+    # First detection tells a human once, with the worktree path.
+    dirty = [
+        n
+        for n in client.notifications
+        if "uncommitted changes" in f"{n[0]} {n[1]}".lower()
+    ]
+    assert len(dirty) == 1
+    assert str(wt_path) in f"{dirty[0][0]} {dirty[0][1]}"
+
+    # The next tick does not re-notify about the same tree: the retained worktree
+    # is refused as dirty before any agent runs, and already known.
+    tick(2)
+    assert len(_gate_attempt_records(history_path, job.name)) == 1
+    [refusal] = [
+        r
+        for r in read_job(history_path, job.name)
+        if r.extra and r.extra.get("reason") == "worktree_reuse_not_clean"
+    ]
+    assert refusal.state == "skipped"
+    assert refusal.extra is not None
+    assert refusal.extra.get("worktree_path") == str(wt_path)
+    dirty = [
+        n
+        for n in client.notifications
+        if "uncommitted changes" in f"{n[0]} {n[1]}".lower()
+    ]
+    assert len(dirty) == 1
