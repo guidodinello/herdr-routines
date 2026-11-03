@@ -556,7 +556,7 @@ def test_commented_or_linked_gate_probe_failure(tmp_path: Path) -> None:
     }
     context = VerifyContext(gh=_CommentedOrLinkedGh(), **fields)  # type: ignore[arg-type]
 
-    verdict = VERIFY_GATES["commented_or_linked"](context)  # type: ignore[index]
+    verdict = VERIFY_GATES["commented_or_linked"](context)
     assert (verdict.passed, verdict.reason) == (False, "worker_verification_failed")
 
     # An unreadable/shapeless reply is a probe failure too: not a pass, not a crash.

@@ -244,6 +244,10 @@ def test_gated_event_check_behaviour_unchanged_after_migration(
     monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
     git = _RecordingGitSubprocess()
     monkeypatch.setattr("herdr_routines.tick.subprocess", git)
+    # Issue 078 added post-settle gates that need a real worktree; this golden pin
+    # stubs git, so it disables them to keep probing 077's record shapes and
+    # watermark rules. The gates have their own real-git tests in test_github_event.
+    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
 
     def tick(minute: int) -> None:
         run_tick(
@@ -302,7 +306,7 @@ def test_gated_event_check_behaviour_unchanged_after_migration(
     assert rec4.state == "done"
     rec4_extra = rec4.extra
     assert rec4_extra is not None
-    assert rec4_extra["reason"] == "gate_failed"
+    assert rec4_extra.get("reason") is None
     assert rec4_extra["attempt"] == 0
     assert rec4_extra["target"] == "issue"
     assert rec4_extra["fix_worker_agent"]
@@ -320,7 +324,7 @@ def test_gated_event_check_behaviour_unchanged_after_migration(
     rec7_extra = rec7.extra
     assert rec7_extra is not None
     assert rec7.state == "done"
-    assert rec7_extra["reason"] == "gate_failed"
+    assert rec7_extra.get("reason") is None
     assert rec7_extra["attempt"] == 0
     assert rec7_extra["event_number"] == 7
     assert rec7_extra["target"] == "pr"
@@ -405,9 +409,9 @@ def test_gated_event_check_behaviour_unchanged_after_migration(
     assert any("skipped" in title.lower() for title, _, _ in client.notifications), (
         "budget exhaustion must notify"
     )
-    assert _pr_event_id(10) in (_last_seen_event_ids(history_path, "gate-fix") or []), (
-        "the exhausted event is marked seen"
-    )
+    assert _pr_event_id(10) not in (
+        _last_seen_event_ids(history_path, "gate-fix") or []
+    ), "the exhausted event stays out of the watermark (issue 078)"
     tick(11)
     assert (
         len(_records_with_reason(history_path, "gate-fix", "max_attempts_exceeded"))
@@ -514,6 +518,9 @@ def test_single_event_watermark_per_job(
     )
     monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    # Issue 078's settle gates need a real worktree; this watermark pin stubs git and
+    # only cares which poll writes `last_seen_event_ids`.
+    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
 
     run_ids: list[str] = []
 

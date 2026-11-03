@@ -29,7 +29,7 @@ import subprocess as _sp
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -374,6 +374,9 @@ def _register_then_tick(
     monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh_client)
     monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    # These 014-path tests predate issue 078's settle gates and stub git, so no real
+    # worktree exists to verify. The gates have their own tests (`_gated_ticks`).
+    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
 
     run_tick(config, history_path, client=client, now=at)  # type: ignore[arg-type]
     outcome = run_tick(
@@ -430,8 +433,7 @@ def test_github_event_new_event_dispatches_one_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC 2: one new matching event dispatches exactly one worker whose prompt
-    is seeded with the event payload, plus a per-attempt record with
-    `reason: gate_failed` and `event_id`."""
+    is seeded with the event payload, plus a per-attempt record with `event_id`."""
     repo = _init_repo(tmp_path)
     job = _make_event_job(repo)
     gh = EventGhClient(events=True)
@@ -451,11 +453,9 @@ def test_github_event_new_event_dispatches_one_worker(
     attempts = [
         r
         for r in read_job(history_path, job.name)
-        if r.extra and r.extra.get("reason") == "gate_failed"
+        if r.extra and r.extra.get("fix_worker_agent")
     ]
-    assert len(attempts) == 1, (
-        f"expected one gate_failed attempt record, got {len(attempts)}"
-    )
+    assert len(attempts) == 1, f"expected one per-attempt record, got {len(attempts)}"
     event_id = attempts[0].extra.get("event_id") if attempts[0].extra else None
     assert event_id is not None, "attempt record carries no event_id"
     assert str(EVENT_NUMBER) in str(event_id)
@@ -465,7 +465,6 @@ _EVENT_RECORD_KEYS = [
     "event_id",
     "event_number",
     "attempt",
-    "reason",
     "fix_worker_agent",
     "pane_id",
     "report_path",
@@ -476,11 +475,12 @@ _EVENT_RECORD_KEYS = [
 
 
 @pytest.mark.parametrize(
-    ("worker_result", "state", "extra_values", "trailing_keys"),
+    ("worker_result", "state", "reason", "extra_values", "trailing_keys"),
     [
         pytest.param(
             _WorkerFailed(reason="agent_start_failed", error="boom", pane_id="p1"),
             "failed",
+            "agent_start_failed",
             {
                 "pane_id": "p1",
                 "report_path": None,
@@ -488,12 +488,13 @@ _EVENT_RECORD_KEYS = [
                 "final_agent_status": None,
                 "error": "boom",
             },
-            ["error"],
+            ["reason", "error"],
             id="failure-with-pane",
         ),
         pytest.param(
             _WorkerFailed(reason="clone_failed", error="nope"),
             "failed",
+            "clone_failed",
             {
                 "pane_id": None,
                 "report_path": None,
@@ -501,7 +502,7 @@ _EVENT_RECORD_KEYS = [
                 "final_agent_status": None,
                 "error": "nope",
             },
-            ["error"],
+            ["reason", "error"],
             id="failure-without-pane",
         ),
         pytest.param(
@@ -513,6 +514,7 @@ _EVENT_RECORD_KEYS = [
                 session_id="sess-9",
             ),
             "done",
+            None,
             {
                 "pane_id": "p2",
                 "report_path": "/reports/r.md",
@@ -529,12 +531,14 @@ def test_github_event_worker_result_history_record(
     monkeypatch: pytest.MonkeyPatch,
     worker_result: _WorkerResult,
     state: str,
+    reason: str | None,
     extra_values: dict[str, Any],
     trailing_keys: list[str],
 ) -> None:
     """The per-event history record built from a worker result: exact `extra` key order
-    (it is the JSONL column order), the values copied from the worker, and the optional
-    `error` key present only when the worker reported one."""
+    (it is the JSONL column order), the values copied from the worker, a failure's own
+    reason preserved (issue 078) and the optional `error` key present only when the
+    worker reported one."""
     monkeypatch.setattr(
         "herdr_routines.tick._dispatch_event_worker", lambda **kwargs: worker_result
     )
@@ -558,7 +562,7 @@ def test_github_event_worker_result_history_record(
     assert record.state == state
     assert record.extra is not None
     assert list(record.extra) == _EVENT_RECORD_KEYS + trailing_keys
-    assert record.extra["reason"] == "gate_failed"
+    assert record.extra.get("reason") == reason
     assert record.extra["target"] == "pr"
     assert record.extra["attempt"] == 0
     for key, value in extra_values.items():
@@ -584,6 +588,8 @@ def test_github_event_repoll_dedups_same_event(
     monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
     monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    # Stubbed git means no real worktree; the settle gates are 078's own tests.
+    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
 
     t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1079,6 +1085,9 @@ def _event_ticks(
     monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
     monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
     monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    # The 014-path tests below stub git, so no real worktree exists to verify; issue
+    # 078's settle gates have their own real-git tests (`_gated_ticks`).
+    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
     t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
 
@@ -1719,6 +1728,18 @@ def _gate_attempt_records(history_path: Path, job_name: str) -> list[HistoryReco
     ]
 
 
+def _extra(record: HistoryRecord) -> dict[str, Any]:
+    return cast(dict[str, Any], record.extra or {})
+
+
+def _verify_records(record: HistoryRecord) -> list[dict[str, Any]]:
+    return cast(list[dict[str, Any]], _extra(record).get("verify", []))
+
+
+def _seen_ids(record: HistoryRecord) -> list[str]:
+    return cast(list[str], _extra(record).get("last_seen_event_ids", []))
+
+
 def test_event_fix_worker_done_without_effect_recorded_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1738,12 +1759,11 @@ def test_event_fix_worker_done_without_effect_recorded_failed(
 
     attempts = _gate_attempt_records(history_path, job.name)
     assert len(client.tab_creates) == 3, "three retries within the budget, then skip"
-    assert [(a.state, a.extra["reason"]) for a in attempts] == [
+    assert [(a.state, _extra(a)["reason"]) for a in attempts] == [
         ("failed", "worker_pushed_nothing")
     ] * 3
     verdicts = {
-        v["gate"]: (v["passed"], v["reason"])
-        for v in attempts[0].extra["verify"]  # type: ignore[index]
+        v["gate"]: (v["passed"], v["reason"]) for v in _verify_records(attempts[0])
     }
     assert verdicts == {
         "worktree_clean": (True, None),
@@ -1751,12 +1771,7 @@ def test_event_fix_worker_done_without_effect_recorded_failed(
     }
 
     # The event never joins the `handled` watermark, so it keeps being retried.
-    watermark = {
-        e
-        for r in read_job(history_path, job.name)
-        if r.extra and r.extra.get("last_seen_event_ids")
-        for e in r.extra["last_seen_event_ids"]
-    }
+    watermark = {e for r in read_job(history_path, job.name) for e in _seen_ids(r)}
     assert EVENT_ID not in watermark
 
     # Until the per-event budget taps out, which is a `skipped` + notify, not a
@@ -1815,7 +1830,7 @@ def test_event_worker_failure_reason_preserved(
     assert record.extra is not None
     # The event carries `prs:labels`' gate set, and `pushed_or_replied` fails with
     # the missing dispatch head — that gate's reason is the record's reason.
-    assert {v["gate"]: (v["passed"], v["reason"]) for v in record.extra["verify"]} == {
+    assert {v["gate"]: (v["passed"], v["reason"]) for v in _verify_records(record)} == {
         "worktree_clean": (True, None),
         "pushed_or_replied": (False, "worker_verification_failed"),
     }
@@ -1850,7 +1865,7 @@ def test_prs_labels_event_worker_done_gates_pass(
     assert record.extra.get("worktree_path") == str(
         repo / ".worktrees" / f"event-{EVENT_ID}"
     )
-    assert [(v["gate"], v["passed"]) for v in record.extra["verify"]] == [
+    assert [(v["gate"], v["passed"]) for v in _verify_records(record)] == [
         ("worktree_clean", True),
         ("pushed_or_replied", True),
     ]
@@ -1860,7 +1875,7 @@ def test_prs_labels_event_worker_done_gates_pass(
     assert len(client.tab_creates) == 1
     terminal = read_job(history_path, job.name)[-1]
     assert terminal.extra is not None
-    assert EVENT_ID in terminal.extra.get("last_seen_event_ids", [])
+    assert EVENT_ID in _seen_ids(terminal)
 
 
 def _issue_ticks(
@@ -1909,13 +1924,13 @@ def test_issues_opened_event_worker_done_via_linked_pr(
     assert record.state == "done"
     assert record.extra is not None
     assert record.extra.get("reason") is None
-    assert {(v["gate"], v["passed"]) for v in record.extra["verify"]} == {
+    assert {(v["gate"], v["passed"]) for v in _verify_records(record)} == {
         ("worktree_clean", True),
         ("commented_or_linked", True),
     }
     terminal = read_job(history_path, job.name)[-1]
     assert terminal.extra is not None
-    assert "evt-issue-9" in terminal.extra.get("last_seen_event_ids", [])
+    assert "evt-issue-9" in _seen_ids(terminal)
 
 
 def test_issues_opened_event_worker_done_via_comment(
@@ -1945,13 +1960,13 @@ def test_issues_opened_event_worker_done_via_comment(
     assert record.state == "done"
     assert record.extra is not None
     assert record.extra.get("reason") is None
-    assert {(v["gate"], v["passed"]) for v in record.extra["verify"]} == {
+    assert {(v["gate"], v["passed"]) for v in _verify_records(record)} == {
         ("worktree_clean", True),
         ("commented_or_linked", True),
     }
     terminal = read_job(history_path, job.name)[-1]
     assert terminal.extra is not None
-    assert "evt-issue-9" in terminal.extra.get("last_seen_event_ids", [])
+    assert "evt-issue-9" in _seen_ids(terminal)
 
 
 def test_event_worker_dirty_worktree_reported(
@@ -1974,7 +1989,7 @@ def test_event_worker_dirty_worktree_reported(
     assert record.extra is not None
     assert record.extra.get("reason") == "worker_left_uncommitted_changes"
     assert record.extra.get("worktree_path") == str(wt_path)
-    failing = {v["gate"]: (v["passed"], v["reason"]) for v in record.extra["verify"]}
+    failing = {v["gate"]: (v["passed"], v["reason"]) for v in _verify_records(record)}
     assert failing["worktree_clean"] == (False, "worker_left_uncommitted_changes")
 
     # First detection tells a human once, with the worktree path.
