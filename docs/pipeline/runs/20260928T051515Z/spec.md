@@ -325,4 +325,3 @@ change to any `blocking`/`non-blocking` call or confidence tier.
   `src/`). Every test name above is a specification to be written by the implementation, not a
   reference to a passing test. Tiering in this spec is a judgement about what must block the
   PR, not an observation of current behaviour. — confidence: high
-
