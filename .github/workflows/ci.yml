@@ -55,6 +55,10 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
+          # Must match language_version in .pre-commit-config.yaml, or uv
+          # builds the venv on the newest allowed Python and pre-commit
+          # can't find python3.13.
+          python-version: "3.13"
 
       - name: Install dependencies
         run: uv sync --locked --dev
@@ -63,6 +67,18 @@ jobs:
       # it pushes, so CI and the pipeline's own check cannot drift apart.
       - name: ruff format + lint
         run: scripts/ci-check.sh lint
+
+      # Hook envs live in ~/.cache/pre-commit, outside setup-uv's cache.
+      # pre-commit rebuilds an env whose interpreter has since changed.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      # Runs the whole .pre-commit-config.yaml so the hygiene hooks gate merges
+      # too; a hookless clone, --no-verify or the web editor skips them locally.
+      - name: pre-commit hooks
+        run: uv run pre-commit run --all-files --show-diff-on-failure
 
   typecheck-python:
     name: Typecheck Python

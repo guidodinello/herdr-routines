@@ -56,4 +56,3 @@ non-blocking: exact wording of grace-window note for open question 2 may remain 
 confidence: high — doc-contract greps are deterministic for criteria 1-5
 confidence: medium — manual 2026-08-25 session-resume verification used bare workspace, not shared multi-pane workspace; stage 1 sanity-check against shared-workspace flow documented in Risks
 confidence: low — live Pi launcher scripts (~/.local/bin/pipeline-launch-*.sh) remain out of scope and are not verified by tests
-

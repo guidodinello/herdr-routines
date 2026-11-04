@@ -27,6 +27,7 @@ allow-direct-references = true
 [dependency-groups]
 dev = [
     "mypy>=2.3.0",
+    "pre-commit>=4.7",
     "pytest>=9.1.1",
     "ruff>=0.16.4",
     "types-croniter>=6.0.0",
