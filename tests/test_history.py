@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -555,3 +557,50 @@ def test_read_all_skips_unknown_state_line(
 
     assert [r.state for r in records] == ["registered", "done"]
     assert f"skipping unparseable history line {tmp_history_path}:2" in caplog.text
+
+
+def _concurrent_append_worker(path: Path, worker: int, count: int) -> None:
+    for i in range(count):
+        append(
+            path,
+            HistoryRecord(
+                ts=datetime.now(UTC),
+                job=f"writer-{worker}",
+                state="done",
+                run_id=f"writer-{worker}-{i}",
+                # A record this size spans several buffered write syscalls, which is
+                # exactly the window where unguarded appends interleave between
+                # processes — the corruption issue 079's internal history lock ends.
+                extra={"payload": "x" * 40_000},
+            ),
+        )
+
+
+def test_concurrent_history_appends_are_atomic(tmp_history_path: Path) -> None:
+    """Concurrent multi-process writers — tick dispatches and manual runs across
+    several jobs, the writers `append` must now shelter on its own lock — never
+    interleave: every line written is one complete, valid JSON record, and nothing
+    the writers appended is lost or merged with another record's bytes."""
+    workers, per_worker = 4, 20
+    procs = [
+        multiprocessing.get_context("fork").Process(
+            target=_concurrent_append_worker, args=(tmp_history_path, w, per_worker)
+        )
+        for w in range(workers)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=60)
+        assert proc.exitcode == 0
+
+    lines = [ln for ln in tmp_history_path.read_text().splitlines() if ln]
+    total = workers * per_worker
+    assert len(lines) == total
+    run_ids = []
+    for line in lines:
+        # One line = one record, parseable on its own: no interleaved fragments.
+        record: dict[str, Any] = json.loads(line)
+        assert record["state"] == "done"
+        run_ids.append(record["run_id"])
+    assert len(set(run_ids)) == total
