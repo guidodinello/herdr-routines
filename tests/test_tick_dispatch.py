@@ -372,20 +372,21 @@ def test_earlier_occurrences_collapse_into_one_missed_record_before_the_run(
     kind: Kind, history: Path, cycle_calls: list[str]
 ) -> None:
     job = kind.make_job()
-    # Three fires (Oct 10, 11, 12) since registration: the first two collapse.
+    # Three fires (Oct 10, 11, 12) since the last finished run: the first two collapse.
+    # A never-run job does not collapse (its registration is only a scheduler watermark).
     append(
         history,
         HistoryRecord(
             ts=datetime(2026, 10, 9, 12, 0, tzinfo=UTC),
             job=job.name,
-            state="registered",
+            state="done",
         ),
     )
 
     _process(kind, job, history, GuardClient())
 
     records = read_job(history, job.name)
-    assert [r.state for r in records] == ["registered", "missed", "running"]
+    assert [r.state for r in records] == ["done", "missed", "running"]
     collapsed = records[1].extra
     assert collapsed is not None
     assert collapsed["reason"] == "collapsed_earlier_occurrences"

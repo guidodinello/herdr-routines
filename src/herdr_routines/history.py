@@ -233,7 +233,9 @@ def history_lock_path(path: Path) -> Path:
 
 
 @contextmanager
-def _history_lock(path: Path, *, timeout_s: float = HISTORY_LOCK_TIMEOUT_S) -> Generator[None]:
+def _history_lock(
+    path: Path, *, timeout_s: float = HISTORY_LOCK_TIMEOUT_S
+) -> Generator[None]:
     """Exclusive flock around one short history write, bounded rather than blocking.
 
     Every `append` takes this on its own so the ~40 call sites do not have to thread a
@@ -271,9 +273,8 @@ def append(path: Path, record: HistoryRecord) -> None:
     append from ever seeing two records spliced together."""
     path.parent.mkdir(parents=True, exist_ok=True)
     line = record.to_json_line()
-    with _history_lock(path):
-        with path.open("a") as f:
-            f.write(line + "\n")
+    with _history_lock(path), path.open("a") as f:
+        f.write(line + "\n")
 
 
 def read_all(path: Path) -> list[HistoryRecord]:
@@ -443,7 +444,12 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
     terminals the gated / review / audit cycles write without knowing the trigger, and the
     `interrupted_unknown` / pipeline-reconcile records, which reuse the run's run_id. "Latest
     before it" keeps `run --run-id <scheduled run_id>` from un-counting that run's original
-    scheduled terminal record."""
+    scheduled terminal record.
+
+    A `collapsed_earlier_occurrences` record is not a finished run: it reports occurrences
+    skipped *before* the one now being dispatched. Counting it as terminal would make a
+    concurrent dispatcher see the occurrence as not due and never reach the job lock (issue
+    079), so it is ignored here."""
     off_schedule_run_ids: set[str] = set()
     scheduled: HistoryRecord | None = None
     for record in read_job(path, job_name):
@@ -453,6 +459,8 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
             else:
                 off_schedule_run_ids.discard(record.run_id)
         elif record.state in TERMINAL_STATES:
+            if (record.extra or {}).get("reason") == "collapsed_earlier_occurrences":
+                continue
             off_schedule = _is_off_schedule(record) or (
                 record.run_id is not None and record.run_id in off_schedule_run_ids
             )
