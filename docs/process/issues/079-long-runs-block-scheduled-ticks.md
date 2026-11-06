@@ -1,7 +1,7 @@
 ---
 id: "079"
 title: "A long manual or request run holds the tick lock and blocks every scheduled job"
-status: open
+status: done
 priority: low
 area: scheduler
 ---
