@@ -102,16 +102,56 @@ Files touched (test-fixture seams consulted; nothing else exists):
 - **`pipeline` kind** stays detached and untouched by the job lock (it already holds no lock
   for its run); only its launch boundary flows through the per-job lock like everything else.
 
-## Acceptance
+## Acceptance criteria
 
-Mapping to the issue's blocking ACs:
+Each criterion has a tier (`blocking` / `non-blocking`) and a `confidence:` rating. Test
+names are exact — the three new tests are named in the issue; the others are existing tests
+this change must keep green (with the updates noted in Files touched).
 
-1. AC 1 — job A's per-job lock held does not stop job B dispatching: `test_long_run_does_not_block_other_jobs`.
-2. AC 2 — two dispatches of one job never overlap: `test_same_job_never_dispatched_concurrently`.
-3. AC 3 — history appends atomic under concurrent writers:
-   `test_concurrent_history_appends_are_atomic` (multi-process writers → every line valid
-   JSON, no interleaving).
+**Blocking**
 
-Verification: `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`; manual
-tier-3 spot-check of one long `run` coinciding with a tick that dispatches an unrelated job.
+1. **blocking, confidence: high** — AC 1: while job A's dispatch holds its per-job lock for a
+   long run, job B dispatches normally via tick and manual `run` (the 2026-10-23
+   `babysit-prs` silent skip cannot recur). Test: `test_long_run_does_not_block_other_jobs`
+2. **blocking, confidence: high** — AC 2: two dispatches of the same job never overlap; the
+   loser records `skipped` with reason `dispatch_in_flight` and issue 004's one-live-agent
+   guarantee holds. Test: `test_same_job_never_dispatched_concurrently`
+3. **blocking, confidence: high** — AC 3: history appends are atomic under concurrent
+   writers across jobs and manual runs — multi-process writers produce a JSONL where every
+   line is valid JSON with no interleaving. Test: `test_concurrent_history_appends_are_atomic`
+
+**Non-blocking**
+
+4. **non-blocking, confidence: medium** — `_cmd_run` refusal semantics change from "global
+   tick lock held" to "this job's dispatch already in flight", and the refusal no longer
+   waits a long run out. Test: `test_manual_pipeline_run_refuses_while_a_run_is_open`
+5. **non-blocking, confidence: medium** — `self-update` behaviour is unchanged: it contends
+   only for the brief global lock, so `TICK_LOCK_WAIT_S` never realistically fires on a long
+   run. Test: `test_self_update_respects_tick_lock`
+6. **non-blocking, confidence: low** — history rotation while job locks are held skips/warns
+   instead of waiting on a holder that may be an hour away; no deadlock from the documented
+   lock ordering (per-checkout inside job lock, history innermost).
+   Test: `test_run_tick_rotates_and_survives_rotation_error`
+7. **non-blocking, confidence: low** — two jobs sharing a repo's checkout cannot mutate git
+   state concurrently (`ensure_repo` brief lock for worktree mode; whole dispatch for
+   `workspace: root`). Test: `test_dispatch_reuses_existing_worktree`
+8. **non-blocking, confidence: medium** — `/job` request launches need no separate change
+   (they converge on `run`, which takes the per-job lock). Test: `test_tick_and_manual_run_share_dispatch`
+
+## Verification
+
+`uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`; manual tier-3
+spot-check of one long `run` coinciding with a tick that dispatches an unrelated job.
 Issue doc 079 gets a Log entry when this lands.
+
+## Changelog v1→v2
+
+- Renamed `## Acceptance` to `## Acceptance criteria` and expanded the three-issue-mapped
+  ACs into tiered items (`blocking` / `non-blocking`) each ending in `Test: <exact name>`,
+  with `confidence:` per item. Criteria 1–3 (blocking) are unchanged in substance from v1;
+  criteria 4–8 (non-blocking) pin down the guarantee-preserving side effects v1 only
+  described in prose (run refusal semantics, self-update, rotation/deadlock, per-checkout
+  lock, `/job` convergence).
+- Added `## Changelog v1→v2` (this section).
+- No changes to Problem, Approach, or Risks: the design, file list, and risk register are
+  carried over from v1 verbatim; v2 only strengthens the acceptance mapping.
