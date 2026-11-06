@@ -11,9 +11,12 @@ which spans the rolls, so no caller has to know they exist.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +25,12 @@ from typing import Literal, TypedDict, TypeIs, get_args
 from logger import get_logger
 
 log = get_logger(__name__)
+
+# How long a writer waits for a sibling writer before giving up. Appends hold the lock for
+# one line, so contention is measured in microseconds; the bound only matters when a
+# crashed-but-alive process is wedged, where a silent forever-wait would be worse than a
+# loud error (issue 079).
+HISTORY_LOCK_TIMEOUT_S = 30.0
 
 TerminalState = Literal["done", "failed", "skipped", "missed", "interrupted_unknown"]
 NonTerminalState = Literal["registered", "scheduled", "running"]
@@ -215,12 +224,57 @@ class HistoryRecord:
         )
 
 
+def history_lock_path(path: Path) -> Path:
+    """The sibling lock file that serializes writers of *path* (issue 079).
+
+    Derived from the live file's own name (`history.jsonl` -> `history.lock`) so a
+    custom history path gets its own lock rather than contending on the default one."""
+    return path.parent / f"{path.stem}.lock"
+
+
+@contextmanager
+def _history_lock(
+    path: Path, *, timeout_s: float = HISTORY_LOCK_TIMEOUT_S
+) -> Generator[None]:
+    """Exclusive flock around one short history write, bounded rather than blocking.
+
+    Every `append` takes this on its own so the ~40 call sites do not have to thread a
+    lock through; it is the innermost lock in tick.py's ordering (global decision ->
+    per-job dispatch -> history), so it may only ever be held for one record's write."""
+    lock_path = history_lock_path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"timed out after {timeout_s}s waiting for {lock_path}"
+                    ) from None
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def append(path: Path, record: HistoryRecord) -> None:
-    """Append one record. Callers needing overlap-safety should hold the tick lock first."""
+    """Append one record atomically with respect to every other writer (issue 079).
+
+    Concurrent writers are now normal — a long dispatch of job A no longer excludes a
+    tick or manual run of job B — so the record is written as a single line under a
+    sibling `history.lock` flock. One line per write also keeps a reader that races the
+    append from ever seeing two records spliced together."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(record.to_json_line())
-        f.write("\n")
+    line = record.to_json_line()
+    with _history_lock(path), path.open("a") as f:
+        f.write(line + "\n")
 
 
 def read_all(path: Path) -> list[HistoryRecord]:
@@ -287,33 +341,36 @@ def maybe_rotate(
 
     A same-second collision (two rotations in the same second) skips the rotation and warns
     rather than inventing a suffix, which would reintroduce the ordering bug `rolled_path`'s
-    docstring rules out. Callers hold the exclusive `tick.lock` (see tick.run_tick), which
-    makes this unreachable in practice; the guard is there so the failure mode is a
-    warning, not corrupted history. `Retention`-independent on purpose — the thresholds are
+    docstring rules out. The same `history.lock` that serializes `append` guards the check
+    and the rename, so a rotation can never interleave with a writer's line; the tick takes
+    it non-blockingly at the end of its run and skips/warns rather than waiting on an hour
+    away holder (issue 079). `Retention`-independent on purpose — the thresholds are
     passed in, so this module stays free of any config import.
     """
     if max_bytes is None and max_age_days is None:
         return None
     if not path.exists():
         return None
-    if not _over_rotation_threshold(
-        path, max_bytes=max_bytes, max_age_days=max_age_days, now=now
-    ):
-        return None
 
-    target = rolled_path(path, now)
-    if target.exists():
-        log.warning(
-            "history rotation skipped: %s already exists (leaving %s in place)",
-            target,
-            path,
-        )
-        return None
+    with _history_lock(path):
+        if not _over_rotation_threshold(
+            path, max_bytes=max_bytes, max_age_days=max_age_days, now=now
+        ):
+            return None
 
-    os.replace(path, target)
-    path.touch()
-    log.info("history rotated: %s -> %s", path, target)
-    return target
+        target = rolled_path(path, now)
+        if target.exists():
+            log.warning(
+                "history rotation skipped: %s already exists (leaving %s in place)",
+                target,
+                path,
+            )
+            return None
+
+        os.replace(path, target)
+        path.touch()
+        log.info("history rotated: %s -> %s", path, target)
+        return target
 
 
 def _over_rotation_threshold(
@@ -387,7 +444,12 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
     terminals the gated / review / audit cycles write without knowing the trigger, and the
     `interrupted_unknown` / pipeline-reconcile records, which reuse the run's run_id. "Latest
     before it" keeps `run --run-id <scheduled run_id>` from un-counting that run's original
-    scheduled terminal record."""
+    scheduled terminal record.
+
+    A `collapsed_earlier_occurrences` record is not a finished run: it reports occurrences
+    skipped *before* the one now being dispatched. Counting it as terminal would make a
+    concurrent dispatcher see the occurrence as not due and never reach the job lock (issue
+    079), so it is ignored here."""
     off_schedule_run_ids: set[str] = set()
     scheduled: HistoryRecord | None = None
     for record in read_job(path, job_name):
@@ -397,6 +459,8 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
             else:
                 off_schedule_run_ids.discard(record.run_id)
         elif record.state in TERMINAL_STATES:
+            if (record.extra or {}).get("reason") == "collapsed_earlier_occurrences":
+                continue
             off_schedule = _is_off_schedule(record) or (
                 record.run_id is not None and record.run_id in off_schedule_run_ids
             )

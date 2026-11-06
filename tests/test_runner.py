@@ -58,6 +58,9 @@ class ScriptedClient:
     def notification_show(self, title, *, body=None, sound="none"):
         self.notifications = [*getattr(self, "notifications", []), (title, body)]
 
+    def agent_statuses(self) -> dict[str, str]:
+        return {}
+
     def __init__(
         self,
         *,

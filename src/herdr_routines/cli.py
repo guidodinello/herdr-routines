@@ -112,11 +112,13 @@ from herdr_routines.tick import (
     pipeline_deadline_epoch,
     pipeline_report_path,
     run_tick,
-    tick_lock,
 )
 from herdr_routines.tmp_hygiene import reap_tmp
 
 log = get_logger(__name__)
+
+# Kept as cli's test seam for the brief global lock (issue 079 moved it out of dispatch).
+tick_lock = tick.tick_lock
 
 # Shared with `pipeline_run`'s contract (0 ok, 1 partial/failed) and argparse's own usage
 # code. A gate given a missing requirement returns 2, not 1: nothing was checked, and
@@ -743,20 +745,16 @@ def _load_config_or_exit(args: argparse.Namespace) -> RoutinesConfig:
 def _cmd_tick(args: argparse.Namespace) -> int:
     config = _load_config_or_exit(args)
     history_path = default_history_path()
-    lock_path = default_lock_path()
-    with tick_lock(lock_path) as acquired:
-        if not acquired:
-            # Another tick (or a manual `run`, or self-update) holds it — skip with
-            # rc 0, per docs/plan-v1.md §4. One INFO line so contention is visible in
-            # journalctl: a silent skip hid three nights of self-update collisions.
-            log.info("tick: skipped, tick lock %s is held", lock_path)
-            return 0
-        now = datetime.now(UTC)
-        client = HerdrClient()
-        outcome = run_tick(config, history_path, client=client, now=now)
-        for line in outcome.summaries:
-            log.info(line)
-        return 1 if outcome.any_job_failed else 0
+    # The global tick lock is no longer held across the whole tick (issue 079): run_tick
+    # takes it briefly around each job's schedule decision and the housekeeping preamble,
+    # and each dispatch holds only its own job lock. A decision phase that cannot get the
+    # lock skips with rc 0 inside run_tick, preserving the systemd contract.
+    now = datetime.now(UTC)
+    client = HerdrClient()
+    outcome = run_tick(config, history_path, client=client, now=now)
+    for line in outcome.summaries:
+        log.info(line)
+    return 1 if outcome.any_job_failed else 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -1163,9 +1161,10 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
         else:
             # Scale by (1 + retry_attempts) so the validate check accounts for
             # the worst-case tick time when a routine job retries transient failures
-            # (issue 008, spec risk 2: retry loop holds the tick lock), and by
-            # max_targets_per_run: a multi-target run (issue 076) runs one agent per
-            # target in turn, each bounded by start + run, plus the worktree/gh slop once.
+            # (issue 008), and by max_targets_per_run: a multi-target run (issue 076)
+            # runs one agent per target in turn, each bounded by start + run, plus the
+            # worktree/gh slop once. A tick still dispatches its jobs sequentially; only
+            # the lock it holds across them narrowed (issue 079).
             total_job_seconds += (
                 GATE_SLOP_S if job.pick in MULTI_TARGET_SELECTORS else 0
             ) + (
@@ -1205,31 +1204,33 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(" ".join(command))
         return 0
 
+    log.info("%s: starting run %s", job.name, run_id)
     # A manual run shares the `rt-<job>` agent name and the repo checkout with the
-    # scheduled tick, so it takes the tick lock.
-    with tick_lock(default_lock_path()) as acquired:
-        if not acquired:
-            log.error("%s: a tick is running; try again when it finishes", job.name)
-            if args.trigger == TRIGGER_REQUEST:
-                # Detached from Telegram, so nobody reads the log: say so where they look.
-                tick._notify(
-                    HerdrClient(),
-                    f"herdr-routines: {job.name} request refused",
-                    body="a tick is running; send /job again later",
-                    sound="request",
-                )
-            return 1
-        log.info("%s: starting run %s", job.name, run_id)
-        # Same dispatch as a scheduled tick (issue 074): the schedule decision is the only
-        # thing skipped. Called through the module so tests can see the call.
-        summary, failed = tick.dispatch_occurrence(
-            job,
-            default_history_path(),
-            tick.Occurrence(run_id, HistoryExtra(trigger=args.trigger)),
-            client=HerdrClient(),
-            now=now,
-            trusted_review_authors=config.trusted_review_authors,
+    # scheduled tick, so it takes this job's dispatch lock (issue 079), not the global
+    # tick lock. Same dispatch as a scheduled tick (issue 074): the schedule decision is
+    # the only thing skipped. Called through the module so tests can see the call.
+    summary, failed, in_flight = tick.dispatch_manual_occurrence(
+        job,
+        default_history_path(),
+        tick.Occurrence(run_id, HistoryExtra(trigger=args.trigger)),
+        client=HerdrClient(),
+        now=now,
+        trusted_review_authors=config.trusted_review_authors,
+    )
+    if in_flight:
+        log.error(
+            "%s: this job's dispatch is already running; try again when it finishes",
+            job.name,
         )
+        if args.trigger == TRIGGER_REQUEST:
+            # Detached from Telegram, so nobody reads the log: say so where they look.
+            tick._notify(
+                HerdrClient(),
+                f"herdr-routines: {job.name} request refused",
+                body="this job's dispatch is already running; send /job again later",
+                sound="request",
+            )
+        return 1
     (log.error if failed else log.info)(summary)
     return 1 if failed else 0
 

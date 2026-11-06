@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -178,6 +178,38 @@ def tick_lock(path: Path) -> Generator[bool]:
         os.close(fd)
 
 
+def job_lock_path(history_path: Path, job_name: str) -> Path:
+    """The per-job dispatch lock (issue 079): a sibling of the history file's state dir,
+    so it follows the same `HERDR_PLUGIN_STATE_DIR` override the history path does."""
+    return history_path.parent / "locks" / f"job-{job_name}.lock"
+
+
+@contextmanager
+def job_lock(history_path: Path, job_name: str) -> Generator[bool]:
+    """Exclusive, non-blocking flock held for one job's *entire* synchronous dispatch.
+
+    Replaces the tick-wide lock that used to span a run (issue 079): a long run of job A
+    holds only `locks/job-A.lock`, so ticks and manual runs of job B proceed. Yields True
+    when acquired and False when another dispatcher of the same job already holds it —
+    the loser records `skipped` with reason `dispatch_in_flight` rather than racing the
+    `rt-<job>` agent name or mutating the shared checkout."""
+    path = job_lock_path(history_path, job_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 @dataclass(frozen=True, slots=True)
 class TickOutcome:
     """What one `run_tick` call did. `any_job_failed` is what `cli._cmd_tick` maps to a
@@ -258,18 +290,25 @@ def run_tick(
     # are cleaned before any new agent spawn. Configured from `defaults:` only.
     tmp_hygiene = config.tmp_hygiene
     if tmp_hygiene.enabled:
-        try:
-            reaped = reap_tmp(
-                tmp_dir=Path(tmp_hygiene.tmp_dir), max_age_s=tmp_hygiene.max_age_s
-            )
-            log.info(
-                "tmp hygiene: removed %d, skipped %d fresh, %d errors",
-                reaped.removed,
-                reaped.skipped_fresh,
-                reaped.errors,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.warning("tmp hygiene reap failed (continuing): %s", e)
+        with tick_lock(default_lock_path()) as acquired:
+            if not acquired:
+                log.info(
+                    "tmp hygiene: skipped, tick lock %s is held", default_lock_path()
+                )
+            else:
+                try:
+                    reaped = reap_tmp(
+                        tmp_dir=Path(tmp_hygiene.tmp_dir),
+                        max_age_s=tmp_hygiene.max_age_s,
+                    )
+                    log.info(
+                        "tmp hygiene: removed %d, skipped %d fresh, %d errors",
+                        reaped.removed,
+                        reaped.skipped_fresh,
+                        reaped.errors,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("tmp hygiene reap failed (continuing): %s", e)
 
     summaries: list[str] = []
     any_job_failed = False
@@ -300,27 +339,79 @@ def run_tick(
     # it is safe to run unattended here; it carries the same best-effort contract as the reap
     # above, because a state-dir housekeeping failure must not be the reason systemd marks
     # the unit failed and a job never dispatches. Deleting anything is `prune`'s job.
-    try:
-        maybe_rotate(
-            history_path,
-            max_bytes=config.retention.history_max_bytes,
-            max_age_days=config.retention.history_max_age_days,
-            now=now,
-        )
-    except Exception as e:  # noqa: BLE001
-        log.warning("history rotation failed (continuing): %s", e)
+    with tick_lock(default_lock_path()) as acquired:
+        if not acquired:
+            # Never wait on the global lock here: a tick decision phase holds it briefly,
+            # but skip-and-warn keeps the end of a tick from stalling behind another one
+            # (issue 079's documented lock ordering).
+            log.warning(
+                "history rotation skipped: tick lock %s is held", default_lock_path()
+            )
+        else:
+            try:
+                maybe_rotate(
+                    history_path,
+                    max_bytes=config.retention.history_max_bytes,
+                    max_age_days=config.retention.history_max_age_days,
+                    now=now,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("history rotation failed (continuing): %s", e)
 
     return TickOutcome(summaries=tuple(summaries), any_job_failed=any_job_failed)
+
+
+def _skip_on_tick_lock(job: Job) -> tuple[str, bool]:
+    """A decision phase that lost the brief global lock exits quietly, as a whole tick
+    used to: the holder is another tick's schedule decision, not a long run (issue 079)."""
+    log.info("%s: skipped, tick lock %s is held", job.name, default_lock_path())
+    return f"{job.name}: skipped (tick lock held)", False
+
+
+def _skip_if_agent_live(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    live_check: Callable[[HerdrClient, Job], bool],
+) -> tuple[str, bool] | None:
+    """The advisory `agent_name_live` guard, run before the schedule decision so a live
+    agent is reported as a skip even when the occurrence is not due. The authoritative
+    check is repeated inside the job-locked dispatch (issue 079)."""
+    if not live_check(client, job):
+        return None
+    append(
+        history_path,
+        HistoryRecord(
+            ts=now,
+            job=job.name,
+            state="skipped",
+            extra=HistoryExtra(reason="agent_name_live"),
+        ),
+    )
+    return f"{job.name}: skipped (agent already live)", False
 
 
 def _process_audit_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
-    """Process a kind: audit job (issues 057, 058).
+    """Decide a kind: audit job under the brief global lock, then dispatch under its
+    per-job lock (issues 057, 058, 079).
 
     The schedule guards are a gated job's; when the cron fires, `_audit_cycle` runs the
     audit, diffs its findings against the ledger, and dispatches at most one fix worker.
     One run spans the audit and the fix worker, so staleness is judged against both."""
+    with tick_lock(default_lock_path()) as acquired:
+        if not acquired:
+            return _skip_on_tick_lock(job)
+        pending = _decide_audit_job(job, history_path, client=client, now=now)
+    return _finish_dispatch(pending, client=client, now=now)
+
+
+def _decide_audit_job(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+) -> tuple[str, bool] | _PendingDispatch:
     audit = job.require_audit()
     run_timeout_ms = audit.timeout_ms + job.timeout_ms
 
@@ -349,22 +440,24 @@ def _process_audit_job(
             ),
         )
 
-    if is_currently_running(history_path, job.name, timeout_ms=run_timeout_ms, now=now):
-        return f"{job.name}: skipped (already running)", False
+    live_skip = _skip_if_agent_live(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        live_check=_live_audit_agent_exists,
+    )
+    if live_skip is not None:
+        return live_skip
 
-    if _live_audit_agent_exists(client, job):
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="skipped",
-                extra=HistoryExtra(reason="agent_name_live"),
-            ),
-        )
-        return f"{job.name}: skipped (agent already live)", False
-
-    return _fire_triggers(job, history_path, client=client, now=now)
+    return _fire_triggers(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        run_timeout_ms=run_timeout_ms,
+        live_check=_live_audit_agent_exists,
+    )
 
 
 # Per-run cap on how many suppressed IDs the history record carries. Suppression is
@@ -1121,8 +1214,29 @@ def _process_gated_job(
     now: datetime,
     trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
 ) -> tuple[str, bool]:
-    """Process a gated job: run checks, dispatch fix agent on failure.
-    Handles both pr and base targets."""
+    """Decide a gated job under the brief global lock, then dispatch its checks/fix
+    worker under the per-job lock (issues 049, 079)."""
+    with tick_lock(default_lock_path()) as acquired:
+        if not acquired:
+            return _skip_on_tick_lock(job)
+        pending = _decide_gated_job(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+        )
+    return _finish_dispatch(pending, client=client, now=now)
+
+
+def _decide_gated_job(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
+) -> tuple[str, bool] | _PendingDispatch:
     # Standard guards (same as _process_job for regular jobs).
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
@@ -1149,20 +1263,15 @@ def _process_gated_job(
             ),
         )
 
-    if is_currently_running(history_path, job.name, timeout_ms=job.timeout_ms, now=now):
-        return f"{job.name}: skipped (already running)", False
-
-    if _live_agent_exists(client, job):
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="skipped",
-                extra=HistoryExtra(reason="agent_name_live"),
-            ),
-        )
-        return f"{job.name}: skipped (agent already live)", False
+    live_skip = _skip_if_agent_live(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        live_check=_live_agent_exists,
+    )
+    if live_skip is not None:
+        return live_skip
 
     return _fire_triggers(
         job,
@@ -1170,6 +1279,8 @@ def _process_gated_job(
         client=client,
         now=now,
         trusted_review_authors=trusted_review_authors,
+        run_timeout_ms=job.timeout_ms,
+        live_check=_live_agent_exists,
     )
 
 
@@ -3182,9 +3293,15 @@ def _fire_triggers(
     client: HerdrClient,
     now: datetime,
     trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
-) -> tuple[str, bool]:
+    run_timeout_ms: int | None = None,
+    live_check: Callable[[HerdrClient, Job], bool] | None = None,
+) -> tuple[str, bool] | _PendingDispatch:
     """What the job's triggers decide this tick (issue 075), after the guards (registered,
-    stale, already running, agent live) every kind shares.
+    stale) every kind shares.
+
+    Returns a `_PendingDispatch` when an occurrence is due: the caller has been running
+    under the brief global decision lock and now releases it before the per-job dispatch
+    lock is taken (issue 079).
 
     The cron trigger goes first: a due occurrence dispatches and the event poll waits for
     the next tick, so one tick starts at most one run per job. A cron that is not due, or
@@ -3194,6 +3311,10 @@ def _fire_triggers(
     A gated job whose `github_event` check *is* its gate (issue 077) takes the event path
     every tick: its cron no longer has a gate to evaluate, and the moved check keeps
     014's poll-and-fire behaviour."""
+    if run_timeout_ms is None:
+        run_timeout_ms = job.timeout_ms * max(1, job.max_targets_per_run)
+    if live_check is None:
+        live_check = _live_agent_exists
     event_trigger, event_is_gate = _event_trigger_for(job)
     cron_summary: str | None = None
     if not event_is_gate and job.cron is not None:
@@ -3210,26 +3331,27 @@ def _fire_triggers(
 
         if result.decision == Decision.RUN:
             run_id = make_run_id(job.name, result.occurrence)
-            if result.skipped_occurrences:
-                append(
-                    history_path,
-                    HistoryRecord(
-                        ts=now,
-                        job=job.name,
-                        state="missed",
-                        extra=HistoryExtra(
-                            reason="collapsed_earlier_occurrences",
-                            skipped_occurrences=result.skipped_occurrences,
-                            skipped_first=result.skipped_first.isoformat()
-                            if result.skipped_first
-                            else None,
-                            skipped_last=result.skipped_last.isoformat()
-                            if result.skipped_last
-                            else None,
-                        ),
+            # Only a job that has already finished a scheduled run has a real "since" to
+            # collapse against. A never-run job's registration is a scheduler watermark,
+            # not missed work, so its first run does not invent a `missed` record.
+            collapsed: HistoryRecord | None = None
+            if result.skipped_occurrences and last is not None:
+                collapsed = HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="missed",
+                    extra=HistoryExtra(
+                        reason="collapsed_earlier_occurrences",
+                        skipped_occurrences=result.skipped_occurrences,
+                        skipped_first=result.skipped_first.isoformat()
+                        if result.skipped_first
+                        else None,
+                        skipped_last=result.skipped_last.isoformat()
+                        if result.skipped_last
+                        else None,
                     ),
                 )
-            return dispatch_occurrence(
+            return _pending_occurrence(
                 job,
                 history_path,
                 Occurrence(
@@ -3243,6 +3365,9 @@ def _fire_triggers(
                 client=client,
                 now=now,
                 trusted_review_authors=trusted_review_authors,
+                run_timeout_ms=run_timeout_ms,
+                live_check=live_check,
+                collapsed=collapsed,
             )
 
         if result.decision == Decision.MISSED:
@@ -3270,13 +3395,20 @@ def _fire_triggers(
     if event_trigger is None:
         return cron_summary or f"{job.name}: not due (request only)", False
 
-    event_summary, failed = _poll_event_trigger(
+    event_result = _poll_event_trigger(
         job,
         history_path,
         client=client,
         now=now,
         trusted_review_authors=trusted_review_authors,
+        run_timeout_ms=run_timeout_ms,
+        live_check=live_check,
     )
+    if isinstance(event_result, _PendingDispatch):
+        if cron_summary is not None:
+            return replace(event_result, prefix=cron_summary)
+        return event_result
+    event_summary, failed = event_result
     if cron_summary is not None:
         return f"{cron_summary}; {event_summary}", failed
     return event_summary, failed
@@ -3301,7 +3433,9 @@ def _poll_event_trigger(
     client: HerdrClient,
     now: datetime,
     trusted_review_authors: tuple[str, ...],
-) -> tuple[str, bool]:
+    run_timeout_ms: int,
+    live_check: Callable[[HerdrClient, Job], bool],
+) -> tuple[str, bool] | _PendingDispatch:
     """The `trigger.event` poll (issue 075): run the job once for the first new matching
     event, through the same `dispatch_occurrence` a cron firing uses.
 
@@ -3324,14 +3458,20 @@ def _poll_event_trigger(
     if event_is_gate:
         if event_trigger is None:
             raise RuntimeError(f"{job.name}: no event trigger configured")
-        return _process_event_target(
-            job,
-            history_path,
-            client=client,
-            now=now,
-            run_id=make_run_id(job.name, now),
-            check=event_trigger,
-            trusted_review_authors=trusted_review_authors,
+        return _PendingDispatch(
+            job=job,
+            history_path=history_path,
+            run_timeout_ms=run_timeout_ms,
+            live_check=live_check,
+            dispatch=lambda: _process_event_target(
+                job,
+                history_path,
+                client=client,
+                now=now,
+                run_id=make_run_id(job.name, now),
+                check=event_trigger,
+                trusted_review_authors=trusted_review_authors,
+            ),
         )
 
     check = job.trigger_event
@@ -3437,7 +3577,7 @@ def _poll_event_trigger(
         return f"{job.name}: not due (no new events)", False
 
     event = fired[0]
-    return dispatch_occurrence(
+    return _pending_occurrence(
         job,
         history_path,
         Occurrence(
@@ -3451,6 +3591,8 @@ def _poll_event_trigger(
         client=client,
         now=now,
         trusted_review_authors=trusted_review_authors,
+        run_timeout_ms=run_timeout_ms,
+        live_check=live_check,
     )
 
 
@@ -3493,6 +3635,159 @@ def _append_running(
             extra=_occurrence_extra(occ),
         ),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingDispatch:
+    """A firing whose schedule decision ran under the brief global tick lock, now waiting
+    to be dispatched under its per-job lock (issue 079). The callable is either the shared
+    `dispatch_occurrence` or the gated event-target cycle, which never routed through it."""
+
+    job: Job
+    history_path: Path
+    run_timeout_ms: int
+    live_check: Callable[[HerdrClient, Job], bool]
+    dispatch: Callable[[], tuple[str, bool]]
+    prefix: str | None = None
+    # The collapsed-earlier-occurrences record for this firing, written only once the
+    # job lock is won: a lost race must record `skipped`, not a second `missed`.
+    collapsed: HistoryRecord | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchOutcome:
+    summary: str
+    failed: bool
+    in_flight: bool = False
+
+
+def _pending_occurrence(
+    job: Job,
+    history_path: Path,
+    occ: Occurrence,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...],
+    run_timeout_ms: int,
+    live_check: Callable[[HerdrClient, Job], bool],
+    prefix: str | None = None,
+    collapsed: HistoryRecord | None = None,
+) -> _PendingDispatch:
+    return _PendingDispatch(
+        job=job,
+        history_path=history_path,
+        run_timeout_ms=run_timeout_ms,
+        live_check=live_check,
+        dispatch=lambda: dispatch_occurrence(
+            job,
+            history_path,
+            occ,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+        ),
+        prefix=prefix,
+        collapsed=collapsed,
+    )
+
+
+def _dispatch_pending(
+    pending: _PendingDispatch, *, client: HerdrClient, now: datetime
+) -> _DispatchOutcome:
+    """Take the per-job lock and dispatch one decided firing (issue 079).
+
+    Losing the non-blocking lock is skip-not-queue, exactly as a global-lock miss used to
+    be, and is recorded so a starved occurrence is visible in history. The history and
+    live-agent guards are repeated here — inside the job-locked section — because they are
+    the second guard behind the flock, and because the `running` record must be written
+    here so a concurrent loser sees it."""
+    job = pending.job
+    history_path = pending.history_path
+    with job_lock(history_path, job.name) as acquired:
+        if not acquired:
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    extra=HistoryExtra(reason="dispatch_in_flight"),
+                ),
+            )
+            return _DispatchOutcome(
+                f"{job.name}: skipped (dispatch in flight)", False, in_flight=True
+            )
+
+        if job.kind != "pipeline" and is_currently_running(
+            history_path, job.name, timeout_ms=pending.run_timeout_ms, now=now
+        ):
+            return _DispatchOutcome(f"{job.name}: skipped (already running)", False)
+
+        if pending.live_check(client, job):
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    extra=HistoryExtra(reason="agent_name_live"),
+                ),
+            )
+            return _DispatchOutcome(f"{job.name}: skipped (agent already live)", False)
+
+        if pending.collapsed is not None:
+            append(history_path, pending.collapsed)
+
+        summary, failed = pending.dispatch()
+        if pending.prefix is not None:
+            summary = f"{pending.prefix}; {summary}"
+        return _DispatchOutcome(summary, failed)
+
+
+def _finish_dispatch(
+    pending: tuple[str, bool] | _PendingDispatch,
+    *,
+    client: HerdrClient,
+    now: datetime,
+) -> tuple[str, bool]:
+    if not isinstance(pending, _PendingDispatch):
+        return pending
+    outcome = _dispatch_pending(pending, client=client, now=now)
+    return outcome.summary, outcome.failed
+
+
+def dispatch_manual_occurrence(
+    job: Job,
+    history_path: Path,
+    occ: Occurrence,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
+) -> tuple[str, bool, bool]:
+    """Dispatch a manual or request occurrence under the job lock (issues 074, 079).
+
+    Returns `(summary, failed, in_flight)`; `in_flight` is the refusal signal `run` maps
+    to rc 1 and a request notification. It is the same lock-and-reverify path the tick's
+    `_dispatch_pending` uses, so the two entry points cannot drift."""
+    run_timeout_ms = job.timeout_ms * max(1, job.max_targets_per_run)
+    live_check = _live_audit_agent_exists if job.kind == "audit" else _live_agent_exists
+    outcome = _dispatch_pending(
+        _pending_occurrence(
+            job,
+            history_path,
+            occ,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+            run_timeout_ms=run_timeout_ms,
+            live_check=live_check,
+        ),
+        client=client,
+        now=now,
+    )
+    return outcome.summary, outcome.failed, outcome.in_flight
 
 
 def dispatch_occurrence(
@@ -3897,6 +4192,29 @@ def _process_job(
     # the other, so the running-record staleness window scales with it.
     run_timeout_ms = job.timeout_ms * max(1, job.max_targets_per_run)
 
+    with tick_lock(default_lock_path()) as acquired:
+        if not acquired:
+            return _skip_on_tick_lock(job)
+        pending = _decide_routine_job(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+            run_timeout_ms=run_timeout_ms,
+        )
+    return _finish_dispatch(pending, client=client, now=now)
+
+
+def _decide_routine_job(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...],
+    run_timeout_ms: int,
+) -> tuple[str, bool] | _PendingDispatch:
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
         return f"{job.name}: registered", False
@@ -3922,20 +4240,15 @@ def _process_job(
             ),
         )
 
-    if is_currently_running(history_path, job.name, timeout_ms=run_timeout_ms, now=now):
-        return f"{job.name}: skipped (already running)", False
-
-    if _live_agent_exists(client, job):
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="skipped",
-                extra=HistoryExtra(reason="agent_name_live"),
-            ),
-        )
-        return f"{job.name}: skipped (agent already live)", False
+    live_skip = _skip_if_agent_live(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        live_check=_live_agent_exists,
+    )
+    if live_skip is not None:
+        return live_skip
 
     return _fire_triggers(
         job,
@@ -3943,6 +4256,8 @@ def _process_job(
         client=client,
         now=now,
         trusted_review_authors=trusted_review_authors,
+        run_timeout_ms=run_timeout_ms,
+        live_check=_live_agent_exists,
     )
 
 
@@ -4146,6 +4461,19 @@ def _build_pipeline_launch_argv(
 def _process_pipeline_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
+    """Decide a kind: pipeline job under the brief global lock, then launch under its
+    per-job lock (issues 026, 079). Reconcile records belong to the decision phase; the
+    launch itself is the per-job dispatch."""
+    with tick_lock(default_lock_path()) as acquired:
+        if not acquired:
+            return _skip_on_tick_lock(job)
+        pending = _decide_pipeline_job(job, history_path, client=client, now=now)
+    return _finish_dispatch(pending, client=client, now=now)
+
+
+def _decide_pipeline_job(
+    job: Job, history_path: Path, *, client: HerdrClient, now: datetime
+) -> tuple[str, bool] | _PendingDispatch:
     if not has_ever_been_seen(history_path, job.name):
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
         return f"{job.name}: registered", False
@@ -4338,7 +4666,7 @@ def _process_pipeline_job(
         return f"{job.name}: missed", False
 
     # Decision.RUN
-    return dispatch_occurrence(
+    return _pending_occurrence(
         job,
         history_path,
         Occurrence(
@@ -4351,6 +4679,9 @@ def _process_pipeline_job(
         ),
         client=client,
         now=now,
+        trusted_review_authors=DEFAULT_TRUSTED_REVIEW_AUTHORS,
+        run_timeout_ms=job.timeout_ms,
+        live_check=_live_agent_exists,
     )
 
 
