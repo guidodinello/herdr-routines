@@ -108,14 +108,15 @@ GIT_TIMEOUT_S = 120
 # the night's notification is held (host_drift.PROBE_TIMEOUT_S per probe, a dozen
 # probes at most), plus slack.
 VALIDATE_TIMEOUT_S = 300
-# How long to keep retrying a held tick lock before deferring. A tick holds it for
-# seconds (~8s on the Pi), so a timer that lands on a tick boundary — 21:30 UTC is
-# one, and it deferred three nights running on exactly that — is a transient
-# collision, not a reason to wait another 24h. Five minutes rides out any ordinary
-# tick, including one that dispatches a job, while a lock still held after that is
-# almost certainly a long `herdr-routines run <job>` (which holds it for the whole
-# run): that is worth a notification, not an open-ended wait inside a unit with a
-# finite TimeoutStartSec. Polled rather than a blocking flock so the bound is ours.
+# How long to keep retrying a held tick lock before deferring. Since issue 079 a tick
+# holds it only for brief housekeeping and schedule-decision sections, never across a
+# dispatch (~8s on the Pi), so a timer that lands on a tick boundary — 21:30 UTC is one,
+# and it deferred three nights running on exactly that — is a transient collision, not a
+# reason to wait another 24h. Five minutes rides out any ordinary tick, including one that
+# dispatches a job; a lock still held after that is a tick stuck in a decision phase (or a
+# pre-079 process), which is worth a notification rather than an open-ended wait inside a
+# unit with a finite TimeoutStartSec. Polled rather than a blocking flock so the bound is
+# ours.
 TICK_LOCK_WAIT_S = 300
 TICK_LOCK_POLL_S = 5
 

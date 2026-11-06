@@ -37,3 +37,15 @@ Whichever is chosen must keep the guarantees issue 004 introduced the lock for.
 ## Notes
 
 - Related: 004 (tick lock), 053 (self-update), 074, 075.
+
+## Log
+
+- **2026-11-06**: chose the per-job lock option (spec `20261106T050000Z`). The global
+  `tick.lock` now covers only brief housekeeping and schedule-decision sections, history
+  appends rotate under a sibling `history.lock`, and each job's whole synchronous dispatch
+  holds `locks/job-<name>.lock`. A loser of the non-blocking job lock records `skipped`
+  (`dispatch_in_flight`) instead of racing the same `rt-<job>` name; `run`/`/job` converge on
+  the same lock. Collapsed-earlier-occurrence records no longer count as a scheduled terminal
+  (they would hide an in-flight run from a concurrent decision), and a never-run job no longer
+  invents a `missed` record for the gap since registration. Per-checkout root-mode locking
+  (AC 7) is still open.
