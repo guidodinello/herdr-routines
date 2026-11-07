@@ -228,7 +228,7 @@ class _GitGhFake:
 def _issue_repo(tmp_path: Path) -> Path:
     """A checkout-shaped repo dir: `docs/process/issues/` + ROADMAP.md."""
     repo = tmp_path / "repo"
-    (repo / "docs" / "process" / "issues").mkdir(parents=True)
+    (repo / "docs" / "process" / "issues").mkdir(parents=True, exist_ok=True)
     (repo / "ROADMAP.md").write_text(ROADMAP)
     return repo
 
@@ -941,8 +941,11 @@ def test_refine_issue_review_pass_cli_usage_errors(
 
 
 def test_refine_issue_check_issue_cli_accepts_a_valid_issue(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # The uniqueness source is external; stub it empty so this stays a
+    # frontmatter-only unit test (the duplicate gate has its own tests above).
+    _stub_subprocess(monkeypatch, _GitGhFake())
     issue = tmp_path / "999-foo.md"
     issue.write_text(GOOD_ISSUE)
     assert _run_refine_cli(["--check-issue", str(issue)]) == 0
