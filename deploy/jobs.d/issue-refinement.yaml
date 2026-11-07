@@ -11,11 +11,16 @@
 # this one job session: the job agent authors, then invokes a fresh independent
 # `opencode run` (different model) as the reviewer — no nested `herdr agent`
 # spawn, so this needs none of the pipeline's HERDR_ENV workspace plumbing.
-# The loop's two rules are code, not prose (issues 034/035 precedent): after each
-# review pass `refine-issue --review-pass N --reviewer-reply FILE` parses the
-# reviewer's confidence and enforces the 3-pass cap; before the PR
-# `refine-issue --check-issue PATH` validates the new issue's frontmatter. Both
-# answer by exit code like `gate`. `validate` warns if this job ever stops being
+# The loop's load-bearing decisions are code, not prose (issues 034/035
+# precedent): the issue number comes from `uv run herdr-routines refine-issue
+# --next-id` (fresh origin/main union every open same-repo PR); after each
+# review pass `uv run herdr-routines refine-issue --review-pass N
+# --reviewer-reply FILE` parses the reviewer's confidence and enforces the
+# 3-pass cap; the ROADMAP pointer is written by `uv run herdr-routines
+# refine-issue --roadmap-pointer PATH` keyed off the filename slug; and before
+# the PR `uv run herdr-routines refine-issue --check-issue PATH` validates the
+# new issue's frontmatter and that its number is still unused. All answer by
+# exit code like `gate`. `validate` warns if this job ever stops being
 # opencode-only.
 #
 # Output is a PR on head `auto/issue-refinement-<run_id>` (built from `name` by
@@ -52,13 +57,16 @@ prompt: |
      nothing is eligible OR the "already refined" guard could not run (e.g. gh
      failure): write that reason to $ROUTINE_REPORT and STOP. Never invent an idea.
 
-  2. AUTHOR. Create docs/process/issues/NNN-<slug>.md where NNN is the highest
-     existing issue number + 1 (zero-padded to 3 digits). Frontmatter: id "NNN",
-     title, status: open, priority (high|medium|low), area — then ## Description,
-     ## Design, ## Acceptance sections detailed enough for one worker to build.
-     Copy the shape of a recent issue file in that directory. Also add a one-line
-     ROADMAP.md Parking Lot pointer for the idea ending
-     ``→ [`NNN`](docs/process/issues/NNN-<slug>.md)``.
+  2. AUTHOR. Compute the number in code — never from your own snapshot of the
+     issues directory (that stale snapshot caused the 2026-10-24 collision):
+       NEXT_ID=$(uv run herdr-routines refine-issue --next-id)
+     A non-zero exit means the number could not be computed (git/gh unavailable):
+     write that reason to $ROUTINE_REPORT and STOP. Never guess a number.
+     Create docs/process/issues/$NEXT_ID-<slug>.md with that id. Frontmatter:
+     id "$NEXT_ID", title, status: open, priority (high|medium|low), area — then
+     ## Description, ## Design, ## Acceptance sections detailed enough for one
+     worker to build. Copy the shape of a recent issue file in that directory.
+     Leave ROADMAP.md alone here: the pointer is its own step after review.
 
   3. REVIEW LOOP — the code decides when it ends (at most 3 passes). Independence
      is the point: each pass runs a FRESH reviewer in its own session and a
@@ -83,13 +91,23 @@ prompt: |
      - exit 2 → you called it wrong (missing/unreadable reply file); fix the
        call, never skip it.
 
-  4. CHECK THE ISSUE FILE. After the loop's last edit and before any git command:
+  4. ROADMAP POINTER. After the review loop settles, write the pointer once —
+     on the merged-to-be branch, not once per review pass. The code attaches it
+     to this idea's own Parking Lot bullet:
+       uv run herdr-routines refine-issue --roadmap-pointer docs/process/issues/NNN-<slug>.md
+     A non-zero exit means no Parking Lot bullet matches the filename slug (or
+     the issue has no id): fix the filename/frontmatter, never hand-edit a
+     guessed paragraph. Re-running the call is safe (it is idempotent).
+
+  5. CHECK THE ISSUE FILE. After the pointer edit and before any git command:
        uv run herdr-routines refine-issue --check-issue docs/process/issues/NNN-<slug>.md
-     A non-zero exit lists the frontmatter problems on stderr: fix them and
-     re-run until it exits 0. If you cannot make it pass, write the problems to
+     A non-zero exit lists the frontmatter or duplicate-id problems on stderr:
+     fix them and re-run until it exits 0. A duplicate id must be fixed by
+     taking the next free number (re-run the step-2 --next-id call) — never by
+     ignoring the problem. If you cannot make it pass, write the problems to
      $ROUTINE_REPORT and STOP — do not open the PR.
 
-  5. OPEN THE PR (never commit to main) — only after step 4 exited 0:
+  6. OPEN THE PR (never commit to main) — only after step 5 exited 0:
        git add -A
        git commit -m "docs: refine issue NNN — <title> (issue 029)"
        git push -u origin HEAD
@@ -102,5 +120,5 @@ prompt: |
        EOF
        )"
 
-  6. REPORT. Write to $ROUTINE_REPORT: the bullet picked, the new issue number,
+  7. REPORT. Write to $ROUTINE_REPORT: the bullet picked, the new issue number,
      the PR URL, the loop pass count, and whether consensus was reached.

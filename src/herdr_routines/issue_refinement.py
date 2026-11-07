@@ -6,9 +6,11 @@ to merge. The author->reviewer loop itself is prompt-driven inside the job's
 opencode session (same architecture as the pipeline orchestrator — there is no
 Python stage/spawn loop in this repo, see ROADMAP's "Unify routines + pipeline"
 bullet). This module is the deterministic part: *which* bullet to refine and whether it
-is already covered, plus the two checks the loop must pass through code rather
-than prompt prose (the issues 034/035 precedent) — the 3-pass cap / consensus
-decision and the refined issue's frontmatter.
+is already covered, plus the decisions the loop must make through code rather
+than prompt prose (the issues 034/035 precedent) — the next issue number (fresh
+``origin/main`` union every open same-repo PR), the 3-pass cap / consensus
+decision, the refined issue's frontmatter and id uniqueness, and the ROADMAP
+pointer keyed off the issue filename.
 
 Pure filesystem + YAML + one batched ``gh`` call — no HerdrClient, no ``herdr``
 binary — mirroring ``pick_feature.py``'s "no Herdr server required" posture so it
@@ -64,6 +66,10 @@ PR_MARKER_PREFIX = "Refines-Parking-Lot:"
 _PR_MARKER_RE = re.compile(
     rf"{re.escape(PR_MARKER_PREFIX)}\s*([a-z0-9][a-z0-9-]*)", re.IGNORECASE
 )
+
+# Issue numbers live in filenames as ``docs/process/issues/NNN-<slug>.md``.
+ISSUES_DIR_RELPATH = "docs/process/issues"
+_ISSUE_NUMBER_RE = re.compile(r"docs/process/issues/(\d+)-")
 
 GH_TIMEOUT_SECONDS = 30
 FRONTMATTER_DELIM = "---"
@@ -280,6 +286,163 @@ def refinement_open_pr_slugs(repo: Path) -> frozenset[str] | None:
     return frozenset(slugs)
 
 
+def _issue_numbers_in_paths(paths: list[str]) -> set[int]:
+    """Issue numbers carried by ``docs/process/issues/NNN-*`` paths, as integers.
+
+    Compared as integers so ``071``, ``71`` and ``0071`` are the same number —
+    the collision space is the set of numbers, not the lexicographic max.
+    """
+    numbers: set[int] = set()
+    for path in paths:
+        match = _ISSUE_NUMBER_RE.search(path)
+        if match:
+            numbers.add(int(match.group(1)))
+    return numbers
+
+
+def main_issue_numbers(repo: Path) -> frozenset[int] | None:
+    """Issue numbers on *fresh-fetched* ``origin/main``, or ``None`` on failure.
+
+    Fetches first (the worktree checkout can be stale — the 2026-10-24 collision)
+    and reads the issues directory off ``origin/main`` rather than the working
+    tree. Any ``git`` failure returns ``None`` so the caller can fail safe.
+    """
+    try:
+        fetched = subprocess.run(
+            ["git", "fetch", "origin", "main", "--quiet"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: git fetch origin main failed: {exc}", file=sys.stderr)
+        return None
+    if fetched.returncode != 0:
+        print(
+            f"warning: git fetch origin main failed: {fetched.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        tree = subprocess.run(
+            [
+                "git",
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "origin/main",
+                "--",
+                f"{ISSUES_DIR_RELPATH}/",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: git ls-tree origin/main failed: {exc}", file=sys.stderr)
+        return None
+    if tree.returncode != 0:
+        print(
+            f"warning: git ls-tree origin/main failed: {tree.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    return frozenset(_issue_numbers_in_paths(tree.stdout.splitlines()))
+
+
+def open_pr_issue_numbers(repo: Path) -> frozenset[int] | None:
+    """Issue numbers carried by ``docs/process/issues/NNN-*`` files in open,
+    same-repo PRs — *any* author, not just ``@me`` — or ``None`` on failure.
+
+    A refinement PR (or a pipeline PR) already carries its number until it
+    merges; counting only this account's PRs would miss the pipeline bot's. A
+    fork PR never owns a number in this repo. ``None`` means "unknown" and the
+    caller must fail safe, exactly like ``refinement_open_pr_slugs``.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "200",
+                "--json",
+                "headRefName,files,isCrossRepository",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: gh pr list failed: {exc}", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(f"warning: gh pr list failed: {proc.stderr.strip()}", file=sys.stderr)
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        print("warning: gh pr list returned invalid JSON", file=sys.stderr)
+        return None
+    if not isinstance(data, list):
+        print("warning: gh pr list returned an unexpected shape", file=sys.stderr)
+        return None
+
+    paths: list[str] = []
+    for item in data:
+        if not isinstance(item, dict) or item.get("isCrossRepository") is not False:
+            continue
+        files = item.get("files")
+        if not isinstance(files, list):
+            continue
+        for entry in files:
+            if not isinstance(entry, dict):
+                continue
+            path = entry.get("path")
+            if isinstance(path, str):
+                paths.append(path)
+    return frozenset(_issue_numbers_in_paths(paths))
+
+
+def next_issue_id(repo: Path) -> int | None:
+    """The next free 3-digit issue number: union of fresh ``origin/main`` and every
+    open same-repo PR, max + 1 (``1`` when nothing is in use).
+
+    ``None`` when either source cannot be read — never a guessed number.
+    """
+    main_numbers = main_issue_numbers(repo)
+    if main_numbers is None:
+        return None
+    pr_numbers = open_pr_issue_numbers(repo)
+    if pr_numbers is None:
+        return None
+    return max(main_numbers | pr_numbers, default=0) + 1
+
+
+def run_next_issue_id(repo: Path) -> int:
+    """Entry point behind ``refine-issue --next-id``: print the next zero-padded
+    id on stdout, or exit 1 with the failing source named on stderr."""
+    number = next_issue_id(repo)
+    if number is None:
+        print(
+            "error: could not compute the next issue id — refusing to guess "
+            "(git origin/main or gh pr list is unavailable); will retry next run",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+    print(f"{number:03d}")
+    return EXIT_OK
+
+
 def is_covered(
     bullet: ParkingLotBullet,
     issue_titles: list[str],
@@ -366,23 +529,167 @@ def job_is_opencode_only(job_config: Mapping[str, object]) -> bool:
     return not any("claude" in str(m or "").lower() for m in models)
 
 
-def run_check_issue(path: Path) -> int:
+def _id_as_number(value: object) -> int | None:
+    """A frontmatter ``id`` as an integer, so ``071``/``71``/``0071`` collide."""
+    text = str(value).strip() if value is not None else ""
+    return int(text) if text.isdigit() else None
+
+
+def _parking_lot_blocks(roadmap_text: str) -> list[tuple[str, int, int]]:
+    """``(slug, first_line, last_line)`` for each Parking Lot bullet, in file order.
+
+    Same bullet/continuation rules as ``parse_parking_lot_bullets`` but keeps the
+    original line span so a pointer can be appended in place.
+    """
+    lines = roadmap_text.split("\n")
+    start = next(
+        (i for i, line in enumerate(lines) if line.strip() == PARKING_LOT_HEADER),
+        None,
+    )
+    if start is None:
+        return []
+
+    blocks: list[tuple[str, int, int]] = []
+    current: list[str] | None = None
+    first = last = 0
+
+    def _flush() -> None:
+        nonlocal current
+        if current is not None:
+            blocks.append((_finalize_bullet(current).slug, first, last))
+            current = None
+
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.startswith("## "):
+            break
+        if line.startswith("- "):
+            _flush()
+            current = [line[2:].strip()]
+            first = last = i
+        elif current is not None and line.startswith("  ") and line.strip():
+            current.append(line.strip())
+            last = i
+        elif current is not None:
+            _flush()
+            if blocks:
+                break
+    _flush()
+    return blocks
+
+
+def apply_roadmap_pointer(roadmap_path: Path, issue_path: Path) -> int:
+    """Entry point behind ``refine-issue --roadmap-pointer``: append the issue
+    pointer to its own Parking Lot bullet.
+
+    The bullet is located by the issue *filename* slug — no guessing a paragraph
+    (the 2026-10-24 bug). Idempotent: the exact pointer already on the bullet is
+    exit 0 with no edit. A slug with no bullet is exit 1; an unreadable issue or
+    absent/empty frontmatter ``id`` is exit 2 (nothing could be built).
+    """
+    match = re.fullmatch(r"(\d+)-(.+)\.md", issue_path.name)
+    if not match:
+        print(
+            f"roadmap-pointer: {issue_path.name} is not an NNN-<slug>.md issue file",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+    slug = match.group(2)
+
+    try:
+        issue_text = issue_path.read_text()
+    except OSError as exc:
+        print(f"roadmap-pointer: cannot read {issue_path}: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        frontmatter = read_frontmatter(issue_text)
+    except ValueError as exc:
+        print(f"roadmap-pointer: {issue_path}: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    raw_id = frontmatter.get("id")
+    issue_id = str(raw_id).strip() if raw_id is not None else ""
+    if not issue_id:
+        print(
+            f"roadmap-pointer: {issue_path} has no frontmatter id: cannot build "
+            "the pointer",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
+
+    try:
+        roadmap_text = roadmap_path.read_text()
+    except OSError as exc:
+        print(f"roadmap-pointer: cannot read {roadmap_path}: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
+
+    block = next(
+        (b for b in _parking_lot_blocks(roadmap_text) if b[0] == slug),
+        None,
+    )
+    if block is None:
+        print(
+            f"roadmap-pointer: no Parking Lot bullet matches slug '{slug}' — "
+            "refusing to attach the pointer to a guessed paragraph",
+            file=sys.stderr,
+        )
+        return EXIT_FAILURE
+    _, first, last = block
+
+    lines = roadmap_text.split("\n")
+    pointer = f"→ [`{issue_id}`](docs/process/issues/{issue_path.name})"
+    bullet_text = "\n".join(lines[first : last + 1])
+    if pointer in bullet_text:
+        return EXIT_OK
+
+    if lines[last].startswith("  "):
+        lines[last] = f"{lines[last].rstrip()} {pointer}"
+    else:
+        lines.insert(last + 1, f"  {pointer}")
+    roadmap_path.write_text("\n".join(lines))
+    return EXIT_OK
+
+
+def run_check_issue(repo: Path, path: Path) -> int:
     """Entry point behind ``refine-issue --check-issue``: the job's last step
     before opening its PR (issue 029's frontmatter rule, in code rather than
     prompt prose — the issues 034/035 precedent).
 
-    Exits 0 when the refined issue's frontmatter is valid, 1 with every problem
-    on stderr when it is not, 2 when the file cannot be read.
+    Exits 0 when the refined issue's frontmatter is valid *and* its ``id`` is
+    unused on fresh ``origin/main`` or by an open PR, 1 with every problem on
+    stderr when it is not, 2 when the file cannot be read. An unavailable number
+    source is exit 1 ("could not verify number uniqueness") — never fail-open.
     """
     try:
         text = path.read_text()
     except OSError as exc:
         print(f"check-issue: cannot read {path}: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    frontmatter: dict[str, object] | None = None
     try:
-        problems = validate_issue_frontmatter(read_frontmatter(text))
+        frontmatter = read_frontmatter(text)
+        problems = validate_issue_frontmatter(frontmatter)
     except ValueError as exc:
         problems = [str(exc)]
+
+    if not problems and frontmatter is not None:
+        used = main_issue_numbers(repo)
+        if used is not None:
+            pr_numbers = open_pr_issue_numbers(repo)
+            used = None if pr_numbers is None else frozenset(used | pr_numbers)
+        if used is None:
+            print(
+                "check-issue failed: could not verify number uniqueness — "
+                "git origin/main or gh pr list is unavailable",
+                file=sys.stderr,
+            )
+            return EXIT_FAILURE
+        own_number = _id_as_number(frontmatter.get("id"))
+        if own_number is not None and own_number in used:
+            problems.append(
+                f"duplicate id: {frontmatter.get('id')} is already used on "
+                "origin/main or by an open PR"
+            )
+
     if not problems:
         return EXIT_OK
     print(f"check-issue failed: {path}", file=sys.stderr)

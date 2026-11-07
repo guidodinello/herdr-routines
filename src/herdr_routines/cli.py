@@ -56,9 +56,11 @@ from herdr_routines.history import (
 )
 from herdr_routines.host_drift import check_host, format_findings
 from herdr_routines.issue_refinement import (
+    apply_roadmap_pointer,
     job_is_opencode_only,
     run_check_issue,
     run_loop_check,
+    run_next_issue_id,
     run_refine_issue,
 )
 from herdr_routines.pick_feature import ReclaimedPick, run_pick_feature
@@ -554,12 +556,29 @@ def _build_parser() -> argparse.ArgumentParser:
     # 034/035 precedent): read the verdict off the exit code like `gate`.
     refine_mode = p_refine.add_mutually_exclusive_group()
     refine_mode.add_argument(
+        "--next-id",
+        action="store_true",
+        help="instead of selecting: print the next free issue id (fresh "
+        "origin/main union every open same-repo PR), or exit 1 if it cannot be "
+        "computed",
+    )
+    refine_mode.add_argument(
+        "--roadmap-pointer",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="instead of selecting: append this issue file's pointer to its "
+        "matching ROADMAP Parking Lot bullet (idempotent; exit 1 if no bullet "
+        "matches the filename slug)",
+    )
+    refine_mode.add_argument(
         "--check-issue",
         type=Path,
         default=None,
         metavar="PATH",
         help="instead of selecting: check a refined issue file's frontmatter "
-        "(id/title/status/priority/area, status: open); exit 1 lists the problems",
+        "(id/title/status/priority/area, status: open) and that its id is unused "
+        "on origin/main / open PRs; exit 1 lists the problems",
     )
     refine_mode.add_argument(
         "--review-pass",
@@ -1650,8 +1669,13 @@ def _cmd_pipeline_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_refine_issue(args: argparse.Namespace) -> int:
+    if args.next_id:
+        return run_next_issue_id(args.repo)
+    if args.roadmap_pointer is not None:
+        roadmap_path = args.roadmap or args.repo / "ROADMAP.md"
+        return apply_roadmap_pointer(roadmap_path, args.roadmap_pointer)
     if args.check_issue is not None:
-        return run_check_issue(args.check_issue)
+        return run_check_issue(args.repo, args.check_issue)
     if args.review_pass is not None:
         if args.reviewer_reply is None:
             print(

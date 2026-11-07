@@ -1,7 +1,7 @@
 ---
 id: "080"
 title: "issue-refinement can reuse an issue number taken by an open PR or a recent merge"
-status: open
+status: done
 priority: low
 area: pipeline
 ---
