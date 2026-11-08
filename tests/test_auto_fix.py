@@ -1785,22 +1785,22 @@ def test_tick_uses_the_configured_trusted_review_authors(
 
 
 def test_run_checks_runner_param_is_callable_contract(tmp_path: Path) -> None:
-    """AC 3 (blocking): ``run_checks`` declares
-    ``runner: Callable[..., tuple[int, str, str]] | None = None`` with ``Callable``
-    imported from ``collections.abc``; ``_default_runner`` keeps that exact signature
-    and the ``runner = _default_runner`` fallback wiring is untouched; an injected
-    runner still drives the checks."""
+    """AC 3 (blocking): ``run_checks`` declares ``runner: Runner | None = None`` with
+    ``Runner`` imported from the one runner seam (issue 081) — no local ``Callable``
+    annotation; ``_default_runner`` keeps its exact signature and the
+    ``runner = _default_runner`` fallback wiring is untouched; an injected runner
+    still drives the checks."""
     import ast
     import inspect
-    from collections.abc import Callable
     from typing import get_type_hints
 
     import herdr_routines.auto_fix as af
     from herdr_routines.auto_fix import run_checks
     from herdr_routines.config import GateCheck
+    from herdr_routines.runner_seam import BoundedRunner as Runner
 
     hints = get_type_hints(run_checks)
-    assert hints["runner"] == Callable[..., tuple[int, str, str]] | None
+    assert hints["runner"] == Runner | None
 
     module_path = Path(af.__file__)
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
@@ -1816,11 +1816,11 @@ def test_run_checks_runner_param_is_callable_contract(tmp_path: Path) -> None:
         if isinstance(node, ast.ImportFrom) and node.module == "typing"
         for alias in node.names
     ]
-    assert "Callable" in abc_names
+    assert "Callable" not in abc_names
     assert "Callable" not in typing_names
 
     src = inspect.getsource(run_checks)
-    assert "runner: Callable[..., tuple[int, str, str]] | None = None," in src
+    assert "runner: Runner | None = None," in src
     assert "def _default_runner(" in src
     assert "argv: list[str], *, timeout_s: float" in src
     assert ") -> tuple[int, str, str]:" in src
