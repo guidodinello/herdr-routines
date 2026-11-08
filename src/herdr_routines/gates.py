@@ -29,6 +29,7 @@ from herdr_routines.auto_fix import (
     is_trusted_author,
     repo_owner_and_name,
 )
+from herdr_routines.runner_seam import BoundedRunner as Runner
 
 # Bounds the CI-gate poll (issue 034): CI on this repo finishes in well under 2
 # minutes, so 10 minutes is generous headroom without letting a stuck check eat the
@@ -462,7 +463,7 @@ def run_gate1(
     repo_path: Path,
     spec: Path,
     *,
-    runner: Callable[..., tuple[int, str, str]] | None = None,
+    runner: Runner | None = None,
 ) -> GateVerdict:
     """Stage 1's spec exists, is non-trivial, sits on a pipeline branch, and is
     committed — `orchestrator-prompt.md` G-1 verbatim.
@@ -705,7 +706,7 @@ def run_stage_gate(
     spec: Path | None = None,
     pr: int | None = None,
     branch: str | None = None,
-    runner: Callable[..., tuple[int, str, str]] | None = None,
+    runner: Runner | None = None,
     trusted_authors: frozenset[str] | None = None,
 ) -> GateVerdict:
     """Dispatch one gate by its CLI stage token. Raises `ValueError` for an unknown token

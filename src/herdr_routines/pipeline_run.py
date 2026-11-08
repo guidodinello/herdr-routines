@@ -89,6 +89,7 @@ from herdr_routines.pipeline_watchdog import (
     validate_stage_sessions,
 )
 from herdr_routines.runner import SUCCESS_AGENT_STATUSES
+from herdr_routines.runner_seam import BoundedRunner as Runner
 from herdr_routines.signing import (
     ResignError,
     resign_local_commits,
@@ -864,9 +865,7 @@ def _heartbeat_hook(
 # ---------------------------------------------------------------------------
 
 
-def _issue_committed_done(
-    state: _State, runner: Callable[..., tuple[int, str, str]]
-) -> tuple[bool, str]:
+def _issue_committed_done(state: _State, runner: Runner) -> tuple[bool, str]:
     """Gate 5's second condition: the picked issue is committed as `status: done`.
 
     Both halves are needed and neither alone suffices. `git status --porcelain <path>`
@@ -908,8 +907,6 @@ def _issue_committed_done(
 # ---------------------------------------------------------------------------
 # Bookkeeping the stage prompts used to ask a model for (issue 059)
 # ---------------------------------------------------------------------------
-
-Runner = Callable[..., tuple[int, str, str]]
 
 
 def _git_out(state: _State, runner: Runner, *args: str, what: str) -> str:
@@ -1358,7 +1355,7 @@ def _open_pr(
     gh: GhClient,
     owner: str,
     repo: str,
-    runner: Callable[..., tuple[int, str, str]],
+    runner: Runner,
     edited_tests: Sequence[str] = (),
 ) -> int:
     """Push the branch, open the PR, return its number. No agent is involved.
@@ -1804,7 +1801,7 @@ def _gate_for_stage(
     owner: str,
     repo: str,
     spec_text: str,
-    runner: Callable[..., tuple[int, str, str]],
+    runner: Runner,
     trusted_authors: frozenset[str] | None = None,
 ) -> GateVerdict:
     """The gate that must pass before stage `spec.stage + 1` starts.
@@ -1863,7 +1860,7 @@ def run_pipeline(
     client: HerdrClient | None = None,
     gh: GhClient | None = None,
     heartbeat_dir: Path | None = None,
-    runner: Callable[..., tuple[int, str, str]] | None = None,
+    runner: Runner | None = None,
     session_export: Callable[[str], str | None] = _opencode_export,
     clock: Callable[[], float] = time.time,
     trusted_review_authors: Sequence[str] = DEFAULT_TRUSTED_REVIEW_AUTHORS,
