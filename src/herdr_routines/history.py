@@ -76,7 +76,8 @@ class HistoryExtra(TypedDict, total=False):
     whatever its file holds (older files have keys no writer emits any more), so readers
     narrow what they read by key instead of trusting this shape.
 
-    Statuses are plain `str` here so this module stays free of herdr/config imports.
+    Statuses are plain `str` here except `select_mode`, which uses config's
+    `ReviewSelectMode` so the write-side schema cannot drift from the validated set.
     """
 
     # why/where
@@ -292,7 +293,8 @@ def maybe_rotate(
     docstring rules out. Callers hold the exclusive `tick.lock` (see tick.run_tick), which
     makes this unreachable in practice; the guard is there so the failure mode is a
     warning, not corrupted history. `Retention`-independent on purpose — the thresholds are
-    passed in, so this module stays free of any config import.
+    passed in, so rotation itself reads no config (the module's only config import is the
+    write-side `ReviewSelectMode` above).
     """
     if max_bytes is None and max_age_days is None:
         return None
