@@ -21,6 +21,8 @@ from typing import Literal, TypedDict, TypeIs, get_args
 
 from logger import get_logger
 
+from herdr_routines.config import ReviewSelectMode
+
 log = get_logger(__name__)
 
 TerminalState = Literal["done", "failed", "skipped", "missed", "interrupted_unknown"]
@@ -163,7 +165,7 @@ class HistoryExtra(TypedDict, total=False):
     repos_failed: int
     target_key: str
     repo: str
-    select_mode: str
+    select_mode: ReviewSelectMode
     verified: bool | None
 
 

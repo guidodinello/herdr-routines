@@ -132,7 +132,8 @@ MULTI_TARGET_SELECTORS: frozenset[TargetSelector] = frozenset({"my_open_prs"})
 # Recognized values for a `my_open_prs` job's `select` list (issues 055, 076). "author" is the
 # default-worthy one; "review_requested" is opt-in because it puts the routine in someone
 # else's PR queue.
-VALID_REVIEW_SELECT = frozenset({"author", "review_requested"})
+ReviewSelectMode = Literal["author", "review_requested"]
+VALID_REVIEW_SELECT: frozenset[str] = frozenset(get_args(ReviewSelectMode))
 
 # Closed set of known terminal RunOutcome.reason values eligible for retry.
 # Derived from runner.py + tick.py failure sites. Unknown strings in retry_on
@@ -550,7 +551,7 @@ class Job:
     # -- pick: my_open_prs (issues 055, 076) ----------------------------------------
     # Which PR sets to watch: a non-empty, duplicate-free subset of
     # {author, review_requested}. Required for `pick: my_open_prs`, None otherwise.
-    select: tuple[str, ...] | None = None
+    select: tuple[ReviewSelectMode, ...] | None = None
     # Opt in to reviewing `auto/*` (pipeline-owned) branches too; default off so a
     # pipeline PR is never reviewed twice.
     include_auto_branches: bool = False
@@ -1703,7 +1704,7 @@ def _build_job(
 
     # -- pick: my_open_prs (issues 055, 076) ---------------------------------------------
     reviews_my_prs = review_sugar or merged["pick"] == "my_open_prs"
-    select: tuple[str, ...] | None = None
+    select: tuple[ReviewSelectMode, ...] | None = None
     include_auto_branches = False
     if reviews_my_prs:
         select_raw = merged.get("select")
