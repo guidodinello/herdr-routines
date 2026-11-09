@@ -28,10 +28,10 @@ from herdr_routines.config import ReviewSelectMode
 
 log = get_logger(__name__)
 
-# How long a writer waits for a sibling writer before giving up. Appends hold the lock for
-# one line, so contention is measured in microseconds; the bound only matters when a
-# crashed-but-alive process is wedged, where a silent forever-wait would be worse than a
-# loud error (issue 079).
+# How long a writer waits for a sibling writer before giving up. An append holds the lock
+# for one line and a rotation for a stat/read, a rename and a touch, so contention is
+# measured in milliseconds; the bound only matters when a crashed-but-alive process is
+# wedged, where a silent forever-wait would be worse than a loud error (issue 079).
 HISTORY_LOCK_TIMEOUT_S = 30.0
 
 TerminalState = Literal["done", "failed", "skipped", "missed", "interrupted_unknown"]
@@ -48,6 +48,16 @@ TRIGGER_CRON = "cron"
 TRIGGER_EVENT = "event"
 TRIGGER_REQUEST = "request"
 TRIGGER_MANUAL = "manual"
+
+# Terminal-state records that report *contention*, not a finished run (issue 079). They
+# never feed `schedule.decide`: the occurrence they describe is still owed, and is consumed
+# by the terminal record of whichever run actually serves it.
+#   - `collapsed_earlier_occurrences`: occurrences skipped before the one being dispatched.
+#   - `dispatch_in_flight`: a dispatcher lost the job's non-blocking dispatch lock.
+#   - `checkout_busy`: a `workspace: root` dispatch lost its checkout's lock to another job.
+NOT_A_RUN_REASONS: frozenset[str] = frozenset(
+    {"collapsed_earlier_occurrences", "dispatch_in_flight", "checkout_busy"}
+)
 
 
 def is_history_state(value: object) -> TypeIs[HistoryState]:
@@ -239,11 +249,13 @@ def history_lock_path(path: Path) -> Path:
 def _history_lock(
     path: Path, *, timeout_s: float = HISTORY_LOCK_TIMEOUT_S
 ) -> Generator[None]:
-    """Exclusive flock around one short history write, bounded rather than blocking.
+    """Exclusive flock around one short history write. It polls for up to *timeout_s*
+    and then raises `RuntimeError`, rather than blocking forever.
 
     Every `append` takes this on its own so the ~40 call sites do not have to thread a
-    lock through; it is the innermost lock in tick.py's ordering (global decision ->
-    per-job dispatch -> history), so it may only ever be held for one record's write."""
+    lock through. `maybe_rotate` holds it across its threshold check, rename and touch.
+    It is the innermost lock in tick.py's ordering (global decision -> per-job dispatch ->
+    per-checkout -> history), so nothing may be acquired while holding it."""
     lock_path = history_lock_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
@@ -344,10 +356,11 @@ def maybe_rotate(
 
     A same-second collision (two rotations in the same second) skips the rotation and warns
     rather than inventing a suffix, which would reintroduce the ordering bug `rolled_path`'s
-    docstring rules out. The same `history.lock` that serializes `append` guards the check
-    and the rename, so a rotation can never interleave with a writer's line; the tick takes
-    it non-blockingly at the end of its run and skips/warns rather than waiting on an hour
-    away holder (issue 079). `Retention`-independent on purpose — the thresholds are
+    docstring rules out. The same `history.lock` that serializes `append` guards the check,
+    the rename and the touch, so a rotation can never interleave with a writer's line. That
+    lock is a bounded wait (`HISTORY_LOCK_TIMEOUT_S`, then `RuntimeError`), not a skip; the
+    non-blocking skip-and-warn is `run_tick`'s, on the global tick lock it takes around this
+    call (issue 079). `Retention`-independent on purpose — the thresholds are
     passed in, so rotation itself reads no config (the module's only config import is the
     write-side `ReviewSelectMode` above).
     """
@@ -450,10 +463,11 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
     before it" keeps `run --run-id <scheduled run_id>` from un-counting that run's original
     scheduled terminal record.
 
-    A `collapsed_earlier_occurrences` record is not a finished run: it reports occurrences
-    skipped *before* the one now being dispatched. Counting it as terminal would make a
-    concurrent dispatcher see the occurrence as not due and never reach the job lock (issue
-    079), so it is ignored here."""
+    Records whose reason is in `NOT_A_RUN_REASONS` are ignored (issue 079). A
+    `collapsed_earlier_occurrences` record reports occurrences skipped *before* the one now
+    being dispatched; a `dispatch_in_flight` or `checkout_busy` skip reports that a
+    dispatcher lost a lock. Counting any of them would let contention, or a refused manual
+    run, consume a cron occurrence that no run has served."""
     off_schedule_run_ids: set[str] = set()
     scheduled: HistoryRecord | None = None
     for record in read_job(path, job_name):
@@ -463,7 +477,7 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
             else:
                 off_schedule_run_ids.discard(record.run_id)
         elif record.state in TERMINAL_STATES:
-            if (record.extra or {}).get("reason") == "collapsed_earlier_occurrences":
+            if (record.extra or {}).get("reason") in NOT_A_RUN_REASONS:
                 continue
             off_schedule = _is_off_schedule(record) or (
                 record.run_id is not None and record.run_id in off_schedule_run_ids

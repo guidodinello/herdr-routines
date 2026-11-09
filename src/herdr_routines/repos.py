@@ -11,10 +11,16 @@ pipeline's ``$REPO_PARENT``, which is outside the job-dispatch path.
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 
 from logger import get_logger
@@ -24,6 +30,19 @@ from herdr_routines.config import Job
 log = get_logger(__name__)
 
 REPO_TIMEOUT_S = 120
+
+# How long `_ensure_checkout` waits for another dispatch's brief sync of the same checkout
+# (issue 079). One sync is a fetch, a rev-parse and a merge, each bounded by REPO_TIMEOUT_S,
+# so this covers an ordinary holder; a `workspace: root` run holding the checkout for its
+# whole dispatch outlasts it, and the sync fails as `CheckoutBusy` instead of mutating the
+# tree under that run.
+CHECKOUT_LOCK_WAIT_S = 2 * REPO_TIMEOUT_S
+CHECKOUT_LOCK_POLL_S = 0.5
+
+
+class CheckoutBusy(RuntimeError):
+    """Another dispatch holds this checkout's lock (issue 079). A `RuntimeError`, so every
+    caller that maps a clone/sync failure to a terminal outcome still handles it."""
 
 
 def default_repos_dir() -> Path:
@@ -37,6 +56,75 @@ def default_repos_dir() -> Path:
         else Path.home() / ".local" / "state" / "herdr-routines"
     )
     return base / "repos"
+
+
+def checkout_lock_path(checkout: Path) -> Path:
+    """The per-checkout lock (issue 079), in the state dir rather than the checkout.
+
+    Keyed by the resolved path, so a managed clone and a `repo:` path naming the same
+    directory share one lock. It lives outside the tree on purpose: a lock file inside
+    the checkout would be an untracked file there, which makes `git status` dirty (the
+    self-update and dirty-worktree checks read it) and is one `git add -A` away from
+    being committed by a `workspace: root` agent."""
+    resolved = checkout.resolve()
+    digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:16]
+    return (
+        default_repos_dir().parent / "locks" / f"checkout-{resolved.name}-{digest}.lock"
+    )
+
+
+# Locks this thread already holds, so a `workspace: root` dispatch (which holds its
+# checkout for the whole run) can still call `ensure_repo` on it. flock conflicts between
+# two open() calls even inside one process, so without this the nested sync would wait on
+# itself. Per thread, not per process: tests serialize threads on the same lock.
+_held_checkouts = threading.local()
+
+
+def _held() -> dict[Path, int]:
+    held: dict[Path, int] | None = getattr(_held_checkouts, "paths", None)
+    if held is None:
+        held = {}
+        _held_checkouts.paths = held
+    return held
+
+
+@contextmanager
+def checkout_lock(checkout: Path, *, wait_s: float = 0.0) -> Generator[bool]:
+    """Exclusive flock serializing git mutations of one checkout across jobs (issue 079).
+
+    Yields True holding the lock, or False when another holder kept it for *wait_s*
+    seconds (0 = one non-blocking try). Re-entrant within a thread. Lock ordering: taken
+    inside a job's dispatch lock and outside `history.lock`."""
+    path = checkout_lock_path(checkout)
+    held = _held()
+    if path in held:
+        held[path] += 1
+        try:
+            yield True
+        finally:
+            held[path] -= 1
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    deadline = time.monotonic() + wait_s
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(CHECKOUT_LOCK_POLL_S)
+        held[path] = 1
+        try:
+            yield True
+        finally:
+            del held[path]
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def is_repo_less(job: Job) -> bool:
@@ -80,12 +168,20 @@ def _ensure_checkout(clone_url: str | None, dest: Path, *, base: str) -> Path:
     job (``clone_url is None``) is still never cloned, only synced.
 
     Returns *dest*.  Raises ``RuntimeError`` on clone/sync failure so callers
-    can map it to a terminal outcome.
+    can map it to a terminal outcome, and its ``CheckoutBusy`` subclass when another
+    dispatch kept the checkout locked for ``CHECKOUT_LOCK_WAIT_S`` (issue 079): two jobs
+    sharing a checkout must not fetch, fast-forward or clone it at the same time.
     """
-    if clone_url is not None and not (dest / ".git").exists():
-        _clone(clone_url, dest)
-    else:
-        _fetch_and_fast_forward(dest, base=base)
+    with checkout_lock(dest, wait_s=CHECKOUT_LOCK_WAIT_S) as acquired:
+        if not acquired:
+            raise CheckoutBusy(
+                f"checkout {dest} is locked by another dispatch "
+                f"(waited {CHECKOUT_LOCK_WAIT_S}s)"
+            )
+        if clone_url is not None and not (dest / ".git").exists():
+            _clone(clone_url, dest)
+        else:
+            _fetch_and_fast_forward(dest, base=base)
 
     return dest
 

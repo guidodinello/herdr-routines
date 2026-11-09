@@ -369,7 +369,10 @@ time that repeats. One `set` and a few lines in `schedule._occurrences_since`, n
 - **Overlapping ticks:** the tick takes an exclusive `flock` on
   `~/.local/state/herdr-routines/tick.lock` and exits quietly (rc 0) if it cannot get it. Cheap
   insurance against two processes appending the same JSONL, and it makes the "skip, never queue"
-  rule automatic.
+  rule automatic. *Superseded by issue 079:* `tick.lock` now covers only each job's decision
+  phase and housekeeping; each dispatch holds a per-job `locks/job-<name>.lock`, a
+  `workspace: root` dispatch also holds its checkout's lock, and every history write takes
+  `history.lock`. See `docs/process/issues/079-long-runs-block-scheduled-ticks.md`.
 - **A `running` record with no terminal record** (tick killed, power cut mid-run): treated as
   stale once `now > started_at + timeout_ms + 5 min`, rewritten as `interrupted_unknown`, and it
   does **not** block the next run. Without this rule, one crash silently disables a job forever

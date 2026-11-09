@@ -83,9 +83,10 @@ def reap_tmp(
 ) -> ReapResult:
     """Remove leaked files/dirs from *tmp_dir* that match known patterns and are older
     than *max_age_s* seconds. A directory's age is its newest mtime anywhere in its tree
-    (bounded walk), not its own mtime: pipeline, Telegram and manual agent runs write
-    into these dirs without holding tick.lock, and nested writes don't touch the top
-    level. A tree that can't be fully inspected is kept and counted as an error.
+    (bounded walk), not its own mtime: agent runs write into these dirs while the reap
+    runs (pipeline runs hold no lock, and since issue 079 every other dispatch holds only
+    its job lock, never the `tick.lock` the reap takes), and nested writes don't touch the
+    top level. A tree that can't be fully inspected is kept and counted as an error.
 
     Only matches files/dirs at the top level of *tmp_dir*. Follows no symlinks.
     Per-entry try/except ensures a single failure never aborts the sweep.
