@@ -116,12 +116,7 @@ from herdr_routines.pipeline_watchdog import (
     system_boot_epoch,
     validate_stage_sessions,
 )
-from herdr_routines.repos import (
-    _ensure_checkout,
-    checkout_lock,
-    default_repos_dir,
-    ensure_repo,
-)
+from herdr_routines.repos import _ensure_checkout, default_repos_dir, ensure_repo
 from herdr_routines.review_scan import (
     DISPATCHED,
     Candidate,
@@ -213,34 +208,6 @@ def job_lock(history_path: Path, job_name: str) -> Generator[bool]:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
-
-
-def held_job_locks(history_path: Path) -> list[str]:
-    """Names of jobs whose dispatch lock (`locks/job-<name>.lock`) is held right now.
-
-    Used by self-update (issue 053/079) to keep a code swap from landing under a live
-    synchronous dispatch: since 079 a long run holds only its job lock, not `tick.lock`.
-    A held flock is proof the owning process is alive (it dies with the process), so the
-    probe takes each lock non-blockingly and releases it immediately when it wins."""
-    locks_dir = history_path.parent / "locks"
-    if not locks_dir.is_dir():
-        return []
-    held: list[str] = []
-    for path in sorted(locks_dir.glob("job-*.lock")):
-        try:
-            fd = os.open(path, os.O_RDWR)
-        except OSError:
-            continue
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                held.append(path.stem.removeprefix("job-"))
-            else:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-    return held
 
 
 @dataclass(frozen=True, slots=True)
@@ -395,10 +362,8 @@ def run_tick(
 
 
 def _skip_on_tick_lock(job: Job) -> tuple[str, bool]:
-    """A decision phase that lost the global lock exits quietly, as a whole tick used
-    to: the holder is another tick's decision phase, not a long run (issue 079). The
-    phase is short *relative to a dispatch*, not necessarily sub-second — it may run
-    `ensure_repo` or a `gh` event poll — so a concurrent tick can still skip on it."""
+    """A decision phase that lost the brief global lock exits quietly, as a whole tick
+    used to: the holder is another tick's schedule decision, not a long run (issue 079)."""
     log.info("%s: skipped, tick lock %s is held", job.name, default_lock_path())
     return f"{job.name}: skipped (tick lock held)", False
 
@@ -428,48 +393,6 @@ def _skip_if_agent_live(
     return f"{job.name}: skipped (agent already live)", False
 
 
-def _reconcile_stale_running(
-    job: Job,
-    history_path: Path,
-    *,
-    client: HerdrClient,
-    now: datetime,
-    timeout_ms: int,
-) -> None:
-    """Close out a stale `running` record as `interrupted_unknown` (docs/plan-v1.md §4).
-
-    Runs in the decision phase, outside the job lock, so it must first prove no dispatch
-    is alive: a held job flock means a live run whose `running` record can merely *look*
-    stale (a retry/fallback record carries the tick-start `ts`, and a run dispatched late
-    in a sequential tick does too). Reaping such a run would write a false terminal, and
-    then a second real terminal for the same run_id (issue 079). The probe and the
-    rewrite happen under the job lock so a dispatch cannot start between them."""
-    with job_lock(history_path, job.name) as acquired:
-        if not acquired:
-            return
-        stale = find_stale_running(
-            history_path, job.name, timeout_ms=timeout_ms, now=now
-        )
-        if stale is None:
-            return
-        stale_extra = HistoryExtra(reason="stale_running_record")
-        reaped = _reap_agents_of_rebooted_run(
-            client, job, stale, boot_epoch=system_boot_epoch()
-        )
-        if reaped:
-            stale_extra["reaped_agents"] = reaped
-        append(
-            history_path,
-            HistoryRecord(
-                ts=now,
-                job=job.name,
-                state="interrupted_unknown",
-                run_id=stale.run_id,
-                extra=stale_extra,
-            ),
-        )
-
-
 def _process_audit_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool]:
@@ -496,9 +419,26 @@ def _decide_audit_job(
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
         return f"{job.name}: registered", False
 
-    _reconcile_stale_running(
-        job, history_path, client=client, now=now, timeout_ms=run_timeout_ms
+    stale = find_stale_running(
+        history_path, job.name, timeout_ms=run_timeout_ms, now=now
     )
+    if stale is not None:
+        stale_extra = HistoryExtra(reason="stale_running_record")
+        reaped = _reap_agents_of_rebooted_run(
+            client, job, stale, boot_epoch=system_boot_epoch()
+        )
+        if reaped:
+            stale_extra["reaped_agents"] = reaped
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="interrupted_unknown",
+                run_id=stale.run_id,
+                extra=stale_extra,
+            ),
+        )
 
     live_skip = _skip_if_agent_live(
         job,
@@ -1302,9 +1242,26 @@ def _decide_gated_job(
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
         return f"{job.name}: registered", False
 
-    _reconcile_stale_running(
-        job, history_path, client=client, now=now, timeout_ms=job.timeout_ms
+    stale = find_stale_running(
+        history_path, job.name, timeout_ms=job.timeout_ms, now=now
     )
+    if stale is not None:
+        stale_extra = HistoryExtra(reason="stale_running_record")
+        reaped = _reap_agents_of_rebooted_run(
+            client, job, stale, boot_epoch=system_boot_epoch()
+        )
+        if reaped:
+            stale_extra["reaped_agents"] = reaped
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="interrupted_unknown",
+                run_id=stale.run_id,
+                extra=stale_extra,
+            ),
+        )
 
     live_skip = _skip_if_agent_live(
         job,
@@ -3487,10 +3444,8 @@ def _poll_event_trigger(
     per tick (the rest stay out of the watermark and fire on later ticks), which keeps the
     tick lock's worst case at one run per job, as `validate`'s timeout budget assumes.
 
-    The watermark is written *before* the run itself but *after* `_dispatch_pending`'s
-    job-lock / running / live-agent guards: a crash mid-run never re-fires its event, but a
-    guard that skips the dispatch leaves the event unseen so it fires again next tick. A
-    failed run is retried by its own `retry_on` / `fallback_model`, not here.
+    The watermark is written *before* the dispatch: a crash mid-run never re-fires its
+    event. A failed run is retried by its own `retry_on` / `fallback_model`, not here.
     Every record this writes without a run_id carries `trigger: event`, so none of them
     counts toward `schedule.decide`. A poll failure fails closed (never "no events") and
     pages once per outage, not every tick.
@@ -3577,31 +3532,31 @@ def _poll_event_trigger(
 
     def _poll_record(
         watermark: list[str], reason: str, *, new: int, dispatched: int
-    ) -> HistoryRecord:
-        return HistoryRecord(
-            ts=now,
-            job=job.name,
-            state="done",
-            extra=HistoryExtra(
-                trigger=TRIGGER_EVENT,
-                phase=_EVENT_POLL_PHASE,
-                reason=reason,
-                target=event_target,
-                query=check.query,
-                polled=len(events),
-                new=new,
-                dispatched=dispatched,
-                last_seen_event_ids=watermark,
+    ) -> None:
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="done",
+                extra=HistoryExtra(
+                    trigger=TRIGGER_EVENT,
+                    phase=_EVENT_POLL_PHASE,
+                    reason=reason,
+                    target=event_target,
+                    query=check.query,
+                    polled=len(events),
+                    new=new,
+                    dispatched=dispatched,
+                    last_seen_event_ids=watermark,
+                ),
             ),
         )
 
     if last_seen is None and check.query == "issues:opened":
         # Same first-poll rule as 014's gate: adopt the open issues as the baseline.
-        append(
-            history_path,
-            _poll_record(
-                [e.event_id for e in events], "event_baseline", new=0, dispatched=0
-            ),
+        _poll_record(
+            [e.event_id for e in events], "event_baseline", new=0, dispatched=0
         )
         return f"{job.name}: baseline ({len(events)} open issues adopted)", False
 
@@ -3613,21 +3568,15 @@ def _poll_event_trigger(
 
     # A quiet poll writes nothing, so a */5 tick adds no history line; a changed watermark
     # or the first poll after a failed one (which ends the outage) does.
-    poll_record: HistoryRecord | None = None
     if watermark != (last_seen or []) or previously_failed:
-        poll_record = _poll_record(
+        _poll_record(
             watermark, "event_poll", new=len(new_events), dispatched=len(fired)
         )
 
     if not fired:
-        if poll_record is not None:
-            append(history_path, poll_record)
         return f"{job.name}: not due (no new events)", False
 
     event = fired[0]
-    # A fired event's watermark reaches history only after `_dispatch_pending`'s guards
-    # pass: if the job lock / running / live-agent guard skips the dispatch, the event
-    # stays unseen and fires again next tick instead of being consumed (issue 079).
     return _pending_occurrence(
         job,
         history_path,
@@ -3644,7 +3593,6 @@ def _poll_event_trigger(
         trusted_review_authors=trusted_review_authors,
         run_timeout_ms=run_timeout_ms,
         live_check=live_check,
-        poll_record=poll_record,
     )
 
 
@@ -3704,10 +3652,6 @@ class _PendingDispatch:
     # The collapsed-earlier-occurrences record for this firing, written only once the
     # job lock is won: a lost race must record `skipped`, not a second `missed`.
     collapsed: HistoryRecord | None = None
-    # The event poll's watermark record, written only after the job-locked guards pass:
-    # writing it in the decision phase would consume an event that a guard then skipped,
-    # so it would never fire again (issue 079).
-    poll_record: HistoryRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3729,7 +3673,6 @@ def _pending_occurrence(
     live_check: Callable[[HerdrClient, Job], bool],
     prefix: str | None = None,
     collapsed: HistoryRecord | None = None,
-    poll_record: HistoryRecord | None = None,
 ) -> _PendingDispatch:
     return _PendingDispatch(
         job=job,
@@ -3746,7 +3689,6 @@ def _pending_occurrence(
         ),
         prefix=prefix,
         collapsed=collapsed,
-        poll_record=poll_record,
     )
 
 
@@ -3759,52 +3701,9 @@ def _dispatch_pending(
     be, and is recorded so a starved occurrence is visible in history. The history and
     live-agent guards are repeated here — inside the job-locked section — because they are
     the second guard behind the flock, and because the `running` record must be written
-    here so a concurrent loser sees it.
-
-    A `workspace: root` routine also takes its checkout lock for the *whole* dispatch
-    (issue 079 guarantee 3): the agent works directly in the checkout, so a second job
-    sharing that path must not sync or run in it concurrently. Worktree-mode jobs take the
-    same lock only briefly, inside `ensure_repo`.
-
-    The `running` guard and the live-agent guard both mean a run is already in flight, so
-    they are refusals for a manual `run`/`/job` (`in_flight=True` → rc 1 + notification),
-    not silent successes."""
+    here so a concurrent loser sees it."""
     job = pending.job
     history_path = pending.history_path
-
-    def _dispatch_guarded() -> _DispatchOutcome:
-        if job.kind != "pipeline" and is_currently_running(
-            history_path, job.name, timeout_ms=pending.run_timeout_ms, now=now
-        ):
-            return _DispatchOutcome(
-                f"{job.name}: skipped (already running)", False, in_flight=True
-            )
-
-        if pending.live_check(client, job):
-            append(
-                history_path,
-                HistoryRecord(
-                    ts=now,
-                    job=job.name,
-                    state="skipped",
-                    extra=HistoryExtra(reason="agent_name_live"),
-                ),
-            )
-            return _DispatchOutcome(
-                f"{job.name}: skipped (agent already live)", False, in_flight=True
-            )
-
-        if pending.collapsed is not None:
-            append(history_path, pending.collapsed)
-
-        if pending.poll_record is not None:
-            append(history_path, pending.poll_record)
-
-        summary, failed = pending.dispatch()
-        if pending.prefix is not None:
-            summary = f"{pending.prefix}; {summary}"
-        return _DispatchOutcome(summary, failed)
-
     with job_lock(history_path, job.name) as acquired:
         if not acquired:
             append(
@@ -3820,26 +3719,30 @@ def _dispatch_pending(
                 f"{job.name}: skipped (dispatch in flight)", False, in_flight=True
             )
 
-        if job.kind == "routine" and job.workspace == "root":
-            with checkout_lock(job.repo) as checkout_acquired:
-                if not checkout_acquired:
-                    append(
-                        history_path,
-                        HistoryRecord(
-                            ts=now,
-                            job=job.name,
-                            state="skipped",
-                            extra=HistoryExtra(reason="checkout_in_flight"),
-                        ),
-                    )
-                    return _DispatchOutcome(
-                        f"{job.name}: skipped (checkout in flight)",
-                        False,
-                        in_flight=True,
-                    )
-                return _dispatch_guarded()
+        if job.kind != "pipeline" and is_currently_running(
+            history_path, job.name, timeout_ms=pending.run_timeout_ms, now=now
+        ):
+            return _DispatchOutcome(f"{job.name}: skipped (already running)", False)
 
-        return _dispatch_guarded()
+        if pending.live_check(client, job):
+            append(
+                history_path,
+                HistoryRecord(
+                    ts=now,
+                    job=job.name,
+                    state="skipped",
+                    extra=HistoryExtra(reason="agent_name_live"),
+                ),
+            )
+            return _DispatchOutcome(f"{job.name}: skipped (agent already live)", False)
+
+        if pending.collapsed is not None:
+            append(history_path, pending.collapsed)
+
+        summary, failed = pending.dispatch()
+        if pending.prefix is not None:
+            summary = f"{pending.prefix}; {summary}"
+        return _DispatchOutcome(summary, failed)
 
 
 def _finish_dispatch(
@@ -4316,9 +4219,26 @@ def _decide_routine_job(
         append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
         return f"{job.name}: registered", False
 
-    _reconcile_stale_running(
-        job, history_path, client=client, now=now, timeout_ms=run_timeout_ms
+    stale = find_stale_running(
+        history_path, job.name, timeout_ms=run_timeout_ms, now=now
     )
+    if stale is not None:
+        stale_extra = HistoryExtra(reason="stale_running_record")
+        reaped = _reap_agents_of_rebooted_run(
+            client, job, stale, boot_epoch=system_boot_epoch()
+        )
+        if reaped:
+            stale_extra["reaped_agents"] = reaped
+        append(
+            history_path,
+            HistoryRecord(
+                ts=now,
+                job=job.name,
+                state="interrupted_unknown",
+                run_id=stale.run_id,
+                extra=stale_extra,
+            ),
+        )
 
     live_skip = _skip_if_agent_live(
         job,

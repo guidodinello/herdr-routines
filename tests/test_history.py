@@ -18,7 +18,6 @@ from herdr_routines.history import (
     first_seen_at,
     has_ever_been_seen,
     is_currently_running,
-    last_scheduled_terminal_run,
     last_terminal_run,
     maybe_rotate,
     read_all,
@@ -431,41 +430,6 @@ def test_history_queries_span_rolled_files(tmp_path: Path) -> None:
         assert stale is not None
         assert stale.run_id == "a-2"
         assert is_currently_running(path, "a", timeout_ms=1_000, now=now) is False
-
-
-def test_last_scheduled_terminal_run_ignores_dispatch_guard_skips(
-    tmp_history_path: Path,
-) -> None:
-    """Issue 079: a guard skip is not a finished occurrence, so it must not make
-    `schedule.decide` think the next cron occurrence already ran — nor may an in-flight
-    dispatch's every-tick `agent_name_live` skip consume it."""
-    scheduled = HistoryRecord(
-        ts=T0, job="a", state="running", run_id="a-1", extra={"trigger": "cron"}
-    )
-    append(tmp_history_path, scheduled)
-    append(
-        tmp_history_path,
-        HistoryRecord(
-            ts=T0 + timedelta(minutes=1),
-            job="a",
-            state="done",
-            run_id="a-1",
-            extra={"trigger": "cron"},
-        ),
-    )
-    for reason in ("dispatch_in_flight", "agent_name_live"):
-        append(
-            tmp_history_path,
-            HistoryRecord(
-                ts=T0 + timedelta(minutes=2),
-                job="a",
-                state="skipped",
-                extra={"reason": reason},
-            ),
-        )
-
-    last = last_scheduled_terminal_run(tmp_history_path, "a")
-    assert last is not None and last.run_id == "a-1"
 
 
 def test_maybe_rotate_preserves_all_records(tmp_history_path: Path) -> None:

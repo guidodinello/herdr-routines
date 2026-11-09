@@ -80,9 +80,7 @@ def test_long_run_does_not_block_other_jobs(
     normally: once by a scheduled tick, once by a manual run (the 2026-10-23
     `babysit-prs` silent skip cannot recur)."""
     long_job = _job(tmp_path)
-    # Distinct checkout: issue 079 guarantee 3 serializes `workspace: root` jobs that
-    # share a repo, so job b must not share job a's (test-pinned) checkout.
-    other = _job(tmp_path / "b", name="b", repo=tmp_path / "b")
+    other = _job(tmp_path, name="b")
     started = threading.Event()
     release = threading.Event()
     dispatch_calls: list[str] = []
@@ -132,53 +130,6 @@ def test_long_run_does_not_block_other_jobs(
     assert cron.extra is not None and cron.extra["trigger"] == "cron"
     manual = records[3]
     assert manual.extra is not None and manual.extra["trigger"] == "manual"
-
-
-def test_root_jobs_sharing_a_checkout_are_serialized(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue 079 guarantee 3: a `workspace: root` agent runs directly in the checkout,
-    so a second root job on the same path must skip while the first is in flight (it
-    would otherwise `ensure_repo` and run in a checkout an agent is using)."""
-    first = _job(tmp_path)
-    second = _job(tmp_path, name="b")
-    started = threading.Event()
-    release = threading.Event()
-    dispatch_calls: list[str] = []
-
-    def execute_run(run_job, client, *, run_id, **_):
-        dispatch_calls.append(run_job.name)
-        started.set()
-        release.wait(timeout=BLOCK_TIMEOUT_S)
-        return RunOutcome(state="done", run_id=run_id)
-
-    history = _wire(
-        monkeypatch,
-        tmp_path,
-        _Client(),
-        RoutinesConfig(jobs=(first, second)),
-        execute_run,
-    )
-    for job in (first, second):
-        _register(history, job, at=FROZEN_NOW - timedelta(days=2))
-
-    try:
-        first_thread, first_outcome = _run_first_tick_in_thread([])
-        assert started.wait(timeout=BLOCK_TIMEOUT_S)
-        assert cli.main(["tick"]) == 0
-    finally:
-        release.set()
-    first_thread.join(timeout=BLOCK_TIMEOUT_S)
-    assert not first_thread.is_alive()
-    assert first_outcome == [0]
-
-    # a ran once; b was skipped by the contender tick and ran once after a released.
-    assert dispatch_calls == ["a", "b"]
-    records = read_job(history, "b")
-    assert [r.state for r in records] == ["registered", "skipped", "running", "done"]
-    skipped = records[1]
-    assert skipped.extra is not None
-    assert skipped.extra["reason"] == "checkout_in_flight"
 
 
 def test_same_job_never_dispatched_concurrently(
