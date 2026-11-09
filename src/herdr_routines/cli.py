@@ -765,9 +765,13 @@ def _cmd_tick(args: argparse.Namespace) -> int:
     config = _load_config_or_exit(args)
     history_path = default_history_path()
     # The global tick lock is no longer held across the whole tick (issue 079): run_tick
-    # takes it briefly around each job's schedule decision and the housekeeping preamble,
-    # and each dispatch holds only its own job lock. A decision phase that cannot get the
-    # lock skips with rc 0 inside run_tick, preserving the systemd contract.
+    # takes it around each job's decision phase (schedule decision, event poll, guarded
+    # checks) and the housekeeping preamble, but never across a dispatch — each dispatch
+    # holds only its own job (and, for workspace: root, checkout) lock. A decision phase
+    # that cannot get the lock skips with rc 0 inside run_tick, preserving the systemd
+    # contract. "Brief" is per job, not a hard bound: a decision phase can run
+    # `ensure_repo` or a `gh` event poll, so a tick can hold it for seconds, not exactly
+    # milliseconds.
     now = datetime.now(UTC)
     client = HerdrClient()
     outcome = run_tick(config, history_path, client=client, now=now)

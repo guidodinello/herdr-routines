@@ -279,6 +279,39 @@ def test_event_trigger_fires_once_per_event(
     assert len(runs) == 3
 
 
+def test_event_guard_skip_does_not_consume_the_event(
+    tmp_path: Path,
+    history: Path,
+    client: _Client,
+    runs: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue 079: the event watermark is written after the job-locked guards, so an event
+    whose dispatch the live-agent guard skips is not marked seen — the next tick fires it
+    once the agent ends (the decision-phase live check passes, the dispatch's repeats)."""
+    job = _job(tmp_path, cron=None, trigger_event=EVENT_CHECK)
+    _register(history, job, at=datetime(2026, 10, 19, tzinfo=UTC))
+    _poll_returns(monkeypatch, [_event("evt-pr-1")])
+
+    live_calls = 0
+
+    def live_after_decision(client: Any, job: Job) -> bool:
+        nonlocal live_calls
+        live_calls += 1
+        return live_calls >= 2
+
+    monkeypatch.setattr(tick, "_live_agent_exists", live_after_decision)
+    assert _tick(job, history, client, FROZEN_NOW) == ("a: skipped (agent already live)",)
+    assert runs == []
+    assert not [r for r in read_job(history, "a") if (r.extra or {}).get("last_seen_event_ids")]
+
+    monkeypatch.setattr(tick, "_live_agent_exists", lambda client, job: False)
+    assert _tick(job, history, client, FROZEN_NOW + timedelta(minutes=5)) == ("a: done",)
+    assert runs == ["a-20261020T102500Z"]
+    running = [r for r in read_job(history, "a") if r.state == "running"]
+    assert (running[0].extra or {}).get("event_id") == "evt-pr-1"
+
+
 def test_event_runs_do_not_consume_the_cron_occurrence(
     tmp_path: Path,
     history: Path,

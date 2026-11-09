@@ -46,20 +46,21 @@ of those seams, and is exercised for real in `tests/test_self_update.py`.
 Sequence (spec 20260929T050000Z, `### Sequence`):
 
     1. tick_lock     not acquired within TICK_LOCK_WAIT_S -> deferred + notify, rc 0
-    2. pipeline_run_open               open run     -> deferred,  rc 0
-    3. repo_state       unreadable HEAD / dirty / not <base> / detached
+    2. in-flight dispatch (a held `locks/job-*.lock`)    -> deferred,  rc 0
+    3. pipeline_run_open               open run     -> deferred,  rc 0
+    4. repo_state       unreadable HEAD / dirty / not <base> / detached
                                                         -> refused,  rc 1
-    4. resolve_uv                      missing      -> refused,  rc 1   (before any git op)
-    5. one fetch, resolve `new`, CI gate on that exact `new`
+    5. resolve_uv                      missing      -> refused,  rc 1   (before any git op)
+    6. one fetch, resolve `new`, CI gate on that exact `new`
                                          not green    -> deferred,  rc 0
                                          already rejected -> deferred, rc 0
-    6. baseline validate (best effort) failure -> no baseline, count check skipped
-    7. merge --ff-only <gated new>      failed       -> refused,  rc 1
-    8. re-read HEAD                    unchanged    -> up_to_date (+ warn if unpushed),
+    7. baseline validate (best effort) failure -> no baseline, count check skipped
+    8. merge --ff-only <gated new>      failed       -> refused,  rc 1
+    9. re-read HEAD                    unchanged    -> up_to_date (+ warn if unpushed),
                                                       refused if HEAD is a rejected SHA
-    9. post validate                   failed / fewer jobs -> reset --keep, rc 1
-   10. deploy changes are reported, never applied
-   11. host_check (updated / up_to_date / deferred) -> drift appended to the
+   10. post validate                   failed / fewer jobs -> reset --keep, rc 1
+   11. deploy changes are reported, never applied
+   12. host_check (updated / up_to_date / deferred) -> drift appended to the
                                                       notification, or notified alone
 
 Nothing on this path raises: every git call is bounded and a `TimeoutExpired` comes
@@ -94,7 +95,7 @@ from herdr_routines.gates import (
 from herdr_routines.host_drift import DriftFinding, format_findings
 from herdr_routines.runner_seam import SubprocessRunner as Runner
 from herdr_routines.runner_seam import _real_runner
-from herdr_routines.tick import _open_pipeline_run, tick_lock
+from herdr_routines.tick import _open_pipeline_run, held_job_locks, tick_lock
 
 log = get_logger(__name__)
 
@@ -111,14 +112,15 @@ GIT_TIMEOUT_S = 120
 # probes at most), plus slack.
 VALIDATE_TIMEOUT_S = 300
 # How long to keep retrying a held tick lock before deferring. Since issue 079 a tick
-# holds it only for brief housekeeping and schedule-decision sections, never across a
-# dispatch (~8s on the Pi), so a timer that lands on a tick boundary — 21:30 UTC is one,
+# holds it only for its decision phases (schedule decision, event poll, guarded checks,
+# `ensure_repo`) and the housekeeping preamble — never across a dispatch (~8s on the Pi
+# outside a decision phase), so a timer that lands on a tick boundary — 21:30 UTC is one,
 # and it deferred three nights running on exactly that — is a transient collision, not a
-# reason to wait another 24h. Five minutes rides out any ordinary tick, including one that
-# dispatches a job; a lock still held after that is a tick stuck in a decision phase (or a
-# pre-079 process), which is worth a notification rather than an open-ended wait inside a
-# unit with a finite TimeoutStartSec. Polled rather than a blocking flock so the bound is
-# ours.
+# reason to wait another 24h. Five minutes rides out any ordinary tick, including one
+# whose decision phases run a fetch or a `gh` poll; a lock still held after that is a tick
+# stuck in a decision phase (or a pre-079 process), which is worth a notification rather
+# than an open-ended wait inside a unit with a finite TimeoutStartSec. Polled rather than
+# a blocking flock so the bound is ours.
 TICK_LOCK_WAIT_S = 300
 TICK_LOCK_POLL_S = 5
 
@@ -679,11 +681,15 @@ def _run_self_update(
                     body=(
                         f"{reason} ({lock_path}) — no update this run; the timer "
                         "tries again the next night. A lock held this long is "
-                        "usually a manual `herdr-routines run <job>` still in "
-                        "progress."
+                        "usually a tick still in a decision phase (or a pre-079 "
+                        "process stuck across a run)."
                     ),
                 )
             return result
+
+        in_flight = held_job_locks(history_path)
+        if in_flight:
+            return _deferred(f"dispatch in flight for {', '.join(in_flight)}", checkout)
 
         open_job = pipeline_run_open(config, history_path)
         if open_job is not None:

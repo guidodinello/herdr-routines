@@ -35,6 +35,7 @@ from herdr_routines import cli, self_update
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append
 from herdr_routines.self_update import SelfUpdateResult, run_self_update
+from herdr_routines.tick import job_lock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -420,6 +421,25 @@ def test_self_update_defers_while_pipeline_run_open(sandbox: Sandbox) -> None:
     assert notify.calls == []
     assert validate.calls == []
     assert gh.calls == []
+
+
+def test_self_update_defers_while_a_job_dispatch_is_in_flight(
+    sandbox: Sandbox,
+) -> None:
+    """Issue 079: a synchronous dispatch no longer holds `tick.lock`, only its job lock,
+    so the swap must defer on a held `locks/job-*.lock` too — not just on an open
+    pipeline run."""
+    old = sandbox.head()
+    sandbox.push("NEW.md", "new\n", "add NEW.md")
+    notify = Recorder()
+
+    with job_lock(sandbox.history_path, "babysit-prs"):
+        result = sandbox.run(notify=notify)
+
+    assert result.status == "deferred"
+    assert "babysit-prs" in (result.reason or "")
+    assert sandbox.head() == old
+    assert notify.calls == []
 
 
 # ---------------------------------------------------------------------------

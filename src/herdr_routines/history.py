@@ -239,11 +239,15 @@ def history_lock_path(path: Path) -> Path:
 def _history_lock(
     path: Path, *, timeout_s: float = HISTORY_LOCK_TIMEOUT_S
 ) -> Generator[None]:
-    """Exclusive flock around one short history write, bounded rather than blocking.
+    """Exclusive flock around one history write, polled for up to `timeout_s`.
 
     Every `append` takes this on its own so the ~40 call sites do not have to thread a
     lock through; it is the innermost lock in tick.py's ordering (global decision ->
-    per-job dispatch -> history), so it may only ever be held for one record's write."""
+    per-job dispatch -> history), so a writer holds it only for one record's write.
+    `maybe_rotate` is the one exception: it holds the same lock across its threshold
+    read and the rename, since the check and the rename must not interleave with an
+    append. The wait is bounded and then raises rather than blocking forever; the
+    non-blocking skip-and-warn at tick level is the global `tick_lock`, not this one."""
     lock_path = history_lock_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
@@ -345,11 +349,11 @@ def maybe_rotate(
     A same-second collision (two rotations in the same second) skips the rotation and warns
     rather than inventing a suffix, which would reintroduce the ordering bug `rolled_path`'s
     docstring rules out. The same `history.lock` that serializes `append` guards the check
-    and the rename, so a rotation can never interleave with a writer's line; the tick takes
-    it non-blockingly at the end of its run and skips/warns rather than waiting on an hour
-    away holder (issue 079). `Retention`-independent on purpose — the thresholds are
-    passed in, so rotation itself reads no config (the module's only config import is the
-    write-side `ReviewSelectMode` above).
+    and the rename, so a rotation can never interleave with a writer's line; a writer waits
+    for that lock (bounded, then raises), and the tick's non-blocking skip-and-warn is the
+    *global* `tick_lock` around the rotation call, not this per-file lock. `Retention`-
+    independent on purpose — the thresholds are passed in, so rotation itself reads no
+    config (the module's only config import is the write-side `ReviewSelectMode` above).
     """
     if max_bytes is None and max_age_days is None:
         return None
@@ -453,7 +457,21 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
     A `collapsed_earlier_occurrences` record is not a finished run: it reports occurrences
     skipped *before* the one now being dispatched. Counting it as terminal would make a
     concurrent dispatcher see the occurrence as not due and never reach the job lock (issue
-    079), so it is ignored here."""
+    079), so it is ignored here.
+
+    The dispatch guards' skip records are ignored for the same reason: `dispatch_in_flight`
+    (a concurrent dispatcher won the job lock, often a refused manual `run`),
+    `checkout_in_flight` (another job is using the shared `workspace: root` checkout) and
+    `agent_name_live` (the job's own long or manual run is still live) describe a firing
+    that did not happen. They must not consume the next cron occurrence, or issue 074's
+    "a manual run does not consume the next scheduled occurrence" breaks for the length of
+    that run's every-tick guard records."""
+    ignored_skip_reasons = {
+        "collapsed_earlier_occurrences",
+        "dispatch_in_flight",
+        "checkout_in_flight",
+        "agent_name_live",
+    }
     off_schedule_run_ids: set[str] = set()
     scheduled: HistoryRecord | None = None
     for record in read_job(path, job_name):
@@ -463,7 +481,7 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
             else:
                 off_schedule_run_ids.discard(record.run_id)
         elif record.state in TERMINAL_STATES:
-            if (record.extra or {}).get("reason") == "collapsed_earlier_occurrences":
+            if (record.extra or {}).get("reason") in ignored_skip_reasons:
                 continue
             off_schedule = _is_off_schedule(record) or (
                 record.run_id is not None and record.run_id in off_schedule_run_ids
