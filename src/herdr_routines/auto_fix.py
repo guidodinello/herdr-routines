@@ -14,7 +14,7 @@ import re
 import shlex
 import subprocess
 import textwrap
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +27,7 @@ from herdr_routines.config import (
 )
 from herdr_routines.findings import Finding
 from herdr_routines.history import HistoryState, read_job
+from herdr_routines.runner_seam import BoundedRunner as Runner
 
 log = logging.getLogger(__name__)
 
@@ -1109,7 +1110,7 @@ def run_checks(
     *,
     cwd: str,
     env: dict[str, str] | None = None,
-    runner: Callable[..., tuple[int, str, str]] | None = None,
+    runner: Runner | None = None,
 ) -> GateOutcome:
     """Run all gate checks sequentially, no short-circuit. Returns GateOutcome.
 

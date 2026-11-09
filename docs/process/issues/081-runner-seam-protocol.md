@@ -1,7 +1,7 @@
 ---
 id: "081"
 title: "Replace the Callable[..., X] runner seams with a Runner Protocol"
-status: open
+status: done
 priority: low
 area: infra
 ---
