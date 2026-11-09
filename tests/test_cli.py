@@ -702,6 +702,9 @@ def test_cmd_run_pipeline_never_calls_execute_run(
         raise AssertionError("execute_run must never be called for kind: pipeline")
 
     monkeypatch.setattr(tick, "execute_run", fail_execute_run)
+    # The dispatch's live-agent guard queries herdr; give it a fake client so the test never
+    # shells out to a real `herdr` binary (absent on CI, present on a dev machine).
+    monkeypatch.setattr(cli, "HerdrClient", lambda: _NoLiveAgentsClient())
 
     launched: list[list[str]] = []
 
@@ -959,6 +962,13 @@ class _NotifyingClient:
 
     def notification_show(self, title, *, body=None, sound="none"):
         pass
+
+
+class _NoLiveAgentsClient(_NotifyingClient):
+    """`_NotifyingClient` plus the live-agent query a dispatch makes: no agent is live."""
+
+    def agent_statuses(self) -> dict[str, str]:
+        return {}
 
 
 def _prepare_run_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
