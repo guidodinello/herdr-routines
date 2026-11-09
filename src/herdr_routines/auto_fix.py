@@ -24,6 +24,7 @@ from herdr_routines.config import (
     DEFAULT_TRUSTED_REVIEW_AUTHORS,
     GateCheck,
     GateCheckKind,
+    ReviewSelectMode,
 )
 from herdr_routines.findings import Finding
 from herdr_routines.history import HistoryState, read_job
@@ -109,7 +110,9 @@ class GhClient(Protocol):
         gate-5 failure hours later, so it must never be a silent no-op."""
         ...
 
-    def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
+    def search_prs(
+        self, modes: Sequence[ReviewSelectMode], limit: int = 100
+    ) -> ReviewSearch | None:
         """One batched ``gh api graphql`` search, one alias per selected mode. Returns
         ``None`` on any failure (fail closed — an unknown answer must never mean
         "nothing to review")."""
@@ -156,9 +159,7 @@ class ReviewPR:
     author: str | None  # None for a deleted ("ghost") author
     repo: str  # base repo "owner/name" (repository.nameWithOwner)
     head_repo: str | None  # head repo "owner/name", or None when unknown
-    mode: (
-        str  # the selected mode alias that returned it ("author" | "review_requested")
-    )
+    mode: ReviewSelectMode  # the selected mode alias that returned it
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +168,7 @@ class ReviewSearch:
     ceiling (recorded as ``search_truncated`` — phase A does not paginate)."""
 
     prs: tuple[ReviewPR, ...]
-    truncated_modes: tuple[str, ...] = ()
+    truncated_modes: tuple[ReviewSelectMode, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,7 +339,9 @@ class RealGhClient:
             raise RuntimeError(f"gh pr create printed no PR url: {stdout.strip()!r}")
         return int(match.group(1))
 
-    def search_prs(self, modes: Sequence[str], limit: int = 100) -> ReviewSearch | None:
+    def search_prs(
+        self, modes: Sequence[ReviewSelectMode], limit: int = 100
+    ) -> ReviewSearch | None:
         aliases = [m for m in modes if m in REVIEW_SEARCH_QUALIFIERS]
         if not aliases:
             return ReviewSearch(prs=())
@@ -360,7 +363,7 @@ class RealGhClient:
         if not isinstance(payload, dict):
             return None
         prs: list[ReviewPR] = []
-        truncated: list[str] = []
+        truncated: list[ReviewSelectMode] = []
         for mode in aliases:
             bucket = payload.get(mode)
             if not isinstance(bucket, dict):
@@ -892,7 +895,7 @@ _REVIEW_NODE_FIELDS = (
 )
 
 
-def _parse_review_node(node: object, mode: str) -> ReviewPR | None:
+def _parse_review_node(node: object, mode: ReviewSelectMode) -> ReviewPR | None:
     """Best-effort parse of one search node; a malformed node is skipped, not fatal."""
     if not isinstance(node, dict):
         return None

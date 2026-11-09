@@ -1,7 +1,7 @@
 ---
 id: "082"
 title: "Carry the review select mode as a Literal from config to history"
-status: open
+status: done
 priority: low
 area: infra
 ---

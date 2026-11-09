@@ -25,7 +25,7 @@ from herdr_routines.auto_fix import (
     has_trusted_marker,
     review_marker,
 )
-from herdr_routines.config import Job
+from herdr_routines.config import Job, ReviewSelectMode
 
 log = get_logger(__name__)
 
@@ -67,7 +67,7 @@ class Candidate:
     updated_at: str
     head_ref: str
     author: str | None
-    select_mode: str  # "author" | "review_requested"
+    select_mode: ReviewSelectMode
     skip_reason: str | None = None
 
 
@@ -79,7 +79,7 @@ class ScanOutcome:
 
     candidates: tuple[Candidate, ...]
     skipped: tuple[Candidate, ...]
-    truncated_modes: tuple[str, ...] = ()
+    truncated_modes: tuple[ReviewSelectMode, ...] = ()
     enumerated: int = 0
 
 
@@ -242,7 +242,7 @@ class Classification:
 
     rows: tuple[tuple[Candidate, str], ...]
     dispatchable: tuple[Candidate, ...]
-    truncated_modes: tuple[str, ...]
+    truncated_modes: tuple[ReviewSelectMode, ...]
     enumerated: int
     candidate_count: int
     trusted_authors: frozenset[str]
