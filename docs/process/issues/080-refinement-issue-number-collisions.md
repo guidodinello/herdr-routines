@@ -1,7 +1,7 @@
 ---
 id: "080"
 title: "issue-refinement can reuse an issue number taken by an open PR or a recent merge"
-status: open
+status: done
 priority: low
 area: pipeline
 ---
@@ -18,7 +18,7 @@ wrong paragraph.
 
 - Compute the next number in code (a `refine-issue --next-id` step, like 029's other
   checks), from the union of: main's issue files after a fresh fetch, and every
-  `docs/process/issues/NNN-*` path added by an open PR (`gh pr list` + files).
+  `docs/process/issues/NNN-*` path changed by an open PR (`gh pr list` + files).
 - `--check-issue` (issue 029) also fails when the file's id is already used on
   `origin/main` or by an open PR.
 - Make the ROADMAP pointer a code step too: append to the bullet whose slug the issue
