@@ -24,6 +24,8 @@ from typing import Literal, TypedDict, TypeIs, get_args
 
 from logger import get_logger
 
+from herdr_routines.config import ReviewSelectMode
+
 log = get_logger(__name__)
 
 # How long a writer waits for a sibling writer before giving up. Appends hold the lock for
@@ -83,7 +85,8 @@ class HistoryExtra(TypedDict, total=False):
     whatever its file holds (older files have keys no writer emits any more), so readers
     narrow what they read by key instead of trusting this shape.
 
-    Statuses are plain `str` here so this module stays free of herdr/config imports.
+    Statuses are plain `str` here except `select_mode`, which uses config's
+    `ReviewSelectMode` so the write-side schema cannot drift from the validated set.
     """
 
     # why/where
@@ -172,7 +175,7 @@ class HistoryExtra(TypedDict, total=False):
     repos_failed: int
     target_key: str
     repo: str
-    select_mode: str
+    select_mode: ReviewSelectMode
     verified: bool | None
 
 
@@ -345,7 +348,8 @@ def maybe_rotate(
     and the rename, so a rotation can never interleave with a writer's line; the tick takes
     it non-blockingly at the end of its run and skips/warns rather than waiting on an hour
     away holder (issue 079). `Retention`-independent on purpose — the thresholds are
-    passed in, so this module stays free of any config import.
+    passed in, so rotation itself reads no config (the module's only config import is the
+    write-side `ReviewSelectMode` above).
     """
     if max_bytes is None and max_age_days is None:
         return None

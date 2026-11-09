@@ -80,7 +80,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Protocol
+from typing import Literal, NamedTuple, Protocol
 
 from logger import get_logger
 
@@ -92,6 +92,8 @@ from herdr_routines.gates import (
     remote_owner_and_repo,
 )
 from herdr_routines.host_drift import DriftFinding, format_findings
+from herdr_routines.runner_seam import SubprocessRunner as Runner
+from herdr_routines.runner_seam import _real_runner
 from herdr_routines.tick import _open_pipeline_run, tick_lock
 
 log = get_logger(__name__)
@@ -130,11 +132,6 @@ class Notify(Protocol):
 
     def __call__(self, title: str, body: str | None = None) -> None: ...
 
-
-# Not typed as Callable[..., CompletedProcess[str]]: subprocess.run is overloaded and
-# some of its overloads return CompletedProcess[bytes], which a narrower annotation
-# would reject. gates' `runner=` seam has the same escape hatch.
-Runner = Callable[..., Any]
 
 SelfUpdateStatus = Literal[
     "up_to_date", "updated", "deferred", "refused", "rolled_back"
@@ -331,7 +328,7 @@ def validate_subprocess(
     checkout: Path,
     uv: str,
     *,
-    runner: Runner = subprocess.run,
+    runner: Runner = _real_runner,
     timeout_s: float = VALIDATE_TIMEOUT_S,
 ) -> ValidateOutcome:
     """`uv run --locked herdr-routines validate` in *checkout*, out of process.
@@ -568,7 +565,7 @@ def run_self_update(
     host_check: Callable[[], list[DriftFinding]],
     base: str = "main",
     dry_run: bool = False,
-    runner: Runner = subprocess.run,
+    runner: Runner = _real_runner,
     uv_resolver: Callable[[], str | None] = resolve_uv,
     lock_wait_s: float = TICK_LOCK_WAIT_S,
     sleep: Callable[[float], None] = time.sleep,
@@ -665,7 +662,7 @@ def _run_self_update(
     state_path: Path,
     base: str = "main",
     dry_run: bool = False,
-    runner: Runner = subprocess.run,
+    runner: Runner = _real_runner,
     uv_resolver: Callable[[], str | None] = resolve_uv,
     lock_wait_s: float = TICK_LOCK_WAIT_S,
     sleep: Callable[[float], None] = time.sleep,

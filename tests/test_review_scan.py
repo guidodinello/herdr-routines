@@ -38,6 +38,7 @@ from herdr_routines.config import (
     VALID_JOB_KINDS,
     ConfigError,
     Job,
+    ReviewSelectMode,
     load_config,
     load_config_dir,
 )
@@ -144,7 +145,7 @@ def _pr(
     head_repo: str | None = None,
     created_at: str = "2026-10-01T00:00:00Z",
     updated_at: str = "2026-10-01T00:00:00Z",
-    mode: str = "author",
+    mode: ReviewSelectMode = "author",
 ) -> ReviewPR:
     return ReviewPR(
         number=number,
@@ -174,7 +175,7 @@ class ReviewGh:
         raw_bodies: dict[str, list[PostedBody]] | None = None,
         search_fail: bool = False,
         bodies_fail: bool = False,
-        truncated_modes: tuple[str, ...] = (),
+        truncated_modes: tuple[ReviewSelectMode, ...] = (),
     ) -> None:
         self.user = user
         self.prs = prs
