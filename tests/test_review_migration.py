@@ -29,7 +29,12 @@ from herdr_routines.auto_fix import (
     build_review_prompt,
     review_marker,
 )
-from herdr_routines.config import RoutinesConfig, TmpHygieneConfig, load_config_dir
+from herdr_routines.config import (
+    ReviewSelectMode,
+    RoutinesConfig,
+    TmpHygieneConfig,
+    load_config_dir,
+)
 from herdr_routines.history import (
     STALE_MARGIN,
     HistoryRecord,
@@ -56,7 +61,7 @@ def _pr(
     head_ref: str = "feature-x",
     author: str = "me",
     head_repo: str | None = None,
-    mode: str = "author",
+    mode: ReviewSelectMode = "author",
 ) -> ReviewPR:
     return ReviewPR(
         number=number,

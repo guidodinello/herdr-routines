@@ -34,14 +34,14 @@ thing missing), and a section in the daily digest.
 from __future__ import annotations
 
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
-# Same escape hatch as self_update.Runner: subprocess.run is overloaded.
-Runner = Callable[..., Any]
+from herdr_routines.runner_seam import SubprocessRunner as Runner
+from herdr_routines.runner_seam import _real_runner
 
 DriftKind = Literal["missing_unit", "stale_unit", "runner_behind", "probe_failed"]
 
@@ -269,7 +269,7 @@ def check_host(
     *,
     base: str = "main",
     unit_dir: Path | None = None,
-    runner: Runner = subprocess.run,
+    runner: Runner = _real_runner,
     now: datetime | None = None,
 ) -> list[DriftFinding]:
     """Every drift finding for the runner *checkout* on this host; empty when clean.

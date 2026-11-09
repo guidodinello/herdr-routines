@@ -21,6 +21,7 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from herdr_routines import verify
 from herdr_routines.auto_fix import (
@@ -59,20 +60,24 @@ class SelectorContext:
     history_path: Path | None = None
 
 
+# The closed set of `reason` values a failed selector run may record.
+SelectorFailureReason = Literal["selector_failed", "gh_auth_missing", "search_failed"]
+
+
 @dataclass(frozen=True, slots=True)
 class SelectorFailed:
     error: str
     # The `reason` the run's `failed` record carries.
-    reason: str = "selector_failed"
+    reason: SelectorFailureReason = "selector_failed"
 
 
 class SelectorError(RuntimeError):
     """A selector that cannot answer, with the `reason` its `failed` record should carry
     (`gh_auth_missing` and `search_failed` are the reasons `kind: review` always recorded)."""
 
-    def __init__(self, reason: str, message: str) -> None:
+    def __init__(self, reason: SelectorFailureReason, message: str) -> None:
         super().__init__(message)
-        self.reason = reason
+        self.reason: SelectorFailureReason = reason
 
 
 def _job_owner_and_repo(job: Job) -> tuple[str, str]:
