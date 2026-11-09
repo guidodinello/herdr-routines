@@ -12,7 +12,8 @@ than prompt prose (the issues 034/035 precedent) — the next issue number (fres
 decision, the refined issue's frontmatter and id uniqueness, and the ROADMAP
 pointer keyed off the issue filename.
 
-Pure filesystem + YAML + one batched ``gh`` call — no HerdrClient, no ``herdr``
+Filesystem + YAML, plus ``gh pr list`` and ``git fetch``/``git ls-tree`` for the
+number scan and ROADMAP.md edits for the pointer — no HerdrClient, no ``herdr``
 binary — mirroring ``pick_feature.py``'s "no Herdr server required" posture so it
 runs from the job's first step before any reviewer session exists.
 
@@ -37,7 +38,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TextIO, TypeIs
 
@@ -108,6 +109,10 @@ class ParkingLotBullet:
     title: str  # bolded lead-in, `**`-stripped, before the em dash
     is_blocked: bool  # names an unmet gate / says "blocked"
     is_promoted: bool  # already linked to a docs/process/issues/ file
+    # 0-based inclusive line span in the ``split("\n")`` of the ROADMAP text, so
+    # ``apply_roadmap_pointer`` edits exactly the bullet this parser selected.
+    first_line: int = field(default=-1, compare=False)
+    last_line: int = field(default=-1, compare=False)
 
     @property
     def slug(self) -> str:
@@ -126,7 +131,7 @@ def parse_parking_lot_bullets(roadmap_text: str) -> list[ParkingLotBullet]:
     blank line or any other column-0 line ends the section (the Parking Lot is
     the last section of ROADMAP.md, followed only by a "House rule:" paragraph).
     """
-    lines = roadmap_text.splitlines()
+    lines = roadmap_text.split("\n")
     start = next(
         (i for i, ln in enumerate(lines) if ln.strip() == PARKING_LOT_HEADER),
         None,
@@ -136,21 +141,25 @@ def parse_parking_lot_bullets(roadmap_text: str) -> list[ParkingLotBullet]:
 
     bullets: list[ParkingLotBullet] = []
     current: list[str] | None = None
+    first = last = 0
 
     def _flush() -> None:
         nonlocal current
         if current is not None:
-            bullets.append(_finalize_bullet(current))
+            bullets.append(_finalize_bullet(current, first, last))
             current = None
 
-    for line in lines[start + 1 :]:
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
         if line.startswith("## "):
             break
         if line.startswith("- "):
             _flush()
             current = [line[2:].strip()]
+            first = last = i
         elif current is not None and line.startswith("  ") and line.strip():
             current.append(line.strip())
+            last = i
         elif current is not None:
             # blank line or a column-0 non-bullet line — end of this bullet, and
             # (once we have bullets) end of the list.
@@ -161,7 +170,7 @@ def parse_parking_lot_bullets(roadmap_text: str) -> list[ParkingLotBullet]:
     return bullets
 
 
-def _finalize_bullet(parts: list[str]) -> ParkingLotBullet:
+def _finalize_bullet(parts: list[str], first: int, last: int) -> ParkingLotBullet:
     raw = " ".join(parts).strip()
     lead = re.split(r"\s+[—-]\s+", raw, maxsplit=1)[0]
     title = lead.replace("**", "").strip()
@@ -170,6 +179,8 @@ def _finalize_bullet(parts: list[str]) -> ParkingLotBullet:
         title=title,
         is_blocked=bool(_BLOCKED_RE.search(raw)),
         is_promoted=bool(_PROMOTED_RE.search(raw)),
+        first_line=first,
+        last_line=last,
     )
 
 
@@ -360,7 +371,11 @@ def open_pr_issue_numbers(repo: Path) -> frozenset[int] | None:
 
     A refinement PR (or a pipeline PR) already carries its number until it
     merges; counting only this account's PRs would miss the pipeline bot's. A
-    fork PR never owns a number in this repo. ``None`` means "unknown" and the
+    fork PR is deliberately not counted (spec 080's ``isCrossRepository: false``
+    gate): it carries no number until merged, so a number a soon-to-merge fork
+    carries can still collide — an accepted trade-off. Every changed path counts
+    (added, modified, renamed), which only errs toward reserving more numbers.
+    ``None`` means "unknown" and the
     caller must fail safe, exactly like ``refinement_open_pr_slugs``.
     """
     try:
@@ -535,49 +550,6 @@ def _id_as_number(value: object) -> int | None:
     return int(text) if text.isdigit() else None
 
 
-def _parking_lot_blocks(roadmap_text: str) -> list[tuple[str, int, int]]:
-    """``(slug, first_line, last_line)`` for each Parking Lot bullet, in file order.
-
-    Same bullet/continuation rules as ``parse_parking_lot_bullets`` but keeps the
-    original line span so a pointer can be appended in place.
-    """
-    lines = roadmap_text.split("\n")
-    start = next(
-        (i for i, line in enumerate(lines) if line.strip() == PARKING_LOT_HEADER),
-        None,
-    )
-    if start is None:
-        return []
-
-    blocks: list[tuple[str, int, int]] = []
-    current: list[str] | None = None
-    first = last = 0
-
-    def _flush() -> None:
-        nonlocal current
-        if current is not None:
-            blocks.append((_finalize_bullet(current).slug, first, last))
-            current = None
-
-    for i in range(start + 1, len(lines)):
-        line = lines[i]
-        if line.startswith("## "):
-            break
-        if line.startswith("- "):
-            _flush()
-            current = [line[2:].strip()]
-            first = last = i
-        elif current is not None and line.startswith("  ") and line.strip():
-            current.append(line.strip())
-            last = i
-        elif current is not None:
-            _flush()
-            if blocks:
-                break
-    _flush()
-    return blocks
-
-
 def apply_roadmap_pointer(roadmap_path: Path, issue_path: Path) -> int:
     """Entry point behind ``refine-issue --roadmap-pointer``: append the issue
     pointer to its own Parking Lot bullet.
@@ -622,18 +594,18 @@ def apply_roadmap_pointer(roadmap_path: Path, issue_path: Path) -> int:
         print(f"roadmap-pointer: cannot read {roadmap_path}: {exc}", file=sys.stderr)
         return EXIT_FAILURE
 
-    block = next(
-        (b for b in _parking_lot_blocks(roadmap_text) if b[0] == slug),
+    bullet = next(
+        (b for b in parse_parking_lot_bullets(roadmap_text) if b.slug == slug),
         None,
     )
-    if block is None:
+    if bullet is None:
         print(
             f"roadmap-pointer: no Parking Lot bullet matches slug '{slug}' — "
             "refusing to attach the pointer to a guessed paragraph",
             file=sys.stderr,
         )
         return EXIT_FAILURE
-    _, first, last = block
+    first, last = bullet.first_line, bullet.last_line
 
     lines = roadmap_text.split("\n")
     pointer = f"→ [`{issue_id}`](docs/process/issues/{issue_path.name})"
@@ -684,7 +656,11 @@ def run_check_issue(repo: Path, path: Path) -> int:
             )
             return EXIT_FAILURE
         own_number = _id_as_number(frontmatter.get("id"))
-        if own_number is not None and own_number in used:
+        if own_number is None:
+            problems.append(
+                f"id must be numeric (digits only), got {frontmatter.get('id')!r}"
+            )
+        elif own_number in used:
             problems.append(
                 f"duplicate id: {frontmatter.get('id')} is already used on "
                 "origin/main or by an open PR"

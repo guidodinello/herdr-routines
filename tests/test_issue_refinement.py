@@ -1091,3 +1091,28 @@ def test_validate_warns_when_issue_refinement_job_uses_claude(
     assert "issue-refinement: runs `herdr-routines refine-issue` but is not " in (
         capsys.readouterr().err
     )
+
+
+def test_check_issue_rejects_non_numeric_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A non-digit frontmatter `id` cannot be compared against the used numbers,
+    so it is a problem — never a silent pass (fail closed)."""
+    repo = _issue_repo(tmp_path)
+    _stub_subprocess(monkeypatch, _GitGhFake(ls_tree=MAIN_LS_TREE, pr_list="[]"))
+    draft = repo / "docs" / "process" / "issues" / "999-x.md"
+    draft.write_text(GOOD_ISSUE.replace('id: "999"', 'id: "abc"'))
+
+    assert _run_refine_cli(["--check-issue", str(draft), "--repo", str(repo)]) == 1
+    assert "id must be numeric" in capsys.readouterr().err
+
+
+def test_parking_lot_bullets_carry_the_line_span_the_pointer_edits() -> None:
+    """The canonical parser is the only bullet locator: its span covers the
+    bullet's first line through its last continuation line."""
+    text = "# R\n\n## Parking lot\n\n- **A** — one\n  more\n- **B** — two\n"
+    first, second = parse_parking_lot_bullets(text)
+    lines = text.split("\n")
+    assert lines[first.first_line].startswith("- **A**")
+    assert lines[first.last_line] == "  more"
+    assert (second.first_line, second.last_line) == (6, 6)

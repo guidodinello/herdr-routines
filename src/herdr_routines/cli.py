@@ -531,8 +531,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--repo",
         type=Path,
         default=Path.cwd(),
-        help="git checkout to read ROADMAP.md/issues from and run `gh pr list` in "
-        "(default: cwd)",
+        help="git checkout to read ROADMAP.md/issues from and run `gh pr list`, "
+        "`git fetch` and `git ls-tree` in (default: cwd)",
     )
     p_refine.add_argument(
         "--issues-dir",

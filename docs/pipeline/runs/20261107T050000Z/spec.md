@@ -39,7 +39,7 @@ id on stdout. The union of numbers in use:
 - `origin/main` **after a fresh fetch** (`git fetch origin main --quiet`,
   then `git ls-tree -r --name-only origin/main -- docs/process/issues/`) — not
   the worktree checkout. Any `git` failure ⇒ exit 1 with the reason.
-- every `docs/process/issues/NNN-*` path added by an **open, same-repo PR**
+- every `docs/process/issues/NNN-*` path changed by an **open, same-repo PR** (any change type, not only additions)
   (`gh pr list --state open --json headRefName,files,isCrossRepository`; count
   any PR with `isCrossRepository: false`, not just `--author @me` — the
   pipeline's own PRs belong to another bot identity but own their numbers all
