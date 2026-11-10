@@ -3847,7 +3847,10 @@ def _checkout_busy_skip_recorded(
         if record.state in TERMINAL_STATES:
             if extra.get("reason") not in NOT_A_RUN_REASONS:
                 return False
-            if extra.get("reason") == "checkout_busy" and extra.get("trigger") == trigger:
+            if (
+                extra.get("reason") == "checkout_busy"
+                and extra.get("trigger") == trigger
+            ):
                 return True
     return False
 

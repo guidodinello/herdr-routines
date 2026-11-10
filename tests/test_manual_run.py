@@ -456,6 +456,4 @@ def test_request_pipeline_run_refused_while_open_notifies(
 
     assert _run_cli(monkeypatch, job, "--trigger", "request") == 1
     assert launched == []
-    assert [n[0] for n in client.notifications] == [
-        "herdr-routines: a request refused"
-    ]
+    assert [n[0] for n in client.notifications] == ["herdr-routines: a request refused"]

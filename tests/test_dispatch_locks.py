@@ -602,4 +602,3 @@ def test_dispatch_records_use_the_clock_at_dispatch_time(
     records = read_job(history, "a")
     assert [r.state for r in records] == ["registered", "running", "done"]
     assert [r.ts for r in records[1:]] == [dispatch_now, dispatch_now]
-

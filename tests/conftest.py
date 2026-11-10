@@ -123,9 +123,7 @@ def _dispatch_clock_follows_tick_now(monkeypatch: pytest.MonkeyPatch) -> None:
         return wrapper
 
     monkeypatch.setattr(tick, "_process_job", _follow(tick._process_job))
-    monkeypatch.setattr(
-        tick, "dispatch_occurrence", _follow(tick.dispatch_occurrence)
-    )
+    monkeypatch.setattr(tick, "dispatch_occurrence", _follow(tick.dispatch_occurrence))
     monkeypatch.setattr(
         tick, "dispatch_manual_occurrence", _follow(tick.dispatch_manual_occurrence)
     )
