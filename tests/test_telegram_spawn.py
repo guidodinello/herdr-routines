@@ -10,9 +10,10 @@ Spec: docs/pipeline/runs/20261014T050000Z/spec.md v2, ## Acceptance criteria.
 Issue 083 (spec docs/pipeline/runs/20261110T050000Z/spec.md v2) rewrites the alias
 fixtures to construct ``config.SpawnAlias`` records and the two issue-065
 source-contract tests to pin ``dict[str, SpawnAlias]`` / ``Mapping[str,
-SpawnAlias]``. The typed-record propagation does not exist yet, so the rewritten
-tests are expected to FAIL until it is implemented; each asserts exactly the
-behaviour its acceptance criterion describes.
+SpawnAlias]``. These tests were authored red in e76685a, before the typed-record
+propagation landed in e5aac9f; they pass against the implementation on this
+branch, and each asserts exactly the behaviour its acceptance criterion
+describes.
 
 Contract pinned for the stage-4 implementation:
 
@@ -1087,20 +1088,23 @@ def test_typed_boundaries_have_no_any() -> None:
 
 
 # Issue 083 AC 9 (non-blocking, meta-check): ci green with the blocking tests
-# authored first (TDD — contract tests rewritten, confirmed red, then implementation).
+# present and passing. The assertions below check present state; the TDD ordering
+# (tests rewritten red in e76685a, implementation in e5aac9f) is evidenced by git
+# history, not by anything this test can inspect.
 
 
 def test_ci_green_with_blocking_tests_run_first() -> None:
-    """The blocking criteria (AC 1-5) were written first and are the thing CI
-    greenlights: the rewritten contract tests exist in this file ahead of any
-    implementation change (red against the un-typed ``telegram_spawn.py``, green
-    once issue 083 lands), ``scripts/ci-check.sh`` stays the one definition of
-    green wiring mypy and the suite, and ``mypy --strict src`` is green — the
+    """The blocking criteria (AC 1-5) are the thing CI greenlights: the rewritten
+    contract tests are defined in this file and pass against the typed
+    implementation, ``scripts/ci-check.sh`` stays the one definition of green
+    wiring mypy and the suite, and ``mypy --strict src`` is green — the
     ``str(spec.repo)`` conversion keeps the ``SpawnClient`` ``cwd: str`` boundary
     clean under strict typing."""
     repo_root = Path(__file__).resolve().parents[1]
 
-    # The blocking tests were authored in this file, before the implementation.
+    # The blocking contract tests are defined in this file. This is a presence
+    # check only — ordering is evidenced by git history (e76685a precedes
+    # e5aac9f), not by same-file existence.
     source = Path(__file__).read_text(encoding="utf-8")
     for name in (
         "test_alias_table_spawn_param_is_telegram_spawn",
@@ -1108,7 +1112,7 @@ def test_ci_green_with_blocking_tests_run_first() -> None:
         "test_typed_boundaries_have_no_any",
         "test_spawn_root_mode_opens_a_tab_in_the_checkout",
     ):
-        assert f"def {name}(" in source, f"{name} must be authored first"
+        assert f"def {name}(" in source, f"{name} must be defined in this file"
 
     # ci-check.sh wires the same two gates this test runs, so its verdict covers
     # every blocking criterion above (its full suite run is CI's business, not a
