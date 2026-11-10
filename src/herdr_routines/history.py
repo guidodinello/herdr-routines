@@ -11,9 +11,12 @@ which spans the rolls, so no caller has to know they exist.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-from collections.abc import Mapping
+import time
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +27,12 @@ from logger import get_logger
 from herdr_routines.config import ReviewSelectMode
 
 log = get_logger(__name__)
+
+# How long a writer waits for a sibling writer before giving up. An append holds the lock
+# for one line and a rotation for a stat/read, a rename and a touch, so contention is
+# measured in milliseconds; the bound only matters when a crashed-but-alive process is
+# wedged, where a silent forever-wait would be worse than a loud error (issue 079).
+HISTORY_LOCK_TIMEOUT_S = 30.0
 
 TerminalState = Literal["done", "failed", "skipped", "missed", "interrupted_unknown"]
 NonTerminalState = Literal["registered", "scheduled", "running"]
@@ -39,6 +48,16 @@ TRIGGER_CRON = "cron"
 TRIGGER_EVENT = "event"
 TRIGGER_REQUEST = "request"
 TRIGGER_MANUAL = "manual"
+
+# Terminal-state records that report *contention*, not a finished run (issue 079). They
+# never feed `schedule.decide`: the occurrence they describe is still owed, and is consumed
+# by the terminal record of whichever run actually serves it.
+#   - `collapsed_earlier_occurrences`: occurrences skipped before the one being dispatched.
+#   - `dispatch_in_flight`: a dispatcher lost the job's non-blocking dispatch lock.
+#   - `checkout_busy`: a `workspace: root` dispatch lost its checkout's lock to another job.
+NOT_A_RUN_REASONS: frozenset[str] = frozenset(
+    {"collapsed_earlier_occurrences", "dispatch_in_flight", "checkout_busy"}
+)
 
 
 def is_history_state(value: object) -> TypeIs[HistoryState]:
@@ -218,12 +237,59 @@ class HistoryRecord:
         )
 
 
+def history_lock_path(path: Path) -> Path:
+    """The sibling lock file that serializes writers of *path* (issue 079).
+
+    Derived from the live file's own name (`history.jsonl` -> `history.lock`) so a
+    custom history path gets its own lock rather than contending on the default one."""
+    return path.parent / f"{path.stem}.lock"
+
+
+@contextmanager
+def _history_lock(
+    path: Path, *, timeout_s: float = HISTORY_LOCK_TIMEOUT_S
+) -> Generator[None]:
+    """Exclusive flock around one short history write. It polls for up to *timeout_s*
+    and then raises `RuntimeError`, rather than blocking forever.
+
+    Every `append` takes this on its own so the ~40 call sites do not have to thread a
+    lock through. `maybe_rotate` holds it across its threshold check, rename and touch.
+    It is the innermost lock in tick.py's ordering (global decision -> per-job dispatch ->
+    per-checkout -> history), so nothing may be acquired while holding it."""
+    lock_path = history_lock_path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"timed out after {timeout_s}s waiting for {lock_path}"
+                    ) from None
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def append(path: Path, record: HistoryRecord) -> None:
-    """Append one record. Callers needing overlap-safety should hold the tick lock first."""
+    """Append one record atomically with respect to every other writer (issue 079).
+
+    Concurrent writers are now normal — a long dispatch of job A no longer excludes a
+    tick or manual run of job B — so the record is written as a single line under a
+    sibling `history.lock` flock. One line per write also keeps a reader that races the
+    append from ever seeing two records spliced together."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(record.to_json_line())
-        f.write("\n")
+    line = record.to_json_line()
+    with _history_lock(path), path.open("a") as f:
+        f.write(line + "\n")
 
 
 def read_all(path: Path) -> list[HistoryRecord]:
@@ -290,9 +356,11 @@ def maybe_rotate(
 
     A same-second collision (two rotations in the same second) skips the rotation and warns
     rather than inventing a suffix, which would reintroduce the ordering bug `rolled_path`'s
-    docstring rules out. Callers hold the exclusive `tick.lock` (see tick.run_tick), which
-    makes this unreachable in practice; the guard is there so the failure mode is a
-    warning, not corrupted history. `Retention`-independent on purpose — the thresholds are
+    docstring rules out. The same `history.lock` that serializes `append` guards the check,
+    the rename and the touch, so a rotation can never interleave with a writer's line. That
+    lock is a bounded wait (`HISTORY_LOCK_TIMEOUT_S`, then `RuntimeError`), not a skip; the
+    non-blocking skip-and-warn is `run_tick`'s, on the global tick lock it takes around this
+    call (issue 079). `Retention`-independent on purpose — the thresholds are
     passed in, so rotation itself reads no config (the module's only config import is the
     write-side `ReviewSelectMode` above).
     """
@@ -300,24 +368,26 @@ def maybe_rotate(
         return None
     if not path.exists():
         return None
-    if not _over_rotation_threshold(
-        path, max_bytes=max_bytes, max_age_days=max_age_days, now=now
-    ):
-        return None
 
-    target = rolled_path(path, now)
-    if target.exists():
-        log.warning(
-            "history rotation skipped: %s already exists (leaving %s in place)",
-            target,
-            path,
-        )
-        return None
+    with _history_lock(path):
+        if not _over_rotation_threshold(
+            path, max_bytes=max_bytes, max_age_days=max_age_days, now=now
+        ):
+            return None
 
-    os.replace(path, target)
-    path.touch()
-    log.info("history rotated: %s -> %s", path, target)
-    return target
+        target = rolled_path(path, now)
+        if target.exists():
+            log.warning(
+                "history rotation skipped: %s already exists (leaving %s in place)",
+                target,
+                path,
+            )
+            return None
+
+        os.replace(path, target)
+        path.touch()
+        log.info("history rotated: %s -> %s", path, target)
+        return target
 
 
 def _over_rotation_threshold(
@@ -391,7 +461,13 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
     terminals the gated / review / audit cycles write without knowing the trigger, and the
     `interrupted_unknown` / pipeline-reconcile records, which reuse the run's run_id. "Latest
     before it" keeps `run --run-id <scheduled run_id>` from un-counting that run's original
-    scheduled terminal record."""
+    scheduled terminal record.
+
+    Records whose reason is in `NOT_A_RUN_REASONS` are ignored (issue 079). A
+    `collapsed_earlier_occurrences` record reports occurrences skipped *before* the one now
+    being dispatched; a `dispatch_in_flight` or `checkout_busy` skip reports that a
+    dispatcher lost a lock. Counting any of them would let contention, or a refused manual
+    run, consume a cron occurrence that no run has served."""
     off_schedule_run_ids: set[str] = set()
     scheduled: HistoryRecord | None = None
     for record in read_job(path, job_name):
@@ -401,6 +477,8 @@ def last_scheduled_terminal_run(path: Path, job_name: str) -> HistoryRecord | No
             else:
                 off_schedule_run_ids.discard(record.run_id)
         elif record.state in TERMINAL_STATES:
+            if (record.extra or {}).get("reason") in NOT_A_RUN_REASONS:
+                continue
             off_schedule = _is_off_schedule(record) or (
                 record.run_id is not None and record.run_id in off_schedule_run_ids
             )

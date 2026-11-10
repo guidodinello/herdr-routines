@@ -25,13 +25,14 @@ import shutil
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from herdr_routines import cli, self_update
+from herdr_routines import cli, self_update, tick
 from herdr_routines.config import Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append
 from herdr_routines.self_update import SelfUpdateResult, run_self_update
@@ -525,6 +526,60 @@ def test_self_update_waits_out_a_briefly_held_tick_lock(
     assert slept == [self_update.TICK_LOCK_POLL_S]
     assert sandbox.head() == sandbox.head(sandbox.work)
     assert not any("deferred" in title for title, _body in notify.calls)
+
+
+def _routine_job(repo: Path, name: str = "long-job") -> Job:
+    """A plain routine job: since issue 079 its dispatch holds only its job lock."""
+    return replace(_pipeline_job(repo, name), kind="routine", prompt="x")
+
+
+def test_self_update_defers_while_a_job_dispatch_lock_is_held(
+    sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 053 under issue 079: a long routine, manual or `/job` run holds only its
+    job's dispatch lock, never the global tick lock. The update must still not swap code
+    under it, so a job lock held past the whole wait defers with no git call at all and
+    a notification naming the job."""
+    config = RoutinesConfig(jobs=(_routine_job(sandbox.checkout),))
+    old = sandbox.head()
+    sandbox.push("NEW.md", "new\n", "add NEW.md")
+    git_calls = _record_git_calls(monkeypatch)
+    slept: list[float] = []
+
+    with tick.job_lock(sandbox.history_path, "long-job") as held:
+        assert held
+        notify = Recorder()
+        result = sandbox.run(config=config, notify=notify, sleep=slept.append)
+
+    assert result.status == "deferred"
+    assert "long-job" in (result.reason or "")
+    assert git_calls.calls == []
+    assert sandbox.head() == old
+    assert sum(slept) == self_update.TICK_LOCK_WAIT_S
+    assert len(notify.calls) == 1
+    assert "long-job" in (notify.calls[0][1] or "")
+    # The global lock was released between polls, so ticks were not stalled meanwhile.
+    with tick.tick_lock(sandbox.lock_path) as free:
+        assert free
+
+
+def test_self_update_holds_every_job_lock_across_the_swap(sandbox: Sandbox) -> None:
+    """While the update fast-forwards and validates, no dispatch can start: a manual
+    `run` (which takes only its job lock) finds that lock held for the whole swap."""
+    config = RoutinesConfig(jobs=(_routine_job(sandbox.checkout),))
+    sandbox.push("NEW.md", "new\n", "add NEW.md")
+    free_during_validate: list[bool] = []
+
+    def probe(_index: int) -> None:
+        with tick.job_lock(sandbox.history_path, "long-job") as acquired:
+            free_during_validate.append(acquired)
+
+    result = sandbox.run(config=config, runner=FakeValidate(before_return=probe))
+
+    assert result.status == "updated"
+    assert free_during_validate and not any(free_during_validate)
+    with tick.job_lock(sandbox.history_path, "long-job") as acquired:
+        assert acquired, "the update must release the job locks when it finishes"
 
 
 # ---------------------------------------------------------------------------

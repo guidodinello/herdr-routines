@@ -30,10 +30,10 @@ decision in here, and all three come from that incident:
   then discarded their edit without moving HEAD — is a refusal, not an
   "up to date": it is running code that failed its own validation, and saying
   nothing there is how this command's reason for existing is defeated.
-- **Fail closed, exit 0.** Anything unverifiable — a tick lock held, an open
-  pipeline run, a red or pending or unqueryable CI state, a missing `uv` — defers
-  quietly and leaves the host exactly as it was. The one deferral that is *not*
-  quiet is the tick lock still being held after `TICK_LOCK_WAIT_S`: the timer fires
+- **Fail closed, exit 0.** Anything unverifiable — a tick or job dispatch lock held,
+  an open pipeline run, a red or pending or unqueryable CI state, a missing `uv` —
+  defers quietly and leaves the host exactly as it was. The one deferral that is *not*
+  quiet is a lock still being held after `TICK_LOCK_WAIT_S`: the timer fires
   once a night, so giving up on a lock is giving up for 24h, and three nights of
   that (2026-10-21..23) left the runner 9 commits behind with nobody told.
 
@@ -45,7 +45,8 @@ of those seams, and is exercised for real in `tests/test_self_update.py`.
 
 Sequence (spec 20260929T050000Z, `### Sequence`):
 
-    1. tick_lock     not acquired within TICK_LOCK_WAIT_S -> deferred + notify, rc 0
+    1. tick_lock + every job's dispatch lock (issue 079)
+                     not all acquired within TICK_LOCK_WAIT_S -> deferred + notify, rc 0
     2. pipeline_run_open               open run     -> deferred,  rc 0
     3. repo_state       unreadable HEAD / dirty / not <base> / detached
                                                         -> refused,  rc 1
@@ -75,7 +76,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -94,7 +95,7 @@ from herdr_routines.gates import (
 from herdr_routines.host_drift import DriftFinding, format_findings
 from herdr_routines.runner_seam import SubprocessRunner as Runner
 from herdr_routines.runner_seam import _real_runner
-from herdr_routines.tick import _open_pipeline_run, tick_lock
+from herdr_routines.tick import _open_pipeline_run, hold_job_locks, tick_lock
 
 log = get_logger(__name__)
 
@@ -110,14 +111,17 @@ GIT_TIMEOUT_S = 120
 # the night's notification is held (host_drift.PROBE_TIMEOUT_S per probe, a dozen
 # probes at most), plus slack.
 VALIDATE_TIMEOUT_S = 300
-# How long to keep retrying a held tick lock before deferring. A tick holds it for
-# seconds (~8s on the Pi), so a timer that lands on a tick boundary — 21:30 UTC is
-# one, and it deferred three nights running on exactly that — is a transient
-# collision, not a reason to wait another 24h. Five minutes rides out any ordinary
-# tick, including one that dispatches a job, while a lock still held after that is
-# almost certainly a long `herdr-routines run <job>` (which holds it for the whole
-# run): that is worth a notification, not an open-ended wait inside a unit with a
-# finite TimeoutStartSec. Polled rather than a blocking flock so the bound is ours.
+# How long to keep retrying before deferring, while either the global tick lock or any
+# job's dispatch lock is held. Since issue 079 a tick holds the global lock only for its
+# decision phases and housekeeping, and each dispatch holds its own job lock instead; the
+# update needs both kinds, so that no dispatch is running or can start while it swaps
+# code (issue 053). A timer that lands on a tick boundary (21:30 UTC is one, and it
+# deferred three nights running on exactly that) or on a short dispatch is a transient
+# collision, not a reason to wait another 24h. Five minutes rides those out; a lock still
+# held after that is usually a long `herdr-routines run <job>`, `/job` or scheduled run,
+# which is worth a notification rather than an open-ended wait inside a unit with a
+# finite TimeoutStartSec. Polled rather than a blocking flock so the bound is ours, and
+# the global lock is released between polls so ticks keep running meanwhile.
 TICK_LOCK_WAIT_S = 300
 TICK_LOCK_POLL_S = 5
 
@@ -442,25 +446,38 @@ def record_rejected(
 
 
 @contextmanager
-def _wait_for_tick_lock(
-    lock_path: Path, *, wait_s: float, sleep: Callable[[float], None]
-) -> Generator[bool]:
-    """`tick_lock`, retried every TICK_LOCK_POLL_S for up to *wait_s* seconds.
-    Yields True holding the lock, or False once the bound is spent. The bound is
-    counted in polls rather than read off a clock so a test's `sleep` alone drives
-    it."""
+def _wait_for_dispatch_locks(
+    lock_path: Path,
+    *,
+    history_path: Path,
+    job_names: Iterable[str],
+    wait_s: float,
+    sleep: Callable[[float], None],
+) -> Generator[str | None]:
+    """The global `tick_lock` plus every job's dispatch lock, retried every
+    TICK_LOCK_POLL_S for up to *wait_s* seconds (issues 053, 079).
+
+    Yields None while holding all of them, so no dispatch is running and none can start
+    (a manual `run` or `/job` takes only its job lock). Otherwise yields what was still
+    held once the bound is spent. All locks are released between polls. The bound is
+    counted in polls rather than read off a clock so a test's `sleep` alone drives it."""
+    names = tuple(job_names)
     polls = max(0, int(wait_s // TICK_LOCK_POLL_S))
     for attempt in range(polls + 1):
         with tick_lock(lock_path) as acquired:
-            if acquired or attempt == polls:
-                yield acquired
+            if acquired:
+                with hold_job_locks(history_path, names) as busy:
+                    if not busy:
+                        yield None
+                        return
+                    holder = f"job dispatch in flight ({', '.join(busy)})"
+            else:
+                holder = f"tick lock held ({lock_path})"
+            if attempt == polls:
+                yield holder
                 return
         if attempt == 0:
-            log.info(
-                "self-update: tick lock %s held; retrying for up to %ss",
-                lock_path,
-                wait_s,
-            )
+            log.info("self-update: %s; retrying for up to %ss", holder, wait_s)
         sleep(TICK_LOCK_POLL_S)
 
 
@@ -668,17 +685,23 @@ def _run_self_update(
 ) -> SelfUpdateResult:
     """`run_self_update` minus the host check; see there."""
     wait_s = 0 if dry_run else lock_wait_s
-    with _wait_for_tick_lock(lock_path, wait_s=wait_s, sleep=sleep) as acquired:
-        if not acquired:
-            reason = f"tick lock held for over {wait_s:g}s"
+    with _wait_for_dispatch_locks(
+        lock_path,
+        history_path=history_path,
+        job_names=(job.name for job in config.jobs),
+        wait_s=wait_s,
+        sleep=sleep,
+    ) as holder:
+        if holder is not None:
+            reason = f"{holder} for over {wait_s:g}s"
             result = _deferred(reason, checkout)
             if not dry_run:
                 notify(
                     f"herdr-routines: self-update deferred ({checkout})",
                     body=(
-                        f"{reason} ({lock_path}) — no update this run; the timer "
-                        "tries again the next night. A lock held this long is "
-                        "usually a manual `herdr-routines run <job>` still in "
+                        f"{reason} — no update this run; the timer tries again the "
+                        "next night. A lock held this long is usually a long run "
+                        "(scheduled, `herdr-routines run <job>` or `/job`) still in "
                         "progress."
                     ),
                 )

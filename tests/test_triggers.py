@@ -32,7 +32,6 @@ from herdr_routines.history import (
     read_job,
 )
 from herdr_routines.runner import RunOutcome
-from herdr_routines.tick import tick_lock
 
 # 10:20 on a day when the hourly cron last fired at 10:00.
 FROZEN_NOW = datetime(2026, 10, 20, 10, 20, tzinfo=UTC)
@@ -401,7 +400,7 @@ def test_telegram_job_verb_runs_request_jobs_only(
     assert len(runs) == 2
 
 
-def test_telegram_job_request_refused_while_tick_holds_lock_notifies(
+def test_telegram_job_request_refused_while_job_lock_held_notifies(
     tmp_path: Path,
     history: Path,
     client: _Client,
@@ -409,14 +408,19 @@ def test_telegram_job_request_refused_while_tick_holds_lock_notifies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = RoutinesConfig(jobs=(_job(tmp_path, cron=None, request=True),))
-    with tick_lock(tmp_path / "tick.lock") as acquired:
+    with tick.job_lock(history, "a") as acquired:
         assert acquired
         rc = _run_cli(monkeypatch, config, "run", "a", "--trigger", "request")
         manual_rc = _run_cli(monkeypatch, config, "run", "a")
 
     assert rc == manual_rc == 1
     assert runs == []
-    assert not history.exists()
+    records = read_job(history, "a")
+    assert [r.state for r in records] == ["skipped", "skipped"]
+    assert all(
+        r.extra is not None and r.extra["reason"] == "dispatch_in_flight"
+        for r in records
+    )
     # Only the request run, which nobody is watching, says so; a manual run just exits 1.
     assert [t[0] for t in client.notifications] == ["herdr-routines: a request refused"]
 

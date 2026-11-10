@@ -26,7 +26,7 @@ from herdr_routines.herdr import (
     PromptWatchdogKilled,
     build_agent_start_args,
 )
-from herdr_routines.repos import ensure_repo
+from herdr_routines.repos import CheckoutBusy, ensure_repo
 from herdr_routines.signing import ResignError, resign_unsigned_branch
 from herdr_routines.verify import (
     VerifyContext,
@@ -627,6 +627,10 @@ def execute_run(
     try:
         if placement is None:
             ensure_repo(job)
+    except CheckoutBusy:
+        # Contention with another dispatch, not a run failure (issue 079): the callers in
+        # tick.py turn this into a `skipped`/`checkout_busy` record rather than a failure.
+        raise
     except (RuntimeError, OSError) as e:
         return RunOutcome(
             state="failed",

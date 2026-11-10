@@ -702,6 +702,9 @@ def test_cmd_run_pipeline_never_calls_execute_run(
         raise AssertionError("execute_run must never be called for kind: pipeline")
 
     monkeypatch.setattr(tick, "execute_run", fail_execute_run)
+    # The dispatch's live-agent guard queries herdr; give it a fake client so the test never
+    # shells out to a real `herdr` binary (absent on CI, present on a dev machine).
+    monkeypatch.setattr(cli, "HerdrClient", lambda: _NoLiveAgentsClient())
 
     launched: list[list[str]] = []
 
@@ -961,6 +964,13 @@ class _NotifyingClient:
         pass
 
 
+class _NoLiveAgentsClient(_NotifyingClient):
+    """`_NotifyingClient` plus the live-agent query a dispatch makes: no agent is live."""
+
+    def agent_statuses(self) -> dict[str, str]:
+        return {}
+
+
 def _prepare_run_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Config with one plain job `a` and the lock path under tmp_path; returns the lock path."""
     repo = tmp_path / "repo"
@@ -972,60 +982,70 @@ def _prepare_run_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return lock_path
 
 
-def test_cmd_tick_returns_zero_without_running_when_the_lock_is_held(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The skip is rc 0 but not silent: one INFO line naming the lock, so contention
-    (a self-update or manual `run` colliding with the tick) shows in journalctl."""
-    lock_path = _prepare_run_cli(tmp_path, monkeypatch)
-
-    def fail_run_tick(*a, **kw):
-        raise AssertionError("run_tick must not run while another tick holds the lock")
-
-    monkeypatch.setattr(cli, "run_tick", fail_run_tick)
-    with cli.tick_lock(lock_path) as holder_acquired, caplog.at_level("INFO"):
-        assert holder_acquired
-        assert cli.main(["tick"]) == 0
-    skips = [r for r in caplog.records if "lock" in r.message and "skip" in r.message]
-    assert len(skips) == 1
-    assert skips[0].levelname == "INFO"
-    assert str(lock_path) in skips[0].getMessage()
-
-
-def test_cmd_run_refuses_while_a_tick_holds_the_lock(
+def test_cmd_tick_runs_without_taking_the_global_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A manual run of a plain job shares the `rt-<job>` agent name and the repo checkout
-    with the scheduled tick, so it must not overlap one."""
+    """Issue 079: `tick.lock` covers only brief decision phases, not the whole tick, so a
+    holder elsewhere (a long run used to hold it) no longer makes the tick exit unseen.
+    The decision phases themselves skip when they cannot get it."""
     lock_path = _prepare_run_cli(tmp_path, monkeypatch)
+    calls: list[str] = []
+
+    def fake_run_tick(*a, **kw):
+        calls.append("run_tick")
+        return TickOutcome(summaries=(), any_job_failed=False)
+
+    monkeypatch.setattr(cli, "run_tick", fake_run_tick)
+    with cli.tick_lock(lock_path) as holder_acquired:
+        assert holder_acquired
+        assert cli.main(["tick"]) == 0
+    assert calls == ["run_tick"]
+
+
+def test_cmd_run_refuses_while_the_job_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manual run of a job shares its `rt-<job>` agent name and checkout with a scheduled
+    dispatch, so it refuses while *that job's* dispatch lock is held (issue 079). The global
+    tick lock is no longer the thing a run contends for."""
+    _prepare_run_cli(tmp_path, monkeypatch)
 
     def fail_execute_run(*a, **kw):
-        raise AssertionError("execute_run must not run while a tick holds the lock")
+        raise AssertionError("execute_run must not run while the job lock is held")
 
     monkeypatch.setattr(tick, "execute_run", fail_execute_run)
-    with cli.tick_lock(lock_path) as holder_acquired:
+    history = tmp_path / "state" / "history.jsonl"
+    with tick.job_lock(history, "a") as holder_acquired:
         assert holder_acquired
         assert cli.main(["run", "a"]) == 1
 
 
-def test_cmd_run_holds_the_tick_lock_while_the_job_runs(
+def test_cmd_run_holds_the_job_lock_while_the_job_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     lock_path = _prepare_run_cli(tmp_path, monkeypatch)
-    lock_free_during_run: list[bool] = []
+    history = tmp_path / "state" / "history.jsonl"
+    job_lock_free_during_run: list[bool] = []
+    tick_lock_free_during_run: list[bool] = []
 
     def fake_execute_run(job, client, *, run_id, **_):
+        with tick.job_lock(history, job.name) as acquired:
+            job_lock_free_during_run.append(acquired)
         with cli.tick_lock(lock_path) as acquired:
-            lock_free_during_run.append(acquired)
+            tick_lock_free_during_run.append(acquired)
         return RunOutcome(state="done", run_id=run_id)
 
     monkeypatch.setattr(tick, "execute_run", fake_execute_run)
+    monkeypatch.setattr(tick, "_live_agent_exists", lambda client, job: False)
     monkeypatch.setattr(cli, "HerdrClient", lambda: _NotifyingClient())
 
     assert cli.main(["run", "a"]) == 0
-    assert lock_free_during_run == [False]
+    assert job_lock_free_during_run == [False]
+    assert tick_lock_free_during_run == [True]
+    with tick.job_lock(history, "a") as acquired:
+        assert acquired, "the job lock must be released once the run finishes"
     with cli.tick_lock(lock_path) as acquired:
-        assert acquired, "the lock must be released once the run finishes"
+        assert acquired, "the run never held the global lock"
 
 
 def test_cmd_run_dry_run_ignores_the_tick_lock(

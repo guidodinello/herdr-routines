@@ -35,8 +35,9 @@ PROMPT_WAIT_GRACE_S = 30.0
 
 # Budget for a plain request/response herdr call (create a tab/workspace, `agent get`,
 # notification). A healthy server answers in well under a second; this only has to turn a
-# wedged one (socket accepted, never answered) into a HerdrCliError instead of a tick that
-# holds tick.lock until the systemd unit's TimeoutStartSec — hours of silently skipped ticks.
+# wedged one (socket accepted, never answered) into a HerdrCliError instead of a dispatch
+# that holds its job lock (and a tick that never ends) until the systemd unit's
+# TimeoutStartSec — hours of silently skipped runs of that job.
 DEFAULT_CALL_TIMEOUT_S = 30.0
 
 # `worktree create` runs a `git worktree add` plus a full checkout, which can take minutes on
