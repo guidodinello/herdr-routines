@@ -18,7 +18,7 @@ open when the contender fires.
 from __future__ import annotations
 
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +27,12 @@ import pytest
 from herdr_routines import cli, repos, tick
 from herdr_routines.auto_fix import GithubEvent
 from herdr_routines.config import GateCheck, RoutinesConfig
-from herdr_routines.history import HistoryRecord, append, read_job
+from herdr_routines.history import (
+    HistoryRecord,
+    append,
+    last_scheduled_terminal_run,
+    read_job,
+)
 from herdr_routines.repos import CheckoutBusy, _ensure_checkout, checkout_lock
 from herdr_routines.runner import RunOutcome
 from tests.test_manual_run import FROZEN_NOW, _Client, _FrozenDatetime, _job, _register
@@ -466,6 +471,9 @@ def test_root_jobs_sharing_a_checkout_never_overlap(
         first_thread, first = _run_first_tick_in_thread([])
         assert started.wait(timeout=BLOCK_TIMEOUT_S)
         assert cli.main(["tick"]) == 0
+        # A second contended tick leaves the occurrence owed, but does not write a second
+        # identical `checkout_busy` record: one skip already reports the contention.
+        assert cli.main(["tick"]) == 0
         assert cli.main(["run", "b"]) == 1
     finally:
         release.set()
@@ -530,3 +538,68 @@ def test_checkout_sync_waits_for_another_jobs_lock(
 
     _ensure_checkout(None, checkout, base="main")
     assert synced == [checkout, checkout]
+
+
+def test_checkout_busy_during_a_worktree_sync_is_a_skip_not_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worktree-mode sync that meets a `workspace: root` holder raises `CheckoutBusy`
+    after its bounded wait. That is contention, not a failed run: the dispatch records
+    `skipped`/`checkout_busy` under the occurrence's trigger, closes the `running` record
+    it wrote, leaves the cron occurrence owed, and sends no failure notification."""
+    job = _job(tmp_path, workspace="worktree")
+    client = _Client()
+
+    def busy_execute_run(job: Any, client: Any, *, run_id: str, **_: Any) -> Any:
+        raise CheckoutBusy(f"checkout {job.repo} is locked by another dispatch")
+
+    history = _wire(
+        monkeypatch,
+        tmp_path,
+        client,
+        RoutinesConfig(jobs=(job,)),
+        busy_execute_run,
+    )
+    _register(history, job, at=FROZEN_NOW - timedelta(days=2))
+
+    assert cli.main(["tick"]) == 0
+
+    records = read_job(history, "a")
+    assert [r.state for r in records] == ["registered", "running", "skipped"]
+    running, skipped = records[-2:]
+    assert skipped.run_id == running.run_id
+    assert skipped.extra == {"reason": "checkout_busy", "trigger": "cron"}
+    # Contention is not a run: the occurrence stays owed and nothing pages anyone.
+    assert last_scheduled_terminal_run(history, "a") is None
+    assert client.notifications == []
+
+
+def test_dispatch_records_use_the_clock_at_dispatch_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 079: a tick may decide a job is due and reach its dispatch much later, so the
+    `running`/terminal timestamps come from the clock at dispatch time, not tick start."""
+    job = _job(tmp_path)
+    dispatch_now = FROZEN_NOW + timedelta(hours=2)
+
+    class _DispatchClock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return dispatch_now
+
+    history = _wire(
+        monkeypatch,
+        tmp_path,
+        _Client(),
+        RoutinesConfig(jobs=(job,)),
+        _unparked([]),
+    )
+    monkeypatch.setattr(tick, "datetime", _DispatchClock)
+    _register(history, job, at=FROZEN_NOW - timedelta(days=2))
+
+    assert cli.main(["tick"]) == 0
+
+    records = read_job(history, "a")
+    assert [r.state for r in records] == ["registered", "running", "done"]
+    assert [r.ts for r in records[1:]] == [dispatch_now, dispatch_now]
+

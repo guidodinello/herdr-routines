@@ -259,12 +259,25 @@ _EXPECTED_DELETERS = {
 }
 
 
-def test_no_automatic_deletion_outside_prune(tmp_path: Path) -> None:
+def test_no_automatic_deletion_outside_prune(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Acceptance 14: nothing deletes a report or a roll without someone asking. Two halves
     — the code that does the deleting (a static scan, so a future `unlink` in tick.py or
     runner.py fails here rather than in production), and one tick that rotates, proving the
     automatic path is the rename it claims to be: same files on disk afterwards, plus one
     roll."""
+    from herdr_routines import tick as tick_module
+
+    class _FixedNow(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return NOW
+
+    # Rotation re-reads the clock at rotation time (issue 079), not tick start: pin it so
+    # the roll's name is deterministic.
+    monkeypatch.setattr(tick_module, "datetime", _FixedNow)
+
     found = {
         p.name
         for p in (REPO_ROOT / "src" / "herdr_routines").glob("*.py")

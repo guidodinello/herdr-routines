@@ -421,4 +421,41 @@ def test_manual_pipeline_run_refuses_while_a_run_is_open(
 
     assert _run_cli(monkeypatch, job) == 1
     assert launched == []
-    assert len(read_job(history, "a")) == 1
+    records = read_job(history, "a")
+    assert [r.state for r in records] == ["running", "skipped"]
+    assert records[-1].extra is not None
+    assert records[-1].extra["reason"] == "already_running"
+    assert records[-1].extra["trigger"] == "manual"
+
+
+def test_request_pipeline_run_refused_while_open_notifies(
+    tmp_path: Path,
+    history: Path,
+    client: _Client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `/job` for a pipeline with an open run is a refusal like any other: rc 1 and a
+    notification, never a silent skip."""
+    job = _kinds(tmp_path)["pipeline"]
+    append(
+        history,
+        HistoryRecord(
+            ts=FROZEN_NOW - timedelta(hours=1),
+            job="a",
+            state="running",
+            run_id="a-20261020T090000Z",
+        ),
+    )
+    launched: list[list[str]] = []
+
+    def fake_launch(argv: list[str], **_: Any) -> tuple[int, str, str]:
+        launched.append(argv)
+        return (0, "", "")
+
+    monkeypatch.setattr(tick, "launch_pipeline", fake_launch)
+
+    assert _run_cli(monkeypatch, job, "--trigger", "request") == 1
+    assert launched == []
+    assert [n[0] for n in client.notifications] == [
+        "herdr-routines: a request refused"
+    ]

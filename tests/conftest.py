@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import functools
 import os
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -86,3 +88,44 @@ def _hermetic_host_check(monkeypatch: pytest.MonkeyPatch) -> None:
     with their own `cli.check_host` (see `tests/test_host_drift.py`).
     """
     monkeypatch.setattr("herdr_routines.cli.check_host", lambda *_a, **_kw: [])
+
+
+@pytest.fixture(autouse=True)
+def _dispatch_clock_follows_tick_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make tick's dispatch-time clock deterministic, without pinning it to tick start.
+
+    Since issue 079 `_dispatch_pending` re-reads the clock at dispatch time. Tests drive
+    `run_tick(now=...)` with a simulated clock, so this fixture makes the re-read return
+    that same simulated value (or the real clock when a test supplies none). It does not
+    change production: the module only reads the clock through `datetime.now`.
+    """
+    from herdr_routines import tick
+
+    current: dict[str, datetime | None] = {"now": None}
+    real_datetime = tick.datetime
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            value = current["now"]
+            if value is None:
+                return cast(datetime, real_datetime.now(tz))
+            return value if tz is not None else value.replace(tzinfo=None)
+
+    monkeypatch.setattr(tick, "datetime", _Clock)
+
+    def _follow(fn: Any) -> Any:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            current["now"] = kwargs.get("now")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(tick, "_process_job", _follow(tick._process_job))
+    monkeypatch.setattr(
+        tick, "dispatch_occurrence", _follow(tick.dispatch_occurrence)
+    )
+    monkeypatch.setattr(
+        tick, "dispatch_manual_occurrence", _follow(tick.dispatch_manual_occurrence)
+    )

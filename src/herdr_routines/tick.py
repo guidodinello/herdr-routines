@@ -14,7 +14,7 @@ import time
 from collections.abc import Callable, Generator, Iterable
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Literal, assert_never
 
@@ -87,6 +87,7 @@ from herdr_routines.herdr import (
     HerdrCliError,
 )
 from herdr_routines.history import (
+    NOT_A_RUN_REASONS,
     TERMINAL_STATES,
     TRIGGER_CRON,
     TRIGGER_EVENT,
@@ -119,6 +120,7 @@ from herdr_routines.pipeline_watchdog import (
     validate_stage_sessions,
 )
 from herdr_routines.repos import (
+    CheckoutBusy,
     _ensure_checkout,
     checkout_lock,
     default_repos_dir,
@@ -262,8 +264,8 @@ def _record_unexpected_failure(
 ) -> str:
     """Give a job whose processing raised unexpectedly a terminal `failed` record.
 
-    Closes the `running` records this tick wrote for the job (every `running` append in
-    this module uses `ts=now`, which is what scopes this to the current tick), or writes a
+    Closes the `running` records this tick wrote for the job, whose dispatch-time
+    timestamps are at or after the tick-start `now` (issue 079), or writes a
     `run_id`-less `failed` when none was open so the occurrence is consumed rather than
     re-raising every tick. A pipeline job's open records are left alone: its detached unit
     may still be live and the pipeline watchdog owns finalising them. Best-effort: a
@@ -278,7 +280,7 @@ def _record_unexpected_failure(
             r.run_id
             for r in records
             if r.state == "running"
-            and r.ts == now
+            and r.ts >= now
             and r.run_id
             and r.run_id not in terminal_run_ids
         ]
@@ -382,7 +384,10 @@ def run_tick(
                     history_path,
                     max_bytes=config.retention.history_max_bytes,
                     max_age_days=config.retention.history_max_age_days,
-                    now=now,
+                    # Rotation names the roll after the clock at rotation time, not tick
+                    # start: a tick that ran for an hour must not sort its roll before a
+                    # shorter tick that started later (issue 079).
+                    now=datetime.now(UTC),
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("history rotation failed (continuing): %s", e)
@@ -487,7 +492,7 @@ def _process_audit_job(
         if not acquired:
             return _skip_on_tick_lock(job)
         pending = _decide_audit_job(job, history_path, client=client, now=now)
-    return _finish_dispatch(pending, client=client, now=now)
+    return _finish_dispatch(pending, client=client)
 
 
 def _decide_audit_job(
@@ -867,6 +872,10 @@ def _run_audit(
 
     try:
         ensure_repo(job)
+    except CheckoutBusy:
+        # Contention, not a failed run (issue 079): let the dispatch turn it into a
+        # `skipped`/`checkout_busy` record under the occurrence's trigger.
+        raise
     except (RuntimeError, OSError) as e:
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
@@ -1292,7 +1301,7 @@ def _process_gated_job(
             now=now,
             trusted_review_authors=trusted_review_authors,
         )
-    return _finish_dispatch(pending, client=client, now=now)
+    return _finish_dispatch(pending, client=client)
 
 
 def _decide_gated_job(
@@ -1421,6 +1430,10 @@ def _process_event_target(
 
     try:
         ensure_repo(job)
+    except CheckoutBusy:
+        # Contention, not a failed run (issue 079): let the dispatch turn it into a
+        # `skipped`/`checkout_busy` record under the occurrence's trigger.
+        raise
     except (RuntimeError, OSError) as e:
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
@@ -1911,6 +1924,10 @@ def _dispatch_event_worker(
 
     try:
         ensure_repo(job)
+    except CheckoutBusy:
+        # Contention, not a failed run (issue 079): let the dispatch turn it into a
+        # `skipped`/`checkout_busy` record under the occurrence's trigger.
+        raise
     except (RuntimeError, OSError) as e:
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
@@ -2104,6 +2121,10 @@ def _process_pr_target(
     # Ensure repo checkout before any git remote / worktree operations
     try:
         ensure_repo(job)
+    except CheckoutBusy:
+        # Contention, not a failed run (issue 079): let the dispatch turn it into a
+        # `skipped`/`checkout_busy` record under the occurrence's trigger.
+        raise
     except (RuntimeError, OSError) as e:
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
@@ -2527,6 +2548,10 @@ def _process_base_target(
     # Ensure repo checkout before any worktree creation
     try:
         ensure_repo(job)
+    except CheckoutBusy:
+        # Contention, not a failed run (issue 079): let the dispatch turn it into a
+        # `skipped`/`checkout_busy` record under the occurrence's trigger.
+        raise
     except (RuntimeError, OSError) as e:
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
@@ -3034,6 +3059,10 @@ def _dispatch_fix_worker(
     # Ensure repo checkout before any worktree creation
     try:
         ensure_repo(job)
+    except CheckoutBusy:
+        # Contention, not a failed run (issue 079): let the dispatch turn it into a
+        # `skipped`/`checkout_busy` record under the occurrence's trigger.
+        raise
     except (RuntimeError, OSError) as e:
         reason = (
             "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
@@ -3414,7 +3443,6 @@ def _fire_triggers(
                     ),
                 ),
                 client=client,
-                now=now,
                 trusted_review_authors=trusted_review_authors,
                 run_timeout_ms=run_timeout_ms,
                 live_check=live_check,
@@ -3512,20 +3540,22 @@ def _poll_event_trigger(
     if event_is_gate:
         if event_trigger is None:
             raise RuntimeError(f"{job.name}: no event trigger configured")
+        run_id = make_run_id(job.name, now)
         return _PendingDispatch(
             job=job,
             history_path=history_path,
             run_timeout_ms=run_timeout_ms,
             live_check=live_check,
-            dispatch=lambda: _process_event_target(
+            dispatch=lambda dispatched_at: _process_event_target(
                 job,
                 history_path,
                 client=client,
-                now=now,
-                run_id=make_run_id(job.name, now),
+                now=dispatched_at,
+                run_id=run_id,
                 check=event_trigger,
                 trusted_review_authors=trusted_review_authors,
             ),
+            run_id=run_id,
             trigger=TRIGGER_EVENT,
         )
 
@@ -3666,7 +3696,6 @@ def _poll_event_trigger(
             ),
         ),
         client=client,
-        now=now,
         trusted_review_authors=trusted_review_authors,
         run_timeout_ms=run_timeout_ms,
         live_check=live_check,
@@ -3740,7 +3769,12 @@ class _PendingDispatch:
     history_path: Path
     run_timeout_ms: int
     live_check: Callable[[HerdrClient, Job], bool]
-    dispatch: Callable[[], tuple[str, bool]]
+    # Takes the dispatch-time clock, captured under the job lock (issue 079): a sequential
+    # tick can reach this job long after its decision, so tick-start `now` is not its time.
+    dispatch: Callable[[datetime], tuple[str, bool]]
+    # The occurrence's run_id, so a sync that finds the checkout busy can close the
+    # `running` record it already wrote instead of leaving it open.
+    run_id: str
     # The occurrence's `extra.trigger`. Stamped on every skip this dispatch writes, so a
     # refused manual run is off-schedule and never consumes a cron occurrence.
     trigger: str
@@ -3764,7 +3798,6 @@ def _pending_occurrence(
     occ: Occurrence,
     *,
     client: HerdrClient,
-    now: datetime,
     trusted_review_authors: tuple[str, ...],
     run_timeout_ms: int,
     live_check: Callable[[HerdrClient, Job], bool],
@@ -3775,14 +3808,15 @@ def _pending_occurrence(
         history_path=history_path,
         run_timeout_ms=run_timeout_ms,
         live_check=live_check,
-        dispatch=lambda: dispatch_occurrence(
+        dispatch=lambda dispatched_at: dispatch_occurrence(
             job,
             history_path,
             occ,
             client=client,
-            now=now,
+            now=dispatched_at,
             trusted_review_authors=trusted_review_authors,
         ),
+        run_id=occ.run_id,
         trigger=occ.extra.get("trigger") or TRIGGER_CRON,
         before_dispatch=before_dispatch,
     )
@@ -3799,8 +3833,27 @@ def _root_checkout_lock(job: Job) -> AbstractContextManager[bool]:
     return checkout_lock(job.repo)
 
 
+def _checkout_busy_skip_recorded(
+    history_path: Path, job_name: str, trigger: str
+) -> bool:
+    """Whether this trigger already has a `checkout_busy` skip since the job last really
+    ran (issue 079). A contended checkout leaves the occurrence owed, so a root job blocked
+    by another root job's run on the same checkout would otherwise write one `skipped`
+    record per tick for the holder's whole run."""
+    for record in reversed(read_job(history_path, job_name)):
+        extra = record.extra or {}
+        if record.state == "running":
+            return False
+        if record.state in TERMINAL_STATES:
+            if extra.get("reason") not in NOT_A_RUN_REASONS:
+                return False
+            if extra.get("reason") == "checkout_busy" and extra.get("trigger") == trigger:
+                return True
+    return False
+
+
 def _dispatch_pending(
-    pending: _PendingDispatch, *, client: HerdrClient, now: datetime
+    pending: _PendingDispatch, *, client: HerdrClient
 ) -> DispatchOutcome:
     """Take the per-job lock and dispatch one decided firing (issue 079).
 
@@ -3812,14 +3865,31 @@ def _dispatch_pending(
     job = pending.job
     history_path = pending.history_path
     person = pending.trigger in _PERSON_TRIGGERS
+    # Capture the clock at dispatch time, not at tick start (issue 079): a sequential tick
+    # can reach this job long after its decision, and overlapping ticks may dispatch jobs
+    # in a different order than they started, so every record this dispatch writes (and
+    # the rotation after the tick) must use the clock as of now.
+    now = datetime.now(UTC)
 
-    def skip(reason: DispatchRefusal, summary: str) -> DispatchOutcome:
+    def skip(
+        reason: DispatchRefusal, summary: str, *, run_id: str | None = None
+    ) -> DispatchOutcome:
+        # A root-held checkout writes no `running` record, so suppress repeats of the same
+        # trigger's skip; a sync that failed after `running` must still close that record.
+        if (
+            run_id is None
+            and reason == "checkout_busy"
+            and _checkout_busy_skip_recorded(history_path, job.name, pending.trigger)
+        ):
+            log.info("%s: %s (already recorded)", job.name, summary)
+            return DispatchOutcome(f"{job.name}: {summary}", False, refusal=reason)
         append(
             history_path,
             HistoryRecord(
                 ts=now,
                 job=job.name,
                 state="skipped",
+                run_id=run_id,
                 extra=HistoryExtra(reason=reason, trigger=pending.trigger),
             ),
         )
@@ -3842,6 +3912,16 @@ def _dispatch_pending(
                 refusal="already_running",
             )
 
+        # A manual or request run of a pipeline must be refused, not launched alongside an
+        # open run (and not silently reported as a failure): the pipeline branch of
+        # `dispatch_occurrence` cannot express a refusal, so guard here.
+        if (
+            job.kind == "pipeline"
+            and person
+            and _open_pipeline_run(history_path, job.name) is not None
+        ):
+            return skip("already_running", "skipped (already running)")
+
         if pending.live_check(client, job):
             return skip("agent_name_live", "skipped (agent already live)")
 
@@ -3849,8 +3929,19 @@ def _dispatch_pending(
             if not owned:
                 return skip("checkout_busy", "skipped (checkout busy)")
             for record in pending.before_dispatch:
-                append(history_path, record)
-            summary, failed = pending.dispatch()
+                append(history_path, replace(record, ts=now))
+            try:
+                summary, failed = pending.dispatch(now)
+            except CheckoutBusy as e:
+                # The sync met another dispatch's checkout holder (issue 079). That is
+                # contention, not a failed run: close any `running` record the dispatch
+                # wrote (a pipeline launch writes none) and leave the occurrence owed.
+                log.info("%s: dispatch skipped: %s", job.name, e)
+                return skip(
+                    "checkout_busy",
+                    "skipped (checkout busy)",
+                    run_id=None if job.kind == "pipeline" else pending.run_id,
+                )
         if pending.prefix is not None:
             summary = f"{pending.prefix}; {summary}"
         return DispatchOutcome(summary, failed)
@@ -3860,11 +3951,10 @@ def _finish_dispatch(
     pending: tuple[str, bool] | _PendingDispatch,
     *,
     client: HerdrClient,
-    now: datetime,
 ) -> tuple[str, bool]:
     if not isinstance(pending, _PendingDispatch):
         return pending
-    outcome = _dispatch_pending(pending, client=client, now=now)
+    outcome = _dispatch_pending(pending, client=client)
     return outcome.summary, outcome.failed
 
 
@@ -3890,13 +3980,11 @@ def dispatch_manual_occurrence(
             history_path,
             occ,
             client=client,
-            now=now,
             trusted_review_authors=trusted_review_authors,
             run_timeout_ms=run_timeout_ms,
             live_check=live_check,
         ),
         client=client,
-        now=now,
     )
 
 
@@ -3913,13 +4001,9 @@ def dispatch_occurrence(
     reaches it from each `_process_*_job` once `schedule.decide` says RUN; `herdr-routines
     run` skips that decision and calls it directly. One function, so the two cannot drift."""
     if job.kind == "pipeline":
-        # An off-schedule run's `running` record would shadow an in-flight one, and tick
-        # reconciles only the latest open run, so refuse instead.
-        if (
-            occ.extra.get("trigger", TRIGGER_CRON) != TRIGGER_CRON
-            and _open_pipeline_run(history_path, job.name) is not None
-        ):
-            return f"{job.name}: skipped (already running)", True
+        # An off-schedule run of a pipeline with an open run is refused by
+        # `_dispatch_pending` (an `already_running` refusal); this entry point only ever
+        # launches a firing the job-locked dispatch already cleared.
         return _launch_pipeline_run(
             job,
             history_path,
@@ -4313,7 +4397,7 @@ def _process_job(
             trusted_review_authors=trusted_review_authors,
             run_timeout_ms=run_timeout_ms,
         )
-    return _finish_dispatch(pending, client=client, now=now)
+    return _finish_dispatch(pending, client=client)
 
 
 def _decide_routine_job(
@@ -4563,7 +4647,7 @@ def _process_pipeline_job(
         if not acquired:
             return _skip_on_tick_lock(job)
         pending = _decide_pipeline_job(job, history_path, client=client, now=now)
-    return _finish_dispatch(pending, client=client, now=now)
+    return _finish_dispatch(pending, client=client)
 
 
 def _decide_pipeline_job(
@@ -4773,7 +4857,6 @@ def _decide_pipeline_job(
             ),
         ),
         client=client,
-        now=now,
         trusted_review_authors=DEFAULT_TRUSTED_REVIEW_AUTHORS,
         run_timeout_ms=job.timeout_ms,
         live_check=_live_agent_exists,
@@ -4800,6 +4883,9 @@ def _launch_pipeline_run(
 
     try:
         ensure_repo(job)
+    except CheckoutBusy:
+        # Contention, not a failed launch (issue 079): the dispatch records it as a skip.
+        raise
     except RuntimeError as e:
         append(
             history_path,
