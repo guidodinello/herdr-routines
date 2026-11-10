@@ -7,6 +7,14 @@ pass once the feature exists.
 
 Spec: docs/pipeline/runs/20261014T050000Z/spec.md v2, ## Acceptance criteria.
 
+Issue 083 (spec docs/pipeline/runs/20261110T050000Z/spec.md v2) rewrites the alias
+fixtures to construct ``config.SpawnAlias`` records and the two issue-065
+source-contract tests to pin ``dict[str, SpawnAlias]`` / ``Mapping[str,
+SpawnAlias]``. These tests were authored red in e76685a, before the typed-record
+propagation landed in e5aac9f; they pass against the implementation on this
+branch, and each asserts exactly the behaviour its acceptance criterion
+describes.
+
 Contract pinned for the stage-4 implementation:
 
 - New module ``herdr_routines.telegram_spawn`` exposing:
@@ -15,8 +23,9 @@ Contract pinned for the stage-4 implementation:
     ``[a-z][a-z0-9_-]*`` returns ``<t>``; anything else (zero tokens, extra
     args, non-command text, unknown verb, ill-shaped token) returns None.
   - ``handle_spawn_message(text, chat_id, *, allowed_chat_id, aliases, client,
-    reply) -> str`` — event handler. ``aliases`` maps alias -> ``{"repo":
-    <path>, "agent_kind": <kind>, "workspace": <mode>}``. ``client`` is a
+    reply) -> str`` — event handler. ``aliases`` maps alias ->
+    ``config.SpawnAlias`` record (issue 083: config's validated values travel as
+    the record itself, never re-flattened to dicts). ``client`` is a
     HerdrClient-like with ``worktree_create_full(*, cwd, branch, base, label=None)``
     (``workspace: worktree``) or ``tab_create(*, cwd, label=None)`` (``workspace:
     root``), and ``agent_start(*, name, kind, pane_id, start_timeout_ms, ...)``. ``reply``
@@ -36,11 +45,16 @@ from __future__ import annotations
 import importlib
 import json
 import re
+import subprocess
+import sys
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from herdr_routines.config import SpawnAlias, TelegramSpawn
 from herdr_routines.herdr import HerdrCliError, WorktreeInfo
 
 
@@ -49,16 +63,11 @@ def _spawn_module():
     return importlib.import_module("herdr_routines.telegram_spawn")
 
 
-def _aliases(
-    repo: Path | str, *, name: str = "nightly-audit"
-) -> dict[str, dict[str, Any]]:
-    return {
-        name: {
-            "repo": str(repo),
-            "agent_kind": "claude",
-            "workspace": "worktree",
-        }
-    }
+def _aliases(repo: Path | str, *, name: str = "nightly-audit") -> dict[str, SpawnAlias]:
+    """One alias as config's own frozen record (issue 083): every default lives in
+    ``SpawnAlias``'s fields, and ``repo`` stays a ``Path`` until the handler's
+    ``str(spec.repo)`` conversion at the ``SpawnClient`` protocol boundary."""
+    return {name: SpawnAlias(alias=name, repo=Path(repo))}
 
 
 class FakeSpawnClient:
@@ -141,7 +150,7 @@ def _handle(
     chat_id: Any,
     *,
     allowed_chat_id: Any,
-    aliases: dict[str, dict[str, Any]],
+    aliases: Mapping[str, SpawnAlias],
     client: FakeSpawnClient,
 ) -> tuple[str, list[str]]:
     sent: list[str] = []
@@ -305,7 +314,16 @@ def test_spawn_fails_closed_without_allowlist(tmp_path: Path) -> None:
 def test_spawn_unknown_target_lists_aliases(tmp_path: Path) -> None:
     mod = _spawn_module()
     repo = _git_repo(tmp_path / "w")
-    aliases = _aliases(repo)
+    # Issue 083 (AC 7): the reply path consumes alias_table's new record values —
+    # the mapping is alias_table's own output, SpawnAlias values unmodified.
+    spawn_cfg = TelegramSpawn(
+        allowed_chat_id="12345",
+        aliases=(SpawnAlias(alias="nightly-audit", repo=repo),),
+    )
+    aliases = mod.alias_table(spawn_cfg)
+    assert all(isinstance(a, SpawnAlias) for a in aliases.values()), (
+        "alias_table must carry config's SpawnAlias records as its values"
+    )
     client = FakeSpawnClient()
 
     result, _ = _handle(
@@ -373,15 +391,18 @@ def test_spawn_alias_map_validation(tmp_path: Path) -> None:
         load_config(dup_path)
 
     # `base` (the branch a worktree spawn starts from) defaults to main and flows into
-    # the handler's alias table; an empty one is rejected.
-    from herdr_routines.telegram_spawn import alias_table
+    # the handler's alias table as the record's own field (issue 083: attribute
+    # access, no dict re-flattening); an empty one is rejected. Routed through the
+    # module seam so the pre-implementation dict return keeps mypy green while this
+    # attribute read is pytest-red.
+    mod = _spawn_module()
 
     assert cfg.telegram_spawn is not None
-    assert alias_table(cfg.telegram_spawn)["nightly"]["base"] == "main"
+    assert mod.alias_table(cfg.telegram_spawn)["nightly"].base == "main"
     based_path = tmp_path / "based.yaml"
     based_path.write_text(_spawn_config_text(good_repo) + "      base: develop\n")
     based = load_config(based_path).telegram_spawn
-    assert based is not None and alias_table(based)["nightly"]["base"] == "develop"
+    assert based is not None and mod.alias_table(based)["nightly"].base == "develop"
     empty_base_path = tmp_path / "empty-base.yaml"
     empty_base_path.write_text(_spawn_config_text(good_repo) + "      base: ''\n")
     with pytest.raises(ConfigError, match="base"):
@@ -486,7 +507,8 @@ def test_spawn_root_mode_opens_a_tab_in_the_checkout(tmp_path: Path) -> None:
     mod = _spawn_module()
     repo = _git_repo(tmp_path / "repo-root")
     aliases = _aliases(repo)
-    aliases["nightly-audit"]["workspace"] = "root"
+    # SpawnAlias is frozen: a variant mode is a new record, as config would build it.
+    aliases["nightly-audit"] = replace(aliases["nightly-audit"], workspace="root")
     client = FakeSpawnClient()
 
     result, _ = _handle(
@@ -502,6 +524,23 @@ def test_spawn_root_mode_opens_a_tab_in_the_checkout(tmp_path: Path) -> None:
     assert [c["cwd"] for c in client.tab_calls] == [str(repo)]
     assert client.agent_calls[0]["pane_id"] == "w7:p1"
     assert "w7:p1" in result
+
+    # Same dispatch structure (issue 083 AC 5): a worktree-mode alias still reaches
+    # worktree_create_full and never a tab — the else-branch stays the structural
+    # fallback, with no /workspace == "root" exhaustive-match rewiring.
+    worktree_client = FakeSpawnClient()
+    _handle(
+        mod,
+        "/run nightly-audit",
+        12345,
+        allowed_chat_id=12345,
+        aliases=_aliases(repo),
+        client=worktree_client,
+    )
+    assert len(worktree_client.workspace_calls) == 1
+    assert worktree_client.workspace_calls[0]["cwd"] == str(repo)
+    assert worktree_client.workspace_calls[0]["base"] == "main"
+    assert worktree_client.tab_calls == []
 
 
 def test_spawn_agent_name_fits_the_32_char_cap(tmp_path: Path) -> None:
@@ -689,7 +728,7 @@ def test_spawn_starts_the_requested_harness_and_model(tmp_path: Path) -> None:
 def test_spawn_alias_model_applies_only_to_its_own_harness(tmp_path: Path) -> None:
     mod = _spawn_module()
     aliases = _aliases(_git_repo(tmp_path / "repo"))
-    aliases["nightly-audit"]["model"] = "opus"
+    aliases["nightly-audit"] = replace(aliases["nightly-audit"], model="opus")
 
     for text, expected in (
         ("/run nightly-audit", ("claude", "opus")),
@@ -752,6 +791,10 @@ def test_spawn_malformed_command_gets_usage_only_in_the_allowed_chat(
 def test_spawn_alias_model_is_validated_and_reaches_the_handler(
     tmp_path: Path,
 ) -> None:
+    """Issue 083 AC 6 (non-blocking): the one None-carrying field round-trips —
+    ``SpawnAlias.model`` (``str | None``) reaches the handler as ``None`` when
+    omitted and as the configured string per alias otherwise, through the new
+    attribute reads (no dict re-flattening in between)."""
     from herdr_routines.config import ConfigError, load_config
 
     mod = _spawn_module()
@@ -761,12 +804,43 @@ def test_spawn_alias_model_is_validated_and_reaches_the_handler(
     cfg_path.write_text(_spawn_config_text(repo) + "      model: opus\n")
     spawn = load_config(cfg_path).telegram_spawn
     assert spawn is not None
-    assert mod.alias_table(spawn)["nightly"]["model"] == "opus"
+    table = mod.alias_table(spawn)
+    assert table["nightly"].model == "opus"
 
     bad = _spawn_config_text(repo).replace("agent_kind: claude", "agent_kind: gemini")
     cfg_path.write_text(bad + "      model: pro\n")
     with pytest.raises(ConfigError, match="'model' is not supported"):
         load_config(cfg_path)
+
+    # The configured model reaches agent_start on the alias's own harness...
+    client = FakeSpawnClient()
+    _handle(
+        mod,
+        "/run nightly",
+        12345,
+        allowed_chat_id=12345,
+        aliases=table,
+        client=client,
+    )
+    assert client.agent_calls[0]["model"] == "opus"
+
+    # ...and an omitted model arrives as None, not as a re-coerced default.
+    bare_path = tmp_path / "bare.yaml"
+    bare_path.write_text(_spawn_config_text(repo))
+    bare = load_config(bare_path).telegram_spawn
+    assert bare is not None
+    bare_table = mod.alias_table(bare)
+    assert bare_table["nightly"].model is None
+    client = FakeSpawnClient()
+    _handle(
+        mod,
+        "/run nightly",
+        12345,
+        allowed_chat_id=12345,
+        aliases=bare_table,
+        client=client,
+    )
+    assert client.agent_calls[0]["model"] is None
 
 
 @pytest.mark.parametrize(
@@ -864,26 +938,45 @@ def test_spawn_from_group_chat_reaches_no_herdr_call(tmp_path: Path) -> None:
 
 
 def test_alias_table_spawn_param_is_telegram_spawn() -> None:
-    """AC 1 (blocking): ``alias_table`` declares ``spawn: TelegramSpawn`` with
-    ``TelegramSpawn`` imported at runtime from ``herdr_routines.config`` (no
-    ``TYPE_CHECKING`` guard, no cycle), keeps the ``dict[str, dict[str, str | None]]``
-    return, and the ``cli.py`` call site (``aliases=alias_table(spawn)``) is
-    unchanged."""
+    """AC 1 (blocking) + AC 8 (non-blocking), issue 083 (spec
+    docs/pipeline/runs/20261110T050000Z/spec.md v2): ``alias_table`` declares
+    ``spawn: TelegramSpawn`` and returns ``dict[str, SpawnAlias]`` — config's own
+    frozen record, imported at runtime from ``herdr_routines.config`` (no
+    ``TYPE_CHECKING`` guard, no cycle), with the pass-through body
+    ``{a.alias: a for a in spawn.aliases}`` so values travel unmodified and the
+    ``WorkspaceMode`` Literal stays attached to every entry. The ``cli.py`` call
+    site (``aliases=alias_table(spawn)``) is unchanged, and the fixtures (the
+    ``_aliases`` helper and every literal alias fixture) construct
+    ``SpawnAlias(...)`` records, so ``repo`` arrives as a ``Path`` and leaves the
+    handler as ``str(spec.repo)`` — keeping ``SpawnClient.worktree_create_full``/
+    ``tab_create``'s ``cwd: str`` clean under strict typing."""
     import ast
     import inspect
     from typing import get_type_hints
 
-    from herdr_routines.config import TelegramSpawn
+    from herdr_routines.config import SpawnAlias, TelegramSpawn
 
     mod = _spawn_module()
 
+    # Runtime-resolvable hints: SpawnAlias must be imported at runtime (a
+    # TYPE_CHECKING-only import would raise NameError here), so no import cycle.
     hints = get_type_hints(mod.alias_table)
     assert hints["spawn"] is TelegramSpawn
-    assert hints["return"] == dict[str, dict[str, str | None]]
+    assert hints["return"] == dict[str, SpawnAlias]
 
     src = inspect.getsource(mod.alias_table)
     assert src.startswith(
-        "def alias_table(spawn: TelegramSpawn) -> dict[str, dict[str, str | None]]:"
+        "def alias_table(spawn: TelegramSpawn) -> dict[str, SpawnAlias]:"
+    )
+    # Pass-through body: values are the records themselves, never re-flattened.
+    assert "return {a.alias: a for a in spawn.aliases}" in src
+
+    record = SpawnAlias(alias="nightly", repo=Path("/somewhere/x"))
+    table = mod.alias_table(TelegramSpawn(allowed_chat_id="12345", aliases=(record,)))
+    assert table == {"nightly": record}
+    assert table["nightly"] is record, "values pass through unmodified"
+    assert table["nightly"].workspace == "worktree", (
+        "the WorkspaceMode value travels with the record"
     )
 
     module_src = Path(mod.__file__).read_text(encoding="utf-8")
@@ -899,33 +992,60 @@ def test_alias_table_spawn_param_is_telegram_spawn() -> None:
         for alias in node.names
     ]
     assert "TelegramSpawn" in config_imports
+    assert "SpawnAlias" in config_imports
 
     # The single in-repo consumer (cli.py) passes alias_table's own output, untouched.
     cli_src = (Path(mod.__file__).parent / "cli.py").read_text(encoding="utf-8")
     assert "aliases=alias_table(spawn)" in cli_src
 
+    # AC 8: the fixtures follow the record — the ``_aliases`` helper constructs
+    # SpawnAlias(...) records; no literal-dict alias record remains.
+    helper_src = inspect.getsource(_aliases)
+    assert "SpawnAlias(" in helper_src
+    assert '"repo"' not in helper_src and '"workspace"' not in helper_src
+
 
 def test_handle_spawn_message_aliases_are_str_or_none_mapping() -> None:
-    """AC 2 (blocking): ``handle_spawn_message`` declares
-    ``aliases: Mapping[str, Mapping[str, str | None]]`` and reads it exactly as
-    before: aliased fields are read through the ``str(spec.get(...) or default)``
-    coercion and the model through ``spec.get("model")`` as ``str | None``."""
+    """AC 2 + AC 3 (blocking), issue 083: ``handle_spawn_message`` declares
+    ``aliases: Mapping[str, SpawnAlias]`` and reads the record via direct
+    attribute access (``spec.agent_kind``, ``spec.workspace``, ``spec.base``,
+    ``spec.model``, ``str(spec.repo)``); the four ``str(spec.get(...) or
+    default)`` coercions — and the defaults they mirrored — are gone, leaving the
+    ``"worktree"`` default in exactly one place: ``config.SpawnAlias``'s field
+    default."""
     import inspect
     from collections.abc import Mapping
     from typing import get_type_hints
 
+    from herdr_routines.config import SpawnAlias
+
     mod = _spawn_module()
 
     hints = get_type_hints(mod.handle_spawn_message)
-    assert hints["aliases"] == Mapping[str, Mapping[str, str | None]]
+    assert hints["aliases"] == Mapping[str, SpawnAlias]
 
     src = inspect.getsource(mod.handle_spawn_message)
-    assert "aliases: Mapping[str, Mapping[str, str | None]]," in src
-    assert 'str(spec.get("repo") or "")' in src
-    assert 'str(spec.get("agent_kind") or "claude")' in src
-    assert 'str(spec.get("workspace") or "worktree")' in src
-    assert 'str(spec.get("base") or "main")' in src
-    assert 'spec.get("model")' in src
+    assert "aliases: Mapping[str, SpawnAlias]," in src
+    assert "spec.agent_kind" in src
+    assert "spec.workspace" in src
+    assert "spec.base" in src
+    assert "spec.model" in src
+    assert "str(spec.repo)" in src
+
+    # AC 3: the stale coercions are gone — including every remaining dict read on
+    # the record (the outer lookup is aliases.get, never spec.get).
+    assert 'str(spec.get("workspace") or "worktree")' not in src
+    assert 'str(spec.get("agent_kind") or "claude")' not in src
+    assert 'str(spec.get("base") or "main")' not in src
+    assert 'str(spec.get("repo") or "")' not in src
+    assert "spec.get(" not in src
+    assert 'or "worktree"' not in src, (
+        'the "worktree" default lives only in config.SpawnAlias'
+    )
+
+    # ...which is exactly where config keeps it (config.SpawnAlias's field default).
+    config_src = (Path(mod.__file__).parent / "config.py").read_text(encoding="utf-8")
+    assert 'workspace: WorkspaceMode = "worktree"' in config_src
 
 
 def test_typed_boundaries_have_no_any() -> None:
@@ -965,3 +1085,71 @@ def test_typed_boundaries_have_no_any() -> None:
         or re.search(r"\bcast\(", p.read_text(encoding="utf-8"))
     ]
     assert suppressions == []
+
+
+# Issue 083 AC 9 (non-blocking, meta-check): ci green with the blocking tests
+# present and passing. The assertions below check present state; the TDD ordering
+# (tests rewritten red in e76685a, implementation in e5aac9f) is evidenced by git
+# history, not by anything this test can inspect.
+
+
+def test_ci_green_with_blocking_tests_run_first() -> None:
+    """The blocking criteria (AC 1-5) are the thing CI greenlights: the rewritten
+    contract tests are defined in this file and pass against the typed
+    implementation, ``scripts/ci-check.sh`` stays the one definition of green
+    wiring mypy and the suite, and ``mypy --strict src`` is green — the
+    ``str(spec.repo)`` conversion keeps the ``SpawnClient`` ``cwd: str`` boundary
+    clean under strict typing."""
+    repo_root = Path(__file__).resolve().parents[1]
+
+    # The blocking contract tests are defined in this file. This is a presence
+    # check only — ordering is evidenced by git history (e76685a precedes
+    # e5aac9f), not by same-file existence.
+    source = Path(__file__).read_text(encoding="utf-8")
+    for name in (
+        "test_alias_table_spawn_param_is_telegram_spawn",
+        "test_handle_spawn_message_aliases_are_str_or_none_mapping",
+        "test_typed_boundaries_have_no_any",
+        "test_spawn_root_mode_opens_a_tab_in_the_checkout",
+    ):
+        assert f"def {name}(" in source, f"{name} must be defined in this file"
+
+    # ci-check.sh wires the same two gates this test runs, so its verdict covers
+    # every blocking criterion above (its full suite run is CI's business, not a
+    # nested pytest's — the -k filter below excludes this meta-test itself).
+    script = repo_root / "scripts" / "ci-check.sh"
+    assert script.is_file()
+    ci_text = script.read_text(encoding="utf-8")
+    assert "uv run mypy" in ci_text
+    assert "uv run pytest -q" in ci_text
+
+    mypy = subprocess.run(
+        [sys.executable, "-m", "mypy", "--strict", "src"],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=repo_root,
+    )
+    assert mypy.returncode == 0, mypy.stdout + mypy.stderr
+
+    blocking = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "tests/test_telegram_spawn.py",
+            "-k",
+            (
+                "alias_table_spawn_param_is_telegram_spawn or "
+                "handle_spawn_message_aliases_are_str_or_none_mapping or "
+                "typed_boundaries_have_no_any or "
+                "spawn_root_mode_opens_a_tab_in_the_checkout"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=repo_root,
+    )
+    assert blocking.returncode == 0, blocking.stdout + blocking.stderr

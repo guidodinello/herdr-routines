@@ -1,7 +1,7 @@
 ---
 id: "083"
 title: "Type telegram spawn aliases as a record instead of re-stringifying WorkspaceMode"
-status: open
+status: done
 priority: low
 area: infra
 ---

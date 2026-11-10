@@ -34,6 +34,7 @@ from herdr_routines.config import (
     AGENT_MODEL_FLAGS,
     NAME_RE,
     VALID_AGENT_KINDS,
+    SpawnAlias,
     TelegramSpawn,
     is_private_chat_id,
 )
@@ -170,20 +171,13 @@ def is_authorized(chat_id: int | str, allowed_chat_id: int | str | None) -> bool
     return str(chat_id).strip() == allowed
 
 
-def alias_table(spawn: TelegramSpawn) -> dict[str, dict[str, str | None]]:
-    """Turn a ``config.TelegramSpawn`` into the plain ``alias -> record`` mapping
-    ``handle_spawn_message`` consumes. Kept here so the bridge glue has one canonical
-    adapter and the handler stays free of any config import."""
-    return {
-        a.alias: {
-            "repo": str(a.repo),
-            "agent_kind": a.agent_kind,
-            "workspace": a.workspace,
-            "base": a.base,
-            "model": a.model,
-        }
-        for a in spawn.aliases
-    }
+def alias_table(spawn: TelegramSpawn) -> dict[str, SpawnAlias]:
+    """Turn a ``config.TelegramSpawn`` into the ``alias -> record`` mapping
+    ``handle_spawn_message`` consumes. The frozen ``SpawnAlias`` records pass through
+    unmodified (issue 083), so the config-validated ``WorkspaceMode`` Literal and every
+    field default travel with each entry instead of being re-flattened to a plain dict
+    and re-defaulted on the consumer side."""
+    return {a.alias: a for a in spawn.aliases}
 
 
 def handle_spawn_message(
@@ -191,11 +185,15 @@ def handle_spawn_message(
     chat_id: int | str,
     *,
     allowed_chat_id: int | str | None,
-    aliases: Mapping[str, Mapping[str, str | None]],
+    aliases: Mapping[str, SpawnAlias],
     client: SpawnClient,
     reply: Callable[[str], None],
 ) -> str:
     """Handle one inbound Telegram message; return (and send) the in-chat reply text.
+
+    ``aliases`` is ``alias_table``'s output: config's own frozen ``SpawnAlias``
+    records, so every field default (harness, workspace mode, base branch) lives in
+    exactly one place — the record's field defaults — and this handler adds none.
 
     Order is the contract: verb, then auth, then parse, then map — a rejected message
     reaches no Herdr call, and only the allowlisted chat learns the usage or the aliases.
@@ -223,27 +221,30 @@ def handle_spawn_message(
     if spec is None:
         return _reply(reply, f"Unknown target {target!r}. Valid targets: {valid}.")
 
-    repo = str(spec.get("repo") or "")
-    if not repo:
-        return _reply(reply, f"Target {target!r} is misconfigured (no repo).")
-    alias_kind = str(spec.get("agent_kind") or "claude")
+    # The record carries every default config already validated (SpawnAlias's field
+    # defaults), so this handler re-defaults nothing; only repo is str()'d, at the
+    # SpawnClient protocol boundary where cwd is a plain path string.
+    repo = str(spec.repo)
+    alias_kind = spec.agent_kind
     kind = command.agent_kind or alias_kind
     # The alias's default model belongs to its own harness; picking another harness
     # without a model starts that harness on its default.
-    model = command.model or (spec.get("model") if kind == alias_kind else None)
+    model = command.model or (spec.model if kind == alias_kind else None)
     if model is not None and kind not in AGENT_MODEL_FLAGS:
         return _reply(
             reply,
             f"Harness {kind!r} takes no model. A model needs one of: "
             f"{', '.join(sorted(AGENT_MODEL_FLAGS))}.",
         )
-    mode = str(spec.get("workspace") or "worktree")
-    base = str(spec.get("base") or "main")
+    mode = spec.workspace
+    base = spec.base
     stamp = int(time.time())
     base_name = f"rt-{target[:_NAME_ALIAS_CHARS]}-{stamp}"
 
     # Same per-mode layout as runner.execute_run: a worktree run never edits the
-    # checkout the scheduler syncs; a root run works in the checkout itself.
+    # checkout the scheduler syncs; a root run works in the checkout itself. The
+    # else is the structural fallback for any non-"worktree" mode — config's closed
+    # WorkspaceMode leaves only "root" reachable, so no exhaustive match rewiring.
     try:
         if mode == "worktree":
             info = client.worktree_create_full(
