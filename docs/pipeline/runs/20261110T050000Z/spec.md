@@ -1,4 +1,4 @@
-# Spec v1 — issue 083: type telegram spawn aliases as a record
+# Spec v2 — issue 083: type telegram spawn aliases as a record
 
 Run: 20261110T050000Z · issue: `docs/process/issues/083-telegram-alias-typed-record.md` (priority: low, infra)
 
@@ -95,7 +95,82 @@ Everything else from 065 (auto_fix/run_checks/GithubEvent) is untouched.
    these sets coincide; the `else` stays as the structural fallback (no
    `/workspace == "root"` exhaustive-match rewiring), documented in place.
 
-## Acceptance / verification
+## Acceptance criteria
+
+Classification: each item is **blocking** (run must not ship without it) or
+**non-blocking** (valuable, ship with a follow-up note if it slips). Confidence:
+`high` (deterministic, fully testable in-repo), `medium` (testable but depends
+on live external state shape), `low` (can only be exercised against the real
+job). The two issue-065 source-contract tests appear under their v1 names —
+v1's Files touched rewrites them in place; only their asserted types change.
+
+1. **blocking / confidence: high** — `alias_table` propagates config's record
+   typed: return type is `dict[str, SpawnAlias]`, body is the pass-through
+   `{a.alias: a for a in spawn.aliases}` (values unmodified, so the
+   `WorkspaceMode` Literal travels with every entry); `SpawnAlias` is imported
+   at runtime from `herdr_routines.config` (no `TYPE_CHECKING` guard, no
+   cycle). Test: `test_alias_table_spawn_param_is_telegram_spawn`
+2. **blocking / confidence: high** — `handle_spawn_message` declares
+   `aliases: Mapping[str, SpawnAlias]` and reads via direct attribute access on
+   the record (`spec.agent_kind`, `spec.workspace`, `spec.base`, `spec.model`,
+   `str(spec.repo)`); the rewritten source-contract pin asserts the new hints
+   and the new read strings the same way v1's contract test did for the old
+   ones. Test: `test_handle_spawn_message_aliases_are_str_or_none_mapping`
+3. **blocking / confidence: high** — the four stale coercions are gone: no
+   `str(spec.get("workspace") or "worktree")`, `str(spec.get("agent_kind") or
+   "claude")`, `str(spec.get("base") or "main")` or `str(spec.get("repo") or
+   "")` remains in `telegram_spawn.py`; the `"worktree"` default lives in
+   exactly one place — `config.SpawnAlias`'s field default (config.py:399) —
+   asserted by the rewritten test's absence-checks on those source strings.
+   Test: `test_handle_spawn_message_aliases_are_str_or_none_mapping`
+4. **blocking / confidence: high** — issue 065's narrowing direction is
+   preserved with zero new erasure: no `Any`, no `cast(` and no
+   `# type: ignore` in the changed path; 065's guard test passes untouched
+   (exactly the test 083 must not weaken). Test:
+   `test_typed_boundaries_have_no_any`
+5. **blocking / confidence: high** — dispatch behavior is unchanged and the
+   else-branch stays as the structural fallback without exhaustive-match
+   rewiring: a `worktree`-mode alias reaches `worktree_create_full` and a
+   `root`-mode alias reaches `tab_create` on the same `FakeSpawnClient`
+   assertions as before. Test:
+   `test_spawn_root_mode_opens_a_tab_in_the_checkout`
+6. **non-blocking / confidence: high** — the one None-carrying field round-trips:
+   `SpawnAlias.model` (`str | None`) reaches the handler as `None` when omitted
+   and as the configured string per alias otherwise, through the new attribute
+   reads. Test: `test_spawn_alias_model_is_validated_and_reaches_the_handler`
+7. **non-blocking / confidence: high** — alias-map end-user behavior is
+   unchanged: an unknown target still lists the configured aliases in the
+   reply, exercising `alias_table`'s new record values through the user-facing
+   path. Test: `test_spawn_unknown_target_lists_aliases`
+8. **non-blocking / confidence: medium** — the fixtures follow the record: the
+   `_aliases` helper (tests/test_telegram_spawn.py:52) and all literal-dict
+   alias fixtures construct `SpawnAlias(...)` records, and the
+   repo-as-`Path` → `str(spec.repo)` conversion keeps
+   `SpawnClient.worktree_create_full`/`tab_create`'s `cwd: str` clean under
+   strict typing. Test: `test_alias_table_spawn_param_is_telegram_spawn`
+9. **non-blocking / confidence: medium** — meta-check: `scripts/ci-check.sh`
+   green, `uv run mypy --strict src` green, and the blocking criteria verified
+   red before implementation (TDD: contract tests rewritten first, confirmed
+   failing, then implementation). Test:
+   `test_ci_green_with_blocking_tests_run_first`
+
+## Changelog v1→v2
+
+- Title bumped to Spec v2.
+- Added `## Acceptance criteria`: 9 numbered items, each tagged
+  **blocking**/non-blocking with a `confidence:` tier and ending
+  `Test: <name>` (exact test names). The two blocking 065 source-contract
+  tests (`:1`, `:2`) and the no-erasure guard (`:4`) were already implicitly
+  named in v1's Files touched / Issues-065 sections and are now first-class
+  criteria; v1's "Acceptance / verification" prose claims are converted into
+  items 5–9 with concrete test names.
+- Renamed v1's `## Acceptance / verification` heading to `## Verification`
+  (content unchanged) to disambiguate from the new `## Acceptance criteria`
+  section.
+- No change to Problem, Approach, Files touched, Issues-065 interaction, or
+  Risks content — v2 only adds observability of acceptance, per stage-2 scope.
+
+## Verification
 
 - Alias table typed by a named record (`SpawnAlias`); `workspace` is `WorkspaceMode` —
   asserted by the rewritten contract tests.
