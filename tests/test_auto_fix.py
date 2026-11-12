@@ -2037,8 +2037,8 @@ def test_worker_failed_reason_set_is_closed() -> None:
     # NB1: the docstring on `WorkerFailedReason` names both consumers, so a future
     # producer adding a reason must widen the Literal deliberately.
     source = inspect.getsource(history)
-    start = source.index("WorkerFailedReason")
-    window = source[start : start + 2000]
+    start = source.index("WorkerFailedReason = Literal")
+    window = source[max(0, start - 2000) : start + 2000]
     assert "tick" in window, "WorkerFailedReason docstring must name the tick producer"
     assert "_UNCOUNTED_FAILURE_REASONS" in window, (
         "WorkerFailedReason docstring must name auto_fix._UNCOUNTED_FAILURE_REASONS"

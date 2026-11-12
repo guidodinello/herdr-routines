@@ -95,11 +95,12 @@ class VerifyRecord(TypedDict):
 # history.py is the write-side schema home for `extra` keys.
 #
 # Producers: the two mirrored worker functions in tick.py (`_dispatch_event_worker` and
-# `_dispatch_fix_worker`) are the only writers. Consumers: the `worktree_reuse_not_clean`
-# comparisons in tick.py and auto_fix._UNCOUNTED_FAILURE_REASONS, which decides whether a
-# `failed` record consumes a PR's retry budget. A new producer reason must widen this
-# Literal deliberately; the value set is closed, so nothing flows in from herdr error
-# codes (those land in `error`, not `reason`).
+# `_dispatch_fix_worker`) are the only `_WorkerFailed` construction sites. Consumers: the
+# `worktree_reuse_not_clean` comparisons in tick.py and
+# auto_fix._UNCOUNTED_FAILURE_REASONS, which decides whether a `failed` record consumes a
+# PR's retry budget. A new producer reason must widen this Literal deliberately; the
+# value set is closed, so nothing flows in from herdr error codes (those land in
+# `error`, not `reason`).
 WorkerFailedReason = Literal[
     "clone_failed",
     "repo_sync_failed",
