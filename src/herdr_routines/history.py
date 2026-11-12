@@ -89,6 +89,30 @@ class VerifyRecord(TypedDict):
     reason: str | None
 
 
+# `WorkerFailedReason`: the closed set of `reason` values a fix worker writes when it
+# never gets an agent to settle (issue 084). Defined here, not in tick.py, because tick
+# imports auto_fix and auto_fix must be able to type its consumer set without a cycle;
+# history.py is the write-side schema home for `extra` keys.
+#
+# Producers: the two mirrored worker functions in tick.py (`_dispatch_event_worker` and
+# `_dispatch_fix_worker`) are the only `_WorkerFailed` construction sites. Consumers: the
+# `worktree_reuse_not_clean` comparisons in tick.py and
+# auto_fix._UNCOUNTED_FAILURE_REASONS, which decides whether a `failed` record consumes a
+# PR's retry budget. A new producer reason must widen this Literal deliberately; the
+# value set is closed, so nothing flows in from herdr error codes (those land in
+# `error`, not `reason`).
+WorkerFailedReason = Literal[
+    "clone_failed",
+    "repo_sync_failed",
+    "report_dir_creation_failed",
+    "worktree_reuse_not_clean",
+    "worktree_creation_failed",
+    "agent_start_failed",
+    "agent_not_interactive",
+    "agent_prompt_failed",
+]
+
+
 class HistoryExtra(TypedDict, total=False):
     """Every key a writer puts in a record's `extra`, merged into the JSONL line after
     the core fields. Write-side schema only: a record read back from disk carries

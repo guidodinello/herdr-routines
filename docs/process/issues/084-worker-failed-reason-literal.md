@@ -1,7 +1,7 @@
 ---
 id: "084"
 title: "Close the _WorkerFailed.reason value set in tick.py"
-status: open
+status: done
 priority: low
 area: infra
 ---

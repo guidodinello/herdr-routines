@@ -97,6 +97,7 @@ from herdr_routines.history import (
     HistoryRecord,
     HistoryState,
     VerifyRecord,
+    WorkerFailedReason,
     append,
     find_stale_running,
     first_seen_at,
@@ -653,7 +654,7 @@ class _WorkerFailed:
     """A fix worker that never got an agent to settle: why, and the pane it had already
     opened, if any."""
 
-    reason: str
+    reason: WorkerFailedReason
     error: str | None
     pane_id: str | None = None
     # Set for `worktree_reuse_not_clean` (issue 070): the dirty checkout the refusal names.
@@ -1929,10 +1930,14 @@ def _dispatch_event_worker(
         # `skipped`/`checkout_busy` record under the occurrence's trigger.
         raise
     except (RuntimeError, OSError) as e:
-        reason = (
-            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
+        return _WorkerFailed(
+            reason=(
+                "clone_failed"
+                if not (job.repo / ".git").exists()
+                else "repo_sync_failed"
+            ),
+            error=str(e),
         )
-        return _WorkerFailed(reason=reason, error=str(e))
 
     try:
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3064,10 +3069,14 @@ def _dispatch_fix_worker(
         # `skipped`/`checkout_busy` record under the occurrence's trigger.
         raise
     except (RuntimeError, OSError) as e:
-        reason = (
-            "clone_failed" if not (job.repo / ".git").exists() else "repo_sync_failed"
+        return _WorkerFailed(
+            reason=(
+                "clone_failed"
+                if not (job.repo / ".git").exists()
+                else "repo_sync_failed"
+            ),
+            error=str(e),
         )
-        return _WorkerFailed(reason=reason, error=str(e))
 
     # Create report dir
     try:
