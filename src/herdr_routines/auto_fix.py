@@ -27,7 +27,7 @@ from herdr_routines.config import (
     ReviewSelectMode,
 )
 from herdr_routines.findings import Finding
-from herdr_routines.history import HistoryState, read_job
+from herdr_routines.history import HistoryState, WorkerFailedReason, read_job
 from herdr_routines.runner_seam import BoundedRunner as Runner
 
 log = logging.getLogger(__name__)
@@ -46,7 +46,9 @@ _COUNTABLE_STATES = frozenset({"done", "failed"})
 # A `failed` record that never launched an agent spent nothing (issue 070): the refusal
 # to reuse a dirty worktree must not walk a PR to max_attempts_exceeded. Legacy records
 # written as `failed` stop counting too.
-_UNCOUNTED_FAILURE_REASONS = frozenset({"worktree_reuse_not_clean"})
+_UNCOUNTED_FAILURE_REASONS: frozenset[WorkerFailedReason] = frozenset(
+    {"worktree_reuse_not_clean"}
+)
 
 
 def _is_countable_attempt(state: HistoryState, extra: object) -> bool:
