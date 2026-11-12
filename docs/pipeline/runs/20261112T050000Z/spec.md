@@ -1,4 +1,4 @@
-# Spec v1 — issue 084: close the `_WorkerFailed.reason` value set in tick.py
+# Spec v2 — issue 084: close the `_WorkerFailed.reason` value set in tick.py
 
 ## Problem
 
@@ -78,21 +78,26 @@ Explicitly out of scope (different reason families, not this issue): `_AgentRun.
 
 Blocking:
 
-- AC1 — `_WorkerFailed.reason` is annotated `WorkerFailedReason` covering exactly the eight
-  traced values, and the two former pass-through sites are Literal-clean. Test:
-  `test_worker_failed_reason_set_is_closed` (confidence: high).
-- AC2 — `_UNCOUNTED_FAILURE_REASONS` is typed `frozenset[WorkerFailedReason]` (a typo in the
-  set or in a producer string is now a mypy error). Test:
-  `test_worker_failed_reason_set_is_closed` (second assertion: the set is a subset of the
-  Literal's args) (confidence: high).
-- AC3 — No behavior change: same reason strings, same frozenset contents, JSONL output
-  byte-identical for the same run. `scripts/ci-check.sh` and `uv run mypy --strict src` green.
-  (confidence: high)
+1. AC1 — `_WorkerFailed.reason` is annotated `WorkerFailedReason` covering exactly the eight
+   traced values, and the two former pass-through sites are Literal-clean (inlined ternaries
+   type-check under `--strict`). `uv run mypy --strict src` green. (confidence: high)
+   Test: `test_worker_failed_reason_set_is_closed`
+2. AC2 — `_UNCOUNTED_FAILURE_REASONS` is typed `frozenset[WorkerFailedReason]`, so a typo in
+   the set or in a producer string is now a mypy error; the test asserts the set is a subset
+   of the Literal's args. (confidence: high)
+   Test: `test_worker_failed_reason_set_is_closed`
+3. AC3 — No behavior change: same reason strings, same frozenset contents, JSONL output
+   byte-identical for the same run; legacy on-disk records with old reason strings keep
+   counting semantics unchanged. `scripts/ci-check.sh` green. (confidence: high)
+   Test: `test_attempt_counters_skip_legacy_worktree_reuse_refusals`
 
 Non-blocking:
 
-- NB1 — A comment on `WorkerFailedReason` records the closed-set verdict from the trace above
-  so a future producer adding a reason must widen the Literal deliberately (confidence: high).
+4. NB1 — A docstring comment on `WorkerFailedReason` records the closed-set verdict and names
+   the two consumers (tick producer site, `auto_fix._UNCOUNTED_FAILURE_REASONS`) so a future
+   producer adding a reason must widen the Literal deliberately; the closure test asserts the
+   comment exists and names both consumers. (confidence: high)
+   Test: `test_worker_failed_reason_set_is_closed`
 
 ## Risks
 
@@ -112,7 +117,18 @@ Non-blocking:
 - Scope creep into 064 (`HistoryExtra` enforcement) or the other reason families listed above —
   deliberately not attempted here; 064 is blocked on the tick split and is separate work.
 
-## Changelog
+## Changelog v1→v2
+
+- 2026-11-12: v2 — Restructured acceptance criteria: items are numbered, split into explicit
+  `blocking` / `non-blocking` tiers, and every item now ends with an exact `Test:` name plus a
+  `confidence:` tier. AC3 gained an executable pin: the existing issue-070 regression test
+  `test_attempt_counters_skip_legacy_worktree_reuse_refusals` covers legacy-record counting
+  semantics, while the byte-identical-output and CI-green gates stay in AC3's body as
+  verification steps (`scripts/ci-check.sh`, `uv run mypy --strict src`). NB1 is now
+  machine-checked: the closure test additionally asserts the `WorkerFailedReason` docstring
+  names both consumers. Approach, trace, scope, and files touched are unchanged from v1.
+
+## Changelog v1
 
 - 2026-11-12: v1 — initial spec. Trace performed: two pass-through producers resolved to local
   ternaries between literals (`clone_failed`/`repo_sync_failed`), set is closed at eight values,
