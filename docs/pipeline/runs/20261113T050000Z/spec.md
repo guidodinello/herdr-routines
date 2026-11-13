@@ -49,7 +49,7 @@ This matches acceptance bullet 1's first option for all four fields; nothing nee
    asserting all four fields reject 0 (`ConfigError`, matching "positive integer") and
    accept 1, while `catch_up_minutes: 0` still loads (regression guard for the adjacent
    field). Neighboring coverage to keep: `test_max_workers_per_tick_and_max_attempts`
-   (:691) uses positive values only; the audit kind's own 0-rejection tests
+   (:690) uses positive values only; the audit kind's own 0-rejection tests
    (test_kind_audit.py:220-223) are unaffected.
 
 Verification: `scripts/ci-check.sh` green (the issue's acceptance bullet 3).
@@ -91,7 +91,7 @@ how sure the spec is that the item is both correct and testable as written
    `test_timeout_and_worker_limit_fields_reject_zero`
 3. **blocking / confidence: high** — the tightening never loosens: negative
    values stay rejected for `timeout_ms` (pre-existing coverage at
-    test_config.py:270 must stay green after the flip). Test:
+    test_config.py:269 must stay green after the flip). Test:
    `test_negative_timeout_raises`
 4. **non-blocking / confidence: high** — neighboring strict coverage is
    unaffected: positive values for the worker-limit pair still parse through the
