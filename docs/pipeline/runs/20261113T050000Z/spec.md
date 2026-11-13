@@ -1,4 +1,4 @@
-# Spec v1 — issue 085: decide whether 0 is valid for timeout and worker-limit config fields
+# Spec v2 — issue 085: decide whether 0 is valid for timeout and worker-limit config fields
 
 ## Problem
 
@@ -45,11 +45,12 @@ This matches acceptance bullet 1's first option for all four fields; nothing nee
    to `positive=True` (lines 1407, 1408, 1554, 1555). The error message becomes
    "'<key>' must be a positive integer" (the `_int_field` helper already picks the
    article). No helper changes; `catch_up_minutes` at :1409 keeps `positive=False`.
-2. `tests/test_config.py` — one test asserting all four fields reject 0
-   (`ConfigError`, matching "positive integer") while `catch_up_minutes: 0` still loads
-   (regression guard for the adjacent field). Neighboring coverage to keep:
-   `test_max_workers_per_tick_and_max_attempts` (:690) uses positive values only; the
-   audit kind's own 0-rejection tests (test_kind_audit.py:220-223) are unaffected.
+2. `tests/test_config.py` — one test, `test_timeout_and_worker_limit_fields_reject_zero`,
+   asserting all four fields reject 0 (`ConfigError`, matching "positive integer") and
+   accept 1, while `catch_up_minutes: 0` still loads (regression guard for the adjacent
+   field). Neighboring coverage to keep: `test_max_workers_per_tick_and_max_attempts`
+   (:690) uses positive values only; the audit kind's own 0-rejection tests
+   (test_kind_audit.py:220-223) are unaffected.
 
 Verification: `scripts/ci-check.sh` green (the issue's acceptance bullet 3).
 
@@ -71,3 +72,55 @@ Verification: `scripts/ci-check.sh` green (the issue's acceptance bullet 3).
 - **Behavior change is silent-at-config-time no more** — after this change a 0 value is
   a loud load error, which is the intended tightening; no runtime code reads these
   fields differently.
+
+## Acceptance criteria
+
+Classification: each item is **blocking** (run must not ship without it) or
+**non-blocking** (valuable, ship with a follow-up note if it slips). Confidence:
+how sure the spec is that the item is both correct and testable as written
+(high / medium / low). Each item ends with the exact test that proves it.
+
+1. **blocking / confidence: high** — each of `timeout_ms`, `start_timeout_ms`,
+   `max_workers_per_tick`, and `max_attempts_per_target` rejects `0` with
+   `ConfigError` matching "positive integer", and accepts `1` (the boundary is
+   exclusive at 0, inclusive at 1, for all four keys). Test:
+   `test_timeout_and_worker_limit_fields_reject_zero`
+2. **blocking / confidence: high** — the adjacent non-negative field keeps its
+   posture: `catch_up_minutes: 0` still loads without error, proving the flip is
+   scoped to the four keys and did not touch the `_int_field` helper. Test:
+   `test_timeout_and_worker_limit_fields_reject_zero`
+3. **blocking / confidence: high** — the tightening never loosens: negative
+   values stay rejected for `timeout_ms` (pre-existing coverage at
+   test_config.py:269 must stay green after the flip). Test:
+   `test_negative_timeout_raises`
+4. **non-blocking / confidence: high** — neighboring strict coverage is
+   unaffected: positive values for the worker-limit pair still parse through the
+   shared `_build_job` path unchanged. Test:
+   `test_max_workers_per_tick_and_max_attempts`
+5. **non-blocking / confidence: high** — the audit kind's own 0-rejection checks
+   (its separately-parsed `timeout_ms`, `max_attempts_per_target`,
+   `max_findings_per_dispatch`, `ledger_retention_days`) keep passing, proving
+   the audit re-parse path was not disturbed. Test: `test_audit_job_config_validation`
+6. **non-blocking / confidence: medium** — no test asserts the old
+   "non-negative" wording against these four keys (verified by grep; the one
+   "non-negative" hit in tests/ is `prune reports --older-than`, a different
+   field), so the message change breaks no other coverage. Test:
+   `test_timeout_and_worker_limit_fields_reject_zero`
+7. **non-blocking / confidence: medium** — meta: the whole suite plus strict
+   mypy stays green (`scripts/ci-check.sh`, the issue's acceptance bullet 3),
+   including the live-config `herdr-routines validate` confirming no deployed
+   jobs.d file regressed. Test: `test_ci_green_with_blocking_tests_run_first`
+
+## Changelog v1→v2
+
+- Added the `## Acceptance criteria` section: 7 numbered items, each classified
+  **blocking**/non-blocking with a `confidence:` tier and ending
+  `Test: <name>` (exact test names).
+- Pinned the name of the new test (`test_timeout_and_worker_limit_fields_reject_zero`)
+  in "Files touched" so the acceptance criteria's `Test:` references resolve to a
+  single canonical name.
+- No changes to the Decision, Problem, Files-touched mechanics, or Risks: every
+  v1 claim was re-verified against the tree before v2 (the four `positive=False`
+  calls at config.py:1407/1408/1554/1555, the sibling strict fields at
+  :1687/:1689/:1690/:1746, the audit timeout check at :1675-1681, and the cited
+  test names/lines in test_config.py and test_kind_audit.py all hold).
