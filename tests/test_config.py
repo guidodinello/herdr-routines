@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import re
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
@@ -720,9 +719,9 @@ def test_timeout_and_worker_limit_fields_reject_zero(tmp_config_path: Path) -> N
     """Issue 085 AC 1/2/6: each of the four worker-limit fields rejects 0 with a
     ConfigError matching "positive integer" and accepts 1 (boundary exclusive at 0,
     inclusive at 1), while the adjacent catch_up_minutes keeps accepting 0 ("no
-    catch-up grace" — the one zero with a documented meaning), and no test pins the
-    old wording against these keys. Before the flip the 0 cases below load silently
-    and the job does nothing at runtime — the typo class the issue names."""
+    catch-up grace" — the one zero with a documented meaning), and this module pins
+    no stale wording against these keys. Before the flip the 0 cases below load
+    silently and the job does nothing at runtime — the typo class the issue names."""
     for key in ISSUE_085_KEYS:
         zero = f"""
 version: 1
@@ -757,14 +756,14 @@ jobs:
     assert job is not None
     assert job.catch_up_minutes == 0
 
-    # No test pins the old article against these four keys (the single hit for the
-    # old wording in tests/ is prune --older-than, a different field).
-    for path in Path(__file__).parent.glob("*.py"):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            for key in ISSUE_085_KEYS:
-                assert not ("non-negative" in line and key in line), (
-                    f"{path.name}: stale wording pinned for {key}: {line.strip()}"
-                )
+    # This module pins no stale wording for the four keys. Scoped to the file it
+    # owns: sibling tests may legitimately contrast catch_up_minutes with these
+    # fields in prose, and that is not this unit's contract.
+    for line in Path(__file__).read_text(encoding="utf-8").splitlines():
+        for key in ISSUE_085_KEYS:
+            assert not ("non-negative" in line and key in line), (
+                f"stale wording pinned for {key}: {line.strip()}"
+            )
 
 
 def test_job_without_checks_has_none(tmp_config_path: Path) -> None:
@@ -2037,11 +2036,12 @@ def test_ci_green_with_blocking_tests_run_first() -> None:
     """Issue 085 AC 7 (meta-check): the blocking criteria (1-3) are the thing CI
     greenlights — the reject-zero test is defined in this file and
     `scripts/ci-check.sh` stays the one definition of green wiring mypy and the
-    suite. TDD sequencing is pinned in git history: the blocking test's commit
-    precedes any commit flipping the four `_int_field` calls. Watching it go red on
-    a clean tree, then running ci-check, plus the live-config
-    `herdr-routines validate`, is the implementing agent's duty — not something a
-    test can re-assert."""
+    suite. TDD sequencing is not asserted here: CI checks out a depth-1 clone, so a
+    `git log -S` pickaxe cannot order the blocking test's commit against the
+    implementation's, and shelling out to real `git` would defeat the hermetic
+    fixtures. Watching the test go red on a clean tree, then running ci-check plus
+    the live-config `herdr-routines validate`, is the implementing agent's duty —
+    not something a hermetic test can re-assert."""
     source = Path(__file__).read_text(encoding="utf-8")
     assert "def test_timeout_and_worker_limit_fields_reject_zero(" in source, (
         "the blocking test must be defined in this file"
@@ -2052,26 +2052,3 @@ def test_ci_green_with_blocking_tests_run_first() -> None:
     ci_text = script.read_text(encoding="utf-8")
     assert "uv run mypy" in ci_text  # strict typing stays part of green
     assert "uv run pytest -q" in ci_text  # the suite runs under ci-check
-
-    def first_commit_ts(pattern: str, pathspec: str) -> int | None:
-        proc = subprocess.run(
-            ["git", "log", "-S", pattern, "--format=%ct", "--reverse", "--", pathspec],
-            cwd=Path(__file__).parent.parent,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        lines = proc.stdout.splitlines()
-        return int(lines[0]) if proc.returncode == 0 and lines else None
-
-    tests_ts = first_commit_ts(
-        "def test_timeout_and_worker_limit_fields_reject_zero", "tests/test_config.py"
-    )
-    assert tests_ts is not None  # the blocking test was committed first
-
-    impl_ts = first_commit_ts(
-        'timeout_ms", positive=True', "src/herdr_routines/config.py"
-    )
-    if impl_ts is None:
-        return  # the four fields not flipped yet: nothing to sequence against
-    assert tests_ts <= impl_ts

@@ -22,9 +22,9 @@ case the job silently does nothing — the typo class the issue names.
 
 None of these four has a documented meaning for 0. The one non-negative field that *is*
 meaningful is `catch_up_minutes: 0` ("no catch-up grace", plan §4; exercised by
-tests/test_tick.py:1498) — that stays non-negative and is explicitly out of scope.
+tests/test_schedule.py:103) — that stays non-negative and is explicitly out of scope.
 
-## Decision
+## Approach
 
 For each of the four fields, **reject 0** (`positive=True`). Rationale:
 
@@ -49,7 +49,7 @@ This matches acceptance bullet 1's first option for all four fields; nothing nee
    asserting all four fields reject 0 (`ConfigError`, matching "positive integer") and
    accept 1, while `catch_up_minutes: 0` still loads (regression guard for the adjacent
    field). Neighboring coverage to keep: `test_max_workers_per_tick_and_max_attempts`
-   (:690) uses positive values only; the audit kind's own 0-rejection tests
+   (:691) uses positive values only; the audit kind's own 0-rejection tests
    (test_kind_audit.py:220-223) are unaffected.
 
 Verification: `scripts/ci-check.sh` green (the issue's acceptance bullet 3).
@@ -57,7 +57,7 @@ Verification: `scripts/ci-check.sh` green (the issue's acceptance bullet 3).
 ## Risks
 
 - **Breaking an existing jobs.d file that relies on 0** — the issue's own warning.
-  Mitigated: checked the live config tree directly (see Decision); no zero values for
+  Mitigated: checked the live config tree directly (see Approach); no zero values for
   any of the four fields. A post-change `herdr-routines validate` against the live
   config confirms the file still loads.
 - **Tests asserting the old message text** — the wording changes from "must be a
@@ -91,7 +91,7 @@ how sure the spec is that the item is both correct and testable as written
    `test_timeout_and_worker_limit_fields_reject_zero`
 3. **blocking / confidence: high** — the tightening never loosens: negative
    values stay rejected for `timeout_ms` (pre-existing coverage at
-   test_config.py:269 must stay green after the flip). Test:
+    test_config.py:270 must stay green after the flip). Test:
    `test_negative_timeout_raises`
 4. **non-blocking / confidence: high** — neighboring strict coverage is
    unaffected: positive values for the worker-limit pair still parse through the
@@ -119,7 +119,7 @@ how sure the spec is that the item is both correct and testable as written
 - Pinned the name of the new test (`test_timeout_and_worker_limit_fields_reject_zero`)
   in "Files touched" so the acceptance criteria's `Test:` references resolve to a
   single canonical name.
-- No changes to the Decision, Problem, Files-touched mechanics, or Risks: every
+- No changes to the Approach, Problem, Files-touched mechanics, or Risks: every
   v1 claim was re-verified against the tree before v2 (the four `positive=False`
   calls at config.py:1407/1408/1554/1555, the sibling strict fields at
   :1687/:1689/:1690/:1746, the audit timeout check at :1675-1681, and the cited
