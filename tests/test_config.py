@@ -704,6 +704,68 @@ jobs:
     assert job.max_attempts_per_target == 10
 
 
+# -- issue 085: 0 is invalid for timeout and worker-limit fields ----------------------------------
+
+
+ISSUE_085_KEYS = (
+    "timeout_ms",
+    "start_timeout_ms",
+    "max_workers_per_tick",
+    "max_attempts_per_target",
+)
+
+
+def test_timeout_and_worker_limit_fields_reject_zero(tmp_config_path: Path) -> None:
+    """Issue 085 AC 1/2/6: each of the four worker-limit fields rejects 0 with a
+    ConfigError matching "positive integer" and accepts 1 (boundary exclusive at 0,
+    inclusive at 1), while the adjacent catch_up_minutes keeps accepting 0 ("no
+    catch-up grace" — the one zero with a documented meaning), and this module pins
+    no stale wording against these keys. Before the flip the 0 cases below load
+    silently and the job does nothing at runtime — the typo class the issue names."""
+    for key in ISSUE_085_KEYS:
+        zero = f"""
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    {key}: 0
+"""
+        with pytest.raises(ConfigError, match="positive integer") as excinfo:
+            load_config(write(tmp_config_path, zero))
+        assert f"'{key}'" in str(excinfo.value)
+
+        cfg = load_config(
+            write(tmp_config_path, zero.replace(f"{key}: 0", f"{key}: 1"))
+        )
+        job = cfg.job("a")
+        assert job is not None
+        assert getattr(job, key) == 1
+
+    # catch_up_minutes is explicitly out of scope: 0 stays loadable.
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    catch_up_minutes: 0
+"""
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert job.catch_up_minutes == 0
+
+    # This module pins no stale wording for the four keys. Scoped to the file it
+    # owns: sibling tests may legitimately contrast catch_up_minutes with these
+    # fields in prose, and that is not this unit's contract.
+    for line in Path(__file__).read_text(encoding="utf-8").splitlines():
+        for key in ISSUE_085_KEYS:
+            assert not ("non-negative" in line and key in line), (
+                f"stale wording pinned for {key}: {line.strip()}"
+            )
+
+
 def test_job_without_checks_has_none(tmp_config_path: Path) -> None:
     cfg = load_config(write(tmp_config_path, VALID_MINIMAL))
     job = cfg.job("nightly-audit")
@@ -1968,3 +2030,25 @@ def test_deploy_fitted_pr_review_example_declares_its_verify_gates(
     assert job.prompt is not None
     assert "$ROUTINE_TARGET" in job.prompt
     assert "Target:" not in job.prompt
+
+
+def test_ci_green_with_blocking_tests_run_first() -> None:
+    """Issue 085 AC 7 (meta-check): the blocking criteria (1-3) are the thing CI
+    greenlights — the reject-zero test is defined in this file and
+    `scripts/ci-check.sh` stays the one definition of green wiring mypy and the
+    suite. TDD sequencing is not asserted here: CI checks out a depth-1 clone, so a
+    `git log -S` pickaxe cannot order the blocking test's commit against the
+    implementation's, and shelling out to real `git` would defeat the hermetic
+    fixtures. Watching the test go red on a clean tree, then running ci-check plus
+    the live-config `herdr-routines validate`, is the implementing agent's duty —
+    not something a hermetic test can re-assert."""
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert "def test_timeout_and_worker_limit_fields_reject_zero(" in source, (
+        "the blocking test must be defined in this file"
+    )
+
+    script = Path(__file__).parent.parent / "scripts" / "ci-check.sh"
+    assert script.is_file()
+    ci_text = script.read_text(encoding="utf-8")
+    assert "uv run mypy" in ci_text  # strict typing stays part of green
+    assert "uv run pytest -q" in ci_text  # the suite runs under ci-check
