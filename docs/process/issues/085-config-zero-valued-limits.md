@@ -1,7 +1,7 @@
 ---
 id: "085"
 title: "Decide whether 0 is a valid value for timeout and worker-limit config fields"
-status: open
+status: done
 priority: low
 area: config
 ---

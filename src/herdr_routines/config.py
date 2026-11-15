@@ -1404,8 +1404,8 @@ def _build_job(
             f"{label}: 'notify_policy' must be one of {sorted(VALID_NOTIFY_POLICIES)}"
         )
 
-    timeout_ms = _int_field("timeout_ms", positive=False)
-    start_timeout_ms = _int_field("start_timeout_ms", positive=False)
+    timeout_ms = _int_field("timeout_ms", positive=True)
+    start_timeout_ms = _int_field("start_timeout_ms", positive=True)
     configured_catch_up_minutes = _int_field("catch_up_minutes", positive=False)
 
     enabled = merged["enabled"]
@@ -1551,8 +1551,8 @@ def _build_job(
                 "pr" if check_kinds <= {"pr_health", "github_event"} else "base"
             )
 
-    max_workers_per_tick = _int_field("max_workers_per_tick", positive=False)
-    max_attempts_per_target = _int_field("max_attempts_per_target", positive=False)
+    max_workers_per_tick = _int_field("max_workers_per_tick", positive=True)
+    max_attempts_per_target = _int_field("max_attempts_per_target", positive=True)
 
     # -- kind (issue 049: kind is the exhaustive single dispatch key) ----------------
     #
