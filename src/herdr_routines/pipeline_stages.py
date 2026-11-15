@@ -33,9 +33,11 @@ class StageSpec:
 
 # Not on OpenCode Zen, where every primary model lives: Zen's free models route to
 # whichever upstream it picks, and one of those 400'd the implement stage mid-run on
-# 2026-10-10. kimi-k3 is not deepseek (big-pickle's upstream that night) nor nemotron,
-# so a fallback implementer is still a different family from stage 6's reviewer.
-AUTHOR_FALLBACK_MODEL = "nvidia/moonshotai/kimi-k3"
+# 2026-10-10. Not deepseek (big-pickle's upstream that night), glm nor nemotron, so a
+# fallback implementer is still a different family from stage 6's reviewer. Was
+# kimi-k3 until NVIDIA withdrew it (gone by 2026-11-10; opencode ran its default
+# big-pickle in its place without an error).
+AUTHOR_FALLBACK_MODEL = "nvidia/minimaxai/minimax-m3.1-flash"
 # Off Zen and outside every author family: independence from the author is about the
 # model family, which a provider switch does not change.
 REVIEWER_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
@@ -48,7 +50,7 @@ REVIEWER_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 MODEL_FAMILY: dict[str, str] = {
     "opencode/glm-5.3-flash-free": "zhipu",
     "opencode/big-pickle": "zen-router",
-    AUTHOR_FALLBACK_MODEL: "moonshot",
+    AUTHOR_FALLBACK_MODEL: "minimax",
     REVIEWER_FALLBACK_MODEL: "nvidia",
 }
 

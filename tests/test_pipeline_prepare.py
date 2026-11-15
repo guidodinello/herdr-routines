@@ -242,8 +242,10 @@ class _PrepareKwargs(TypedDict):
 
 
 def _all_stage_models() -> set[str]:
-    """An `opencode models` listing that offers every stage model."""
-    return {spec.model for spec in STAGES if spec.model is not None}
+    """An `opencode models` listing that offers every stage model and fallback."""
+    return {
+        m for spec in STAGES for m in (spec.model, spec.fallback_model) if m is not None
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -1015,6 +1017,40 @@ def test_pipeline_prepare_fails_before_claim_when_a_stage_model_is_gone(
     _bare, parent, base = _parent_clone(tmp_path)
     _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
     gone = "opencode/big-pickle"
+    client = FakeHerdr(tmp_path / "worktrees")
+
+    result = prepare_run(
+        **_prepare_kwargs(
+            tmp_path,
+            parent=parent,
+            base=base,
+            client=client,
+            available_models=lambda: _all_stage_models() - {gone},
+        )
+    )
+
+    assert result.outcome == "prepare_failed"
+    report = (tmp_path / "reports" / f"pipeline-{RUN_ID}.md").read_text()
+    assert "stage_model_unavailable" in report
+    assert gone in report
+    assert load_claims(tmp_path / "claims.json") == {}
+    assert client.calls == []
+
+
+def test_pipeline_prepare_fails_before_claim_when_a_fallback_model_is_gone(
+    tmp_path: Path, no_open_prs: None
+) -> None:
+    """Run 20261110T050000Z: the author fallback was no longer listed, so opencode ran
+    its default model in its place. A missing fallback must stop the night like a
+    missing primary, naming the model."""
+    _bare, parent, base = _parent_clone(tmp_path)
+    _seed_issues(parent, ("001", "001-pick-a-feature.md", "open"))
+    primaries = {spec.model for spec in STAGES if spec.model is not None}
+    gone = next(
+        spec.fallback_model
+        for spec in STAGES
+        if spec.fallback_model is not None and spec.fallback_model not in primaries
+    )
     client = FakeHerdr(tmp_path / "worktrees")
 
     result = prepare_run(
