@@ -80,8 +80,13 @@ def test_opencode_pipeline_permission_file() -> None:
         "~/.cache/uv/**",
     }
     assert required <= set(allow), f"missing allowlist entries: {required - set(allow)}"
-    assert all(v == "allow" for v in allow.values())
+    # Last match wins: the catch-all deny must come first so an unlisted path is refused
+    # instead of falling to `ask`, which hangs a headless agent.
+    first, *rest = allow.items()
+    assert first == ("*", "deny")
+    assert all(v == "allow" for _, v in rest)
     assert config["permission"]["tool"] == "allow"
+    assert config["permission"]["question"] == "deny"
     # ~/.local/bin is deliberately NOT allowlisted (issue 050 fix rationale).
     assert not any("/.local/bin" in k for k in allow)
 

@@ -56,6 +56,14 @@ Reply to every listed item, `FIX` and `SKIP` alike, using the ids given for it:
 
 No thanks, praise or "I've gone ahead and…".
 
+Then resolve every `FIX` review thread you replied to, using its `thread_id`:
+
+```bash
+gh api graphql -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }' -f id=<thread_id>
+```
+
+Leave `SKIP` threads unresolved. A skipped `[blocking]` item stays open for a human to decide, and the pipeline's gate fails on it until one does.
+
 ## 6. Swap the label (mandatory)
 
 Run this even when there was nothing to address — it is the signal that the review was processed:
@@ -68,4 +76,4 @@ Then confirm with `gh pr view $PR_NUMBER --json labels -q '[.labels[].name]'`. I
 
 ## 7. Summary
 
-Finish with a table of each item's location, decision and whether its reply was posted, plus whether the label swap was confirmed.
+Finish with a table of each item's location, decision, whether its reply was posted and whether its thread was resolved, plus whether the label swap was confirmed.

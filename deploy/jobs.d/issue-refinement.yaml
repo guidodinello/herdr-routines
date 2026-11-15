@@ -36,7 +36,7 @@ workspace: worktree
 base: main
 agent_kind: opencode
 model: opencode/big-pickle # the author. The reviewer runs as a separate
-    # `opencode run -m nvidia/moonshotai/kimi-k3` (see prompt) — a different
+    # `opencode run -m nvidia/minimaxai/minimax-m3.1-flash` (see prompt) — a different
     # provider AND model family, so the review is independent of the author.
 fallback_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free" # quota_exhausted on Zen → retry on
     # OpenRouter; deliberately not the reviewer's model, so a fallback run stays independent.
@@ -73,7 +73,7 @@ prompt: |
      different model — never re-read your own draft as the review. For pass N
      (N = 1, 2, 3), save the reviewer's raw reply OUTSIDE the worktree (step 5
      runs `git add -A`) to $ROUTINE_REPORT.review-N.txt:
-       opencode run --dir . -m nvidia/moonshotai/kimi-k3 \
+       opencode run --dir . -m nvidia/minimaxai/minimax-m3.1-flash \
          "You are reviewing a draft issue file for herdr-routines. Read
           docs/process/issues/NNN-<slug>.md and compare it to the other files in
           docs/process/issues/. Judge whether it is buildable by a single worker

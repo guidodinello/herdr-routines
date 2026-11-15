@@ -198,8 +198,18 @@ def prepare_run(
     # x-preview-f-free both vanished), and a stage that cannot start its model fails
     # hours into the night after the issue is claimed. Checked before the claim so a
     # bad model costs a report and nothing else. Membership only — a listed model whose
-    # free quota is gone is the stage loop's quota fast-fail to catch.
-    stage_models = sorted({spec.model for spec in STAGES if spec.model is not None})
+    # free quota is gone is the stage loop's quota fast-fail to catch. Fallbacks too:
+    # opencode starts an unlisted `-m` on its default model without an error, so run
+    # 20261110T050000Z's fallback to a withdrawn kimi-k3 silently retried big-pickle,
+    # the model whose quota had just run out.
+    stage_models = sorted(
+        {
+            m
+            for spec in STAGES
+            for m in (spec.model, spec.fallback_model)
+            if m is not None
+        }
+    )
     try:
         # Looked up at call time (not bound as the default) so tests can stub it.
         listed = (available_models or opencode_models)()
