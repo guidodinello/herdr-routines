@@ -5,10 +5,11 @@ docs/pipeline/runs/20260829T050025Z/spec.md.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_type_hints
 
 import pytest
 
@@ -1990,3 +1991,55 @@ def test_fix_prompt_ends_with_commit_push_checklist() -> None:
     assert "`git status` is clean" in tail[1]
     assert "origin/auto/fix-42" in tail[2]
     assert any("reply" in line for line in tail[3:])
+
+
+# -- issue 084 ---------------------------------------------------------------------------
+
+
+def test_worker_failed_reason_set_is_closed() -> None:
+    """AC1/AC2/NB1 (issue 084): the `_WorkerFailed.reason` value set is closed at the
+    eight traced values and Literal-typed end to end. The expected set is spelled out
+    here independently of the `WorkerFailedReason` definition in history.py, so a typo
+    copied into both sides of the Literal cannot make this test vacuous."""
+    from herdr_routines import auto_fix, history, tick
+
+    expected = frozenset(
+        {
+            "clone_failed",
+            "repo_sync_failed",
+            "report_dir_creation_failed",
+            "worktree_reuse_not_clean",
+            "worktree_creation_failed",
+            "agent_start_failed",
+            "agent_not_interactive",
+            "agent_prompt_failed",
+        }
+    )
+
+    # AC1: history.py defines `WorkerFailedReason` covering exactly the eight values.
+    reason_literal = history.WorkerFailedReason
+    assert frozenset(get_args(reason_literal)) == expected
+
+    # AC1: `_WorkerFailed.reason` is annotated `WorkerFailedReason`, not plain `str` —
+    # the annotation must resolve to a Literal over exactly the eight values.
+    reason_hint = get_type_hints(tick._WorkerFailed)["reason"]
+    assert get_args(reason_hint), (
+        f"_WorkerFailed.reason must be annotated WorkerFailedReason, got {reason_hint}"
+    )
+    assert frozenset(get_args(reason_hint)) == expected
+
+    # AC2: `_UNCOUNTED_FAILURE_REASONS` is a subset of the Literal's args, so a typo in
+    # the set or in a producer string is a type error.
+    uncounted = auto_fix._UNCOUNTED_FAILURE_REASONS
+    assert isinstance(uncounted, frozenset)
+    assert uncounted <= expected
+
+    # NB1: the docstring on `WorkerFailedReason` names both consumers, so a future
+    # producer adding a reason must widen the Literal deliberately.
+    source = inspect.getsource(history)
+    start = source.index("WorkerFailedReason = Literal")
+    window = source[max(0, start - 2000) : start + 2000]
+    assert "tick" in window, "WorkerFailedReason docstring must name the tick producer"
+    assert "_UNCOUNTED_FAILURE_REASONS" in window, (
+        "WorkerFailedReason docstring must name auto_fix._UNCOUNTED_FAILURE_REASONS"
+    )
