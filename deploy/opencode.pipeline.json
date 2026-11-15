@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "//": "Tracked source of truth for the opencode permission surface the overnight feature-pipeline needs (docs/pipeline/setup.md \u00a74, docs/pipeline/design.md). Merge the `permission` block into each pipeline host's ~/.config/opencode/opencode.json \u2014 do NOT symlink this file over it, the host file also carries provider/plugin/model config that is deliberately host-local and out of git. Keeping the allowlist here means the Pi and hp-server transcribe from one place instead of drifting (they already did: ~/.cache/uv/** was live on the Pi and absent from the docs). The `bash` block: Unattended agents must never land their own PRs (issue #180): a human merges. Last match wins, so the catch-all comes first; an unmatched command must not fall to `ask`, a headless agent would hang on the prompt. Copy the same block into every `agent.<name>.permission` on the host, since agent rules take precedence over this one. A speed bump, not a boundary: curl with the token still works (see #199).",
+  "//": "Tracked source of truth for the opencode permission surface the overnight feature-pipeline needs (docs/pipeline/setup.md \u00a74, docs/pipeline/design.md). Merge the `permission` block into each pipeline host's ~/.config/opencode/opencode.json \u2014 do NOT symlink this file over it, the host file also carries provider/plugin/model config that is deliberately host-local and out of git. Keeping the allowlist here means the Pi and hp-server transcribe from one place instead of drifting (they already did: ~/.cache/uv/** was live on the Pi and absent from the docs). The `bash` block: Unattended agents must never land their own PRs (issue #180): a human merges. Last match wins, so the catch-all comes first; an unmatched command must not fall to `ask`, a headless agent would hang on the prompt. Copy the same block into every `agent.<name>.permission` on the host, since agent rules take precedence over this one. A speed bump, not a boundary: curl with the token still works (see #199). `question: deny`: the question tool waits for an answer no one gives, which herdr settles as `blocked` (run 20261111T050000Z's implement stage settled `blocked` mid-tool-call right after finding a wrong acceptance test).",
   "permission": {
     "external_directory": {
       "/tmp/**": "allow",
@@ -14,6 +14,7 @@
       "~/.cache/uv/**": "allow"
     },
     "tool": "allow",
+    "question": "deny",
     "bash": {
       "*": "allow",
       "gh pr merge": "deny",
