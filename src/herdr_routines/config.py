@@ -17,10 +17,10 @@ from __future__ import annotations
 import os
 import re
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, TypedDict, get_args
+from typing import Final, Literal, NamedTuple, TypedDict, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -1269,69 +1269,35 @@ def _build_trigger(
     return cron, event, raw_request
 
 
-def _build_job(
+def _int_field(
+    source: Mapping[str, object], key: str, label: str, *, positive: bool
+) -> int:
+    value = source[key]
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or (value <= 0 if positive else value < 0)
+    ):
+        article = "a positive" if positive else "a non-negative"
+        raise ConfigError(f"{label}: '{key}' must be {article} integer")
+    return value
+
+
+def _bool_field(source: Mapping[str, object], key: str, label: str) -> bool:
+    value = source[key]
+    if not isinstance(value, bool):
+        raise ConfigError(f"{label}: '{key}' must be a boolean")
+    return value
+
+
+def _build_repo(
+    merged: Mapping[str, object],
     raw_job: Mapping[str, object],
-    defaults: Mapping[str, object],
-    *,
-    index: int,
-    label_prefix: str | None = None,
-) -> Job:
-    unknown = set(raw_job) - _JOB_ALLOWED_KEYS
-    if unknown:
-        prefix = label_prefix or f"jobs[{index}]"
-        raise ConfigError(f"{prefix}: unknown key(s): {sorted(unknown)}")
-
-    missing = _JOB_REQUIRED_KEYS - set(raw_job)
-    if missing:
-        prefix = label_prefix or f"jobs[{index}]"
-        raise ConfigError(f"{prefix}: missing required key(s): {sorted(missing)}")
-
-    merged: dict[str, object] = {**_JOB_DEFAULTS, **defaults, **raw_job}
-    name = merged["name"]
-    if label_prefix:
-        label = f"{label_prefix} ({name!r})" if isinstance(name, str) else label_prefix
-    else:
-        label = (
-            f"jobs[{index}] ({name!r})" if isinstance(name, str) else f"jobs[{index}]"
-        )
-
-    if not isinstance(name, str) or not NAME_RE.match(name):
-        raise ConfigError(
-            f"{label}: 'name' must match {NAME_RE.pattern} (max 24 chars, "
-            "since the live agent name is 'rt-<name>' and Herdr caps names at 32)"
-        )
-
-    def _int_field(
-        key: str, *, positive: bool, source: Mapping[str, object] = merged
-    ) -> int:
-        value = source[key]
-        if (
-            not isinstance(value, int)
-            or isinstance(value, bool)
-            or (value <= 0 if positive else value < 0)
-        ):
-            article = "a positive" if positive else "a non-negative"
-            raise ConfigError(f"{label}: '{key}' must be {article} integer")
-        return value
-
-    def _bool_field(key: str, *, source: Mapping[str, object] = merged) -> bool:
-        value = source[key]
-        if not isinstance(value, bool):
-            raise ConfigError(f"{label}: '{key}' must be a boolean")
-        return value
-
-    cron, trigger_event, request = _build_trigger(raw_job, label)
-
-    # kind is read here (not only where its rules live below) because a
-    # `kind: review` job has no single checkout: it derives `repo` from the managed
-    # base dir and never calls `ensure_repo`, so the repo/repository machinery must be
-    # bypassed before it runs.
-    if merged["kind"] not in ACCEPTED_KIND_VALUES:
-        raise ConfigError(
-            f"{label}: 'kind' must be one of {sorted(ACCEPTED_KIND_VALUES)}"
-        )
-    review_sugar = merged["kind"] == REVIEW_SUGAR_KIND
-
+    label: str,
+    name: str,
+    review_sugar: bool,
+) -> tuple[Path, str | None]:
+    """Resolve `(repo, repository)`: the checkout path and the URL it is cloned from."""
     repo_raw = merged["repo"]
     repository = merged["repository"]
 
@@ -1374,44 +1340,16 @@ def _build_job(
             if not isinstance(repo_raw, str) or not repo_raw:
                 raise ConfigError(f"{label}: 'repo' must be a non-empty string path")
             repo = Path(repo_raw).expanduser()
+    return repo, repository
 
-    declared_workspace = merged["workspace"]
-    if declared_workspace not in VALID_WORKSPACE_MODES:
-        raise ConfigError(
-            f"{label}: 'workspace' must be one of {sorted(VALID_WORKSPACE_MODES)}"
-        )
-    workspace = declared_workspace
-    if review_sugar:
-        # Whatever defaults.yaml says: each review closes its own pane, as the review-only
-        # dispatch always did, and the agent runs in the target's own worktree anyway.
-        workspace = "worktree"
 
-    agent_kind = merged["agent_kind"]
-    if agent_kind not in VALID_AGENT_KINDS:
-        raise ConfigError(
-            f"{label}: 'agent_kind' must be one of {sorted(VALID_AGENT_KINDS)}"
-        )
-
-    on_missed = merged["on_missed"]
-    if on_missed not in VALID_ON_MISSED:
-        raise ConfigError(
-            f"{label}: 'on_missed' must be one of {sorted(VALID_ON_MISSED)}"
-        )
-
-    notify_policy = merged["notify_policy"]
-    if notify_policy not in VALID_NOTIFY_POLICIES:
-        raise ConfigError(
-            f"{label}: 'notify_policy' must be one of {sorted(VALID_NOTIFY_POLICIES)}"
-        )
-
-    timeout_ms = _int_field("timeout_ms", positive=True)
-    start_timeout_ms = _int_field("start_timeout_ms", positive=True)
-    configured_catch_up_minutes = _int_field("catch_up_minutes", positive=False)
-
-    enabled = merged["enabled"]
-    if not isinstance(enabled, bool):
-        raise ConfigError(f"{label}: 'enabled' must be a boolean")
-
+def _build_models(
+    merged: Mapping[str, object],
+    raw_job: Mapping[str, object],
+    label: str,
+    agent_kind: object,
+) -> tuple[str | None, str | None]:
+    """Resolve `(model, fallback_model)`."""
     model = merged["model"]
     if model is not None and not isinstance(model, str):
         raise ConfigError(f"{label}: 'model' must be a string or null")
@@ -1437,7 +1375,12 @@ def _build_job(
         # agent_kind doesn't support model selection at all shouldn't fail to load just
         # because the default doesn't apply to it — it's simply inert here.
         fallback_model = None
+    return model, fallback_model
 
+
+def _build_prompt(
+    merged: Mapping[str, object], label: str, name: str, review_sugar: bool
+) -> str | None:
     prompt = merged["prompt"]
     if not isinstance(prompt, str):
         raise ConfigError(f"{label}: 'prompt' must be a string")
@@ -1454,21 +1397,12 @@ def _build_job(
             url="$ROUTINE_TARGET_URL",
             report_path="$ROUTINE_REPORT",
         )
+    return prompt
 
-    timezone = merged["timezone"]
-    if not isinstance(timezone, str):
-        raise ConfigError(f"{label}: 'timezone' must be a string")
-    try:
-        ZoneInfo(timezone)
-    except ZoneInfoNotFoundError as e:
-        raise ConfigError(
-            f"{label}: 'timezone' is not a valid IANA zone: {timezone!r}"
-        ) from e
 
-    base = merged["base"]
-    if not isinstance(base, str):
-        raise ConfigError(f"{label}: 'base' must be a string")
-
+def _build_failure_markers(
+    merged: Mapping[str, object], label: str
+) -> tuple[str, ...] | None:
     failure_markers_raw = merged["failure_markers"]
     failure_markers: tuple[str, ...] | None = None
     if failure_markers_raw is not None:
@@ -1479,9 +1413,13 @@ def _build_job(
                 f"{label}: 'failure_markers' must be null or a list of non-empty strings"
             )
         failure_markers = tuple(failure_markers_raw)
+    return failure_markers
 
-    # -- Unified gate model: checks / target / max_workers / max_attempts -----------
 
+def _build_checks(
+    merged: Mapping[str, object], label: str
+) -> tuple[tuple[GateCheck, ...] | None, JobTarget | None]:
+    """Parse `checks` to `(checks, the target they imply)`."""
     checks_raw = merged.get("checks")
     checks: tuple[GateCheck, ...] | None = None
     inferred_target: JobTarget | None = None
@@ -1550,40 +1488,32 @@ def _build_job(
             inferred_target = (
                 "pr" if check_kinds <= {"pr_health", "github_event"} else "base"
             )
+    return checks, inferred_target
 
-    max_workers_per_tick = _int_field("max_workers_per_tick", positive=True)
-    max_attempts_per_target = _int_field("max_attempts_per_target", positive=True)
 
-    # -- kind (issue 049: kind is the exhaustive single dispatch key) ----------------
-    #
-    # Rules key off `raw_job`, never the merged value: a shared `defaults.yaml` (e.g. the
-    # live Pi's `workspace: worktree` + `catch_up_minutes: 120`) must not retroactively
-    # invalidate every pipeline job — only an *explicit* per-job setting is rejected.
-
-    # `kind: review` is sugar (issue 076): from here on the job is a routine, and
-    # `review_sugar` marks the few places that still need to know it was spelled that way.
-    kind: JobKind
-    if review_sugar:
-        kind = "routine"
-    else:
-        declared_kind = merged["kind"]
-        if declared_kind not in VALID_JOB_KINDS:
-            raise ConfigError(
-                f"{label}: 'kind' must be one of {sorted(ACCEPTED_KIND_VALUES)}"
-            )
-        kind = declared_kind
-
-    # -- kind: gated requires non-empty checks -------------------------------------------
-    if kind == "gated" and (checks is None or len(checks) == 0):
+def _require_checks(checks: tuple[GateCheck, ...] | None, label: str) -> None:
+    if checks is None or len(checks) == 0:
         raise ConfigError(f"{label}: 'kind: gated' requires a non-empty 'checks' list")
 
-    # -- checks present but kind is not gated → must migrate -----------------------------
-    if checks is not None and kind != "gated":
+
+def _reject_checks(checks: tuple[GateCheck, ...] | None, label: str) -> None:
+    if checks is not None:
         raise ConfigError(
             f"{label}: 'checks' requires kind: gated "
             "(a job with checks is a gated workflow; add kind: gated)"
         )
 
+
+def _resolve_trigger_event(
+    trigger_event: GateCheck | None,
+    *,
+    kind: JobKind,
+    checks: tuple[GateCheck, ...] | None,
+    repo: Path,
+    review_sugar: bool,
+    label: str,
+) -> GateCheck | None:
+    """Reject an event trigger where it cannot run; load a gated `github_event` check onto it."""
     # -- event trigger (issue 075): where it cannot run ----------------------------------
     if trigger_event is not None:
         if kind == "pipeline":
@@ -1621,89 +1551,107 @@ def _build_job(
                     "github_event check (both track last_seen_event_ids for the job)"
                 )
             trigger_event = event_checks[0]
+    return trigger_event
 
-    # -- kind: audit (issue 057 Phase A) ------------------------------------------------
-    #
-    # An audit is a report-diff gate: it schedules an audit skill/command, parses the
-    # resulting findings manifest, and diffs against a ledger. Unlike a gated job its
-    # "gate" is the diff, not a checks list, and it always targets base.
-    audit: AuditSpec | None = None
-    fix_prompt = merged.get("fix_prompt", "")
-    if not isinstance(fix_prompt, str):
-        raise ConfigError(f"{label}: 'fix_prompt' must be a string")
-    fix_prompt = fix_prompt or None
 
-    if kind == "audit":
-        if merged["workspace"] != "worktree":
-            raise ConfigError(
-                f"{label}: 'workspace' must be 'worktree' for kind: audit "
-                "(the fix worker edits source; an audit never runs in a live checkout)"
-            )
-        target_raw_for_audit = merged.get("target")
-        if target_raw_for_audit is not None and target_raw_for_audit != "base":
-            raise ConfigError(f"{label}: 'target' must be 'base' for kind: audit")
-        if "max_workers_per_tick" in raw_job:
-            raise ConfigError(
-                f"{label}: 'max_workers_per_tick' is not applicable to kind: audit "
-                "(use 'max_findings_per_dispatch')"
-            )
+class _AuditFields(NamedTuple):
+    audit: AuditSpec | None
+    max_findings_per_dispatch: int
+    ledger_retention_days: int
+    adopt_baseline: bool
 
-        audit_raw = merged["audit"]
-        if audit_raw is None:
-            raise ConfigError(f"{label}: kind: audit requires an 'audit' mapping")
-        if not isinstance(audit_raw, dict):
-            raise ConfigError(f"{label}: 'audit' must be a mapping")
-        unknown_audit = set(audit_raw) - {"skill", "command", "timeout_ms"}
-        if unknown_audit:
-            raise ConfigError(
-                f"{label}: 'audit' has unknown key(s): {sorted(unknown_audit)}"
-            )
-        audit_skill = audit_raw.get("skill")
-        audit_command = audit_raw.get("command")
-        if (audit_skill is None) == (audit_command is None):
-            raise ConfigError(
-                f"{label}: 'audit' requires exactly one of 'skill'/'command'"
-            )
-        if audit_skill is not None and (
-            not isinstance(audit_skill, str) or not audit_skill
-        ):
-            raise ConfigError(f"{label}: 'audit.skill' must be a non-empty string")
-        if audit_command is not None and (
-            not isinstance(audit_command, str) or not audit_command
-        ):
-            raise ConfigError(f"{label}: 'audit.command' must be a non-empty string")
-        audit_timeout = audit_raw.get("timeout_ms", 1_800_000)
-        if (
-            not isinstance(audit_timeout, int)
-            or isinstance(audit_timeout, bool)
-            or audit_timeout <= 0
-        ):
-            raise ConfigError(f"{label}: 'audit.timeout_ms' must be a positive integer")
-        audit = AuditSpec(
+
+# kind: audit (issue 057 Phase A)
+#
+# An audit is a report-diff gate: it schedules an audit skill/command, parses the
+# resulting findings manifest, and diffs against a ledger. Unlike a gated job its
+# "gate" is the diff, not a checks list, and it always targets base.
+def _build_audit_fields(
+    merged: Mapping[str, object], raw_job: Mapping[str, object], label: str
+) -> _AuditFields:
+    if merged["workspace"] != "worktree":
+        raise ConfigError(
+            f"{label}: 'workspace' must be 'worktree' for kind: audit "
+            "(the fix worker edits source; an audit never runs in a live checkout)"
+        )
+    target_raw_for_audit = merged.get("target")
+    if target_raw_for_audit is not None and target_raw_for_audit != "base":
+        raise ConfigError(f"{label}: 'target' must be 'base' for kind: audit")
+    if "max_workers_per_tick" in raw_job:
+        raise ConfigError(
+            f"{label}: 'max_workers_per_tick' is not applicable to kind: audit "
+            "(use 'max_findings_per_dispatch')"
+        )
+
+    audit_raw = merged["audit"]
+    if audit_raw is None:
+        raise ConfigError(f"{label}: kind: audit requires an 'audit' mapping")
+    if not isinstance(audit_raw, dict):
+        raise ConfigError(f"{label}: 'audit' must be a mapping")
+    unknown_audit = set(audit_raw) - {"skill", "command", "timeout_ms"}
+    if unknown_audit:
+        raise ConfigError(
+            f"{label}: 'audit' has unknown key(s): {sorted(unknown_audit)}"
+        )
+    audit_skill = audit_raw.get("skill")
+    audit_command = audit_raw.get("command")
+    if (audit_skill is None) == (audit_command is None):
+        raise ConfigError(f"{label}: 'audit' requires exactly one of 'skill'/'command'")
+    if audit_skill is not None and (
+        not isinstance(audit_skill, str) or not audit_skill
+    ):
+        raise ConfigError(f"{label}: 'audit.skill' must be a non-empty string")
+    if audit_command is not None and (
+        not isinstance(audit_command, str) or not audit_command
+    ):
+        raise ConfigError(f"{label}: 'audit.command' must be a non-empty string")
+    audit_timeout = audit_raw.get("timeout_ms", 1_800_000)
+    if (
+        not isinstance(audit_timeout, int)
+        or isinstance(audit_timeout, bool)
+        or audit_timeout <= 0
+    ):
+        raise ConfigError(f"{label}: 'audit.timeout_ms' must be a positive integer")
+    return _AuditFields(
+        audit=AuditSpec(
             skill=audit_skill, command=audit_command, timeout_ms=audit_timeout
-        )
+        ),
+        max_findings_per_dispatch=_int_field(
+            merged, "max_findings_per_dispatch", label, positive=True
+        ),
+        ledger_retention_days=_int_field(
+            merged, "ledger_retention_days", label, positive=True
+        ),
+        adopt_baseline=_bool_field(merged, "adopt_baseline", label),
+    )
 
-        max_findings_per_dispatch = _int_field(
-            "max_findings_per_dispatch", positive=True
-        )
-        max_attempts_per_target = _int_field("max_attempts_per_target", positive=True)
-        ledger_retention_days = _int_field("ledger_retention_days", positive=True)
-        adopt_baseline = _bool_field("adopt_baseline")
-    elif "audit" in raw_job:
+
+def _inert_audit_fields(
+    merged: Mapping[str, object], raw_job: Mapping[str, object], label: str
+) -> _AuditFields:
+    if "audit" in raw_job:
         raise ConfigError(f"{label}: 'audit' requires kind: audit")
-    else:
-        # Inert outside kind: audit, so a malformed inherited value is not an error: store
-        # the default.
-        max_findings_per_dispatch = _int_field(
-            "max_findings_per_dispatch", positive=True, source=_JOB_DEFAULTS
-        )
-        ledger_retention_days = _int_field(
-            "ledger_retention_days", positive=True, source=_JOB_DEFAULTS
-        )
-        adopt_baseline = _bool_field("adopt_baseline", source=_JOB_DEFAULTS)
+    # Inert outside kind: audit, so a malformed inherited value is not an error: store
+    # the default.
+    return _AuditFields(
+        audit=None,
+        max_findings_per_dispatch=_int_field(
+            _JOB_DEFAULTS, "max_findings_per_dispatch", label, positive=True
+        ),
+        ledger_retention_days=_int_field(
+            _JOB_DEFAULTS, "ledger_retention_days", label, positive=True
+        ),
+        adopt_baseline=_bool_field(_JOB_DEFAULTS, "adopt_baseline", label),
+    )
 
-    # -- pick: my_open_prs (issues 055, 076) ---------------------------------------------
-    reviews_my_prs = review_sugar or merged["pick"] == "my_open_prs"
+
+def _build_review_select(
+    merged: Mapping[str, object],
+    raw_job: Mapping[str, object],
+    label: str,
+    reviews_my_prs: bool,
+) -> tuple[tuple[ReviewSelectMode, ...] | None, bool]:
+    """Resolve `(select, include_auto_branches)` for a job that reviews my open PRs."""
     select: tuple[ReviewSelectMode, ...] | None = None
     include_auto_branches = False
     if reviews_my_prs:
@@ -1721,86 +1669,108 @@ def _build_job(
                     f"{label}: 'select[{si}]' must be one of {sorted(VALID_REVIEW_SELECT)}"
                 )
         select = tuple(select_raw)
-        include_auto_branches = _bool_field("include_auto_branches")
+        include_auto_branches = _bool_field(merged, "include_auto_branches", label)
     elif "select" in raw_job or "include_auto_branches" in raw_job:
         raise ConfigError(
             f"{label}: 'select'/'include_auto_branches' require kind: review "
             "or pick: my_open_prs"
         )
+    return select, include_auto_branches
 
-    # A review that landed is never redone, and a review that failed to land is a miss to
-    # report, not to retry — so the budget is 1 unless the job explicitly asks otherwise.
-    if reviews_my_prs and "max_attempts_per_target" not in raw_job:
-        max_attempts_per_target = 1
 
-    # How many targets one run acts on (issue 076). A `kind: review` job has always spelled
-    # this `max_workers_per_tick`, so that is where the sugar reads it from.
-    if review_sugar:
-        if "max_targets_per_run" in raw_job:
-            raise ConfigError(
-                f"{label}: 'max_targets_per_run' is not applicable to kind: review "
-                "(its cap is 'max_workers_per_tick')"
-            )
-        max_targets_per_run = max_workers_per_tick
-    else:
-        max_targets_per_run = _int_field("max_targets_per_run", positive=True)
+def _pipeline_run_limits(
+    merged: Mapping[str, object],
+    raw_job: Mapping[str, object],
+    label: str,
+    configured_catch_up_minutes: int,
+) -> tuple[int, str | None, int | None]:
+    """Resolve `(catch_up_minutes, prompt_file, deadline_ms)` for kind: pipeline."""
+    if "workspace" in raw_job:
+        raise ConfigError(
+            f"{label}: 'workspace' is not applicable to kind: pipeline "
+            "(the orchestrator owns its own worktree, created from the parent clone)"
+        )
+    if "catch_up_minutes" in raw_job:
+        raise ConfigError(
+            f"{label}: 'catch_up_minutes' is not applicable to kind: pipeline "
+            f"(fixed at PIPELINE_CATCH_UP_MINUTES={PIPELINE_CATCH_UP_MINUTES} — "
+            "enough to absorb ordinary same-night tick delay, not to fire late into "
+            "the workday; remove the key)"
+        )
+    # Fixed per-kind value, independent of defaults.yaml's shared value.
+    catch_up_minutes = PIPELINE_CATCH_UP_MINUTES
 
-    if kind == "pipeline":
-        if checks is not None:
-            raise ConfigError(
-                f"{label}: 'checks' is not applicable to kind: pipeline "
-                "(gate mode and pipeline mode are mutually exclusive dispatch paths)"
-            )
-        if "workspace" in raw_job:
-            raise ConfigError(
-                f"{label}: 'workspace' is not applicable to kind: pipeline "
-                "(the orchestrator owns its own worktree, created from the parent clone)"
-            )
-        if "catch_up_minutes" in raw_job:
-            raise ConfigError(
-                f"{label}: 'catch_up_minutes' is not applicable to kind: pipeline "
-                f"(fixed at PIPELINE_CATCH_UP_MINUTES={PIPELINE_CATCH_UP_MINUTES} — "
-                "enough to absorb ordinary same-night tick delay, not to fire late into "
-                "the workday; remove the key)"
-            )
-        # Fixed per-kind value, independent of defaults.yaml's shared value.
-        catch_up_minutes = PIPELINE_CATCH_UP_MINUTES
+    prompt_file = merged["prompt_file"]
+    if not isinstance(prompt_file, str) or not prompt_file:
+        raise ConfigError(f"{label}: 'prompt_file' is required for kind: pipeline")
 
-        prompt_file = merged["prompt_file"]
-        if not isinstance(prompt_file, str) or not prompt_file:
-            raise ConfigError(f"{label}: 'prompt_file' is required for kind: pipeline")
+    deadline_ms = merged["deadline_ms"]
+    if (
+        not isinstance(deadline_ms, int)
+        or isinstance(deadline_ms, bool)
+        or deadline_ms <= 0
+    ):
+        raise ConfigError(
+            f"{label}: 'deadline_ms' must be a positive integer for kind: pipeline"
+        )
+    return catch_up_minutes, prompt_file, deadline_ms
 
-        deadline_ms = merged["deadline_ms"]
-        if (
-            not isinstance(deadline_ms, int)
-            or isinstance(deadline_ms, bool)
-            or deadline_ms <= 0
-        ):
-            raise ConfigError(
-                f"{label}: 'deadline_ms' must be a positive integer for kind: pipeline"
-            )
-    else:
-        catch_up_minutes = configured_catch_up_minutes
 
-        deadline_ms = merged["deadline_ms"]
-        if deadline_ms is not None and (
-            not isinstance(deadline_ms, int)
-            or isinstance(deadline_ms, bool)
-            or deadline_ms <= 0
-        ):
-            raise ConfigError(
-                f"{label}: 'deadline_ms' must be a positive integer or null"
-            )
+def _default_run_limits(
+    merged: Mapping[str, object],
+    raw_job: Mapping[str, object],
+    label: str,
+    configured_catch_up_minutes: int,
+) -> tuple[int, str | None, int | None]:
+    """Resolve `(catch_up_minutes, prompt_file, deadline_ms)` for every kind but pipeline."""
+    catch_up_minutes = configured_catch_up_minutes
 
-        prompt_file = merged["prompt_file"]
-        if prompt_file is not None and (
-            not isinstance(prompt_file, str) or not prompt_file
-        ):
-            raise ConfigError(
-                f"{label}: 'prompt_file' must be a non-empty string or null"
-            )
+    deadline_ms = merged["deadline_ms"]
+    if deadline_ms is not None and (
+        not isinstance(deadline_ms, int)
+        or isinstance(deadline_ms, bool)
+        or deadline_ms <= 0
+    ):
+        raise ConfigError(f"{label}: 'deadline_ms' must be a positive integer or null")
 
-    # -- target inference (after kind is resolved) ------------------------------------
+    prompt_file = merged["prompt_file"]
+    if prompt_file is not None and (
+        not isinstance(prompt_file, str) or not prompt_file
+    ):
+        raise ConfigError(f"{label}: 'prompt_file' must be a non-empty string or null")
+    return catch_up_minutes, prompt_file, deadline_ms
+
+
+class _KindRules(NamedTuple):
+    """The build steps that differ by job kind. `_build_job` runs them in a fixed order."""
+
+    check_checks: Callable[[tuple[GateCheck, ...] | None, str], None]
+    audit_fields: Callable[
+        [Mapping[str, object], Mapping[str, object], str], _AuditFields
+    ]
+    run_limits: Callable[
+        [Mapping[str, object], Mapping[str, object], str, int],
+        tuple[int, str | None, int | None],
+    ]
+
+
+_KIND_RULES: Final[dict[JobKind, _KindRules]] = {
+    "routine": _KindRules(_reject_checks, _inert_audit_fields, _default_run_limits),
+    "gated": _KindRules(_require_checks, _inert_audit_fields, _default_run_limits),
+    "audit": _KindRules(_reject_checks, _build_audit_fields, _default_run_limits),
+    "pipeline": _KindRules(_reject_checks, _inert_audit_fields, _pipeline_run_limits),
+}
+
+
+def _build_target(
+    merged: Mapping[str, object],
+    label: str,
+    *,
+    kind: JobKind,
+    inferred_target: JobTarget | None,
+    review_sugar: bool,
+    base: str,
+) -> JobTarget | None:
     target_raw = merged.get("target")
     target: JobTarget | None = None
     if target_raw is not None:
@@ -1834,23 +1804,17 @@ def _build_job(
         raise ConfigError(
             f"{label}: 'base' must be a non-empty string when target is 'base'"
         )
+    return target
 
-    # -- tmp_hygiene (issue 027) ---------------------------------------------------
-    # Validated per job so a bad value fails the job's own file, but only the
-    # defaults-level value is read (`RoutinesConfig.tmp_hygiene`): the reap runs once
-    # per tick, not once per job.
-    tmp_hygiene_raw = merged.get("tmp_hygiene")
-    tmp_hygiene = (
-        _build_tmp_hygiene(tmp_hygiene_raw, label)
-        if tmp_hygiene_raw is not None
-        else None
-    )
 
-    # -- retry_attempts / retry_on (issue 008) ----------------------------------
-    #
-    # Per-job only — NOT inheritable via defaults.yaml (same precedent as kind/checks
-    # in issue 049). retry_attempts is bounded 0..3 to prevent tick-hogging.
-
+# retry_attempts / retry_on (issue 008)
+#
+# Per-job only — NOT inheritable via defaults.yaml (same precedent as kind/checks
+# in issue 049). retry_attempts is bounded 0..3 to prevent tick-hogging.
+def _build_retry(
+    merged: Mapping[str, object], label: str, workspace: object
+) -> tuple[int, tuple[str, ...] | None]:
+    """Resolve `(retry_attempts, retry_on)`."""
     retry_attempts = merged["retry_attempts"]
     if not isinstance(retry_attempts, int) or isinstance(retry_attempts, bool):
         raise ConfigError(f"{label}: 'retry_attempts' must be an integer")
@@ -1887,22 +1851,33 @@ def _build_job(
         warnings.warn(
             f"{label}: 'retry_on' is set but 'retry_attempts' is 0 — "
             "retry_on is inert (no retries will occur)",
-            stacklevel=2,
+            stacklevel=3,
         )
     # workspace: root with retries is a soft warning
     if retry_attempts > 0 and workspace == "root":
         warnings.warn(
             f"{label}: 'retry_attempts' > 0 on workspace: root — "
             "retries are only safe for idempotent jobs",
-            stacklevel=2,
+            stacklevel=3,
         )
+    return retry_attempts, retry_on
 
-    # -- verify (issue 071) ------------------------------------------------------------
-    #
-    # Like the kind rules above, an explicit per-job `verify` on a kind that never reaches
-    # `execute_run` is rejected, while an inherited one is kept aside as `ignored_verify`
-    # (a shared defaults.yaml must not invalidate every gated/audit job). `kind: review`
-    # fixes it: the review's post-condition is not the job's to choose.
+
+# verify (issue 071)
+#
+# Like the kind rules above, an explicit per-job `verify` on a kind that never reaches
+# `execute_run` is rejected, while an inherited one is kept aside as `ignored_verify`
+# (a shared defaults.yaml must not invalidate every gated/audit job). `kind: review`
+# fixes it: the review's post-condition is not the job's to choose.
+def _build_verify(
+    merged: Mapping[str, object],
+    raw_job: Mapping[str, object],
+    label: str,
+    *,
+    kind: JobKind,
+    review_sugar: bool,
+) -> tuple[tuple[VerifyGate, ...], tuple[VerifyGate, ...]]:
+    """Resolve `(verify, ignored_verify)`."""
     if review_sugar and "verify" in raw_job:
         raise ConfigError(
             f"{label}: 'verify' is fixed by kind: review (it is "
@@ -1937,10 +1912,21 @@ def _build_job(
                 f"(kind: {kind} does not run post-run gates yet, issue 071)"
             )
         ignored_verify, verify = verify, ()
+    return verify, ignored_verify
 
-    # -- pick (issue 073) --------------------------------------------------------------
-    # Same rule as `verify`: explicit on a kind that never reaches the routine dispatch is
-    # an error, inherited is kept aside as `ignored_pick` for `validate` to report.
+
+# pick (issue 073)
+# Same rule as `verify`: explicit on a kind that never reaches the routine dispatch is
+# an error, inherited is kept aside as `ignored_pick` for `validate` to report.
+def _build_pick(
+    merged: Mapping[str, object],
+    raw_job: Mapping[str, object],
+    label: str,
+    *,
+    kind: JobKind,
+    review_sugar: bool,
+) -> tuple[TargetSelector | None, TargetSelector | None]:
+    """Resolve `(pick, ignored_pick)`."""
     if review_sugar and "pick" in raw_job:
         raise ConfigError(
             f"{label}: 'pick' is fixed by kind: review (it is my_open_prs); "
@@ -1963,6 +1949,217 @@ def _build_job(
                 f"(kind: {kind} does not run a target selector, issue 073)"
             )
         ignored_pick, pick = pick, None
+    return pick, ignored_pick
+
+
+def _build_job(
+    raw_job: Mapping[str, object],
+    defaults: Mapping[str, object],
+    *,
+    index: int,
+    label_prefix: str | None = None,
+) -> Job:
+    unknown = set(raw_job) - _JOB_ALLOWED_KEYS
+    if unknown:
+        prefix = label_prefix or f"jobs[{index}]"
+        raise ConfigError(f"{prefix}: unknown key(s): {sorted(unknown)}")
+
+    missing = _JOB_REQUIRED_KEYS - set(raw_job)
+    if missing:
+        prefix = label_prefix or f"jobs[{index}]"
+        raise ConfigError(f"{prefix}: missing required key(s): {sorted(missing)}")
+
+    merged: dict[str, object] = {**_JOB_DEFAULTS, **defaults, **raw_job}
+    name = merged["name"]
+    if label_prefix:
+        label = f"{label_prefix} ({name!r})" if isinstance(name, str) else label_prefix
+    else:
+        label = (
+            f"jobs[{index}] ({name!r})" if isinstance(name, str) else f"jobs[{index}]"
+        )
+
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        raise ConfigError(
+            f"{label}: 'name' must match {NAME_RE.pattern} (max 24 chars, "
+            "since the live agent name is 'rt-<name>' and Herdr caps names at 32)"
+        )
+
+    cron, trigger_event, request = _build_trigger(raw_job, label)
+
+    # kind is read here (not only where its rules live below) because a
+    # `kind: review` job has no single checkout: it derives `repo` from the managed
+    # base dir and never calls `ensure_repo`, so the repo/repository machinery must be
+    # bypassed before it runs.
+    if merged["kind"] not in ACCEPTED_KIND_VALUES:
+        raise ConfigError(
+            f"{label}: 'kind' must be one of {sorted(ACCEPTED_KIND_VALUES)}"
+        )
+    review_sugar = merged["kind"] == REVIEW_SUGAR_KIND
+
+    repo, repository = _build_repo(merged, raw_job, label, name, review_sugar)
+
+    declared_workspace = merged["workspace"]
+    if declared_workspace not in VALID_WORKSPACE_MODES:
+        raise ConfigError(
+            f"{label}: 'workspace' must be one of {sorted(VALID_WORKSPACE_MODES)}"
+        )
+    workspace = declared_workspace
+    if review_sugar:
+        # Whatever defaults.yaml says: each review closes its own pane, as the review-only
+        # dispatch always did, and the agent runs in the target's own worktree anyway.
+        workspace = "worktree"
+
+    agent_kind = merged["agent_kind"]
+    if agent_kind not in VALID_AGENT_KINDS:
+        raise ConfigError(
+            f"{label}: 'agent_kind' must be one of {sorted(VALID_AGENT_KINDS)}"
+        )
+
+    on_missed = merged["on_missed"]
+    if on_missed not in VALID_ON_MISSED:
+        raise ConfigError(
+            f"{label}: 'on_missed' must be one of {sorted(VALID_ON_MISSED)}"
+        )
+
+    notify_policy = merged["notify_policy"]
+    if notify_policy not in VALID_NOTIFY_POLICIES:
+        raise ConfigError(
+            f"{label}: 'notify_policy' must be one of {sorted(VALID_NOTIFY_POLICIES)}"
+        )
+
+    timeout_ms = _int_field(merged, "timeout_ms", label, positive=True)
+    start_timeout_ms = _int_field(merged, "start_timeout_ms", label, positive=True)
+    configured_catch_up_minutes = _int_field(
+        merged, "catch_up_minutes", label, positive=False
+    )
+
+    enabled = merged["enabled"]
+    if not isinstance(enabled, bool):
+        raise ConfigError(f"{label}: 'enabled' must be a boolean")
+
+    model, fallback_model = _build_models(merged, raw_job, label, agent_kind)
+    prompt = _build_prompt(merged, label, name, review_sugar)
+
+    timezone = merged["timezone"]
+    if not isinstance(timezone, str):
+        raise ConfigError(f"{label}: 'timezone' must be a string")
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as e:
+        raise ConfigError(
+            f"{label}: 'timezone' is not a valid IANA zone: {timezone!r}"
+        ) from e
+
+    base = merged["base"]
+    if not isinstance(base, str):
+        raise ConfigError(f"{label}: 'base' must be a string")
+
+    failure_markers = _build_failure_markers(merged, label)
+
+    # -- Unified gate model: checks / target / max_workers / max_attempts -----------
+    checks, inferred_target = _build_checks(merged, label)
+    max_workers_per_tick = _int_field(
+        merged, "max_workers_per_tick", label, positive=True
+    )
+    max_attempts_per_target = _int_field(
+        merged, "max_attempts_per_target", label, positive=True
+    )
+
+    # -- kind (issue 049: kind is the exhaustive single dispatch key) ----------------
+    #
+    # Rules key off `raw_job`, never the merged value: a shared `defaults.yaml` (e.g. the
+    # live Pi's `workspace: worktree` + `catch_up_minutes: 120`) must not retroactively
+    # invalidate every pipeline job — only an *explicit* per-job setting is rejected.
+
+    # `kind: review` is sugar (issue 076): from here on the job is a routine, and
+    # `review_sugar` marks the few places that still need to know it was spelled that way.
+    kind: JobKind
+    if review_sugar:
+        kind = "routine"
+    else:
+        declared_kind = merged["kind"]
+        if declared_kind not in VALID_JOB_KINDS:
+            raise ConfigError(
+                f"{label}: 'kind' must be one of {sorted(ACCEPTED_KIND_VALUES)}"
+            )
+        kind = declared_kind
+
+    # The steps that differ by kind come from one table; they run in this fixed order.
+    rules = _KIND_RULES[kind]
+    rules.check_checks(checks, label)
+
+    trigger_event = _resolve_trigger_event(
+        trigger_event,
+        kind=kind,
+        checks=checks,
+        repo=repo,
+        review_sugar=review_sugar,
+        label=label,
+    )
+
+    fix_prompt = merged.get("fix_prompt", "")
+    if not isinstance(fix_prompt, str):
+        raise ConfigError(f"{label}: 'fix_prompt' must be a string")
+    fix_prompt = fix_prompt or None
+
+    audit_fields = rules.audit_fields(merged, raw_job, label)
+
+    # -- pick: my_open_prs (issues 055, 076) ---------------------------------------------
+    reviews_my_prs = review_sugar or merged["pick"] == "my_open_prs"
+    select, include_auto_branches = _build_review_select(
+        merged, raw_job, label, reviews_my_prs
+    )
+
+    # A review that landed is never redone, and a review that failed to land is a miss to
+    # report, not to retry — so the budget is 1 unless the job explicitly asks otherwise.
+    if reviews_my_prs and "max_attempts_per_target" not in raw_job:
+        max_attempts_per_target = 1
+
+    # How many targets one run acts on (issue 076). A `kind: review` job has always spelled
+    # this `max_workers_per_tick`, so that is where the sugar reads it from.
+    if review_sugar:
+        if "max_targets_per_run" in raw_job:
+            raise ConfigError(
+                f"{label}: 'max_targets_per_run' is not applicable to kind: review "
+                "(its cap is 'max_workers_per_tick')"
+            )
+        max_targets_per_run = max_workers_per_tick
+    else:
+        max_targets_per_run = _int_field(
+            merged, "max_targets_per_run", label, positive=True
+        )
+
+    catch_up_minutes, prompt_file, deadline_ms = rules.run_limits(
+        merged, raw_job, label, configured_catch_up_minutes
+    )
+
+    target = _build_target(
+        merged,
+        label,
+        kind=kind,
+        inferred_target=inferred_target,
+        review_sugar=review_sugar,
+        base=base,
+    )
+
+    # -- tmp_hygiene (issue 027) ---------------------------------------------------
+    # Validated per job so a bad value fails the job's own file, but only the
+    # defaults-level value is read (`RoutinesConfig.tmp_hygiene`): the reap runs once
+    # per tick, not once per job.
+    tmp_hygiene_raw = merged.get("tmp_hygiene")
+    tmp_hygiene = (
+        _build_tmp_hygiene(tmp_hygiene_raw, label)
+        if tmp_hygiene_raw is not None
+        else None
+    )
+
+    retry_attempts, retry_on = _build_retry(merged, label, workspace)
+    verify, ignored_verify = _build_verify(
+        merged, raw_job, label, kind=kind, review_sugar=review_sugar
+    )
+    pick, ignored_pick = _build_pick(
+        merged, raw_job, label, kind=kind, review_sugar=review_sugar
+    )
 
     # Several targets need a selector that can return several (issue 076).
     if max_targets_per_run > 1 and pick not in MULTI_TARGET_SELECTORS:
@@ -2009,10 +2206,10 @@ def _build_job(
         tmp_hygiene=tmp_hygiene,
         retry_attempts=retry_attempts,
         retry_on=retry_on,
-        audit=audit,
-        max_findings_per_dispatch=max_findings_per_dispatch,
-        ledger_retention_days=ledger_retention_days,
-        adopt_baseline=adopt_baseline,
+        audit=audit_fields.audit,
+        max_findings_per_dispatch=audit_fields.max_findings_per_dispatch,
+        ledger_retention_days=audit_fields.ledger_retention_days,
+        adopt_baseline=audit_fields.adopt_baseline,
         fix_prompt=fix_prompt,
         select=select,
         include_auto_branches=include_auto_branches,
