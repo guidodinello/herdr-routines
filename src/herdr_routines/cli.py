@@ -37,6 +37,7 @@ from herdr_routines.config import (
     load_config,
 )
 from herdr_routines.digest import digest_now
+from herdr_routines.dispatch_common import Occurrence, _notify
 from herdr_routines.gates import (
     GATE_STAGE_CHOICES,
     PR_GATE_STAGES,
@@ -65,6 +66,12 @@ from herdr_routines.issue_refinement import (
     run_refine_issue,
 )
 from herdr_routines.pick_feature import ReclaimedPick, run_pick_feature
+from herdr_routines.pipeline_flow import (
+    _build_pipeline_launch_argv,
+    launch_pipeline,
+    pipeline_deadline_epoch,
+    pipeline_report_path,
+)
 from herdr_routines.pipeline_prepare import (
     DEFAULT_ISSUES_DIR,
     EXIT_FAILURE,
@@ -108,14 +115,7 @@ from herdr_routines.telegram_spawn import (
     handle_spawn_message,
     is_job_verb,
 )
-from herdr_routines.tick import (
-    _build_pipeline_launch_argv,
-    default_lock_path,
-    launch_pipeline,
-    pipeline_deadline_epoch,
-    pipeline_report_path,
-    run_tick,
-)
+from herdr_routines.tick import default_lock_path, run_tick
 from herdr_routines.tmp_hygiene import reap_tmp
 
 log = get_logger(__name__)
@@ -1246,7 +1246,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     outcome = tick.dispatch_manual_occurrence(
         job,
         default_history_path(),
-        tick.Occurrence(run_id, HistoryExtra(trigger=args.trigger)),
+        Occurrence(run_id, HistoryExtra(trigger=args.trigger)),
         client=HerdrClient(),
         now=now,
         trusted_review_authors=config.trusted_review_authors,
@@ -1257,7 +1257,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         log.error("%s: run refused: %s; try again later", job.name, reason)
         if args.trigger == TRIGGER_REQUEST:
             # Detached from Telegram, so nobody reads the log: say so where they look.
-            tick._notify(
+            _notify(
                 HerdrClient(),
                 f"herdr-routines: {job.name} request refused",
                 body=f"{reason}; send /job again later",

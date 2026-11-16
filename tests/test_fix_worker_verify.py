@@ -18,6 +18,7 @@ from herdr_routines.auto_fix import attempt_count_for_pr
 from herdr_routines.config import GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, read_job
 from herdr_routines.tick import run_tick
+from tests.dispatch_modules import patch_dispatch
 
 BRANCH = "auto/pipeline-20261021T050000Z"
 SHA_BEFORE = "sha-before"
@@ -169,8 +170,8 @@ class World:
         self.client = client
         monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
         self.history_path = tmp_path / "state" / "history.jsonl"
-        monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-        monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+        patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+        patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
         self.job = _job(self.repo)
         self.config = RoutinesConfig(jobs=(self.job,))
         self.t0 = datetime.now(UTC).replace(microsecond=0)

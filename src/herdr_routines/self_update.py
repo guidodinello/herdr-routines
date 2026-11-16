@@ -93,9 +93,10 @@ from herdr_routines.gates import (
     remote_owner_and_repo,
 )
 from herdr_routines.host_drift import DriftFinding, format_findings
+from herdr_routines.pipeline_flow import _open_pipeline_run
 from herdr_routines.runner_seam import SubprocessRunner as Runner
 from herdr_routines.runner_seam import _real_runner
-from herdr_routines.tick import _open_pipeline_run, hold_job_locks, tick_lock
+from herdr_routines.tick import hold_job_locks, tick_lock
 
 log = get_logger(__name__)
 

@@ -32,6 +32,7 @@ from herdr_routines.history import (
     read_job,
 )
 from herdr_routines.runner import RunOutcome
+from tests.dispatch_modules import patch_dispatch
 
 # 10:20 on a day when the hourly cron last fired at 10:00.
 FROZEN_NOW = datetime(2026, 10, 20, 10, 20, tzinfo=UTC)
@@ -102,9 +103,9 @@ def client(monkeypatch: pytest.MonkeyPatch) -> _Client:
 def _wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "default_lock_path", lambda: tmp_path / "tick.lock")
     monkeypatch.setattr(cli, "datetime", _FrozenDatetime)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr(tick, "_live_agent_exists", lambda client, job: False)
-    monkeypatch.setattr(tick, "_live_audit_agent_exists", lambda client, job: False)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "_live_agent_exists", lambda client, job: False)
+    patch_dispatch(monkeypatch, "_live_audit_agent_exists", lambda client, job: False)
 
 
 @pytest.fixture
@@ -116,7 +117,7 @@ def runs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         run_ids.append(run_id)
         return RunOutcome(state="done", run_id=run_id)
 
-    monkeypatch.setattr(tick, "execute_run", fake_execute_run)
+    patch_dispatch(monkeypatch, "execute_run", fake_execute_run)
     return run_ids
 
 
@@ -149,7 +150,7 @@ def _triggers(history: Path, state: str, name: str = "a") -> list[object]:
 
 
 def _poll_returns(monkeypatch: pytest.MonkeyPatch, events: list[GithubEvent]) -> None:
-    monkeypatch.setattr(tick, "poll_github_event", lambda gh, **kw: list(events))
+    patch_dispatch(monkeypatch, "poll_github_event", lambda gh, **kw: list(events))
 
 
 def _event(event_id: str, number: int = 1) -> GithubEvent:
@@ -322,7 +323,7 @@ def test_event_poll_failure_fails_closed_and_pages_once(
     def broken(gh: Any, **kw: Any) -> list[GithubEvent]:
         raise RuntimeError("rate limited")
 
-    monkeypatch.setattr(tick, "poll_github_event", broken)
+    patch_dispatch(monkeypatch, "poll_github_event", broken)
     for minutes in (0, 5):
         summary = _tick(job, history, client, FROZEN_NOW + timedelta(minutes=minutes))
         assert summary == ("a: failed (github_event_poll_failed)",)
@@ -332,7 +333,7 @@ def test_event_poll_failure_fails_closed_and_pages_once(
     # The first good poll ends the outage, so the next one pages again.
     _poll_returns(monkeypatch, [])
     _tick(job, history, client, FROZEN_NOW + timedelta(minutes=10))
-    monkeypatch.setattr(tick, "poll_github_event", broken)
+    patch_dispatch(monkeypatch, "poll_github_event", broken)
     _tick(job, history, client, FROZEN_NOW + timedelta(minutes=15))
     assert len(client.notifications) == 2
 
@@ -482,7 +483,7 @@ def test_run_records_its_trigger(
 
     for cycle in ("_process_base_target", "_audit_cycle"):
         monkeypatch.setattr(tick, cycle, closed_cycle)
-    monkeypatch.setattr(tick, "_run_routine_targets", closed_targets)
+    patch_dispatch(monkeypatch, "_run_routine_targets", closed_targets)
     job = replace(_kind_job(tmp_path, kind), request=True)
     event_job = (
         replace(job, trigger_event=EVENT_CHECK)

@@ -22,6 +22,7 @@ from herdr_routines.history import read_job
 from herdr_routines.runner import execute_run
 from herdr_routines.tick import run_tick
 from herdr_routines.verify import VERIFY_GATES, parse_declared_target
+from tests.dispatch_modules import patch_dispatch
 from tests.test_runner import ScriptedClient, make_job
 from tests.test_tick import FakeFullClient
 from tests.test_tick import make_job as make_tick_job
@@ -34,7 +35,7 @@ REVIEW_BODY = "### Code review\n\nNo blocking issues.\n"
 def _isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
 
 
 class FakeVerifyGh:

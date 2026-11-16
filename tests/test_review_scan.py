@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 import yaml
 
-from herdr_routines import tick
+from herdr_routines import dispatch_common, routine_targets_flow, runner, tick
 from herdr_routines.auto_fix import (
     REVIEW_SEARCH_QUALIFIERS,
     PostedBody,
@@ -51,6 +51,7 @@ from herdr_routines.review_scan import (
     render_review_report,
     scan_review_targets,
 )
+from tests.dispatch_modules import patch_dispatch
 
 NOW = datetime(2026, 10, 10, 8, 30, 0, tzinfo=UTC)
 
@@ -620,7 +621,7 @@ def test_review_scan_marker_guard_and_search_fail_closed(
     history_path = tmp_path / "state" / "history.jsonl"
     gh = ReviewGh(search_fail=True)
     client = ReviewHerdrClient()
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     summary, failed = _run_cycle(
         job, history_path, gh, client, run_id="review-my-prs-20261010T083000Z"
     )
@@ -825,7 +826,7 @@ def test_review_dispatch_creates_per_repo_checkout(
         },
     )
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
 
     summary, failed = _run_cycle(
         job,
@@ -845,7 +846,7 @@ def test_review_dispatch_creates_per_repo_checkout(
     # same numbers today as after `_review_cycle`'s row-building moves into the shared
     # classifier.
     report_path = (
-        tick.default_reports_dir() / "review-review-my-prs-20261010T083000Z.md"
+        runner.default_reports_dir() / "review-review-my-prs-20261010T083000Z.md"
     )
     report = report_path.read_text()
     for line in (
@@ -929,7 +930,7 @@ def test_review_post_condition_ignores_an_untrusted_marker(
         },
     )
     client = ReviewHerdrClient(on_prompt=_write_report)
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     history = tmp_path / "state" / "history.jsonl"
 
     _, failed = _run_cycle(job, history, gh, client, run_id="review-my-prs-r1")
@@ -970,7 +971,7 @@ def test_review_dispatch_does_not_contend_for_head_branch(
     info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
     gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
 
     _, failed = _run_cycle(
         job,
@@ -1021,16 +1022,16 @@ def test_review_dispatch_reuses_own_review_worktree(
         },
     )
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
 
     cleanup_calls = {"n": 0}
-    real_cleanup = tick._cleanup_worktree
+    real_cleanup = dispatch_common._cleanup_worktree
 
     def _spy(repo: Path, path: Path) -> None:
         cleanup_calls["n"] += 1
         real_cleanup(repo, path)
 
-    monkeypatch.setattr(tick, "_cleanup_worktree", _spy)
+    patch_dispatch(monkeypatch, "_cleanup_worktree", _spy)
 
     _run_cycle(
         job,
@@ -1063,7 +1064,7 @@ def test_review_dispatch_reuses_own_review_worktree(
         },
     )
     client2 = ReviewHerdrClient(on_prompt=_mark_posted(gh2))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh2)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh2)
     _run_cycle(
         job,
         tmp_path / "state2" / "history.jsonl",
@@ -1096,16 +1097,16 @@ def test_review_dispatch_removes_worktree_after_settle(
         },
     )
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
 
     recorded: list[list[str]] = []
-    real_run = tick.subprocess.run
+    real_run = subprocess.run
 
     def _spy(argv: list[str], *a: Any, **k: Any) -> Any:
         recorded.append(list(argv))
         return real_run(argv, *a, **k)
 
-    monkeypatch.setattr(tick.subprocess, "run", _spy)
+    monkeypatch.setattr(subprocess, "run", _spy)
 
     _run_cycle(
         job,
@@ -1133,7 +1134,7 @@ def test_review_dispatch_removes_worktree_after_settle(
         },
     )
     client2 = ReviewHerdrClient(on_prompt=_write_report)  # reports, never posts
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh2)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh2)
     _run_cycle(
         job,
         tmp_path / "state" / "history.jsonl",
@@ -1161,7 +1162,7 @@ def test_review_verification_is_fail_closed(
     # (a) marker present → done + verified True + gate passed.
     gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     history = tmp_path / "state" / "history.jsonl"
     _, failed = _run_cycle(job, history, gh, client, run_id="r1")
     assert failed is False
@@ -1177,7 +1178,7 @@ def test_review_verification_is_fail_closed(
     # (b) marker absent → failed (review_not_posted), never done.
     gh2 = ReviewGh(prs=(_pr(2),), repo_infos={("acme", "widgets"): info})
     client2 = ReviewHerdrClient(on_prompt=_write_report)  # reports, never posts
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh2)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh2)
     _, failed2 = _run_cycle(job, history, gh2, client2, run_id="r2")
     assert failed2 is True
     rec2 = _terminal(history, job.name)
@@ -1189,7 +1190,7 @@ def test_review_verification_is_fail_closed(
         prs=(_pr(3),), repo_infos={("acme", "widgets"): info}, bodies_fail=True
     )
     client3 = ReviewHerdrClient(on_prompt=_write_report)
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh3)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh3)
     _, failed3 = _run_cycle(job, history, gh3, client3, run_id="r3")
     assert failed3 is True
     rec3 = _terminal(history, job.name)
@@ -1212,7 +1213,7 @@ def test_kind_review_uses_review_posted_gate(
     info: dict[str, object] = {"clone_url": str(origin), "default_branch": "main"}
     gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     seen: list[verify.VerifyContext] = []
 
     def stub_gate(ctx: verify.VerifyContext) -> GateVerdict:
@@ -1265,7 +1266,7 @@ def test_review_dispatch_isolates_per_repo_failures(
         },
     )
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
 
     history = tmp_path / "state" / "history.jsonl"
     _, failed = _run_cycle(job, history, gh, client, run_id="r1")
@@ -1297,11 +1298,12 @@ def test_review_live_agent_prefix_guard_and_name_cap(
 
     # The liveness guard matches by the shared prefix over live agents.
     client = ReviewHerdrClient(statuses={name: "working"})
-    assert tick._live_review_agent_exists(client, long_job, key) is True  # type: ignore[arg-type]
+    assert routine_targets_flow._live_review_agent_exists(client, long_job, key) is True  # type: ignore[arg-type]
     idle = ReviewHerdrClient(statuses={name: "idle"})
-    assert tick._live_review_agent_exists(idle, long_job, key) is False  # type: ignore[arg-type]
+    assert routine_targets_flow._live_review_agent_exists(idle, long_job, key) is False  # type: ignore[arg-type]
     unrelated = ReviewHerdrClient(statuses={"something-else": "working"})
-    assert tick._live_review_agent_exists(unrelated, long_job, key) is False  # type: ignore[arg-type]
+    live = routine_targets_flow._live_review_agent_exists
+    assert live(unrelated, long_job, key) is False  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -1353,7 +1355,7 @@ def test_review_is_not_repeated_across_ticks(
 
     gh = ReviewGh(prs=(_pr(1),), repo_infos={("acme", "widgets"): info})
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
 
     # Tick 1: dispatches and (via the fake agent) posts the marker.
     _, failed1 = _run_cycle(job, history, gh, client, run_id="t1")
@@ -1762,11 +1764,11 @@ def test_review_scan_drift_tick_report_matches_classification(
     )
     assert classification is not None
 
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     client = ReviewHerdrClient(on_prompt=_mark_posted(gh))
     _summary, _failed = _run_cycle(job, history, gh, client, run_id="drift1")
 
-    report = (tick.default_reports_dir() / "review-drift1.md").read_text()
+    report = (runner.default_reports_dir() / "review-drift1.md").read_text()
     target_lines = [
         m.groups() for m in map(_TARGET_LINE.match, report.splitlines()) if m
     ]

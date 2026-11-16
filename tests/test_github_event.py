@@ -44,14 +44,11 @@ from herdr_routines.auto_fix import (
     poll_github_event,
 )
 from herdr_routines.config import ConfigError, GateCheck, Job, RoutinesConfig
+from herdr_routines.dispatch_common import _WorkerFailed, _WorkerResult, _WorkerSettled
+from herdr_routines.gated_event_flow import _verify_event_worker
 from herdr_routines.history import HistoryRecord, append, read_job
-from herdr_routines.tick import (
-    _verify_event_worker,
-    _WorkerFailed,
-    _WorkerResult,
-    _WorkerSettled,
-    run_tick,
-)
+from herdr_routines.tick import run_tick
+from tests.dispatch_modules import patch_dispatch
 
 SPEC_PATH = (
     Path(__file__).resolve().parent.parent
@@ -378,12 +375,12 @@ def _register_then_tick(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
     config = RoutinesConfig(jobs=(job,))
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh_client)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh_client)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
     # These 014-path tests predate issue 078's settle gates and stub git, so no real
     # worktree exists to verify. The gates have their own tests (`_gated_ticks`).
-    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
+    patch_dispatch(monkeypatch, "_verify_event_worker", lambda *a, **k: ())
 
     run_tick(config, history_path, client=client, now=at)  # type: ignore[arg-type]
     outcome = run_tick(
@@ -546,8 +543,8 @@ def test_github_event_worker_result_history_record(
     (it is the JSONL column order), the values copied from the worker, a failure's own
     reason preserved (issue 078) and the optional `error` key present only when the
     worker reported one."""
-    monkeypatch.setattr(
-        "herdr_routines.tick._dispatch_event_worker", lambda **kwargs: worker_result
+    patch_dispatch(
+        monkeypatch, "_dispatch_event_worker", lambda **kwargs: worker_result
     )
     repo = _init_repo(tmp_path)
     job = _make_event_job(repo)
@@ -592,11 +589,11 @@ def test_github_event_repoll_dedups_same_event(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
     config = RoutinesConfig(jobs=(job,))
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
     # Stubbed git means no real worktree; the settle gates are 078's own tests.
-    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
+    patch_dispatch(monkeypatch, "_verify_event_worker", lambda *a, **k: ())
 
     t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -665,9 +662,9 @@ def test_github_event_budget_exceeded_skips_with_notify(
 
     gh = EventGhClient(events=True)
     client = RecordingHerdrClient()
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
     run_tick(
         config,
         history_path,
@@ -1089,12 +1086,12 @@ def _event_ticks(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
     config = RoutinesConfig(jobs=(job,))
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
     # The 014-path tests below stub git, so no real worktree exists to verify; issue
     # 078's settle gates have their own real-git tests (`_gated_ticks`).
-    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
+    patch_dispatch(monkeypatch, "_verify_event_worker", lambda *a, **k: ())
     t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
 
@@ -1410,9 +1407,9 @@ def test_issues_opened_tick_uses_configured_trusted_authors(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
     config = RoutinesConfig(jobs=(job,), trusted_review_authors=("alice",))
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
     t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
 
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1466,7 +1463,7 @@ def test_invalid_head_ref_is_skipped_without_a_worktree(
     client = RecordingHerdrClient()
     tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
     git = _RecordingGitSubprocess()
-    monkeypatch.setattr("herdr_routines.tick.subprocess", git)
+    patch_dispatch(monkeypatch, "subprocess", git)
 
     tick(1)
     tick(2)
@@ -1496,7 +1493,7 @@ def test_valid_head_ref_dispatches_with_option_terminator(
     client = RecordingHerdrClient()
     tick = _event_ticks(job, tmp_path, monkeypatch, gh, client)
     git = _RecordingGitSubprocess()
-    monkeypatch.setattr("herdr_routines.tick.subprocess", git)
+    patch_dispatch(monkeypatch, "subprocess", git)
 
     tick(1)
 
@@ -1525,7 +1522,7 @@ def test_head_ref_check_that_cannot_run_is_a_retried_failure(
             return super().run(argv, *args, **kwargs)
 
     git = _NoGit()
-    monkeypatch.setattr("herdr_routines.tick.subprocess", git)
+    patch_dispatch(monkeypatch, "subprocess", git)
 
     for minute in (1, 2, 3):
         tick(minute)
@@ -1564,8 +1561,8 @@ def test_event_worktree_reuse_not_clean_does_not_consume_attempt(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
     config = RoutinesConfig(jobs=(job,))
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
 
     t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1711,8 +1708,8 @@ def _gated_ticks(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
     config = RoutinesConfig(jobs=(job,))
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
     t0 = datetime(2026, 10, 13, 5, 0, 0, tzinfo=UTC)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
 
@@ -1803,8 +1800,9 @@ def test_event_worker_failure_reason_preserved(
     job = _make_event_job(repo)
     client = RecordingHerdrClient()
 
-    monkeypatch.setattr(
-        "herdr_routines.tick._dispatch_event_worker",
+    patch_dispatch(
+        monkeypatch,
+        "_dispatch_event_worker",
         lambda **kwargs: _WorkerFailed(
             reason="agent_start_failed", error="boom", pane_id="p1"
         ),
@@ -1820,8 +1818,9 @@ def test_event_worker_failure_reason_preserved(
     assert record.extra.get("error") == "boom"
     assert record.extra.get("reason") != "gate_failed"
 
-    monkeypatch.setattr(
-        "herdr_routines.tick._dispatch_event_worker",
+    patch_dispatch(
+        monkeypatch,
+        "_dispatch_event_worker",
         lambda **kwargs: _WorkerSettled(
             state="done",
             pane_id="p2",

@@ -25,6 +25,7 @@ from herdr_routines.history import (
     read_job,
 )
 from herdr_routines.runner import RunOutcome
+from tests.dispatch_modules import patch_dispatch
 
 # 10:20 on a day when the hourly cron last fired at 10:00.
 FROZEN_NOW = datetime(2026, 10, 20, 10, 20, tzinfo=UTC)
@@ -93,9 +94,9 @@ def client(monkeypatch: pytest.MonkeyPatch) -> _Client:
 def _wiring(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli, "default_lock_path", lambda: tmp_path / "tick.lock")
     monkeypatch.setattr(cli, "datetime", _FrozenDatetime)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr(tick, "_live_agent_exists", lambda client, job: False)
-    monkeypatch.setattr(tick, "_live_audit_agent_exists", lambda client, job: False)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "_live_agent_exists", lambda client, job: False)
+    patch_dispatch(monkeypatch, "_live_audit_agent_exists", lambda client, job: False)
 
 
 def _run_cli(monkeypatch: pytest.MonkeyPatch, job: Job, *extra: str) -> int:
@@ -123,7 +124,7 @@ def test_manual_run_uses_fallback_model(
             return RunOutcome(state="failed", run_id=run_id, reason="quota_exhausted")
         return RunOutcome(state="done", run_id=run_id)
 
-    monkeypatch.setattr(tick, "execute_run", fake_execute_run)
+    patch_dispatch(monkeypatch, "execute_run", fake_execute_run)
 
     assert _run_cli(monkeypatch, job) == 0
 
@@ -147,8 +148,8 @@ def test_manual_run_records_history_and_notifies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job = _job(tmp_path, notify_policy="on-failure")
-    monkeypatch.setattr(
-        tick,
+    patch_dispatch(
+        monkeypatch,
         "execute_run",
         lambda job, client, *, run_id, **_: RunOutcome(
             state="failed", run_id=run_id, reason="agent_prompt_failed"
@@ -167,8 +168,8 @@ def test_manual_run_records_history_and_notifies(
 
     # A failure that the policy excludes stays quiet, but is still recorded.
     quiet = _job(tmp_path, notify_policy="on-failure")
-    monkeypatch.setattr(
-        tick,
+    patch_dispatch(
+        monkeypatch,
         "execute_run",
         lambda job, client, *, run_id, **_: RunOutcome(state="done", run_id=run_id),
     )
@@ -198,8 +199,8 @@ def test_manual_run_does_not_consume_scheduled_occurrence(
             extra={"scheduled_for": "2026-10-20T09:00:00+00:00"},
         ),
     )
-    monkeypatch.setattr(
-        tick,
+    patch_dispatch(
+        monkeypatch,
         "execute_run",
         lambda job, client, *, run_id, **_: RunOutcome(state="done", run_id=run_id),
     )
@@ -273,16 +274,16 @@ def test_manual_run_dispatches_by_kind(
     def fail_execute_run(*a: Any, **kw: Any) -> RunOutcome:
         raise AssertionError("gated jobs never go through execute_run")
 
-    monkeypatch.setattr(tick, "execute_run", fail_execute_run)
+    patch_dispatch(monkeypatch, "execute_run", fail_execute_run)
 
     # gated: the checks run first; the fix worker only starts when they fire.
     monkeypatch.setattr(
-        tick.subprocess,
+        subprocess,
         "run",
         lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""),
     )
-    monkeypatch.setattr(
-        tick,
+    patch_dispatch(
+        monkeypatch,
         "run_checks",
         lambda checks, *, cwd, **kw: GateOutcome(
             passed=checks_pass,
@@ -316,7 +317,7 @@ def test_manual_run_dispatches_by_kind(
         def api_user(self) -> str:
             raise RuntimeError("gh auth missing")
 
-    monkeypatch.setattr(tick, "RealGhClient", _NoAuthGh)
+    patch_dispatch(monkeypatch, "RealGhClient", _NoAuthGh)
     review = _job(
         tmp_path,
         name="r",
@@ -417,7 +418,7 @@ def test_manual_pipeline_run_refuses_while_a_run_is_open(
         launched.append(argv)
         return 0, "", ""
 
-    monkeypatch.setattr(tick, "launch_pipeline", fake_launch)
+    patch_dispatch(monkeypatch, "launch_pipeline", fake_launch)
 
     assert _run_cli(monkeypatch, job) == 1
     assert launched == []
@@ -452,7 +453,7 @@ def test_request_pipeline_run_refused_while_open_notifies(
         launched.append(argv)
         return (0, "", "")
 
-    monkeypatch.setattr(tick, "launch_pipeline", fake_launch)
+    patch_dispatch(monkeypatch, "launch_pipeline", fake_launch)
 
     assert _run_cli(monkeypatch, job, "--trigger", "request") == 1
     assert launched == []

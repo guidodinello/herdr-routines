@@ -20,7 +20,10 @@ A core with no subprocess/network I/O (`config.py` / `schedule.py` / `history.py
 two do read/write the YAML config and the JSONL history file, but neither shells out or talks to
 Herdr) sits under an imperative shell
 (`cli.py` / `tick.py` / `runner.py`); `herdr.py` is the one adapter that shells out to `herdr`,
-behind a seam that's faked in tests. See
+behind a seam that's faked in tests. `tick.py` keeps the tick loop, the locks and the per-job
+dispatch decision; each job kind's run lives in its own `*_flow.py` module (`audit_flow`,
+`gated_pr_flow`, `gated_event_flow`, `gated_base_flow`, `routine_flow`, `routine_targets_flow`,
+`pipeline_flow`), over the helpers they share in `dispatch_common.py`. See
 [`docs/plan-v1.md#diagrams`](docs/plan-v1.md#diagrams) for the full-run sequence diagram and a
 breakdown of exactly what a Herdr API change vs. an agent-CLI change would touch.
 

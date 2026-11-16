@@ -8,6 +8,8 @@ from typing import Any, cast
 
 import pytest
 
+from tests.dispatch_modules import patch_dispatch
+
 
 @pytest.fixture
 def tmp_config_path(tmp_path: Path) -> Path:
@@ -112,7 +114,7 @@ def _dispatch_clock_follows_tick_now(monkeypatch: pytest.MonkeyPatch) -> None:
                 return cast(datetime, real_datetime.now(tz))
             return value if tz is not None else value.replace(tzinfo=None)
 
-    monkeypatch.setattr(tick, "datetime", _Clock)
+    patch_dispatch(monkeypatch, "datetime", _Clock)
 
     def _follow(fn: Any) -> Any:
         @functools.wraps(fn)

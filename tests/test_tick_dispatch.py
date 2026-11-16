@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from herdr_routines import runner, tick
+from herdr_routines import dispatch_common, runner, tick
 from herdr_routines.auto_fix import (
     build_audit_agent_name,
     build_gate_worker_agent_name,
@@ -32,6 +32,7 @@ from herdr_routines.config import Job
 from herdr_routines.findings import ledger_path, load_ledger
 from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import STALE_MARGIN, HistoryRecord, append, read_job
+from tests.dispatch_modules import patch_dispatch
 from tests.test_audit_dispatch import _FakeHerdr, _finding, _git
 from tests.test_audit_dispatch import _job as _audit_job
 from tests.test_review_scan import (
@@ -160,7 +161,7 @@ def cycle_calls(kind: Kind, monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append(run_id)
         return f"{job.name}: cycle ran", False
 
-    monkeypatch.setattr(tick, kind.cycle, _cycle)
+    patch_dispatch(monkeypatch, kind.cycle, _cycle)
     return calls
 
 
@@ -230,8 +231,10 @@ def test_stale_running_record_is_interrupted_and_nothing_is_reaped_on_a_live_boo
     job = kind.make_job()
     _seed(history, job, running_age_ms=kind.stale_age_ms)
     # The host booted before the stale run started, so its agents are not restored ones.
-    monkeypatch.setattr(
-        tick, "system_boot_epoch", lambda: (REGISTERED - timedelta(days=1)).timestamp()
+    patch_dispatch(
+        monkeypatch,
+        "system_boot_epoch",
+        lambda: (REGISTERED - timedelta(days=1)).timestamp(),
     )
     client = GuardClient(panes={job.agent_name: ("blocked", "w1:p1")})
 
@@ -252,7 +255,7 @@ def test_stale_running_record_reaps_the_agents_a_reboot_restored(
     # `workspace: root` jobs never reap (their pane is the ambient workspace).
     job = kind.make_job(workspace="worktree")
     _seed(history, job, running_age_ms=kind.stale_age_ms)
-    monkeypatch.setattr(tick, "system_boot_epoch", lambda: NOW.timestamp())
+    patch_dispatch(monkeypatch, "system_boot_epoch", lambda: NOW.timestamp())
     client = GuardClient(
         panes={
             job.agent_name: ("blocked", "w1:p7"),
@@ -472,7 +475,7 @@ def _review_env(
             ("acme", "widgets"): {"clone_url": str(origin), "default_branch": "main"}
         },
     )
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     history = tmp_path / "history.jsonl"
     append(history, HistoryRecord(ts=REGISTERED, job=job.name, state="registered"))
     return ReviewEnv(
@@ -539,7 +542,7 @@ def test_review_flow_dispatches_the_oldest_target_and_reports_every_skip_reason(
     )
     assert record.extra["pane_id"] == "w1:p1"
     assert record.extra["report_path"] == str(
-        tick.default_reports_dir() / f"auto-review-{run_id}-{h6}.md"
+        runner.default_reports_dir() / f"auto-review-{run_id}-{h6}.md"
     )
     aggregate = read_job(env.history, env.job.name)[-1]
     assert aggregate.state == "done"
@@ -554,7 +557,7 @@ def test_review_flow_dispatches_the_oldest_target_and_reports_every_skip_reason(
         aggregate.extra["failed"],
         aggregate.extra["repos_failed"],
     ) == (4, 4, 1, 3, 0, 0)
-    report = (tick.default_reports_dir() / f"review-{run_id}.md").read_text()
+    report = (runner.default_reports_dir() / f"review-{run_id}.md").read_text()
     for reason in ("max_attempts_exceeded", "review_already_posted", "over_cap"):
         assert reason in report
     assert env.client.started == [record.extra["agent"]]
@@ -612,7 +615,7 @@ def test_review_flow_isolates_a_repo_whose_info_cannot_be_read(
     assert aggregate.extra is not None
     assert aggregate.extra["gate"] == "failed"
     assert aggregate.extra["repos_failed"] == 1
-    report = (tick.default_reports_dir() / f"review-{env.run_id()}.md").read_text()
+    report = (runner.default_reports_dir() / f"review-{env.run_id()}.md").read_text()
     assert "repo_info_failed" in report
     assert env.client.notifications == [
         (
@@ -822,7 +825,7 @@ def test_review_job_prompt_replaces_the_engine_prompt_with_placeholders_resolved
     env.run()
 
     run_id = env.run_id()
-    report = tick.default_reports_dir() / (
+    report = runner.default_reports_dir() / (
         f"auto-review-{run_id}-{review_target_hash(env.job.name, 'acme/widgets#1')}.md"
     )
     assert env.client.prompt_texts == [
@@ -867,7 +870,7 @@ def audit_repo(
         "-m",
         "init",
     )
-    monkeypatch.setattr(tick, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
     return path
 
 
@@ -894,7 +897,7 @@ def _auditor(
     def on_prompt(agent: Any) -> str:
         if agent.name != AUDIT_AGENT:
             return fix_status
-        manifest = tick.default_reports_dir() / f"{AUDIT_RUN_ID}-findings.json"
+        manifest = runner.default_reports_dir() / f"{AUDIT_RUN_ID}-findings.json"
         manifest.parent.mkdir(parents=True, exist_ok=True)
         manifest.write_text(
             json.dumps({"version": 1, "check": "type-health", "findings": findings})
@@ -950,7 +953,7 @@ def test_audit_flow_runs_the_audit_then_one_fix_worker_in_their_own_worktrees(
     assert records[1].extra["scheduled_for"] == "2026-10-12T08:30:00+00:00"
     extra = records[2].extra
     assert extra is not None
-    branch = tick.build_branch_name(AUDIT_JOB, AUDIT_RUN_ID)
+    branch = runner.build_branch_name(AUDIT_JOB, AUDIT_RUN_ID)
     assert extra["gate"] == "fix_dispatched"
     assert extra["target"] == "base"
     assert (extra["findings_total"], extra["new"], extra["dispatched"]) == (2, 2, 2)
@@ -961,7 +964,7 @@ def test_audit_flow_runs_the_audit_then_one_fix_worker_in_their_own_worktrees(
     assert extra["final_agent_status"] == "idle"
     assert extra["session_id"] == f"ses-{FIX_AGENT}"
     assert extra["report_path"] == str(
-        tick.default_reports_dir() / f"{AUDIT_RUN_ID}.md"
+        runner.default_reports_dir() / f"{AUDIT_RUN_ID}.md"
     )
     # The audit and the fix worker each ran in a worktree of their own, both gone now.
     audit, fix = client.agents
@@ -992,7 +995,7 @@ def test_audit_repo_that_cannot_be_prepared_fails_before_any_agent_starts(
     repo.mkdir()
     if has_git_dir:
         (repo / ".git").mkdir()
-    monkeypatch.setattr(tick, "ensure_repo", _raises(RuntimeError("sync exploded")))
+    patch_dispatch(monkeypatch, "ensure_repo", _raises(RuntimeError("sync exploded")))
     job = _due_audit_job(repo, history)
     client = _FakeHerdr()
 
@@ -1007,7 +1010,7 @@ def test_audit_repo_that_cannot_be_prepared_fails_before_any_agent_starts(
     assert extra["target"] == "base"
     assert extra["report_written"] is False
     assert extra["report_path"] == str(
-        tick.default_reports_dir() / f"{AUDIT_RUN_ID}.md"
+        runner.default_reports_dir() / f"{AUDIT_RUN_ID}.md"
     )
     assert client.agents == []
     assert client.notifications == ["herdr-routines: audit-type-health failed"]
@@ -1099,14 +1102,14 @@ def test_audit_agent_that_fails_ends_the_run_without_a_fix_worker(
 def test_audit_fix_that_cannot_get_a_worktree_still_spends_the_attempt(
     audit_repo: Path, history: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_add = tick._add_worktree
+    real_add = dispatch_common._add_worktree
 
     def add_worktree(repo: Path, wt_path: Path, base: str) -> None:
         if wt_path.name.startswith("audit-fix-"):
             raise RuntimeError("git worktree add failed: simulated")
         real_add(repo, wt_path, base)
 
-    monkeypatch.setattr(tick, "_add_worktree", add_worktree)
+    patch_dispatch(monkeypatch, "_add_worktree", add_worktree)
     job = _due_audit_job(audit_repo, history)
     client = _FakeHerdr(_auditor([_finding(1)]))
 

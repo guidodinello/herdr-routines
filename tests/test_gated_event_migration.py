@@ -43,9 +43,11 @@ import pytest
 from herdr_routines import tick
 from herdr_routines.auto_fix import GithubEvent
 from herdr_routines.config import load_config
+from herdr_routines.gated_event_flow import _last_seen_event_ids
 from herdr_routines.history import HistoryRecord, append, read_job
 from herdr_routines.runner import RunOutcome
-from herdr_routines.tick import _last_seen_event_ids, run_tick
+from herdr_routines.tick import run_tick
+from tests.dispatch_modules import patch_dispatch
 from tests.test_github_event import (
     EVENT_LABEL,
     READ_CALLS,
@@ -240,14 +242,14 @@ def test_gated_event_check_behaviour_unchanged_after_migration(
 
     gh = GoldenGh()
     client = RecordingHerdrClient()
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
     git = _RecordingGitSubprocess()
-    monkeypatch.setattr("herdr_routines.tick.subprocess", git)
+    patch_dispatch(monkeypatch, "subprocess", git)
     # Issue 078 added post-settle gates that need a real worktree; this golden pin
     # stubs git, so it disables them to keep probing 077's record shapes and
     # watermark rules. The gates have their own real-git tests in test_github_event.
-    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
+    patch_dispatch(monkeypatch, "_verify_event_worker", lambda *a, **k: ())
 
     def tick(minute: int) -> None:
         run_tick(
@@ -472,7 +474,7 @@ def test_gated_event_check_behaviour_unchanged_after_migration(
                 raise OSError("git: not found")
             return super().run(argv, *args, **kwargs)
 
-    monkeypatch.setattr("herdr_routines.tick.subprocess", _BrokenCheckRef())
+    patch_dispatch(monkeypatch, "subprocess", _BrokenCheckRef())
     gh.prs = {15: {}}
     tick(16)
     tick(17)
@@ -513,14 +515,12 @@ def test_single_event_watermark_per_job(
     repo = _init_repo(tmp_path)
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
-    monkeypatch.setattr(
-        "herdr_routines.tick.RealGhClient", lambda: EventGhClient(events=False)
-    )
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: EventGhClient(events=False))
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
     # Issue 078's settle gates need a real worktree; this watermark pin stubs git and
     # only cares which poll writes `last_seen_event_ids`.
-    monkeypatch.setattr("herdr_routines.tick._verify_event_worker", lambda *a, **k: ())
+    patch_dispatch(monkeypatch, "_verify_event_worker", lambda *a, **k: ())
 
     run_ids: list[str] = []
 
@@ -528,7 +528,7 @@ def test_single_event_watermark_per_job(
         run_ids.append(run_id)
         return RunOutcome(state="done", run_id=run_id)
 
-    monkeypatch.setattr(tick, "execute_run", fake_execute_run)
+    patch_dispatch(monkeypatch, "execute_run", fake_execute_run)
     client = RecordingHerdrClient()
 
     def run(config: Any, minute: int) -> None:
@@ -540,9 +540,7 @@ def test_single_event_watermark_per_job(
         )
 
     def poll_returns(events: list[GithubEvent]) -> None:
-        monkeypatch.setattr(
-            "herdr_routines.tick.poll_github_event", lambda gh, **kw: list(events)
-        )
+        patch_dispatch(monkeypatch, "poll_github_event", lambda gh, **kw: list(events))
 
     def event(event_id: str, number: int) -> GithubEvent:
         return GithubEvent(
