@@ -1,7 +1,7 @@
 ---
 id: "060"
 title: "Split dispatch flows out of tick.py and table-drive config._build_job"
-status: in-progress
+status: done
 priority: medium
 area: infra
 ---
@@ -47,3 +47,14 @@ because any edit to `tick.py` conflicts with the concurrent type-gaps run.
   own logger name. Tests that replaced a collaborator on `tick` use
   `tests/dispatch_modules.patch_dispatch`, which replaces it in every dispatch module
   that binds it. The `_build_job` half is still open.
+- **2026-11-16**: `_build_job` table-driven. Its cyclomatic complexity went from 194
+  to 34 (radon). Each validation block moved verbatim into a `_build_*` helper, and
+  `_build_job` calls them in the original order, so the first error reported for a
+  config with several mistakes is the same as before. The three steps that differ by
+  kind (whether `checks` is required, the audit fields, and
+  `catch_up_minutes`/`prompt_file`/`deadline_ms`) come from the `_KIND_RULES` table.
+  `target`, `verify` and `pick` still compare `kind` inside their own helpers. A
+  differential run of the old and new `_build_job` on 200,000 mutated job configs gave
+  identical results, error messages and warnings. One unreachable branch was dropped:
+  the pipeline-specific `'checks' is not applicable` error, which the general
+  `'checks' requires kind: gated` error always pre-empted.

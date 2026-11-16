@@ -1,10 +1,9 @@
 ---
 id: "064"
 title: "Enforce the HistoryExtra schema when writing history records"
-status: blocked
+status: open
 priority: low
 area: infra
-gate: 060 (tick.py split) is merged
 ---
 
 ## Description
@@ -38,3 +37,6 @@ conflict with that split twice.
 - **2026-10-19**: filed from the type-gaps run (`extra` task, PR #195). The opt-in design
   was chosen there because enforcing it would touch about 60 tick.py sites while a parallel
   run was also editing tick.py.
+- **2026-11-16**: unblocked by 060. The record-construction sites are no longer all in
+  `tick.py`: they are spread over `tick.py`, `dispatch_common.py` and the `*_flow.py`
+  modules.
