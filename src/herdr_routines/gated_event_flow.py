@@ -164,7 +164,7 @@ def _process_event_target(
         )
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -188,7 +188,7 @@ def _process_event_target(
     except Exception as e:  # noqa: BLE001
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -223,7 +223,7 @@ def _process_event_target(
     except Exception as e:  # noqa: BLE001
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -254,7 +254,7 @@ def _process_event_target(
         # red CI that already exists is usually exactly what the job is for.
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="done",
@@ -290,7 +290,7 @@ def _process_event_target(
     if not new_events:
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="done",
@@ -343,7 +343,7 @@ def _process_event_target(
             if event.event_id not in exhausted_reported:
                 append(
                     history_path,
-                    HistoryRecord(
+                    HistoryRecord.new(
                         ts=now,
                         job=job.name,
                         state="skipped",
@@ -380,41 +380,42 @@ def _process_event_target(
         # after enrichment, which may replace it. A malformed name stays malformed, so
         # the event is skipped and marked seen rather than retried every tick; a check
         # that could not run is a failed attempt, retried within the event's budget.
-        ref_ok = _is_valid_branch_name(detailed.head_ref) if detailed.head_ref else True
+        head_ref = detailed.head_ref
+        ref_ok = _is_valid_branch_name(head_ref) if head_ref else True
         if ref_ok is None:
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="failed",
                     run_id=run_id,
-                    extra={
-                        "reason": "head_ref_check_failed",
-                        "event_id": event.event_id,
-                        "event_number": event.number,
-                        "attempt": attempt,
-                        "target": event_target,
-                    },
+                    extra=HistoryExtra(
+                        reason="head_ref_check_failed",
+                        event_id=event.event_id,
+                        event_number=event.number,
+                        attempt=attempt,
+                        target=event_target,
+                    ),
                 ),
             )
             any_failed = True
             continue
-        if not ref_ok:
+        if not ref_ok and head_ref:
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="skipped",
                     run_id=run_id,
-                    extra={
-                        "reason": "invalid_head_ref",
-                        "event_id": event.event_id,
-                        "event_number": event.number,
-                        "head_ref": detailed.head_ref,
-                        "target": event_target,
-                    },
+                    extra=HistoryExtra(
+                        reason="invalid_head_ref",
+                        event_id=event.event_id,
+                        event_number=event.number,
+                        head_ref=head_ref,
+                        target=event_target,
+                    ),
                 ),
             )
             if _notify_gate(job, "failure"):
@@ -451,7 +452,7 @@ def _process_event_target(
             )
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="skipped",
@@ -563,7 +564,7 @@ def _process_event_target(
 
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state=outcome_state,
@@ -581,7 +582,7 @@ def _process_event_target(
     state: HistoryState = "failed" if any_failed else "done"
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state=state,

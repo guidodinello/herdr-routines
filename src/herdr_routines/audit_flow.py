@@ -206,7 +206,7 @@ def _record_audit_failure(
         failure_extra.update(extra)
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state="failed",
@@ -593,7 +593,7 @@ def _diff_and_fix(
             _notify(client, f"herdr-routines: {job.name} {gate}", body=body)
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now, job=job.name, state="done", run_id=run_id, extra=extra
             ),
         )
@@ -629,7 +629,7 @@ def _diff_and_fix(
             _notify(client, f"herdr-routines: {job.name} failed", body=run.reason)
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now, job=job.name, state="failed", run_id=run_id, extra=extra
             ),
         )
@@ -646,7 +646,7 @@ def _diff_and_fix(
         )
     append(
         history_path,
-        HistoryRecord(ts=now, job=job.name, state="done", run_id=run_id, extra=extra),
+        HistoryRecord.new(ts=now, job=job.name, state="done", run_id=run_id, extra=extra),
     )
     return f"{job.name}: done ({gate})", False
 

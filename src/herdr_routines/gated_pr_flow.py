@@ -94,7 +94,7 @@ def _process_pr_target(
         )
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -125,7 +125,7 @@ def _process_pr_target(
     except Exception as e:  # noqa: BLE001
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -147,7 +147,7 @@ def _process_pr_target(
     except Exception as e:  # noqa: BLE001
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -199,7 +199,7 @@ def _process_pr_target(
         if attempt >= job.max_attempts_per_target:
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="skipped",
@@ -236,7 +236,7 @@ def _process_pr_target(
             )
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="skipped",
@@ -289,7 +289,7 @@ def _process_pr_target(
             )
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="skipped",
@@ -393,7 +393,7 @@ def _process_pr_target(
 
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state=outcome_state,
@@ -446,7 +446,7 @@ def _process_pr_target(
 
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state="done" if not any_failed else "failed",

@@ -65,7 +65,7 @@ from pathlib import Path
 from logger import get_logger
 
 from herdr_routines.herdr import HerdrClient, HerdrCliError
-from herdr_routines.history import HistoryRecord, append, read_all
+from herdr_routines.history import HistoryExtra, HistoryRecord, append, read_all
 from herdr_routines.pipeline_prepare import write_state_json, write_terminal_report
 from herdr_routines.pipeline_stages import STAGES, StageSpec
 
@@ -732,19 +732,19 @@ def _resume_run(
 
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=plan.matching.job,
             state="running",
             run_id=plan.matching.run_id,
-            extra={
-                "pipeline_run_id": run.run_id,
-                "report": str(plan.report_path),
-                "unit": plan.unit_name,
-                "deadline_epoch": plan.new_deadline,
-                "resume_count": plan.resume_count,
-                "resumed_from": plan.resumed_from,
-            },
+            extra=HistoryExtra(
+                pipeline_run_id=run.run_id,
+                report=str(plan.report_path),
+                unit=plan.unit_name,
+                deadline_epoch=plan.new_deadline,
+                resume_count=plan.resume_count,
+                resumed_from=plan.resumed_from or "",
+            ),
         ),
     )
 

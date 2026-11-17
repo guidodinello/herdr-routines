@@ -282,7 +282,7 @@ def _launch_pipeline_run(
     except RuntimeError as e:
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -316,7 +316,7 @@ def _launch_pipeline_run(
     if rc != 0:
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -340,7 +340,7 @@ def _launch_pipeline_run(
 
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state="running",

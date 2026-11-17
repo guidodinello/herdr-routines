@@ -77,7 +77,7 @@ def _process_base_target(
         )
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -126,7 +126,7 @@ def _process_base_target(
     except Exception as e:  # noqa: BLE001
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -165,7 +165,7 @@ def _process_base_target(
     if gate_outcome.passed:
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="done",
@@ -187,7 +187,7 @@ def _process_base_target(
     if attempt >= job.max_attempts_per_target:
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="skipped",
@@ -223,7 +223,7 @@ def _process_base_target(
     except OSError as e:
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -288,7 +288,7 @@ def _process_base_target(
     except Exception as e:  # noqa: BLE001
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -323,7 +323,7 @@ def _process_base_target(
         _cleanup_worktree(job.repo, fix_wt_path)
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -351,7 +351,7 @@ def _process_base_target(
         _cleanup_worktree(job.repo, fix_wt_path)
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -388,7 +388,7 @@ def _process_base_target(
         _cleanup_worktree(job.repo, fix_wt_path)
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -426,7 +426,7 @@ def _process_base_target(
     )
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state=state,

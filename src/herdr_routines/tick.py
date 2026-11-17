@@ -216,7 +216,7 @@ def _record_unexpected_failure(
     re-raising every tick. A pipeline job's open records are left alone: its detached unit
     may still be live and the pipeline watchdog owns finalising them. Best-effort: a
     history write failing here must not abort the tick either."""
-    extra = {"reason": "unexpected_error", "error": repr(error)}
+    extra = HistoryExtra(reason="unexpected_error", error=repr(error))
     try:
         records = read_job(history_path, job.name)
         terminal_run_ids = {
@@ -241,7 +241,7 @@ def _record_unexpected_failure(
             for run_id in to_close:
                 append(
                     history_path,
-                    HistoryRecord(
+                    HistoryRecord.new(
                         ts=now,
                         job=job.name,
                         state="failed",
@@ -386,7 +386,7 @@ def _guard_open_run(
                 stale_extra["reaped_agents"] = reaped
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="interrupted_unknown",
@@ -415,7 +415,7 @@ def _skip_if_agent_live(
         return None
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state="skipped",
@@ -448,7 +448,9 @@ def _decide_audit_job(
     run_timeout_ms = audit.timeout_ms + job.timeout_ms
 
     if not has_ever_been_seen(history_path, job.name):
-        append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
+        append(
+            history_path, HistoryRecord.new(ts=now, job=job.name, state="registered")
+        )
         return f"{job.name}: registered", False
 
     open_run_skip = _guard_open_run(
@@ -510,7 +512,9 @@ def _decide_gated_job(
 ) -> tuple[str, bool] | _PendingDispatch:
     # Standard guards (same as _process_job for regular jobs).
     if not has_ever_been_seen(history_path, job.name):
-        append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
+        append(
+            history_path, HistoryRecord.new(ts=now, job=job.name, state="registered")
+        )
         return f"{job.name}: registered", False
 
     open_run_skip = _guard_open_run(
@@ -590,7 +594,7 @@ def _fire_triggers(
             # not missed work, so its first run does not invent a `missed` record.
             collapsed: HistoryRecord | None = None
             if result.skipped_occurrences and last is not None:
-                collapsed = HistoryRecord(
+                collapsed = HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="missed",
@@ -632,7 +636,7 @@ def _fire_triggers(
                 extra["skipped_occurrences"] = result.skipped_occurrences
             append(
                 history_path,
-                HistoryRecord(ts=now, job=job.name, state="missed", extra=extra),
+                HistoryRecord.new(ts=now, job=job.name, state="missed", extra=extra),
             )
             if job.on_missed == "notify":
                 _notify(
@@ -742,7 +746,7 @@ def _poll_event_trigger(
     def _poll_failed(reason: str, error: str) -> tuple[str, bool]:
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -805,7 +809,7 @@ def _poll_event_trigger(
     def _poll_record(
         watermark: list[str], reason: str, *, new: int, dispatched: int
     ) -> HistoryRecord:
-        return HistoryRecord(
+        return HistoryRecord.new(
             ts=now,
             job=job.name,
             state="done",
@@ -1021,7 +1025,7 @@ def _dispatch_pending(
             return DispatchOutcome(f"{job.name}: {summary}", False, refusal=reason)
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="skipped",
@@ -1267,7 +1271,9 @@ def _decide_routine_job(
     run_timeout_ms: int,
 ) -> tuple[str, bool] | _PendingDispatch:
     if not has_ever_been_seen(history_path, job.name):
-        append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
+        append(
+            history_path, HistoryRecord.new(ts=now, job=job.name, state="registered")
+        )
         return f"{job.name}: registered", False
 
     open_run_skip = _guard_open_run(
@@ -1314,7 +1320,9 @@ def _decide_pipeline_job(
     job: Job, history_path: Path, *, client: HerdrClient, now: datetime
 ) -> tuple[str, bool] | _PendingDispatch:
     if not has_ever_been_seen(history_path, job.name):
-        append(history_path, HistoryRecord(ts=now, job=job.name, state="registered"))
+        append(
+            history_path, HistoryRecord.new(ts=now, job=job.name, state="registered")
+        )
         return f"{job.name}: registered", False
 
     open_run = _open_pipeline_run(history_path, job.name)
@@ -1354,7 +1362,7 @@ def _decide_pipeline_job(
                 extra["reason"] = reason
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state=state,
@@ -1399,7 +1407,7 @@ def _decide_pipeline_job(
         if _pipeline_host_rebooted_mid_run(bare_run_id):
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="failed",
@@ -1429,7 +1437,7 @@ def _decide_pipeline_job(
 
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="failed",
@@ -1449,7 +1457,7 @@ def _decide_pipeline_job(
     if _live_agent_exists(client, job):
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="skipped",
@@ -1480,7 +1488,7 @@ def _decide_pipeline_job(
     if result.decision == Decision.MISSED:
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="missed",
