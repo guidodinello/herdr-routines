@@ -152,7 +152,9 @@ def default_log_path() -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    init_logging(log_file=default_log_path())
+    # stderr, not stdout: ps/scheduled/history --json print their data on stdout,
+    # and a log line there (e.g. a config error) would break whatever parses it.
+    init_logging(log_file=default_log_path(), stream=sys.stderr)
     parser = _build_parser()
     args = parser.parse_args(argv)
     handler: Callable[[argparse.Namespace], int] = args.handler
