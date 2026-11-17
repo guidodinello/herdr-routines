@@ -90,3 +90,11 @@ testpaths = ["tests"]
 # pytest keeps the last 3 runs' tmp_path trees by default; here one run is ~270 MiB, which
 # filled the Pi's RAM-backed /tmp alongside opencode's leaked libraries (2026-10-20).
 tmp_path_retention_policy = "failed"
+# A warning fails the test that raises it, so a new one cannot hide in the output. The one
+# exception is the single-file `jobs.yaml` loader's deprecation notice: it is still a
+# supported layout, and many tests write one file as a shortcut. A test that expects a
+# warning asserts it with `pytest.warns`.
+filterwarnings = [
+    "error",
+    "ignore:Loading config from a single file:DeprecationWarning",
+]
