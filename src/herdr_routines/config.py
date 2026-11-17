@@ -20,7 +20,7 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final, Literal, NamedTuple, TypedDict, get_args
+from typing import Final, Literal, NamedTuple, TypedDict, TypeGuard, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -1099,12 +1099,12 @@ def _build_spawn_alias(raw: object, *, label: str) -> SpawnAlias:
         )
 
     agent_kind = raw.get("agent_kind", "claude")
-    if agent_kind not in VALID_AGENT_KINDS:
+    if not _is_choice(agent_kind, VALID_AGENT_KINDS):
         raise ConfigError(
             f"{label} ({alias!r}): 'agent_kind' must be one of {sorted(VALID_AGENT_KINDS)}"
         )
     workspace = raw.get("workspace", "worktree")
-    if workspace not in VALID_WORKSPACE_MODES:
+    if not _is_choice(workspace, VALID_WORKSPACE_MODES):
         raise ConfigError(
             f"{label} ({alias!r}): 'workspace' must be one of "
             f"{sorted(VALID_WORKSPACE_MODES)}"
@@ -1154,7 +1154,7 @@ def _build_github_event_check(evt: object, label: str, where: str) -> GateCheck:
             f"{label}: '{where}.github_event' has unknown key(s): {sorted(unknown_evt)}"
         )
     evt_query = evt.get("query")
-    if evt_query not in VALID_GITHUB_EVENT_QUERIES:
+    if not _is_choice(evt_query, VALID_GITHUB_EVENT_QUERIES):
         raise ConfigError(
             f"{label}: '{where}.query' must be one of "
             f"{sorted(VALID_GITHUB_EVENT_QUERIES)}"
@@ -1267,6 +1267,16 @@ def _build_trigger(
     if not isinstance(raw_request, bool):
         raise ConfigError(f"{label}: 'trigger.request' must be a boolean")
     return cron, event, raw_request
+
+
+def _is_choice[T: str](value: object, choices: frozenset[T]) -> TypeGuard[T]:
+    """True when `value` is one of `choices`.
+
+    Use this instead of a bare `value not in choices`: a YAML list or mapping is
+    unhashable, so the bare test raises TypeError before the ConfigError is reached
+    (issue 087).
+    """
+    return isinstance(value, str) and value in choices
 
 
 def _int_field(
@@ -1661,10 +1671,13 @@ def _build_review_select(
                 f"{label}: kind: review / pick: my_open_prs requires a non-empty "
                 f"'select' list drawn from {sorted(VALID_REVIEW_SELECT)}"
             )
-        if len(set(select_raw)) != len(select_raw):
+        # Only strings can be compared for duplicates; the loop below rejects anything
+        # else by position (a nested list or mapping is unhashable, issue 087).
+        all_strings = all(isinstance(mode, str) for mode in select_raw)
+        if all_strings and len(set(select_raw)) != len(select_raw):
             raise ConfigError(f"{label}: 'select' must not contain duplicates")
         for si, mode in enumerate(select_raw):
-            if not isinstance(mode, str) or mode not in VALID_REVIEW_SELECT:
+            if not _is_choice(mode, VALID_REVIEW_SELECT):
                 raise ConfigError(
                     f"{label}: 'select[{si}]' must be one of {sorted(VALID_REVIEW_SELECT)}"
                 )
@@ -1774,7 +1787,7 @@ def _build_target(
     target_raw = merged.get("target")
     target: JobTarget | None = None
     if target_raw is not None:
-        if not isinstance(target_raw, str) or target_raw not in VALID_TARGETS:
+        if not _is_choice(target_raw, VALID_TARGETS):
             raise ConfigError(f"{label}: 'target' must be 'pr' or 'base' or null")
         target = target_raw
         if inferred_target is not None and target != inferred_target:
@@ -1889,7 +1902,7 @@ def _build_verify(
         if not isinstance(verify_raw, list):
             raise ConfigError(f"{label}: 'verify' must be null or a list of gate names")
         for gate in verify_raw:
-            if not isinstance(gate, str) or gate not in VALID_VERIFY_GATES:
+            if not _is_choice(gate, VALID_VERIFY_GATES):
                 raise ConfigError(
                     f"{label}: 'verify' contains unknown gate {gate!r} — "
                     f"valid gates: "
@@ -1935,7 +1948,7 @@ def _build_pick(
     pick_raw = "my_open_prs" if review_sugar else merged["pick"]
     pick: TargetSelector | None = None
     if pick_raw is not None:
-        if not isinstance(pick_raw, str) or pick_raw not in VALID_TARGET_SELECTORS:
+        if not _is_choice(pick_raw, VALID_TARGET_SELECTORS):
             raise ConfigError(
                 f"{label}: 'pick' must be null or a known selector, got {pick_raw!r} — "
                 f"valid selectors: {sorted(VALID_TARGET_SELECTORS)}"
@@ -1990,7 +2003,7 @@ def _build_job(
     # `kind: review` job has no single checkout: it derives `repo` from the managed
     # base dir and never calls `ensure_repo`, so the repo/repository machinery must be
     # bypassed before it runs.
-    if merged["kind"] not in ACCEPTED_KIND_VALUES:
+    if not _is_choice(merged["kind"], ACCEPTED_KIND_VALUES):
         raise ConfigError(
             f"{label}: 'kind' must be one of {sorted(ACCEPTED_KIND_VALUES)}"
         )
@@ -1999,7 +2012,7 @@ def _build_job(
     repo, repository = _build_repo(merged, raw_job, label, name, review_sugar)
 
     declared_workspace = merged["workspace"]
-    if declared_workspace not in VALID_WORKSPACE_MODES:
+    if not _is_choice(declared_workspace, VALID_WORKSPACE_MODES):
         raise ConfigError(
             f"{label}: 'workspace' must be one of {sorted(VALID_WORKSPACE_MODES)}"
         )
@@ -2010,19 +2023,19 @@ def _build_job(
         workspace = "worktree"
 
     agent_kind = merged["agent_kind"]
-    if agent_kind not in VALID_AGENT_KINDS:
+    if not _is_choice(agent_kind, VALID_AGENT_KINDS):
         raise ConfigError(
             f"{label}: 'agent_kind' must be one of {sorted(VALID_AGENT_KINDS)}"
         )
 
     on_missed = merged["on_missed"]
-    if on_missed not in VALID_ON_MISSED:
+    if not _is_choice(on_missed, VALID_ON_MISSED):
         raise ConfigError(
             f"{label}: 'on_missed' must be one of {sorted(VALID_ON_MISSED)}"
         )
 
     notify_policy = merged["notify_policy"]
-    if notify_policy not in VALID_NOTIFY_POLICIES:
+    if not _is_choice(notify_policy, VALID_NOTIFY_POLICIES):
         raise ConfigError(
             f"{label}: 'notify_policy' must be one of {sorted(VALID_NOTIFY_POLICIES)}"
         )
@@ -2045,7 +2058,9 @@ def _build_job(
         raise ConfigError(f"{label}: 'timezone' must be a string")
     try:
         ZoneInfo(timezone)
-    except ZoneInfoNotFoundError as e:
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        # ValueError is what ZoneInfo raises for a malformed key: an empty string, an
+        # absolute path, or one that climbs with `..`.
         raise ConfigError(
             f"{label}: 'timezone' is not a valid IANA zone: {timezone!r}"
         ) from e
@@ -2078,7 +2093,7 @@ def _build_job(
         kind = "routine"
     else:
         declared_kind = merged["kind"]
-        if declared_kind not in VALID_JOB_KINDS:
+        if not _is_choice(declared_kind, VALID_JOB_KINDS):
             raise ConfigError(
                 f"{label}: 'kind' must be one of {sorted(ACCEPTED_KIND_VALUES)}"
             )
