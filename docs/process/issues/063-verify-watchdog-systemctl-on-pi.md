@@ -1,10 +1,9 @@
 ---
 id: "063"
 title: "Verify systemctl --user works inside the watchdog unit on the Pi"
-status: blocked
+status: done
 priority: high
 area: infra
-gate: operator task, to be run by hand on the Pi; not for the pipeline
 ---
 
 ## Description
@@ -42,3 +41,7 @@ fix the unit environment in `deploy/systemd/`. Then mark this `done`.
 ## Log
 
 - **2026-10-19**: filed from the audit-fixes run (PR #187 follow-up).
+- **2026-11-16**: checked on the Pi. The `systemd-run --user --wait --pipe --collect
+  systemctl --user list-units ...` command exited 0 (with the watchdog's own `--state`
+  filter). `journalctl --user -u herdr-routines-watchdog` shows no "systemd liveness is
+  unknown" warning in the last 30 days. No unit change was needed.
