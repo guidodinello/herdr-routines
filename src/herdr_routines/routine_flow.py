@@ -140,7 +140,7 @@ def _run_routine(
             pre_dispatch_extra["error"] = selected.error
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="failed",
@@ -160,7 +160,7 @@ def _run_routine(
             pre_dispatch_extra["reason"] = "no_target"
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="skipped",
@@ -179,7 +179,7 @@ def _run_routine(
         running_extra["target"] = target.ref
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state="running",
@@ -215,7 +215,7 @@ def _run_routine(
             used_fallback = True
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state=outcome.state,
@@ -231,7 +231,7 @@ def _run_routine(
             fallback_run_id = make_run_id(f"{job.name}-fallback", now)
             append(
                 history_path,
-                HistoryRecord(
+                HistoryRecord.new(
                     ts=now,
                     job=job.name,
                     state="running",
@@ -262,7 +262,7 @@ def _run_routine(
         extra["retry_eligible_reason"] = outcome.reason
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state=outcome.state,
@@ -285,7 +285,7 @@ def _run_routine(
         # Append a running record for the retry attempt
         append(
             history_path,
-            HistoryRecord(
+            HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="running",
@@ -319,7 +319,7 @@ def _run_routine(
         final_extra["final_attempt"] = True
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state=outcome.state,

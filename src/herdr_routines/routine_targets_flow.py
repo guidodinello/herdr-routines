@@ -108,7 +108,7 @@ def _targets_selector_failed(
     extra["error"] = failed.error
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now, job=job.name, state="failed", run_id=occ.run_id, extra=extra
         ),
     )
@@ -240,7 +240,7 @@ def _run_routine_targets(
 
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state="failed" if any_failed else "done",
@@ -333,7 +333,7 @@ def _review_target_record(
         extra["reason"] = reason
     if error is not None:
         extra["error"] = error
-    return HistoryRecord(
+    return HistoryRecord.new(
         ts=now, job=job.name, state=state, run_id=occ.run_id, extra=extra
     )
 
@@ -446,7 +446,7 @@ def _run_one_target(
 
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state="running",
