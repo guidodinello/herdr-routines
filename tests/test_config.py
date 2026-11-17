@@ -1508,7 +1508,8 @@ jobs:
     retry_on:
       - agent_start_failed
 """
-    cfg = load_config(write(tmp_config_path, text))
+    with pytest.warns(UserWarning, match="'retry_on' is set but 'retry_attempts' is 0"):
+        cfg = load_config(write(tmp_config_path, text))
     job = cfg.job("a")
     assert job is not None
     assert job.retry_attempts == 0
@@ -1526,7 +1527,8 @@ jobs:
     retry_on:
       - agent_start_failed
 """
-    cfg = load_config(write(tmp_config_path, text))
+    with pytest.warns(UserWarning, match="'retry_attempts' > 0 on workspace: root"):
+        cfg = load_config(write(tmp_config_path, text))
     job = cfg.job("a")
     assert job is not None
     assert job.retry_attempts == 1
