@@ -1,10 +1,9 @@
 ---
 id: "060"
 title: "Split dispatch flows out of tick.py and table-drive config._build_job"
-status: blocked
+status: in-progress
 priority: medium
 area: infra
-gate: the type-gaps refactor PRs that edit tick.py (#191, #195 and its pending "asserts" wave) are merged
 ---
 
 ## Description
@@ -37,3 +36,14 @@ because any edit to `tick.py` conflicts with the concurrent type-gaps run.
 
 - **2026-10-19**: filed from the code-health audit follow-ups. Blocked only on
   the open type-gaps PRs touching `tick.py`.
+- **2026-11-16**: unblocked. The gate PRs are merged (#191, #195, and the asserts wave
+  as #201). `tick.py` had grown to 5,635 lines by then.
+- **2026-11-16**: dispatch flows split out. `tick.py` (1,523 lines) keeps the loop, the
+  locks, the per-job decide functions and the dispatch core. The per-kind decide
+  functions stay there because they and `dispatch_occurrence` call each other. The runs
+  moved to `audit_flow`, `gated_pr_flow`, `gated_event_flow`, `gated_base_flow`,
+  `routine_flow`, `routine_targets_flow` and `pipeline_flow`, over `dispatch_common`.
+  All 109 top-level definitions are unchanged (compared by AST). Each module now has its
+  own logger name. Tests that replaced a collaborator on `tick` use
+  `tests/dispatch_modules.patch_dispatch`, which replaces it in every dispatch module
+  that binds it. The `_build_job` half is still open.

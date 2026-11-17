@@ -13,6 +13,7 @@ from typing import Any, get_args, get_type_hints
 
 import pytest
 
+from herdr_routines import dispatch_common
 from herdr_routines.auto_fix import (
     PostedBody,
     PRInfo,
@@ -33,8 +34,10 @@ from herdr_routines.config import (
     Job,
     RoutinesConfig,
 )
+from herdr_routines.dispatch_common import _WorkerSettled
 from herdr_routines.history import HistoryRecord, HistoryState, append, read_job
-from herdr_routines.tick import _WorkerSettled, run_tick
+from herdr_routines.tick import run_tick
+from tests.dispatch_modules import patch_dispatch
 
 
 def fetch_thread_bodies(gh: Any, **kwargs: Any) -> str:
@@ -54,7 +57,7 @@ def _stub_ensure_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     """These tests exercise PR enumeration/dispatch/gating logic, not repo-sync behavior
     (that's test_repos.py's job), and mostly point `job.repo` at a bare tmp_path that
     isn't a real git checkout — stub ensure_repo so it's not called for real."""
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
     monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
 
 
@@ -734,9 +737,10 @@ def test_auto_fix_tick_integration(
         def graphql(self, query, **variables):
             return {"data": {}}
 
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", MockGhClient)
-    monkeypatch.setattr(
-        "herdr_routines.tick.subprocess",
+    patch_dispatch(monkeypatch, "RealGhClient", MockGhClient)
+    patch_dispatch(
+        monkeypatch,
+        "subprocess",
         type(
             "MockSubprocess",
             (),
@@ -1727,9 +1731,10 @@ def test_tick_uses_the_configured_trusted_review_authors(
         prs=[_pr_payload(7, "testuser")],
         review_threads={7: _threads_payload(_thread("alice", "ALICE NOTE"))},
     )
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
-    monkeypatch.setattr(
-        "herdr_routines.tick.subprocess",
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
+    patch_dispatch(
+        monkeypatch,
+        "subprocess",
         type(
             "MockSubprocess",
             (),
@@ -1760,7 +1765,7 @@ def test_tick_uses_the_configured_trusted_review_authors(
             session_id=None,
         )
 
-    monkeypatch.setattr("herdr_routines.tick._dispatch_fix_worker", _dispatch)
+    patch_dispatch(monkeypatch, "_dispatch_fix_worker", _dispatch)
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=FakeFullClient(), now=t0)  # type: ignore[arg-type]
@@ -2001,7 +2006,7 @@ def test_worker_failed_reason_set_is_closed() -> None:
     eight traced values and Literal-typed end to end. The expected set is spelled out
     here independently of the `WorkerFailedReason` definition in history.py, so a typo
     copied into both sides of the Literal cannot make this test vacuous."""
-    from herdr_routines import auto_fix, history, tick
+    from herdr_routines import auto_fix, history
 
     expected = frozenset(
         {
@@ -2022,7 +2027,7 @@ def test_worker_failed_reason_set_is_closed() -> None:
 
     # AC1: `_WorkerFailed.reason` is annotated `WorkerFailedReason`, not plain `str` —
     # the annotation must resolve to a Literal over exactly the eight values.
-    reason_hint = get_type_hints(tick._WorkerFailed)["reason"]
+    reason_hint = get_type_hints(dispatch_common._WorkerFailed)["reason"]
     assert get_args(reason_hint), (
         f"_WorkerFailed.reason must be annotated WorkerFailedReason, got {reason_hint}"
     )

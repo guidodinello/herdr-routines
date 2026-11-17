@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from herdr_routines import cli, tick
+from herdr_routines import cli, runner, tick, verify
 from herdr_routines.auto_fix import (
     PostedBody,
     ReviewPR,
@@ -43,6 +43,7 @@ from herdr_routines.history import (
     read_job,
 )
 from herdr_routines.runner import default_reports_dir, substitute_prompt
+from tests.dispatch_modules import patch_dispatch
 from tests.test_review_scan import ReviewGh, ReviewHerdrClient, _setup_repo
 
 JOBS_DIR = Path(__file__).resolve().parent.parent / "deploy" / "jobs.d"
@@ -222,7 +223,7 @@ def test_review_job_selection_unchanged_after_migration(
         },
     )
     client = _MigrationClient(gh)
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     append(history, HistoryRecord(ts=REGISTERED, job=JOB, state="registered"))
     append(
         history,
@@ -443,7 +444,7 @@ def _world(
     )
     client = _SilentClient(gh)
     client.silent = silent
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     history = state / "history.jsonl"
     append(history, HistoryRecord(ts=REGISTERED, job="pr-sweeper", state="registered"))
     return _World(repos, widgets, gh, client, history, jobs_dir)
@@ -484,13 +485,13 @@ def test_routine_fans_out_over_targets(
     job = _load_world_job(world)
     assert (job.kind, job.max_targets_per_run) == ("routine", 3)
     runs: list[tuple[str, Any]] = []
-    real_execute_run = tick.execute_run
+    real_execute_run = runner.execute_run
 
     def spy(job: Any, client: Any, **kw: Any) -> Any:
         runs.append((kw["target"].ref, kw["placement"]))
         return real_execute_run(job, client, **kw)
 
-    monkeypatch.setattr(tick, "execute_run", spy)
+    patch_dispatch(monkeypatch, "execute_run", spy)
 
     outcome = _tick_world(world, job)
 
@@ -608,15 +609,15 @@ def test_review_kind_dispatches_through_routine_path(
         },
     )
     client = _MigrationClient(gh)
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     seen: list[tuple[str, str, Path]] = []
-    real_execute_run = tick.execute_run
+    real_execute_run = runner.execute_run
 
     def spy(job: Any, client: Any, **kw: Any) -> Any:
         seen.append((job.kind, kw["target"].ref, kw["placement"].workdir))
         return real_execute_run(job, client, **kw)
 
-    monkeypatch.setattr(tick, "execute_run", spy)
+    patch_dispatch(monkeypatch, "execute_run", spy)
     job = dataclasses.replace(shipped, enabled=True)
     append(history, HistoryRecord(ts=REGISTERED, job=JOB, state="registered"))
 
@@ -811,7 +812,7 @@ def test_several_targets_need_a_selector_that_can_return_several(
 
 
 def test_target_url_placeholder_does_not_clobber_the_target_placeholder() -> None:
-    target = tick.VerifyTarget("acme", "widgets", 7)
+    target = verify.VerifyTarget("acme", "widgets", 7)
     text = substitute_prompt(
         "$ROUTINE_TARGET_URL | $ROUTINE_TARGET",
         report_path=Path("/r.md"),

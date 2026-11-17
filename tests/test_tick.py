@@ -20,6 +20,14 @@ from herdr_routines.config import (
     Retention,
     RoutinesConfig,
 )
+from herdr_routines.dispatch_common import (
+    _is_job_agent,
+    _live_agent_exists,
+    _reap_agents_of_rebooted_run,
+    _WorkerFailed,
+    _WorkerResult,
+    _WorkerSettled,
+)
 from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
 from herdr_routines.history import (
     HistoryRecord,
@@ -28,17 +36,9 @@ from herdr_routines.history import (
     rolled_history_paths,
     rolled_path,
 )
-from herdr_routines.tick import (
-    _classify_pipeline_outcome,
-    _is_job_agent,
-    _live_agent_exists,
-    _process_pipeline_job,
-    _reap_agents_of_rebooted_run,
-    _WorkerFailed,
-    _WorkerResult,
-    _WorkerSettled,
-    run_tick,
-)
+from herdr_routines.pipeline_flow import _classify_pipeline_outcome
+from herdr_routines.tick import _process_pipeline_job, run_tick
+from tests.dispatch_modules import patch_dispatch
 
 
 @pytest.fixture(autouse=True)
@@ -48,7 +48,7 @@ def _stub_ensure_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     git checkout — stub ensure_repo so it's not called for real. Tests that specifically
     verify the ensure_repo-in-dispatch gate (e.g. test_repo_url_tick_runner_gate) override
     this with their own monkeypatch.setattr."""
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
     monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
 
 
@@ -57,9 +57,7 @@ def _pipeline_unit_not_active(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default the guard's systemd probe to "unit is gone", so tests never shell out to the
     host's real systemctl (absent on macOS, no user bus on CI: it would read as "can't
     tell" and block every stalled run). Tests of the liveness tie-breaker override it."""
-    monkeypatch.setattr(
-        "herdr_routines.tick.pipeline_unit_active", lambda run_id: False
-    )
+    patch_dispatch(monkeypatch, "pipeline_unit_active", lambda run_id: False)
 
 
 @pytest.fixture(autouse=True)
@@ -78,8 +76,9 @@ def _isolate_pipeline_worktrees_root(
     Redirected per-test rather than by `monkeypatch.setenv("HOME", ...)`: the root is a
     function of `Path.home()` captured at call time, and pinning it directly is what makes
     the path a test can compute without duplicating HOME's layout rules."""
-    monkeypatch.setattr(
-        "herdr_routines.tick.default_worktrees_root",
+    patch_dispatch(
+        monkeypatch,
+        "default_worktrees_root",
         lambda *args, **kwargs: (
             tmp_path / "home" / ".herdr" / "worktrees" / "herdr-routines"
         ),
@@ -790,8 +789,8 @@ def test_auto_fix_tick_registers_and_runs(
     config = RoutinesConfig(jobs=(job,))
     client = FakeFullClient()
 
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", MockGhClient)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", MockGhClient)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     outcome1 = run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -956,13 +955,11 @@ def _register_and_run_auto_fix_job(
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
     config = RoutinesConfig(jobs=(job,))
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh_client)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh_client)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
     # These tests pin notification policy, not the post-settle gates (issue 070), and the
     # mocked subprocess has no real worktree for them to read.
-    monkeypatch.setattr(
-        "herdr_routines.tick._verify_fix_worker", lambda *args, **kwargs: ()
-    )
+    patch_dispatch(monkeypatch, "_verify_fix_worker", lambda *args, **kwargs: ())
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1042,8 +1039,8 @@ def test_notify_policy_default_suppresses_per_pr_skip_but_notifies_aggregate(
     history_path_dest = _register_then_populate_over_cap_pr(job, tmp_path, monkeypatch)
     config = RoutinesConfig(jobs=(job,))
     client = FakeFullClient()
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", EligiblePrGhClient)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", EligiblePrGhClient)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
 
     t2 = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)
     outcome = run_tick(config, history_path_dest, client=client, now=t2)  # type: ignore[arg-type]
@@ -1063,8 +1060,8 @@ def test_notify_policy_on_failure_suppresses_per_pr_skip_and_aggregate(
     history_path_dest = _register_then_populate_over_cap_pr(job, tmp_path, monkeypatch)
     config = RoutinesConfig(jobs=(job,))
     client = FakeFullClient()
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", EligiblePrGhClient)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", EligiblePrGhClient)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
 
     t2 = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)
     outcome = run_tick(config, history_path_dest, client=client, now=t2)  # type: ignore[arg-type]
@@ -1084,8 +1081,8 @@ def test_notify_policy_always_shows_per_pr_skip(
     history_path_dest = _register_then_populate_over_cap_pr(job, tmp_path, monkeypatch)
     config = RoutinesConfig(jobs=(job,))
     client = FakeFullClient()
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", EligiblePrGhClient)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", EligiblePrGhClient)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
 
     t2 = datetime(2026, 1, 1, 1, 0, 0, tzinfo=UTC)
     run_tick(config, history_path_dest, client=client, now=t2)  # type: ignore[arg-type]
@@ -1436,7 +1433,7 @@ def test_tick_dispatches_pipeline_launch_before_record(
         calls.append(argv)
         return 0, "", ""
 
-    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
+    patch_dispatch(monkeypatch, "launch_pipeline", fake_launch)
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1473,7 +1470,7 @@ def test_pipeline_deadline_is_computed_by_tick_and_recorded(
         calls.append(argv)
         return 0, "", ""
 
-    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
+    patch_dispatch(monkeypatch, "launch_pipeline", fake_launch)
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=FakePipelineClient(), now=t0)  # type: ignore[arg-type]
@@ -1505,9 +1502,7 @@ def test_pipeline_dispatches_despite_realistic_tick_delay(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1528,9 +1523,7 @@ def test_tick_pipeline_launch_failure_writes_terminal_failed(
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
 
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (1, "", "boom")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (1, "", "boom"))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1563,9 +1556,7 @@ def test_other_jobs_still_run_during_pipeline(
     config = RoutinesConfig(jobs=(pipeline_job, plain_job))
     client = FakeFullClient(settle_status="idle")
 
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     outcome1 = run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1590,9 +1581,7 @@ def test_pipeline_reconciles_ok_report_as_done(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1625,9 +1614,7 @@ def test_pipeline_report_guard_partial_tolerant(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1662,9 +1649,7 @@ def test_pipeline_partial_deadline_report_is_tolerated_but_failed(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1695,9 +1680,7 @@ def test_pipeline_quota_exhausted_report_is_classified(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1737,7 +1720,7 @@ def test_pipeline_quota_exhausted_is_terminal_even_with_a_fallback_model(
         launches.append(argv)
         return 0, "", ""
 
-    monkeypatch.setattr("herdr_routines.tick.launch_pipeline", fake_launch)
+    patch_dispatch(monkeypatch, "launch_pipeline", fake_launch)
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1766,13 +1749,9 @@ def _dispatch_pipeline_and_get_run_id(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
     worktrees_root = tmp_path / "worktrees"
-    monkeypatch.setattr(
-        "herdr_routines.tick.default_worktrees_root", lambda: worktrees_root
-    )
+    patch_dispatch(monkeypatch, "default_worktrees_root", lambda: worktrees_root)
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1866,9 +1845,7 @@ def test_pipeline_fails_fast_on_host_reboot_before_deadline(
         {"1": "ses_a1b2c3d4e5f6a1b2c3d4e5f6a1"},
         mtime=now.timestamp() - 1800,
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick.system_boot_epoch", lambda: now.timestamp() - 300
-    )
+    patch_dispatch(monkeypatch, "system_boot_epoch", lambda: now.timestamp() - 300)
 
     outcome = run_tick(
         config, history_path, client=client, now=now + timedelta(minutes=3)
@@ -1891,9 +1868,7 @@ def test_pipeline_skipped_while_agent_live(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1923,9 +1898,7 @@ def test_tick_pipeline_overlap_guard_survives_without_orchestrator_agent(
     config = RoutinesConfig(jobs=(job,))
     # No orchestrator agent exists any more: `agent_statuses` has nothing to find.
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -1970,17 +1943,15 @@ def _stalled_pipeline_run(
     bare id and the tick time to run the next tick at."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(
-        "herdr_routines.tick.default_heartbeat_dir", lambda: tmp_path / "no-heartbeats"
+    patch_dispatch(
+        monkeypatch, "default_heartbeat_dir", lambda: tmp_path / "no-heartbeats"
     )
     history_path = tmp_path / "state" / "history.jsonl"
     job = make_pipeline_job(tmp_path)
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -2028,7 +1999,7 @@ def test_pipeline_guard_ignores_a_stalled_in_flight_run(
         queried.append(run_id)
         return False
 
-    monkeypatch.setattr("herdr_routines.tick.pipeline_unit_active", unit_gone)
+    patch_dispatch(monkeypatch, "pipeline_unit_active", unit_gone)
 
     outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
     assert outcome.summaries != ("nightly-pipeline: skipped (already running)",)
@@ -2045,9 +2016,7 @@ def test_pipeline_guard_blocks_a_stalled_run_whose_unit_is_live_or_unknown(
     config, client, history_path, _bare_run_id, t2 = _stalled_pipeline_run(
         tmp_path, monkeypatch
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick.pipeline_unit_active", lambda run_id: unit_active
-    )
+    patch_dispatch(monkeypatch, "pipeline_unit_active", lambda run_id: unit_active)
 
     outcome = run_tick(config, history_path, client=client, now=t2)  # type: ignore[arg-type]
     assert outcome.summaries == ("nightly-pipeline: skipped (already running)",)
@@ -2064,7 +2033,7 @@ def test_pipeline_guard_does_not_query_systemd_for_a_healthy_run(
     def fail(run_id: str) -> bool:
         raise AssertionError("systemd queried for a run that is not stalled")
 
-    monkeypatch.setattr("herdr_routines.tick.pipeline_unit_active", fail)
+    patch_dispatch(monkeypatch, "pipeline_unit_active", fail)
 
     # One minute after dispatch: deadline hours away, so the run is not stalled.
     t_healthy = t2 - timedelta(days=1) + timedelta(minutes=1)
@@ -2167,7 +2136,7 @@ def test_dispatch_reuses_existing_worktree(
     since the orchestrator deliberately retains its worktree — dispatches successfully
     by reusing that worktree instead of failing on a second `git worktree add`."""
     from herdr_routines.auto_fix import PRInfo
-    from herdr_routines.tick import _dispatch_fix_worker
+    from herdr_routines.gated_pr_flow import _dispatch_fix_worker
 
     branch = "auto/pipeline-20260904T050000Z"
     repo = _init_repo_with_branch(tmp_path, branch=branch)
@@ -2178,7 +2147,7 @@ def test_dispatch_reuses_existing_worktree(
     _git("worktree", "add", str(other_wt), branch, cwd=repo)
 
     job = make_fix_worker_job(tmp_path, repo=repo)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
 
     client = FakeFixWorkerClient(settle_status="idle")
     pr = PRInfo(
@@ -2223,8 +2192,8 @@ def test_dispatch_failure_records_reason(
     config = RoutinesConfig(jobs=(job,))
     client = FakeFullClient()
 
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", MockGhClient)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", MockGhClient)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
 
     pr = PRInfo(
         number=81,
@@ -2233,18 +2202,21 @@ def test_dispatch_failure_records_reason(
         url="",
         head_sha="sha-before",
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick.list_open_prs",
+    patch_dispatch(
+        monkeypatch,
+        "list_open_prs",
         lambda gh, *, owner, repo, branch_prefix, author, trusted_authors: [pr],
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick.is_eligible",
+    patch_dispatch(
+        monkeypatch,
+        "is_eligible",
         lambda gh, *, owner, repo, pr, trusted_authors: EligiblePR(
             pr=pr, reason="unresolved_threads"
         ),
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick._dispatch_fix_worker",
+    patch_dispatch(
+        monkeypatch,
+        "_dispatch_fix_worker",
         lambda **kwargs: _WorkerFailed(
             reason="worktree_creation_failed", error="boom: something specific"
         ),
@@ -2349,8 +2321,8 @@ def test_dispatch_worker_result_history_record(
     config = RoutinesConfig(jobs=(job,))
     client = FakeFullClient()
 
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", MockGhClient)
-    monkeypatch.setattr("herdr_routines.tick.subprocess", MockSubprocess())
+    patch_dispatch(monkeypatch, "RealGhClient", MockGhClient)
+    patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
 
     pr = PRInfo(
         number=81,
@@ -2359,23 +2331,21 @@ def test_dispatch_worker_result_history_record(
         url="",
         head_sha="sha-before",
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick.list_open_prs",
+    patch_dispatch(
+        monkeypatch,
+        "list_open_prs",
         lambda gh, *, owner, repo, branch_prefix, author, trusted_authors: [pr],
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick.is_eligible",
+    patch_dispatch(
+        monkeypatch,
+        "is_eligible",
         lambda gh, *, owner, repo, pr, trusted_authors: EligiblePR(
             pr=pr, reason="unresolved_threads"
         ),
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick._dispatch_fix_worker", lambda **kwargs: worker_result
-    )
+    patch_dispatch(monkeypatch, "_dispatch_fix_worker", lambda **kwargs: worker_result)
     # The gates have their own tests; this one pins the record's shape for a settled worker.
-    monkeypatch.setattr(
-        "herdr_routines.tick._verify_fix_worker", lambda *args, **kwargs: ()
-    )
+    patch_dispatch(monkeypatch, "_verify_fix_worker", lambda *args, **kwargs: ())
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
@@ -2402,7 +2372,7 @@ def test_live_agent_guard_matches_dispatch_name(tmp_path: Path) -> None:
     (`build_worker_agent_name`, which always carries a run_id tail), not the bare
     `build_pr_agent_name` name that the dispatcher never creates."""
     from herdr_routines.auto_fix import build_pr_agent_name, build_worker_agent_name
-    from herdr_routines.tick import _pr_worker_is_live
+    from herdr_routines.dispatch_common import _pr_worker_is_live
 
     job_name = "auto-fix-prs"
     pr_number = 81
@@ -2437,9 +2407,7 @@ def test_tick_reconciles_launcher_failure_stub(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -2566,7 +2534,7 @@ def test_retry_bounded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Acceptance criterion 4: at most retry_attempts extra attempts are made
     synchronously, then the final failure is recorded and no further attempt occurs."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr("herdr_routines.tick.time.sleep", lambda s: None)
+    monkeypatch.setattr("herdr_routines.routine_flow.time.sleep", lambda s: None)
     history_path = tmp_path / "state" / "history.jsonl"
     # retry_attempts=2 means 2 extra attempts after the first failure = 3 total
     job = make_job(
@@ -2606,7 +2574,7 @@ def test_retry_history_distinct(
     """Acceptance criterion 5: each attempt is logged distinctly with attempt index,
     distinct run_id (-retryN suffix), and last_terminal_run returns the final attempt."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr("herdr_routines.tick.time.sleep", lambda s: None)
+    monkeypatch.setattr("herdr_routines.routine_flow.time.sleep", lambda s: None)
     history_path = tmp_path / "state" / "history.jsonl"
     job = make_job(
         tmp_path,
@@ -2822,13 +2790,13 @@ def test_pipeline_workers_capture_tail_before_close(
     """AC 6: Pipeline gated/base workers mirror the same capture-before-close with
     agent_read_visible --lines 200 and single tail file."""
     from herdr_routines.auto_fix import PRInfo
-    from herdr_routines.tick import _dispatch_fix_worker
+    from herdr_routines.gated_pr_flow import _dispatch_fix_worker
 
     branch = "auto/pipeline-20260913T050000Z"
     repo = _init_repo_with_branch(tmp_path, branch=branch)
 
     job = make_fix_worker_job(tmp_path, repo=repo)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
 
     client = TailTrackingFixClient(visible_screen="pipeline worker tail output")
     pr = PRInfo(
@@ -2938,9 +2906,7 @@ def test_pipeline_skipped_report_classifies_as_skipped(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -2984,9 +2950,7 @@ def test_pipeline_skipped_report_sends_no_failure_notification(
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
-    monkeypatch.setattr(
-        "herdr_routines.tick.launch_pipeline", lambda argv, **kw: (0, "", "")
-    )
+    patch_dispatch(monkeypatch, "launch_pipeline", lambda argv, **kw: (0, "", ""))
 
     t0 = datetime.now(UTC).replace(microsecond=0)
     run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type]
@@ -3260,9 +3224,7 @@ def test_pipeline_open_run_without_run_id_raises_a_clear_error(
     t0 = datetime.now(UTC).replace(microsecond=0)
     append(history_path, HistoryRecord(ts=t0, job=job.name, state="registered"))
     append(history_path, HistoryRecord(ts=t0, job=job.name, state="running"))
-    monkeypatch.setattr(
-        "herdr_routines.tick._pipeline_run_is_live", lambda *a, **kw: False
-    )
+    patch_dispatch(monkeypatch, "_pipeline_run_is_live", lambda *a, **kw: False)
 
     with pytest.raises(RuntimeError, match="open pipeline run record has no run_id"):
         _process_pipeline_job(
@@ -3327,14 +3289,15 @@ def _run_base_gate(
     checks_pass: bool,
 ) -> tuple[str, bool]:
     from herdr_routines.auto_fix import GateOutcome
-    from herdr_routines.tick import _process_base_target
+    from herdr_routines.gated_base_flow import _process_base_target
 
     monkeypatch.setattr(
-        "herdr_routines.tick.subprocess.run",
+        "subprocess.run",
         lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""),
     )
-    monkeypatch.setattr(
-        "herdr_routines.tick.run_checks",
+    patch_dispatch(
+        monkeypatch,
+        "run_checks",
         lambda checks, *, cwd, **kw: GateOutcome(
             passed=checks_pass,
             results=(),

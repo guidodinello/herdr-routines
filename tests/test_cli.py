@@ -25,6 +25,7 @@ from herdr_routines.config import GateCheck, Job, RoutinesConfig
 from herdr_routines.history import HistoryRecord, append, rolled_path
 from herdr_routines.runner import RunOutcome
 from herdr_routines.tick import TickOutcome
+from tests.dispatch_modules import patch_dispatch
 from tests.test_review_scan import ReviewGh, _pr
 
 
@@ -701,7 +702,7 @@ def test_cmd_run_pipeline_never_calls_execute_run(
     def fail_execute_run(*a, **kw):
         raise AssertionError("execute_run must never be called for kind: pipeline")
 
-    monkeypatch.setattr(tick, "execute_run", fail_execute_run)
+    patch_dispatch(monkeypatch, "execute_run", fail_execute_run)
     # The dispatch's live-agent guard queries herdr; give it a fake client so the test never
     # shells out to a real `herdr` binary (absent on CI, present on a dev machine).
     monkeypatch.setattr(cli, "HerdrClient", lambda: _NoLiveAgentsClient())
@@ -712,8 +713,8 @@ def test_cmd_run_pipeline_never_calls_execute_run(
         launched.append(argv)
         return 0, "", ""
 
-    monkeypatch.setattr(tick, "launch_pipeline", fake_launch)
-    monkeypatch.setattr(tick, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "launch_pipeline", fake_launch)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
 
     assert cli.main(["run", "nightly-pipeline"]) == 0
     assert len(launched) == 1
@@ -1013,7 +1014,7 @@ def test_cmd_run_refuses_while_the_job_lock_is_held(
     def fail_execute_run(*a, **kw):
         raise AssertionError("execute_run must not run while the job lock is held")
 
-    monkeypatch.setattr(tick, "execute_run", fail_execute_run)
+    patch_dispatch(monkeypatch, "execute_run", fail_execute_run)
     history = tmp_path / "state" / "history.jsonl"
     with tick.job_lock(history, "a") as holder_acquired:
         assert holder_acquired
@@ -1035,8 +1036,8 @@ def test_cmd_run_holds_the_job_lock_while_the_job_runs(
             tick_lock_free_during_run.append(acquired)
         return RunOutcome(state="done", run_id=run_id)
 
-    monkeypatch.setattr(tick, "execute_run", fake_execute_run)
-    monkeypatch.setattr(tick, "_live_agent_exists", lambda client, job: False)
+    patch_dispatch(monkeypatch, "execute_run", fake_execute_run)
+    patch_dispatch(monkeypatch, "_live_agent_exists", lambda client, job: False)
     monkeypatch.setattr(cli, "HerdrClient", lambda: _NotifyingClient())
 
     assert cli.main(["run", "a"]) == 0
@@ -1396,7 +1397,7 @@ def test_review_scan_is_read_only_touches_nothing(
         raise AssertionError("review-scan must not run agents")
 
     monkeypatch.setattr(cli, "HerdrClient", _no_herdr)
-    monkeypatch.setattr(tick, "execute_run", _no_execute)
+    patch_dispatch(monkeypatch, "execute_run", _no_execute)
 
     assert _code(lambda: cli.main(_scan_argv(config_path))) == 0
     captured = capsys.readouterr()

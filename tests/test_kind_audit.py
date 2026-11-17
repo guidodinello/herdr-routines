@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 import yaml
 
-from herdr_routines import tick
+from herdr_routines import audit_flow, dispatch_common, tick
 from herdr_routines.auto_fix import consecutive_base_gate_failures
 from herdr_routines.config import (
     _DEFAULTS_ALLOWED_KEYS,
@@ -38,6 +38,7 @@ from herdr_routines.findings import (
 )
 from herdr_routines.history import read_job
 from herdr_routines.runner import substitute_prompt
+from tests.dispatch_modules import patch_dispatch
 
 NOW = datetime(2026, 10, 10, 4, 0, 0, tzinfo=UTC)
 RUN_ID = "audit-type-health-20261010T040000Z"
@@ -148,13 +149,13 @@ def _diff_step(
 ) -> tuple[str, bool]:
     """Phases 2-3 of an audit cycle, with phase 1 (the audit) stood in for by a manifest
     the test wrote itself."""
-    return tick._diff_and_fix(
+    return audit_flow._diff_and_fix(
         job,
         history_path,
         client=client,
         now=now,
         run_id=run_id,
-        paths=tick._AuditPaths.for_run(job.name, run_id),
+        paths=audit_flow._AuditPaths.for_run(job.name, run_id),
     )
 
 
@@ -166,7 +167,7 @@ class _FixRecorder:
 
     def __call__(self, job: Job, **kwargs: Any) -> Any:
         self.calls.append([f.id for f in kwargs["findings"]])
-        return tick._AgentRun(final_agent_status="idle")
+        return dispatch_common._AgentRun(final_agent_status="idle")
 
 
 def _last_record(history_path: Path, job_name: str) -> Any:
@@ -373,7 +374,7 @@ def test_cold_start_adopts_baseline_without_dispatch(
     job2 = _audit_job(tmp_path, adopt_baseline=False)
     client2 = _FakeAuditClient()
     fix = _FixRecorder()
-    monkeypatch.setattr(tick, "_dispatch_audit_fix", fix)
+    patch_dispatch(monkeypatch, "_dispatch_audit_fix", fix)
     _summary2, failed2 = _diff_step(
         job2,
         history,
@@ -624,7 +625,7 @@ def test_report_and_extra_record_the_full_dispatch_set(
     client = _FakeAuditClient()
     history = tmp_path / "history.jsonl"
     fix = _FixRecorder()
-    monkeypatch.setattr(tick, "_dispatch_audit_fix", fix)
+    patch_dispatch(monkeypatch, "_dispatch_audit_fix", fix)
     _summary, failed = _diff_step(
         job,
         history,
@@ -747,20 +748,20 @@ def _scenario(
             json.dumps({"version": 1, "check": "type-health", "findings": findings})
         )
     if fix_run is None:
-        monkeypatch.setattr(tick, "_dispatch_audit_fix", _FixRecorder())
+        patch_dispatch(monkeypatch, "_dispatch_audit_fix", _FixRecorder())
     else:
-        monkeypatch.setattr(
-            tick,
+        patch_dispatch(
+            monkeypatch,
             "_dispatch_audit_fix",
             lambda job, **_kw: fix_run,
         )
-    tick._diff_and_fix(
+    audit_flow._diff_and_fix(
         job,
         tmp_path / "state" / name / "history.jsonl",
         client=_FakeAuditClient(),  # type: ignore[arg-type]
         now=NOW,
         run_id=RUN_ID,
-        paths=tick._AuditPaths.for_run(job.name, RUN_ID),
+        paths=audit_flow._AuditPaths.for_run(job.name, RUN_ID),
     )
     records = read_job(tmp_path / "state" / name / "history.jsonl", job.name)
     assert records
@@ -788,20 +789,20 @@ def test_ledger_is_on_disk_before_the_fix_worker_is_dispatched(
         captured["ledger"] = from_disk
         captured["finding_id"] = kwargs["findings"][0].id
         captured["run_id"] = kwargs["run_id"]
-        return tick._AgentRun(final_agent_status="idle")
+        return dispatch_common._AgentRun(final_agent_status="idle")
 
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     job = _audit_job(tmp_path, adopt_baseline=False)
     payload = _finding_payload(1)
     _write_manifest(tmp_path, RUN_ID, [payload])
-    monkeypatch.setattr(tick, "_dispatch_audit_fix", recorder)
-    tick._diff_and_fix(
+    patch_dispatch(monkeypatch, "_dispatch_audit_fix", recorder)
+    audit_flow._diff_and_fix(
         job,
         tmp_path / "history.jsonl",
         client=_FakeAuditClient(),  # type: ignore[arg-type]
         now=NOW,
         run_id=RUN_ID,
-        paths=tick._AuditPaths.for_run(job.name, RUN_ID),
+        paths=audit_flow._AuditPaths.for_run(job.name, RUN_ID),
     )
 
     # The dispatch was handed a ledger that already carried this run's budget spend.
@@ -823,7 +824,7 @@ def test_audit_gate_set_is_closed(
     `_AUDIT_GATE_NOTIFY_KIND` directly, so a sixth gate value would ``KeyError`` on a
     cron fire; the anchor and the driven scenarios must both agree on the five."""
     expected = {"baseline", "passed", "fix_dispatched", "suppressed", "failed"}
-    assert set(tick._AUDIT_GATE_NOTIFY_KIND) == expected
+    assert set(audit_flow._AUDIT_GATE_NOTIFY_KIND) == expected
 
     seen: set[str] = set()
 
@@ -914,7 +915,7 @@ def test_audit_state_gate_pairings_match_the_design_table(
         "dispatch_failed",
         findings=[_finding_payload(5)],
         adopt=False,
-        fix_run=tick._AgentRun(reason="agent_start_failed", error="boom"),
+        fix_run=dispatch_common._AgentRun(reason="agent_start_failed", error="boom"),
     )
     assert rec.state == "failed" and _extra_of(rec)["gate"] == "fix_dispatched"
     pairings.add(("failed", "fix_dispatched"))
@@ -1045,7 +1046,9 @@ def test_audit_extra_key_sets_are_per_path(
             "dispatch_failed",
             findings=[_finding_payload(5)],
             adopt=False,
-            fix_run=tick._AgentRun(reason="agent_start_failed", error="boom"),
+            fix_run=dispatch_common._AgentRun(
+                reason="agent_start_failed", error="boom"
+            ),
         )
     )
     _assert_extra_keys(
@@ -1192,7 +1195,7 @@ def test_suppressed_count_is_true_while_ids_are_capped(
             adopt=False,
         )
     )
-    assert tick._AUDIT_SUPPRESSED_ID_CAP == 20
+    assert audit_flow._AUDIT_SUPPRESSED_ID_CAP == 20
     assert extra["gate"] == "suppressed"
     assert extra["suppressed"] == 25
     assert len(extra["suppressed_ids"]) == 20
@@ -1226,33 +1229,35 @@ def test_audit_records_never_move_consecutive_base_gate_failures(
     job = _audit_job(tmp_path, adopt_baseline=False)
 
     # A failed audit dispatch (record failed + gate fix_dispatched).
-    monkeypatch.setattr(
-        tick,
+    patch_dispatch(
+        monkeypatch,
         "_dispatch_audit_fix",
-        lambda job, **_kw: tick._AgentRun(reason="agent_start_failed", error="boom"),
+        lambda job, **_kw: dispatch_common._AgentRun(
+            reason="agent_start_failed", error="boom"
+        ),
     )
     payload = _finding_payload(1)
     _write_manifest(tmp_path, RUN_ID, [payload])
     for _ in range(3):
-        tick._diff_and_fix(
+        audit_flow._diff_and_fix(
             job,
             history,
             client=_FakeAuditClient(),  # type: ignore[arg-type]
             now=NOW,
             run_id=RUN_ID,
-            paths=tick._AuditPaths.for_run(job.name, RUN_ID),
+            paths=audit_flow._AuditPaths.for_run(job.name, RUN_ID),
         )
     assert consecutive_base_gate_failures(history, job.name) == 0
 
     # A failed audit command records its failure without a gate_branch, via the
     # pre-verdict failure path (_record_audit_failure).
-    tick._record_audit_failure(
+    audit_flow._record_audit_failure(
         job,
         history,
         client=_FakeAuditClient(),  # type: ignore[arg-type]
         now=NOW,
         run_id=RUN_ID,
-        paths=tick._AuditPaths.for_run(job.name, RUN_ID),
+        paths=audit_flow._AuditPaths.for_run(job.name, RUN_ID),
         reason="audit_command_failed",
     )
     assert consecutive_base_gate_failures(history, job.name) == 0

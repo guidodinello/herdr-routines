@@ -35,6 +35,7 @@ from herdr_routines.history import (
 )
 from herdr_routines.repos import CheckoutBusy, _ensure_checkout, checkout_lock
 from herdr_routines.runner import RunOutcome
+from tests.dispatch_modules import patch_dispatch
 from tests.test_manual_run import FROZEN_NOW, _Client, _FrozenDatetime, _job, _register
 
 BLOCK_TIMEOUT_S = 30.0
@@ -56,10 +57,10 @@ def _wire(
     monkeypatch.setattr(cli, "HerdrClient", lambda: client)
     monkeypatch.setattr(cli, "datetime", _FrozenDatetime)
     monkeypatch.setattr(cli, "_load_config_or_exit", lambda args: config)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr(tick, "_live_agent_exists", lambda client, job: False)
-    monkeypatch.setattr(tick, "_live_audit_agent_exists", lambda client, job: False)
-    monkeypatch.setattr(tick, "execute_run", execute_run)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "_live_agent_exists", lambda client, job: False)
+    patch_dispatch(monkeypatch, "_live_audit_agent_exists", lambda client, job: False)
+    patch_dispatch(monkeypatch, "execute_run", execute_run)
     return history
 
 
@@ -259,7 +260,7 @@ def test_tick_during_a_manual_run_does_not_consume_the_cron_occurrence(
         _parked_execute_run(started, release, dispatch_calls, park="a"),
     )
     agent_live = threading.Event()
-    monkeypatch.setattr(tick, "_live_agent_exists", lambda c, j: agent_live.is_set())
+    patch_dispatch(monkeypatch, "_live_agent_exists", lambda c, j: agent_live.is_set())
     _register(history, job, at=FROZEN_NOW - timedelta(days=2))
 
     try:
@@ -368,7 +369,7 @@ def test_skipped_event_dispatch_leaves_the_event_unseen(
     event = GithubEvent(
         event_id="evt-1", number=1, title="t", head_ref=None, label="go", payload={}
     )
-    monkeypatch.setattr(tick, "poll_github_event", lambda gh, **kw: [event])
+    patch_dispatch(monkeypatch, "poll_github_event", lambda gh, **kw: [event])
     _register(history, job, at=FROZEN_NOW - timedelta(days=2))
 
     with tick.job_lock(history, "a") as held:
@@ -400,7 +401,7 @@ def test_manual_run_refused_by_a_live_agent_is_reported(
         RoutinesConfig(jobs=(job,)),
         _unparked(dispatch_calls),
     )
-    monkeypatch.setattr(tick, "_live_agent_exists", lambda c, j: True)
+    patch_dispatch(monkeypatch, "_live_agent_exists", lambda c, j: True)
 
     assert cli.main(["run", "a", "--trigger", "request"]) == 1
     assert cli.main(["run", "a"]) == 1
@@ -594,7 +595,7 @@ def test_dispatch_records_use_the_clock_at_dispatch_time(
         RoutinesConfig(jobs=(job,)),
         _unparked([]),
     )
-    monkeypatch.setattr(tick, "datetime", _DispatchClock)
+    patch_dispatch(monkeypatch, "datetime", _DispatchClock)
     _register(history, job, at=FROZEN_NOW - timedelta(days=2))
 
     assert cli.main(["tick"]) == 0

@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from herdr_routines import tick
+from herdr_routines import runner, tick
 from herdr_routines.auto_fix import (
     build_audit_agent_name,
     build_audit_fix_prompt,
@@ -28,6 +28,7 @@ from herdr_routines.config import AuditSpec, GateCheck, Job, RoutinesConfig
 from herdr_routines.findings import Finding, ledger_path, load_ledger
 from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import HistoryRecord, append, read_job
+from tests.dispatch_modules import patch_dispatch
 
 NOW = datetime(2026, 10, 12, 4, 0, 0, tzinfo=UTC)
 RUN_ID = "audit-type-health-20261012T040000Z"
@@ -62,7 +63,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "init",
     )
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr(tick, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
     return path
 
 
@@ -103,7 +104,7 @@ def _finding(i: int, severity: str = "high") -> dict[str, str]:
 
 
 def _manifest_path() -> Path:
-    return tick.default_reports_dir() / f"{RUN_ID}-findings.json"
+    return runner.default_reports_dir() / f"{RUN_ID}-findings.json"
 
 
 def _write_manifest(findings: list[dict[str, str]]) -> None:
@@ -283,7 +284,7 @@ def test_audit_skill_dispatch_uses_its_own_worktree(repo: Path, tmp_path: Path) 
     assert (audit.cwd / "a.php").exists() is False  # removed afterwards
     assert audit.prompt is not None
     assert "`type-health`" in audit.prompt
-    assert str(tick.default_reports_dir() / f"{RUN_ID}-audit.md") in audit.prompt
+    assert str(runner.default_reports_dir() / f"{RUN_ID}-audit.md") in audit.prompt
     assert str(_manifest_path()) in audit.prompt
     assert "Do NOT edit source files, commit, push" in audit.prompt
 
@@ -535,7 +536,7 @@ def test_inline_audit_prompt_keeps_the_engine_contract(
 
     # Only the instructions are saved for the fix worker — never the audit agent's
     # read-only rules, which a worker would read as "do not commit".
-    saved = tick.default_reports_dir() / f"{RUN_ID}-audit-instructions.md"
+    saved = runner.default_reports_dir() / f"{RUN_ID}-audit-instructions.md"
     assert saved.read_text() == "Scan src/ for bare `Any` (job audit-type-health)."
     assert "Do NOT" not in saved.read_text()
     assert str(saved) in fix.prompt

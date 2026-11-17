@@ -10,7 +10,7 @@
 # across jobs/hosts and lives under version control.
 #
 # Phase B note: `--agent-name`, `--agent-kind`, `--model`, `--prompt-file` and
-# `--wait-timeout-ms` remain on the flag surface because `tick._build_pipeline_launch_argv`
+# `--wait-timeout-ms` remain on the flag surface because `pipeline_flow._build_pipeline_launch_argv`
 # still passes them, but they no longer change what this script does — the stage agents
 # and their prompts are declared in `pipeline_stages.py`. They are documented as accepted
 # rather than silently ignored so an operator reading `--help` isn't misled.

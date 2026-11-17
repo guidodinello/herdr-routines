@@ -253,7 +253,7 @@ for tests:
   whichever finishes first — a naive `kill -0`-then-`sleep` loop leaves the prompt job a
   zombie forever visible to `kill -0`, spinning indefinitely) and polls `herdr agent read
   --source visible` for `--failure-marker` text (same `job.failure_markers` config,
-  `tick._build_pipeline_launch_argv` passes it through; defaults to `("Free usage
+  `pipeline_flow._build_pipeline_launch_argv` passes it through; defaults to `("Free usage
   exceeded",)`). Same two-consecutive-poll stability gate as §8. On a confirmed match: the
   wait job is killed, and the stub report's `## Outcome:` line reads `failed
   (quota_exhausted)` instead of the generic `failed` — pointing tick at the actual reason

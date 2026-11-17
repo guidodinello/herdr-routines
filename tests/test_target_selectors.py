@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from herdr_routines import cli, tick, verify
+from herdr_routines import cli, verify
 from herdr_routines.auto_fix import PostedBody, RealGhClient
 from herdr_routines.config import (
     MULTI_TARGET_SELECTORS,
@@ -33,6 +33,7 @@ from herdr_routines.target_selectors import (
 )
 from herdr_routines.tick import run_tick
 from herdr_routines.verify import VerifyContext
+from tests.dispatch_modules import patch_dispatch
 from tests.test_runner import ScriptedClient
 from tests.test_tick import FakeFullClient
 from tests.test_tick import make_job as make_tick_job
@@ -49,7 +50,7 @@ REPO_URL = "https://github.com/acme/widgets.git"
 def _isolated_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr("herdr_routines.runner.ensure_repo", lambda job: job.repo)
-    monkeypatch.setattr("herdr_routines.tick.ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
 
 
 def _pr(
@@ -186,7 +187,7 @@ def test_selector_no_target_skips_without_spawning(
     notified: bool,
 ) -> None:
     gh = FakeSelectorGh([_pr(5)], before={5: [_fresh()]})
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     job = _job(
         tmp_path,
         notify_policy=notify_policy,
@@ -231,7 +232,7 @@ def test_selector_target_reaches_prompt_history_and_gate(
     """Code picked #7 (the draft #3 is skipped). The report neither needs to name it nor
     can redirect the gate to another PR."""
     gh = FakeSelectorGh([_pr(7), _pr(3, draft=True)], after={7: [_fresh()], 99: []})
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     history = tmp_path / "state" / "history.jsonl"
     client = RecordingClient(report=report)
 
@@ -364,7 +365,7 @@ def test_selector_error_fails_run_before_dispatch(
         gh = _json_garbage_gh(monkeypatch)
     else:
         gh = FakeSelectorGh([_pr(5)], raise_on=failure)
-    monkeypatch.setattr("herdr_routines.tick.RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     history = tmp_path / "state" / "history.jsonl"
     client = RecordingClient()
 
@@ -414,22 +415,26 @@ def test_manual_run_uses_selector(
     argv = ["run", "a", "--run-id", "a-manual"]
 
     # No target: skipped, exit 0, nothing spawned.
-    monkeypatch.setattr(
-        tick, "RealGhClient", lambda: FakeSelectorGh([_pr(5)], before={5: [_fresh()]})
+    patch_dispatch(
+        monkeypatch,
+        "RealGhClient",
+        lambda: FakeSelectorGh([_pr(5)], before={5: [_fresh()]}),
     )
     assert cli.main(argv) == 0
     assert scripted.calls == []
 
     # A selector error: failed, exit 1, nothing spawned.
-    monkeypatch.setattr(
-        tick, "RealGhClient", lambda: FakeSelectorGh([_pr(5)], raise_on="pr_list")
+    patch_dispatch(
+        monkeypatch,
+        "RealGhClient",
+        lambda: FakeSelectorGh([_pr(5)], raise_on="pr_list"),
     )
     assert cli.main(argv) == 1
     assert scripted.calls == []
 
     # A target: it reaches the prompt and the gate, with no Target: line in the report.
     gh = FakeSelectorGh([_pr(5)], after={5: [_fresh()]})
-    monkeypatch.setattr(tick, "RealGhClient", lambda: gh)
+    patch_dispatch(monkeypatch, "RealGhClient", lambda: gh)
     assert cli.main(argv) == 0
     assert "acme/widgets#5" in scripted.prompts[0]
     assert {p[2] for p in gh.probed} == {5}
