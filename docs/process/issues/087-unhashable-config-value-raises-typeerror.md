@@ -1,7 +1,7 @@
 ---
 id: "087"
 title: "A list or mapping in an enum-like config field raises TypeError, not ConfigError"
-status: open
+status: done
 priority: medium
 area: config
 ---
@@ -47,3 +47,12 @@ behaves the same way, so this predates that refactor.
 ## Log
 
 - **2026-11-16**: filed from the issue 060 fuzz run.
+- **2026-11-16**: fixed. `config._is_choice` does the membership test for every
+  enum-like field: the eight listed above, plus `select`, `target`, `verify` and `pick`,
+  which already checked `isinstance(value, str)` by hand. Messages are unchanged.
+  The fuzz run turned up two more crashes of the same kind, fixed here too:
+  a `select` entry that is a list or mapping (the duplicate check built a set), and a
+  malformed `timezone` key (`""`, an absolute path, one with `..`), for which
+  `ZoneInfo` raises `ValueError` rather than `ZoneInfoNotFoundError`. On 200,000
+  mutated job configs the old code crashed on 21,176; the new code raises `ConfigError`
+  on all of those and gives the same result on the rest.
