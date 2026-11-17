@@ -198,6 +198,9 @@ class HistoryExtra(TypedDict, total=False):
     last_seen_event_ids: list[str]
     pr_number: int
     headRefName: str
+    head_ref: str
+    resume_count: int
+    resumed_from: str
     eligible_reason: str
     enumerated: int
     eligible: int
@@ -220,6 +223,19 @@ class HistoryRecord:
     state: HistoryState
     run_id: str | None = None
     extra: Mapping[str, object] | None = None
+
+    @classmethod
+    def new(
+        cls,
+        ts: datetime,
+        job: str,
+        state: HistoryState,
+        run_id: str | None = None,
+        extra: HistoryExtra | None = None,
+    ) -> HistoryRecord:
+        """The write-side constructor: `extra` must match `HistoryExtra`, so a plain
+        `dict` is a type error. `to_json_line` is unchanged; this is a pure forwarder."""
+        return cls(ts=ts, job=job, state=state, run_id=run_id, extra=extra)
 
     def to_json_line(self) -> str:
         payload: dict[str, object] = {
@@ -252,6 +268,8 @@ class HistoryRecord:
             raise ValueError(f"history run_id must be a string, got {run_id!r}")
         known = {"ts", "job", "state", "run_id"}
         extra = {k: v for k, v in d.items() if k not in known} or None
+        # Sole sanctioned reader construction: on-disk keys are open, so keep them as-is
+        # instead of narrowing them to the write-side HistoryExtra schema via new().
         return HistoryRecord(
             ts=datetime.fromisoformat(ts),
             job=job,
