@@ -236,6 +236,10 @@ considered met). One-liner index; full detail in the issue file.
 - **Enforce `search_prs`'s 100-result ceiling** — the bound lives only in a
   comment. →
   [`086`](docs/process/issues/086-search-prs-limit-bound.md)
+- **Unhashable config values raise `TypeError`** — a list or mapping in an
+  enum-like field (`workspace: []`) ends `validate` and `tick` in a traceback
+  instead of a `ConfigError`. →
+  [`087`](docs/process/issues/087-unhashable-config-value-raises-typeerror.md)
 
 ## Later
 
