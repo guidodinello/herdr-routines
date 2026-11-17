@@ -8,7 +8,7 @@ dependencies = [
     "pyyaml==6.0.3",
     "croniter==6.2.4",
     # Pinned to a commit. To bump: change the SHA, run `uv lock`, commit both files.
-    "logger @ git+https://github.com/guidodinello/logger.git@7dbd2f616040a32fc5bbf458d661e7cd2d2385aa",
+    "logger @ git+https://github.com/guidodinello/logger.git@40c706a642edc5102144cf1ae5de187dde2d1c41",
 ]
 
 [project.scripts]

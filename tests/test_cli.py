@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -279,9 +280,11 @@ def test_cmd_tick_exits_nonzero_when_a_job_failed(
 def test_main_configures_logging_before_parsing_args(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    calls: list[Path | None] = []
+    calls: list[tuple[Path | None, object]] = []
     monkeypatch.setattr(
-        cli, "init_logging", lambda log_file=None, **_: calls.append(log_file)
+        cli,
+        "init_logging",
+        lambda log_file=None, stream=None, **_: calls.append((log_file, stream)),
     )
     monkeypatch.setattr(
         cli, "default_log_path", lambda: tmp_path / "herdr-routines.log"
@@ -291,7 +294,8 @@ def test_main_configures_logging_before_parsing_args(
 
     cli.main(["status"])
 
-    assert calls == [tmp_path / "herdr-routines.log"]
+    # stderr keeps stdout clean for the --json commands
+    assert calls == [(tmp_path / "herdr-routines.log", sys.stderr)]
 
 
 def test_validate_warns_when_prompt_never_writes_the_report(
