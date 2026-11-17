@@ -743,7 +743,7 @@ def _resume_run(
                 unit=plan.unit_name,
                 deadline_epoch=plan.new_deadline,
                 resume_count=plan.resume_count,
-                resumed_from=plan.resumed_from or "",
+                resumed_from=plan.resumed_from,
             ),
         ),
     )
