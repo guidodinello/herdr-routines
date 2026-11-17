@@ -401,6 +401,8 @@ def _process_event_target(
             )
             any_failed = True
             continue
+        # head_ref is necessarily truthy when ref_ok is False; the extra check exists
+        # only to narrow the Optional for mypy.
         if not ref_ok and head_ref:
             append(
                 history_path,

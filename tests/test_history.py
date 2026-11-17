@@ -41,12 +41,12 @@ DIRECT_CONSTRUCTION_RE = re.compile(r"HistoryRecord\(")
 
 def _direct_construction_sites() -> list[tuple[Path, int]]:
     """Every (file, line) in src with a direct `HistoryRecord(` construction."""
-    return [
-        (path, lineno)
-        for path in sorted(SRC.rglob("*.py"))
-        for lineno, line in enumerate(path.read_text().splitlines(), start=1)
-        if DIRECT_CONSTRUCTION_RE.search(line)
-    ]
+    sites: list[tuple[Path, int]] = []
+    for path in sorted(SRC.rglob("*.py")):
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            if DIRECT_CONSTRUCTION_RE.search(line):
+                sites.append((path, lineno))
+    return sites
 
 
 def test_append_and_read_round_trip(tmp_history_path: Path) -> None:
@@ -163,7 +163,7 @@ def test_widened_extra_keys_round_trip(tmp_history_path: Path) -> None:
     round-trips through append/read unchanged, byte for byte."""
     hints = get_type_hints(HistoryExtra)
     assert hints["resume_count"] is int
-    assert hints["resumed_from"] is str
+    assert hints["resumed_from"] == str | None
     assert hints["head_ref"] is str
     assert hints["headRefName"] is str
 
@@ -194,6 +194,23 @@ def test_widened_extra_keys_round_trip(tmp_history_path: Path) -> None:
     [got] = read_all(tmp_history_path)
     assert got.extra == dict(extra)
     assert got.to_json_line() == line
+
+
+def test_resumed_from_none_round_trips_as_json_null(tmp_history_path: Path) -> None:
+    """A legacy running record without `unit` gives the watchdog no `resumed_from`;
+    the write-side schema must keep that null instead of coercing it to `""`."""
+    rec = HistoryRecord.new(
+        ts=T0,
+        job="pipeline-watchdog",
+        state="running",
+        run_id="a-1",
+        extra=HistoryExtra(resumed_from=None),
+    )
+    append(tmp_history_path, rec)
+    [line] = tmp_history_path.read_text().splitlines()
+    assert json.loads(line)["resumed_from"] is None
+    [got] = read_all(tmp_history_path)
+    assert (got.extra or {})["resumed_from"] is None
 
 
 @pytest.mark.parametrize(

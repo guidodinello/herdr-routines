@@ -179,6 +179,8 @@ class HistoryExtra(TypedDict, total=False):
     pipeline_run_id: str
     unit: str
     deadline_epoch: int
+    resume_count: int
+    resumed_from: str | None
     # audit findings
     findings_total: int
     new: int
@@ -199,8 +201,6 @@ class HistoryExtra(TypedDict, total=False):
     pr_number: int
     headRefName: str
     head_ref: str
-    resume_count: int
-    resumed_from: str
     eligible_reason: str
     enumerated: int
     eligible: int
