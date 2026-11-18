@@ -75,8 +75,8 @@ class Candidate:
 @dataclass(frozen=True, slots=True)
 class ScanOutcome:
     """The selector's result. ``candidates`` are eligible and oldest-first; ``skipped``
-    carry their own ``skip_reason``; ``truncated_modes`` names any mode that hit GitHub's
-    100-node ceiling."""
+    carry their own ``skip_reason``; ``truncated_modes`` names any mode that hit the
+    search ``limit``."""
 
     candidates: tuple[Candidate, ...]
     skipped: tuple[Candidate, ...]

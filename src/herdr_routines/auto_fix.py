@@ -125,7 +125,8 @@ class GhClient(Protocol):
     ) -> ReviewSearch | None:
         """One batched ``gh api graphql`` search, one alias per selected mode. Returns
         ``None`` on any failure (fail closed — an unknown answer must never mean
-        "nothing to review")."""
+        "nothing to review"). Raises ``ValueError`` for a ``limit`` below 1 or above
+        ``REVIEW_SEARCH_MAX_RESULTS``."""
         ...
 
     def pr_review_bodies(
@@ -174,8 +175,8 @@ class ReviewPR:
 
 @dataclass(frozen=True, slots=True)
 class ReviewSearch:
-    """The batched search result: nodes plus the modes that hit GitHub's 100-node
-    ceiling (recorded as ``search_truncated`` — phase A does not paginate)."""
+    """The batched search result: nodes plus the modes that hit the search ``limit``
+    (recorded as ``truncated_modes`` — phase A does not paginate)."""
 
     prs: tuple[ReviewPR, ...]
     truncated_modes: tuple[ReviewSelectMode, ...] = ()
