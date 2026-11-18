@@ -26,6 +26,7 @@ allow-direct-references = true
 
 [dependency-groups]
 dev = [
+    "ast-grep-cli>=0.51.3",
     "mypy>=2.3.0",
     "pre-commit>=4.7",
     "pytest>=9.1.1",
