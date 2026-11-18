@@ -1,0 +1,9 @@
+id: subprocess-run-without-timeout
+valid:
+  - 'subprocess.run(["git", "status"], timeout=15)'
+  - 'subprocess.run(argv, capture_output=True, text=True, timeout=t, check=False)'
+  - 'subprocess.run(argv, **kwargs, timeout=30)'
+invalid:
+  - 'subprocess.run(["git", "status"])'
+  - 'subprocess.run(argv, capture_output=True, text=True, check=False)'
+  - 'subprocess.run(argv, **kwargs)'

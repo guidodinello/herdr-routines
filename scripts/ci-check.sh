@@ -9,6 +9,10 @@ lint() {
   uv run ruff format --check .
   uv run ruff check .
   uv run vulture
+  # Project conventions ruff cannot express (sgconfig.yml): rule tests first, so a
+  # broken rule fails loudly instead of scanning clean.
+  uv run ast-grep test --skip-snapshot-tests
+  uv run ast-grep scan
 }
 typecheck() {
   uv run mypy
