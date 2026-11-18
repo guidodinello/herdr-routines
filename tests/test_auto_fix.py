@@ -6,6 +6,7 @@ docs/pipeline/runs/20260829T050025Z/spec.md.
 from __future__ import annotations
 
 import inspect
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -2048,3 +2049,120 @@ def test_worker_failed_reason_set_is_closed() -> None:
     assert "_UNCOUNTED_FAILURE_REASONS" in window, (
         "WorkerFailedReason docstring must name auto_fix._UNCOUNTED_FAILURE_REASONS"
     )
+
+
+# -- issue 086 ---------------------------------------------------------------------------
+
+
+def _record_real_gh_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    graphql_payload: dict[str, object],
+) -> list[list[str]]:
+    """Stub `RealGhClient._run`, answering the graphql channel with `graphql_payload`
+    and recording every argv so tests can prove whether `gh` was invoked at all."""
+    from herdr_routines.auto_fix import RealGhClient
+
+    calls: list[list[str]] = []
+
+    def _run(self: RealGhClient, argv: list[str]) -> tuple[int, str, str]:
+        calls.append(argv)
+        if argv[:3] == ["gh", "api", "graphql"]:
+            return 0, json.dumps(graphql_payload), ""
+        return 0, "[]", ""
+
+    monkeypatch.setattr(RealGhClient, "_run", _run)
+    return calls
+
+
+def _review_node_payload(number: int = 7) -> dict[str, object]:
+    """One well-formed GraphQL search node, shaped like `_parse_review_node` reads it."""
+    return {
+        "number": number,
+        "title": f"Fix the thing #{number}",
+        "url": f"https://github.com/t/r/pull/{number}",
+        "createdAt": "2026-11-01T00:00:00Z",
+        "updatedAt": "2026-11-02T00:00:00Z",
+        "headRefName": "feature/x",
+        "author": {"login": "testuser"},
+        "repository": {"nameWithOwner": "t/r"},
+        "headRepository": {"nameWithOwner": "t/r"},
+    }
+
+
+def test_review_search_max_results_is_single_source_of_truth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1 (issue 086): `REVIEW_SEARCH_MAX_RESULTS = 100` is defined exactly once —
+    next to `REVIEW_SEARCH_QUALIFIERS` — and the `limit: int = 100` defaults on
+    `GhClient.search_prs` (protocol + impl) and `review_scan.scan_review_targets` /
+    `classify_review_candidates` all reference the constant, with a default-driven
+    call still building `first: 100` queries identical to today's."""
+    from herdr_routines import auto_fix, review_scan
+
+    assert auto_fix.REVIEW_SEARCH_MAX_RESULTS == 100
+
+    source = inspect.getsource(auto_fix)
+    const_at = source.index("REVIEW_SEARCH_MAX_RESULTS = 100")
+    qualifiers_at = source.index("REVIEW_SEARCH_QUALIFIERS: dict[str, str] = {")
+    assert abs(const_at - qualifiers_at) < 600, (
+        "the constant must be defined next to REVIEW_SEARCH_QUALIFIERS"
+    )
+
+    for fn in (
+        auto_fix.GhClient.search_prs,
+        auto_fix.RealGhClient.search_prs,
+        review_scan.scan_review_targets,
+        review_scan.classify_review_candidates,
+    ):
+        fn_source = inspect.getsource(fn)
+        assert "limit: int = REVIEW_SEARCH_MAX_RESULTS" in fn_source, (
+            f"{fn.__qualname__} default must reference the constant"
+        )
+        assert "limit: int = 100" not in fn_source, (
+            f"{fn.__qualname__} must not keep the literal 100 default"
+        )
+
+    calls = _record_real_gh_runs(monkeypatch, {"data": {"author": {"nodes": []}}})
+    auto_fix.RealGhClient().search_prs(["author"])
+    graphql_argv = next(argv for argv in calls if argv[:3] == ["gh", "api", "graphql"])
+    assert "first: 100" in " ".join(graphql_argv), (
+        "the default-driven call must build the same first: 100 query as today"
+    )
+
+
+@pytest.mark.parametrize("limit", [0, 101, -5])
+def test_search_prs_rejects_limit_outside_github_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+) -> None:
+    """AC2 (issue 086): `RealGhClient.search_prs` raises `ValueError` for a limit
+    outside 1–100 before any query is built — the recorded channel proves zero `gh`
+    invocations, so the rejection is local, not deferred to GitHub."""
+    from herdr_routines.auto_fix import RealGhClient
+
+    calls = _record_real_gh_runs(monkeypatch, {"data": {"author": {"nodes": []}}})
+    with pytest.raises(ValueError):
+        RealGhClient().search_prs(["author"], limit=limit)
+    assert calls == [], "rejection is local — no gh invocation may happen"
+
+
+@pytest.mark.parametrize("limit", [1, 100])
+def test_search_prs_accepts_limit_at_ceiling_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+) -> None:
+    """AC3 (issue 086): `limit=1` and `limit=100` (the ceiling itself) do not raise and
+    proceed to build/issue the GraphQL search through the mocked channel, matching
+    today's happy path exactly (`first: {limit}` in the issued query)."""
+    from herdr_routines.auto_fix import RealGhClient
+
+    calls = _record_real_gh_runs(
+        monkeypatch, {"data": {"author": {"nodes": [_review_node_payload()]}}}
+    )
+    result = RealGhClient().search_prs(["author"], limit=limit)
+
+    assert result is not None
+    graphql_argvs = [argv for argv in calls if argv[:3] == ["gh", "api", "graphql"]]
+    assert len(graphql_argvs) == 1, "the search must be issued through graphql"
+    assert f"first: {limit}" in " ".join(graphql_argvs[0])
+    assert [pr.number for pr in result.prs] == [7]
