@@ -5,11 +5,13 @@ docs/pipeline/runs/20260829T050025Z/spec.md.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Any, get_args, get_type_hints
 
 import pytest
@@ -51,6 +53,46 @@ def fetch_thread_bodies(gh: Any, **kwargs: Any) -> str:
 TRUSTED = effective_trusted_authors(
     DEFAULT_TRUSTED_REVIEW_AUTHORS, viewer_login="testuser"
 )
+
+
+def _module_assignment_line(module: ModuleType, name: str) -> int:
+    """Line of the only top-level assignment to `name`, found via the AST."""
+    module_file = module.__file__
+    assert module_file is not None
+    module_path = Path(module_file)
+    tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+    linenos = [
+        node.lineno
+        for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+        )
+    ]
+    assert len(linenos) == 1, f"expected exactly one top-level assignment to {name}"
+    return linenos[0]
+
+
+def _leading_comment_block(module: ModuleType, lineno: int) -> str:
+    """Contiguous comment lines immediately above `lineno` in `module`."""
+    module_file = module.__file__
+    assert module_file is not None
+    module_path = Path(module_file)
+    lines = module_path.read_text(encoding="utf-8").splitlines()
+    block: list[str] = []
+    for line in reversed(lines[: lineno - 1]):
+        if not line.lstrip().startswith("#"):
+            break
+        block.append(line)
+    return "\n".join(reversed(block))
 
 
 @pytest.fixture(autouse=True)
@@ -2040,14 +2082,14 @@ def test_worker_failed_reason_set_is_closed() -> None:
     assert isinstance(uncounted, frozenset)
     assert uncounted <= expected
 
-    # NB1: the docstring on `WorkerFailedReason` names both consumers, so a future
+    # NB1: the comment block on `WorkerFailedReason` names both consumers, so a future
     # producer adding a reason must widen the Literal deliberately.
-    source = inspect.getsource(history)
-    start = source.index("WorkerFailedReason = Literal")
-    window = source[max(0, start - 2000) : start + 2000]
-    assert "tick" in window, "WorkerFailedReason docstring must name the tick producer"
-    assert "_UNCOUNTED_FAILURE_REASONS" in window, (
-        "WorkerFailedReason docstring must name auto_fix._UNCOUNTED_FAILURE_REASONS"
+    comments = _leading_comment_block(
+        history, _module_assignment_line(history, "WorkerFailedReason")
+    )
+    assert "tick" in comments, "WorkerFailedReason docs must name the tick producer"
+    assert "_UNCOUNTED_FAILURE_REASONS" in comments, (
+        "WorkerFailedReason docs must name auto_fix._UNCOUNTED_FAILURE_REASONS"
     )
 
 
@@ -2101,10 +2143,9 @@ def test_review_search_max_results_is_single_source_of_truth(
 
     assert auto_fix.REVIEW_SEARCH_MAX_RESULTS == 100
 
-    source = inspect.getsource(auto_fix)
-    const_at = source.index("REVIEW_SEARCH_MAX_RESULTS = 100")
-    qualifiers_at = source.index("REVIEW_SEARCH_QUALIFIERS: dict[str, str] = {")
-    assert abs(const_at - qualifiers_at) < 600, (
+    const_line = _module_assignment_line(auto_fix, "REVIEW_SEARCH_MAX_RESULTS")
+    qualifiers_line = _module_assignment_line(auto_fix, "REVIEW_SEARCH_QUALIFIERS")
+    assert abs(const_line - qualifiers_line) <= 3, (
         "the constant must be defined next to REVIEW_SEARCH_QUALIFIERS"
     )
 
