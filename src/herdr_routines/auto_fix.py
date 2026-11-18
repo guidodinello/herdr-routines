@@ -50,6 +50,14 @@ _UNCOUNTED_FAILURE_REASONS: frozenset[WorkerFailedReason] = frozenset(
     {"worktree_reuse_not_clean"}
 )
 
+# GitHub's ceiling on search results. Defined here, next to the qualifiers, because the
+# GhClient protocol's `search_prs` default is evaluated at class-definition time.
+REVIEW_SEARCH_MAX_RESULTS = 100
+REVIEW_SEARCH_QUALIFIERS: dict[str, str] = {
+    "author": "is:pr is:open archived:false draft:false author:@me",
+    "review_requested": "is:pr is:open archived:false draft:false review-requested:@me",
+}
+
 
 def _is_countable_attempt(state: HistoryState, extra: object) -> bool:
     if state not in _COUNTABLE_STATES:
@@ -113,7 +121,7 @@ class GhClient(Protocol):
         ...
 
     def search_prs(
-        self, modes: Sequence[ReviewSelectMode], limit: int = 100
+        self, modes: Sequence[ReviewSelectMode], limit: int = REVIEW_SEARCH_MAX_RESULTS
     ) -> ReviewSearch | None:
         """One batched ``gh api graphql`` search, one alias per selected mode. Returns
         ``None`` on any failure (fail closed — an unknown answer must never mean
@@ -342,8 +350,13 @@ class RealGhClient:
         return int(match.group(1))
 
     def search_prs(
-        self, modes: Sequence[ReviewSelectMode], limit: int = 100
+        self, modes: Sequence[ReviewSelectMode], limit: int = REVIEW_SEARCH_MAX_RESULTS
     ) -> ReviewSearch | None:
+        if not 1 <= limit <= REVIEW_SEARCH_MAX_RESULTS:
+            raise ValueError(
+                f"search_prs limit must be between 1 and {REVIEW_SEARCH_MAX_RESULTS} "
+                f"(got {limit})"
+            )
         aliases = [m for m in modes if m in REVIEW_SEARCH_QUALIFIERS]
         if not aliases:
             return ReviewSearch(prs=())
@@ -883,13 +896,6 @@ def build_worker_agent_name(job_name: str, pr_number: int, run_id: str) -> str:
 # the target key so two review jobs over one account never treat each other's reviews as
 # their own (the same "own work only" shape as the attempt budget).
 REVIEW_MARKER_PREFIX = "herdr-routines:review"
-
-# The per-mode GitHub search qualifier. `first: 100` (GitHub's own ceiling) is added at
-# query-build time; phase A does not paginate.
-REVIEW_SEARCH_QUALIFIERS: dict[str, str] = {
-    "author": "is:pr is:open archived:false draft:false author:@me",
-    "review_requested": "is:pr is:open archived:false draft:false review-requested:@me",
-}
 
 _REVIEW_NODE_FIELDS = (
     "number title url createdAt updatedAt headRefName "
