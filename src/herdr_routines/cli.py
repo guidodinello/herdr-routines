@@ -25,7 +25,11 @@ from logger import get_logger, init_logging
 
 import herdr_routines
 from herdr_routines import gc, reports_prune, tick
-from herdr_routines.auto_fix import RealGhClient, effective_trusted_authors
+from herdr_routines.auto_fix import (
+    REVIEW_SEARCH_MAX_RESULTS,
+    RealGhClient,
+    effective_trusted_authors,
+)
 from herdr_routines.config import (
     DEFAULT_REPORTS_MAX_AGE_DAYS,
     MULTI_TARGET_SELECTORS,
@@ -616,8 +620,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_review_scan.add_argument(
         "--limit",
         type=int,
-        default=100,
-        help="max PRs to take from the search, 1-100 (GitHub's ceiling; default 100)",
+        default=REVIEW_SEARCH_MAX_RESULTS,
+        help=f"max PRs to take from the search, 1-{REVIEW_SEARCH_MAX_RESULTS} "
+        f"(GitHub's ceiling; default {REVIEW_SEARCH_MAX_RESULTS})",
     )
     p_review_scan.add_argument(
         "--json",
@@ -1739,11 +1744,12 @@ def _cmd_review_scan(args: argparse.Namespace) -> int:
     `--limit` GitHub could never honour), 1 when the answer is unknowable (missing
     job, unusable gh auth, failed search — never a silent empty list), 0 on a
     successful scan however many PRs it found."""
-    if not 1 <= args.limit <= 100:
-        # GitHub's search ceiling is 100 nodes; a wider --limit can never be honoured,
-        # so it is a usage error, rejected before any gh call runs.
+    if not 1 <= args.limit <= REVIEW_SEARCH_MAX_RESULTS:
+        # A wider --limit can never be honoured, so it is a usage error, rejected before
+        # any gh call runs.
         print(
-            f"error: review-scan: --limit must be between 1 and 100 (got {args.limit})",
+            f"error: review-scan: --limit must be between 1 and "
+            f"{REVIEW_SEARCH_MAX_RESULTS} (got {args.limit})",
             file=sys.stderr,
         )
         return EXIT_USAGE
