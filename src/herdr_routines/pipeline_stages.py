@@ -48,7 +48,7 @@ REVIEWER_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 # families instead of strings. `big-pickle` is Zen's own router: its upstream changes
 # night to night, so it is treated as a family of its own, which is all the repo can say.
 MODEL_FAMILY: dict[str, str] = {
-    "opencode/glm-5.3-flash-free": "zhipu",
+    "opencode/deepseek-v4.1-flash-free": "deepseek",
     "opencode/big-pickle": "zen-router",
     AUTHOR_FALLBACK_MODEL: "minimax",
     REVIEWER_FALLBACK_MODEL: "nvidia",
@@ -87,7 +87,7 @@ ADDRESS_COMMENTS_STAGE = 7
 STAGES: tuple[StageSpec, ...] = (
     StageSpec(
         stage=1,
-        model="opencode/glm-5.3-flash-free",
+        model="opencode/deepseek-v4.1-flash-free",
         prompt_file="stage-1.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -95,7 +95,7 @@ STAGES: tuple[StageSpec, ...] = (
     ),
     StageSpec(
         stage=2,
-        model="opencode/glm-5.3-flash-free",
+        model="opencode/deepseek-v4.1-flash-free",
         prompt_file="stage-2.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -106,7 +106,7 @@ STAGES: tuple[StageSpec, ...] = (
         # The test author: writes the acceptance tests and nothing else. A different
         # family from stage 4's implementer, primary and fallback, so the tests are not
         # written by the model they are meant to check.
-        model="opencode/glm-5.3-flash-free",
+        model="opencode/deepseek-v4.1-flash-free",
         prompt_file="stage-3.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -130,10 +130,13 @@ STAGES: tuple[StageSpec, ...] = (
     StageSpec(
         stage=6,
         # A different model family from stage 4's implementer, so the review is
-        # independent. Zen withdrew nemotron-3-ultra-free by 2026-10-29; glm had the
-        # highest accepted-finding rate of the free reviewers on fitted's babysit-prs
-        # leaderboard (95%, 2026-10-30). Not deepseek: big-pickle has routed to it.
-        model="opencode/glm-5.3-flash-free",
+        # independent. Zen withdrew nemotron-3-ultra-free by 2026-10-29 and
+        # glm-5.3-flash-free by 2026-11-19. deepseek-v4.1-flash had the best
+        # accepted-finding rate of the free reviewers left on fitted's babysit-prs
+        # leaderboard (96%, only 3 reviews, 2026-11-22). Known risk, accepted: big-pickle
+        # (stage 4) has routed to deepseek, so on such a night the review is not
+        # independent of the implementer.
+        model="opencode/deepseek-v4.1-flash-free",
         prompt_file="stage-6.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
