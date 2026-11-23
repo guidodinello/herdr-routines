@@ -240,6 +240,10 @@ considered met). One-liner index; full detail in the issue file.
   enum-like field (`workspace: []`) ends `validate` and `tick` in a traceback
   instead of a `ConfigError`. →
   [`087`](docs/process/issues/087-unhashable-config-value-raises-typeerror.md)
+- **Retries for every job kind, backed off across ticks** — `retry_attempts` works
+  only for routines and retries back-to-back; a single DNS failure cost
+  `audit-type-health` a week. →
+  [`088`](docs/process/issues/088-retries-ignored-outside-routines.md)
 
 ## Later
 
