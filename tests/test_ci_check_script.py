@@ -31,12 +31,12 @@ def test_ci_check_script_matches_ci_workflow(tmp_path: Path) -> None:
     # own check (which runs the script bare) cannot drift from what CI enforces.
     for step in steps:
         assert not any(
-            tool in step for tool in ("ruff", "vulture", "mypy", "pytest")
+            tool in step for tool in ("ruff", "vulture", "ast-grep", "mypy", "pytest")
         ), step
     for part in ("lint", "typecheck", "test"):
         assert f"scripts/ci-check.sh {part}" in steps
 
-    # The bare script runs exactly CI's five commands, in order. A fake `uv` logs argv.
+    # The bare script runs exactly CI's seven commands, in order. A fake `uv` logs argv.
     log = tmp_path / "argv.log"
     fake_uv = tmp_path / "bin" / "uv"
     fake_uv.parent.mkdir()
@@ -51,6 +51,8 @@ def test_ci_check_script_matches_ci_workflow(tmp_path: Path) -> None:
         "run ruff format --check .",
         "run ruff check .",
         "run vulture",
+        "run ast-grep test --skip-snapshot-tests",
+        "run ast-grep scan",
         "run mypy",
         "run pytest -q",
     ]

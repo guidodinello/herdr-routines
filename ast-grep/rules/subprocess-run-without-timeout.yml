@@ -1,0 +1,20 @@
+id: subprocess-run-without-timeout
+language: python
+severity: error
+message: "subprocess.run without timeout= can block the routine forever."
+note: >-
+  Pass an explicit timeout, e.g. `subprocess.run([...], timeout=15, check=False)`.
+  Routines run unattended from a scheduler: a git or gh call that hangs (network
+  stall, credential prompt, lock) never returns, and the tick that made it never
+  finishes. A timeout turns the hang into a TimeoutExpired the caller can handle.
+files:
+  - "src/**/*.py"
+rule:
+  pattern: subprocess.run($$$ARGS)
+  not:
+    has:
+      stopBy: end
+      kind: keyword_argument
+      has:
+        field: name
+        regex: ^timeout$

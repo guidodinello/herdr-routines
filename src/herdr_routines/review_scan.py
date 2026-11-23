@@ -19,6 +19,7 @@ from pathlib import Path
 from logger import get_logger
 
 from herdr_routines.auto_fix import (
+    REVIEW_SEARCH_MAX_RESULTS,
     GhClient,
     ReviewPR,
     attempt_count_for_target,
@@ -74,8 +75,8 @@ class Candidate:
 @dataclass(frozen=True, slots=True)
 class ScanOutcome:
     """The selector's result. ``candidates`` are eligible and oldest-first; ``skipped``
-    carry their own ``skip_reason``; ``truncated_modes`` names any mode that hit GitHub's
-    100-node ceiling."""
+    carry their own ``skip_reason``; ``truncated_modes`` names any mode that hit the
+    search ``limit``."""
 
     candidates: tuple[Candidate, ...]
     skipped: tuple[Candidate, ...]
@@ -119,7 +120,7 @@ def _skip_reason(
 
 
 def scan_review_targets(
-    gh: GhClient, job: Job, *, login: str, limit: int = 100
+    gh: GhClient, job: Job, *, login: str, limit: int = REVIEW_SEARCH_MAX_RESULTS
 ) -> ScanOutcome | None:
     """One batched search → a ``ScanOutcome``, or ``None`` on any ``gh`` failure.
 
@@ -255,7 +256,7 @@ def classify_review_candidates(
     login: str,
     history_path: Path,
     trusted_authors: frozenset[str],
-    limit: int = 100,
+    limit: int = REVIEW_SEARCH_MAX_RESULTS,
 ) -> Classification | None:
     """Run the whole selector pipeline once and return its pre-dispatch verdicts.
 

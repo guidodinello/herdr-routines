@@ -1,7 +1,7 @@
 ---
 id: "086"
 title: "Enforce GitHub's 100-result ceiling on search_prs limit"
-status: open
+status: done
 priority: low
 area: infra
 ---

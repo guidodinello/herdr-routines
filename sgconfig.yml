@@ -1,0 +1,7 @@
+# ast-grep project config: project-specific conventions that ruff cannot express.
+# Run by scripts/ci-check.sh lint (`ast-grep scan` and `ast-grep test`), so the
+# rules gate CI and the pipeline's pre-push check alike.
+ruleDirs:
+  - ast-grep/rules
+testConfigs:
+  - testDir: ast-grep/rule-tests
