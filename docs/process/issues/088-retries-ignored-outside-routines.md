@@ -1,6 +1,6 @@
 ---
 id: "088"
-title: "retry_attempts is ignored by audit, gated and pipeline jobs, and retries never wait"
+title: "Retries: work for every job kind, back off across ticks, retry pre-agent failures by default"
 status: open
 priority: medium
 area: runner
@@ -24,22 +24,53 @@ A second gap: the routine retry runs straight after the failed attempt, with no 
 A network outage that lasts longer than one attempt (seconds, for a git fetch) fails
 every attempt, so even routines get little out of `retry_on: [repo_sync_failed]`.
 
+## Design
+
+Two decisions, made on 2026-11-22:
+
+- **Back off across ticks instead of sleeping.** A failed attempt is recorded as a
+  pending retry, and a later tick runs it again: 1 tick later, then 2, then 4
+  (5, 10, 20 min at the 5-minute tick). Sleeping inside a tick would hold the tick
+  lock, delay every job dispatched after this one, and make the next tick skip. With
+  at most 3 attempts, sleeps short enough to fit in a tick (seconds to 2 min) cannot
+  ride out an outage longer than that.
+- **Retry pre-agent failures by default.** Issue 008 defaulted to no retries because
+  rerunning a job that is not idempotent can post or push twice. That risk only exists
+  once the agent has started. The reasons raised before it starts (`clone_failed`,
+  `repo_sync_failed`, `pane_creation_failed`, `agent_start_failed`,
+  `report_dir_creation_failed`) are safe to retry for every job, so they get one retry by
+  default. Reasons raised after the agent started (`no_report`, `blocked`,
+  `agent_prompt_failed`, `quota_exhausted`, `agent_not_interactive`, `tmp_full`) stay
+  opt-in through `retry_on`.
+
 ## Acceptance
 
-- For a job of each kind that emits a retry-eligible reason (audit, gated base,
-  gated PR, pipeline), a failure whose reason is in its `retry_on` is retried up to
-  `retry_attempts` times. Each attempt is a separate `history.jsonl` record, as for
-  routines.
-- Or, for a kind where a retry is unsafe, `validate` rejects `retry_attempts` on that
-  kind with a `ConfigError` saying why, so the key is never silently ignored.
-- Retries of `clone_failed` / `repo_sync_failed` wait between attempts (a fixed or
-  growing delay, bounded so a tick cannot hog the tick lock past its budget). The
-  `validate` timeout check accounts for the delay.
-- A test for each kind fails the first sync and passes the second, and asserts two
-  history records.
+- The default is `retry_attempts: 1` with `retry_on` set to the five pre-agent reasons
+  above. A job can still set `retry_attempts: 0` to opt out, or list post-agent reasons
+  in `retry_on` to opt in. The pre-agent reasons are declared once, as data (a frozenset
+  next to `VALID_RETRY_REASONS`), and the default derives from it.
+- Every job kind that can emit a retry-eligible reason (routine, audit, gated base,
+  gated PR, pipeline) retries it. If a kind is unsafe to retry, `validate` rejects
+  `retry_attempts` on that kind with a `ConfigError` saying why. A key is never accepted
+  and then ignored.
+- A failed attempt with retries left is written to `history.jsonl` as its own record,
+  with `attempt` and the tick it becomes due. The tick does not sleep. A later tick runs
+  it: attempt N becomes due 2^(N-1) ticks after the failure. The schedule guard treats a
+  pending retry as due, not as a missed occurrence.
+- A pending retry is dropped, and logged as dropped, when the job's next scheduled
+  occurrence comes first, so a retry never runs on top of a fresh run.
+- Routines move from back-to-back retries in `routine_flow.py` to the same tick-based
+  retries. `fallback_model` still runs within the same tick, as it does today.
+- `validate`'s timeout check no longer multiplies the timeout by `(1 + retry_attempts)`
+  (`cli.py:1186`), since retries no longer run within one tick.
+- Tests: for each kind, the first sync fails and the retry on a later tick passes, with
+  two history records. A post-agent reason does not retry under the defaults. A pending
+  retry is dropped when the next scheduled occurrence comes first.
 - `scripts/ci-check.sh` is green.
 
 ## Log
 
 - **2026-11-22**: filed after `audit-type-health` lost its 2026-11-16 run to one DNS
   failure. No job on the Pi sets `retry_attempts` today.
+- **2026-11-22**: design added: tick-based exponential backoff, and one retry by default for
+  pre-agent failures only.
