@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "pyyaml==6.0.3",
-    "croniter==6.2.4",
+    "croniter==7.0.0",
     # Pinned to a commit. To bump: change the SHA, run `uv lock`, commit both files.
     "logger @ git+https://github.com/guidodinello/logger.git@40c706a642edc5102144cf1ae5de187dde2d1c41",
 ]
