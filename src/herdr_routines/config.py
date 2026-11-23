@@ -1886,7 +1886,9 @@ def _build_retry(
                     )
             retry_on = tuple(retry_on_raw) if retry_on_raw else None
     else:
-        retry_on = tuple(sorted(PRE_AGENT_RETRY_REASONS)) if retry_attempts > 0 else None
+        retry_on = (
+            tuple(sorted(PRE_AGENT_RETRY_REASONS)) if retry_attempts > 0 else None
+        )
 
     # retry_attempts > 0 with an explicit empty/null retry_on is a hard error
     if retry_attempts > 0 and "retry_on" in raw_job and not retry_on:

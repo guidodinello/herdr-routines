@@ -15,6 +15,7 @@ from pathlib import Path
 from logger import get_logger
 
 from herdr_routines.config import (
+    PRE_AGENT_RETRY_REASONS,
     Job,
 )
 from herdr_routines.dispatch_common import (
@@ -164,6 +165,12 @@ def _classify_pipeline_outcome(report_text: str) -> tuple[HistoryState, str | No
             return "failed", "quota_exhausted"
         if "ci_check_failed" in status:
             return "failed", "ci_check_failed"
+        reason_match = re.search(r"\(([^)]+)\)", status)
+        if (
+            reason_match is not None
+            and reason_match.group(1) in PRE_AGENT_RETRY_REASONS
+        ):
+            return "failed", reason_match.group(1)
         return "failed", "orchestrator_failed"
     return "interrupted_unknown", "outcome_marker_unrecognized"
 

@@ -89,6 +89,15 @@ def occurrences_since(
     return occurrences
 
 
+def next_occurrence_after(cron: str, tz_name: str, after: datetime) -> datetime:
+    """The single next cron occurrence strictly after `after` (issue 088).
+
+    Used by the retry drop check: if the job's next scheduled fire arrives before the
+    retry's backoff is up, the ordinary occurrence supersedes the pending retry.
+    """
+    return croniter(cron, after.astimezone(ZoneInfo(tz_name))).get_next(datetime)
+
+
 def decide(
     *,
     cron: str,

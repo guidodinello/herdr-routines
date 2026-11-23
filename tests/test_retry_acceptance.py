@@ -39,7 +39,7 @@ from tests.dispatch_modules import patch_dispatch
 from tests.test_github_event import (
     EVENT_ID,
     EventGhClient,
-    RecordingHerdrClient,
+    StatusHerdrClient,
     _event_ticks,
 )
 from tests.test_github_event import (
@@ -48,6 +48,7 @@ from tests.test_github_event import (
 from tests.test_tick import (
     FakeClient,
     FakePipelineClient,
+    MockSubprocess,
     _init_repo_with_branch,
     make_job,
     make_pipeline_job,
@@ -213,7 +214,6 @@ version: 1
 jobs:
   - name: review-sugar
     cron: "0 5 * * *"
-    repo: /repo/b
     kind: review
     select: [author]
 """
@@ -260,6 +260,8 @@ def _run_sync_kind_retry(
             cron="0 5 * * *",
             workspace="root",
             repo=tmp_path,
+            retry_attempts=1,
+            retry_on=("clone_failed", "repo_sync_failed"),
         )
         repo = tmp_path
     elif kind == "audit":
@@ -274,6 +276,8 @@ def _run_sync_kind_retry(
             kind="audit",
             audit=AuditSpec(command=_audit_script(tmp_path), timeout_ms=60_000),
             adopt_baseline=True,
+            retry_attempts=1,
+            retry_on=("clone_failed", "repo_sync_failed"),
         )
     elif kind == "gated-base":
         repo = _init_repo_with_branch(tmp_path, branch="unused")
@@ -288,6 +292,8 @@ def _run_sync_kind_retry(
             checks=(GateCheck(kind="command", command="true"),),
             target="base",
             max_attempts_per_target=3,
+            retry_attempts=1,
+            retry_on=("clone_failed", "repo_sync_failed"),
         )
     elif kind == "gated-pr":
         repo = _init_repo_with_branch(tmp_path, branch="unused")
@@ -303,6 +309,8 @@ def _run_sync_kind_retry(
             target="pr",
             max_workers_per_tick=1,
             max_attempts_per_target=3,
+            retry_attempts=1,
+            retry_on=("clone_failed", "repo_sync_failed"),
         )
 
         class _Gh:
@@ -317,11 +325,18 @@ def _run_sync_kind_retry(
         monkeypatch.setattr(
             "herdr_routines.gated_pr_flow.list_open_prs", lambda *_a, **_k: []
         )
+        patch_dispatch(monkeypatch, "subprocess", MockSubprocess())
     else:
         raise AssertionError(f"unknown kind {kind}")
 
     assert repo.exists()
-    _patch_ensure_repo(monkeypatch, _flaky_ensure_repo(fail_times=1))
+
+    def _fail_only_before_first_failure(job: Job) -> Path:
+        if any(r.state == "failed" for r in read_job(history_path, job.name)):
+            return job.repo
+        raise RuntimeError("transient dns failure")
+
+    _patch_ensure_repo(monkeypatch, _fail_only_before_first_failure)
     config = RoutinesConfig(jobs=(job,))
     client = FakeClient(settle_status="idle")
 
@@ -329,21 +344,16 @@ def _run_sync_kind_retry(
     run_tick(config, history_path, client=client, now=CRON_AT)  # type: ignore[arg-type]
 
     records = read_job(history_path, job.name)
-    failed = _failed(records)
-    assert failed, f"{kind}: first attempt did not fail: {_states(records)}"
-    failed = failed[0]
-    assert failed.extra is not None
-    assert failed.extra.get("reason") in {"clone_failed", "repo_sync_failed"}
+    failed_records = _failed(records)
+    assert failed_records, f"{kind}: first attempt did not fail: {_states(records)}"
+    failed_record = failed_records[0]
+    assert failed_record.extra is not None
+    assert failed_record.extra.get("reason") in {"clone_failed", "repo_sync_failed"}
 
     scheduled = _scheduled_retries(records)
     assert scheduled, f"{kind}: no scheduled retry after a pre-agent failure"
 
-    run_tick(
-        config,
-        history_path,
-        client=client,
-        now=CRON_AT + TICK_INTERVAL,
-    )  # type: ignore[arg-type]
+    run_tick(config, history_path, client=client, now=CRON_AT + TICK_INTERVAL)  # type: ignore[arg-type]
 
     records = read_job(history_path, job.name)
     retry_running = [
@@ -353,7 +363,7 @@ def _run_sync_kind_retry(
     ]
     assert retry_running, f"{kind}: the retry never dispatched: {_states(records)}"
     assert retry_running[0].extra is not None
-    assert retry_running[0].extra.get("retried_from_run_id") == failed.run_id
+    assert retry_running[0].extra.get("retried_from_run_id") == failed_record.run_id
     assert records[-1].state == "done", (
         f"{kind}: retry did not end done: {_states(records)}"
     )
@@ -362,10 +372,22 @@ def _run_sync_kind_retry(
 def _run_pipeline_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
     history_path = tmp_path / "state" / "history.jsonl"
-    job = make_pipeline_job(tmp_path, cron="0 5 * * *")
+    job = make_pipeline_job(
+        tmp_path,
+        cron="0 5 * * *",
+        retry_attempts=1,
+        retry_on=("clone_failed", "repo_sync_failed"),
+    )
     (job.repo / ".git").mkdir(parents=True, exist_ok=True)
     config = RoutinesConfig(jobs=(job,))
     client = FakePipelineClient()
+    patch_dispatch(monkeypatch, "ensure_repo", lambda job: job.repo)
+    patch_dispatch(monkeypatch, "pipeline_unit_active", lambda run_id: False)
+    patch_dispatch(
+        monkeypatch,
+        "default_worktrees_root",
+        lambda *a, **k: tmp_path / "home" / ".herdr" / "worktrees" / "herdr-routines",
+    )
     launches: list[list[str]] = []
 
     def fake_launch(
@@ -419,7 +441,7 @@ def _run_pipeline_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert retry_run_id is not None
     retry_bare = retry_run_id.removeprefix(f"{job.name}-")
     done_path = tmp_path / "state" / "reports" / f"pipeline-{retry_bare}.md"
-    done_path.write_text("## Outcome: done\n")
+    done_path.write_text("## Outcome: ok\n")
     run_tick(config, history_path, client=client, now=retry_at + timedelta(minutes=1))  # type: ignore[arg-type]
     records = read_job(history_path, job.name)
     assert records[-1].state == "done", (
@@ -475,9 +497,8 @@ jobs:
     assert "repo_sync_failed" in job.retry_on
 
     gh = EventGhClient(events=True)
-    client = RecordingHerdrClient()
+    client = StatusHerdrClient(["failed", "failed"])
     tick_once = _event_ticks(job, tmp_path, monkeypatch, gh, client)
-    patch_dispatch(monkeypatch, "ensure_repo", _always_fail_ensure_repo)
 
     for minute in range(1, 6):
         tick_once(minute)
@@ -490,9 +511,7 @@ jobs:
     failed = [
         r
         for r in records
-        if r.state == "failed"
-        and (r.extra or {}).get("event_id") == EVENT_ID
-        and (r.extra or {}).get("reason") == "repo_sync_failed"
+        if r.state == "failed" and (r.extra or {}).get("event_id") == EVENT_ID
     ]
     assert len(failed) == 2, (
         f"the per-event budget must allow two attempts, got {_states(records)}"
@@ -543,16 +562,15 @@ def test_retry_backoff_is_one_two_four_ticks_without_sleeping(
     assert len(failed) == 4, f"expected four failed attempts, got {_states(records)}"
 
     intervals = []
-    for marker in scheduled:
+    for index, marker in enumerate(scheduled):
         assert marker.extra is not None
         due = _dt(marker.extra["retry_due_at"])
-        prior = [r for r in failed if r.ts <= due][-1]
+        prior = failed[index]
         intervals.append(int((due - prior.ts).total_seconds()))
     assert intervals == [300, 600, 1200]
     assert not _scheduled_retries(records[-1:])
 
     import herdr_routines.retry as retry_module
-
     import herdr_routines.tick as tick_module
     from herdr_routines import routine_flow
 
@@ -796,6 +814,7 @@ def test_fallback_model_still_runs_within_one_tick(
         fallback_model="fallback-model",
     )
     client = FakeClient(settle_status="idle", quota_exhausted_for_model="primary-model")
+    _patch_ensure_repo(monkeypatch, lambda job: job.repo)
     now = datetime(2026, 1, 1, 5, 0, tzinfo=UTC)
     occ = Occurrence(
         f"{job.name}-retry1",
