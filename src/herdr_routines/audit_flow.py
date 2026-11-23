@@ -646,7 +646,9 @@ def _diff_and_fix(
         )
     append(
         history_path,
-        HistoryRecord.new(ts=now, job=job.name, state="done", run_id=run_id, extra=extra),
+        HistoryRecord.new(
+            ts=now, job=job.name, state="done", run_id=run_id, extra=extra
+        ),
     )
     return f"{job.name}: done ({gate})", False
 
