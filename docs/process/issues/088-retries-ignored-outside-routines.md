@@ -1,7 +1,7 @@
 ---
 id: "088"
 title: "Retries: work for every job kind, back off across ticks, retry pre-agent failures by default"
-status: open
+status: done
 priority: medium
 area: runner
 ---
