@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import ast
 import json
 import multiprocessing
 import os
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, get_type_hints
 
 import pytest
 
+from herdr_routines import history as history_module
 from herdr_routines.auto_fix import attempt_count_for_pr
 from herdr_routines.history import (
     ALL_STATES,
+    HistoryExtra,
     HistoryRecord,
     append,
     find_stale_running,
@@ -27,6 +31,22 @@ from herdr_routines.history import (
 )
 
 T0 = datetime(2026, 8, 22, 6, 0, 0, tzinfo=UTC)
+
+SRC = Path(history_module.__file__).resolve().parent
+
+# A direct construction: `HistoryRecord(` with the paren right after the name.
+# `HistoryRecord.new(` and `HistoryRecord.from_dict(` do not match.
+DIRECT_CONSTRUCTION_RE = re.compile(r"HistoryRecord\(")
+
+
+def _direct_construction_sites() -> list[tuple[Path, int]]:
+    """Every (file, line) in src with a direct `HistoryRecord(` construction."""
+    sites: list[tuple[Path, int]] = []
+    for path in sorted(SRC.rglob("*.py")):
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            if DIRECT_CONSTRUCTION_RE.search(line):
+                sites.append((path, lineno))
+    return sites
 
 
 def test_append_and_read_round_trip(tmp_history_path: Path) -> None:
@@ -79,6 +99,118 @@ def test_read_back_keeps_unknown_extra_keys(tmp_history_path: Path) -> None:
 
     [got] = read_all(tmp_history_path)
     assert got.extra == {"run": "legacy-7", "gate": "passed"}
+
+
+# -- issue 064: enforce the HistoryExtra schema on write -----------------------
+
+
+def test_no_direct_historyrecord_construction_outside_history_module() -> None:
+    """Every production writer constructs records through `HistoryRecord.new(...)`
+    (`HistoryRecord.new(` does not match this scan), so a plain `dict` passed as
+    `extra` is a mypy error. The one direct `HistoryRecord(` construction left in src
+    is the reader path inside `from_dict`, marked as the sole sanctioned site."""
+    sites = _direct_construction_sites()
+    offenders = [
+        f"{path.name}:{lineno}" for path, lineno in sites if path.name != "history.py"
+    ]
+    assert offenders == []
+
+    tree = ast.parse((SRC / "history.py").read_text(), filename="history.py")
+    call_lines = [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "HistoryRecord"
+    ]
+    from_dict = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "from_dict"
+    )
+    assert from_dict.end_lineno is not None
+
+    # Exactly one sanctioned construction, and it is the from_dict reader path, not a
+    # stray writer that migrated only half-way.
+    assert len(call_lines) == 1
+    [call_line] = call_lines
+    assert from_dict.lineno <= call_line <= from_dict.end_lineno
+    assert [lineno for path, lineno in sites if path.name == "history.py"] == [
+        call_line
+    ]
+
+    # The sanctioned site carries the reader comment, so a future writer that bypasses
+    # the convention visibly stands out against it.
+    function_lines = (
+        (SRC / "history.py")
+        .read_text()
+        .splitlines()[from_dict.lineno - 1 : from_dict.end_lineno]
+    )
+    comments = [
+        stripped
+        for stripped in function_lines
+        if "#" in stripped and "reader" in stripped.lower()
+    ]
+    assert comments, (
+        "from_dict is not marked as the sole sanctioned reader construction"
+    )
+
+
+def test_widened_extra_keys_round_trip(tmp_history_path: Path) -> None:
+    """The schema carries the three keys the plain-dict stragglers emit —
+    `resume_count`/`resumed_from` (pipeline_watchdog) and `head_ref` (gated_event_flow,
+    distinct from the pre-existing `headRefName`) — and a record carrying all three
+    round-trips through append/read unchanged, byte for byte."""
+    hints = get_type_hints(HistoryExtra)
+    assert hints["resume_count"] is int
+    assert hints["resumed_from"] == str | None
+    assert hints["head_ref"] is str
+    assert hints["headRefName"] is str
+
+    extra: HistoryExtra = {
+        "resume_count": 2,
+        "resumed_from": "2026-11-17T05:00:00Z",
+        "head_ref": "auto/pipeline-20261117T050000Z",
+        "headRefName": "auto/pipeline-20261117T050000Z",
+    }
+    rec = HistoryRecord(
+        ts=T0, job="pipeline-watchdog", state="running", run_id="a-1", extra=extra
+    )
+    append(tmp_history_path, rec)
+
+    [line] = tmp_history_path.read_text().splitlines()
+    assert line == rec.to_json_line()
+    assert list(json.loads(line)) == [
+        "ts",
+        "job",
+        "state",
+        "run_id",
+        "resume_count",
+        "resumed_from",
+        "head_ref",
+        "headRefName",
+    ]
+
+    [got] = read_all(tmp_history_path)
+    assert got.extra == dict(extra)
+    assert got.to_json_line() == line
+
+
+def test_resumed_from_none_round_trips_as_json_null(tmp_history_path: Path) -> None:
+    """A legacy running record without `unit` gives the watchdog no `resumed_from`;
+    the write-side schema must keep that null instead of coercing it to `""`."""
+    rec = HistoryRecord.new(
+        ts=T0,
+        job="pipeline-watchdog",
+        state="running",
+        run_id="a-1",
+        extra=HistoryExtra(resumed_from=None),
+    )
+    append(tmp_history_path, rec)
+    [line] = tmp_history_path.read_text().splitlines()
+    assert json.loads(line)["resumed_from"] is None
+    [got] = read_all(tmp_history_path)
+    assert (got.extra or {})["resumed_from"] is None
 
 
 @pytest.mark.parametrize(

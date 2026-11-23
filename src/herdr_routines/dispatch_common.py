@@ -323,7 +323,7 @@ def _append_running(
 ) -> None:
     append(
         history_path,
-        HistoryRecord(
+        HistoryRecord.new(
             ts=now,
             job=job.name,
             state="running",

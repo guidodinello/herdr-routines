@@ -1,7 +1,7 @@
 ---
 id: "064"
 title: "Enforce the HistoryExtra schema when writing history records"
-status: open
+status: done
 priority: low
 area: infra
 ---
