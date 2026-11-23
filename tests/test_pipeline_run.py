@@ -1026,7 +1026,7 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_quota_marker
     stage2 = [c for c in client.started if c["name"] == f"pl-2-{RUN_ID}".lower()]
     # A fresh session, never `-s` on the failed one: that resume is `blocked` on arrival.
     assert [(c["model"], c["session_id"]) for c in stage2] == [
-        ("opencode/glm-5.3-flash-free", None),
+        ("opencode/deepseek-v4.1-flash-free", None),
         (AUTHOR_FALLBACK_MODEL, None),
     ]
     # The wedged pane is closed before the fallback starts in a new one.
@@ -1250,7 +1250,7 @@ def test_stage_fallbacks_stay_off_zen_and_keep_the_review_independent() -> None:
     assert all(not s.fallback_model.startswith("opencode/") for s in agent_stages)  # type: ignore[union-attr]
     # Whichever model writes the code, the reviewer's family is a different one.
     assert not stage_families(by_stage[6]) & stage_families(by_stage[4])
-    assert stage_families(by_stage[6]) == {"zhipu", "nvidia"}
+    assert stage_families(by_stage[6]) == {"deepseek", "nvidia"}
 
 
 def test_test_author_model_is_independent_of_implementer() -> None:
@@ -1389,13 +1389,13 @@ def test_stages_table_matches_the_prompt_files_on_disk() -> None:
 def test_stages_declare_the_documented_models_and_timeouts() -> None:
     by_stage = {s.stage: s for s in STAGES}
 
-    assert by_stage[1].model == "opencode/glm-5.3-flash-free"
-    assert by_stage[2].model == "opencode/glm-5.3-flash-free"
-    assert by_stage[3].model == "opencode/glm-5.3-flash-free"
+    assert by_stage[1].model == "opencode/deepseek-v4.1-flash-free"
+    assert by_stage[2].model == "opencode/deepseek-v4.1-flash-free"
+    assert by_stage[3].model == "opencode/deepseek-v4.1-flash-free"
     assert by_stage[3].fallback_model == REVIEWER_FALLBACK_MODEL
     assert by_stage[4].model == "opencode/big-pickle"
     assert by_stage[5].model is None
-    assert by_stage[6].model == "opencode/glm-5.3-flash-free"
+    assert by_stage[6].model == "opencode/deepseek-v4.1-flash-free"
     # The reviewer is never the implementer's model (independent review).
     assert by_stage[6].model != by_stage[4].model
     assert by_stage[7].reuses_stage == 4
