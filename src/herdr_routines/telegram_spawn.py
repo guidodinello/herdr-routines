@@ -4,7 +4,8 @@ An *event handler* for inbound Telegram messages — not a scheduler, not a daem
 complements the Telegram bot's reply-to-steer flow (issue 023) with a
 cold-start path: a ``/run <alias> [harness] [model]`` or ``/start <alias> ...`` message
 creates a workspace and starts an agent against the mapped checkout, then replies with the
-pane handle the phone steers with.
+pane handle the phone steers with. An optional first prompt follows the command on the next
+line(s), or after a ``--`` token on the command line, and is sent once the agent is up.
 
 The handler deliberately reuses the launcher mechanics rather than inventing a layout,
 exactly as ``runner.execute_run`` does per ``workspace`` mode: ``worktree`` opens a fresh
@@ -69,7 +70,15 @@ _TARGET_RE = re.compile(r"[a-z][a-z0-9_-]*")
 # so it can never read as a flag to the harness it is passed to.
 _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 
-_USAGE = "Usage: /run <alias> [harness] [model]"
+_USAGE = (
+    "Usage: /run <alias> [harness] [model] [-- prompt, or the prompt on the next line]"
+)
+
+# The token that ends the command and starts the prompt on a one-line message.
+_PROMPT_SEPARATOR = "--"
+
+# A first prompt longer than a Telegram message can carry is not a phone-typed prompt.
+MAX_PROMPT_CHARS = 4096
 
 # The configured-job verb (issue 075): `/job <name>` runs a job that opted in with
 # `trigger: {request: true}`. Case-sensitive for the same reason as the cold-start verbs.
@@ -113,15 +122,19 @@ class SpawnClient(Protocol):
         session_id: str | None = None,
     ) -> None: ...
 
+    def agent_prompt(self, *, target: str, text: str) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class SpawnCommand:
     """A parsed cold-start command. ``agent_kind``/``model`` are None when not given, so
-    the alias's own defaults apply."""
+    the alias's own defaults apply. ``prompt`` is the first message to send the agent, or
+    None to start it idle."""
 
     target: str
     agent_kind: str | None = None
     model: str | None = None
+    prompt: str | None = None
 
 
 def _is_spawn_verb(text: object) -> bool:
@@ -133,13 +146,30 @@ def _is_spawn_verb(text: object) -> bool:
 def parse_spawn_command(text: str) -> SpawnCommand | None:
     """Parse ``/run <alias> [harness] [model]`` (or ``/start ...``), or return None.
 
+    A first prompt may follow: everything after the first line, or after a ``--`` token on
+    the first line (both, joined by a newline, when a message uses both). The prompt is
+    free text that reaches Herdr only as one argv element, so it is not shape-checked
+    beyond a length cap; an empty prompt is the same as none.
+
     The alias must have the shape ``[a-z][a-z0-9_-]*``. A second token that names a known
     agent kind is the harness, and a third token is then the model; any other second token
     is the model for the alias's own harness, so ``/run x opus`` works too. Anything else
     (no alias, extra tokens, an unknown verb, an ill-shaped alias or model) returns None:
     a loose parse would spawn the wrong checkout, or hand a flag-like or shell-like token
     to the launcher (spec criterion 1/6)."""
-    parts = text.split()
+    header, _, body = text.strip().partition("\n")
+    parts = header.split()
+    inline_prompt = ""
+    if _PROMPT_SEPARATOR in parts:
+        cut = parts.index(_PROMPT_SEPARATOR)
+        # Keep the prompt's own spacing: take the raw text after the separator token.
+        inline_prompt = (
+            header.split(None, cut + 1)[cut + 1] if len(parts) > cut + 1 else ""
+        )
+        parts = parts[:cut]
+    prompt = "\n".join(p for p in (inline_prompt.strip(), body.strip()) if p) or None
+    if prompt is not None and len(prompt) > MAX_PROMPT_CHARS:
+        return None
     if not 2 <= len(parts) <= 4 or parts[0] not in _COMMAND_VERBS:
         return None
     target, *rest = parts[1:]
@@ -151,7 +181,9 @@ def parse_spawn_command(text: str) -> SpawnCommand | None:
     model = rest[0] if rest else None
     if model is not None and not _MODEL_RE.fullmatch(model):
         return None
-    return SpawnCommand(target=target, agent_kind=agent_kind, model=model)
+    return SpawnCommand(
+        target=target, agent_kind=agent_kind, model=model, prompt=prompt
+    )
 
 
 def is_authorized(chat_id: int | str, allowed_chat_id: int | str | None) -> bool:
@@ -277,11 +309,22 @@ def handle_spawn_message(
             _best_effort(client, "pane_close", pane_id)
             return _reply(reply, f"spawn failed: {retry_error}")
 
-    return _reply(
-        reply,
+    # Every success reply keeps ", pane <id>. Reply to this message": the bot matches that
+    # phrase to bind its reply-to-steer flow to the new pane.
+    spawned = (
         f"Spawned {name} ({kind}{f' {model}' if model else ''}) on {where}, "
-        f"pane {pane_id}. Reply to this message to steer it.",
+        f"pane {pane_id}. Reply to this message to"
     )
+    if command.prompt is None:
+        return _reply(reply, f"{spawned} steer it.")
+    try:
+        # No --wait: the bridge waits on this process, and the agent's progress reaches
+        # the phone through the bot's own status notifications.
+        client.agent_prompt(target=name, text=command.prompt)
+    except (HerdrCliError, OSError) as e:
+        # The agent is up, so keep its pane: the phone can still send the prompt by reply.
+        return _reply(reply, f"{spawned} send the prompt; sending it failed: {e}")
+    return _reply(reply, f"{spawned} steer it. Prompt sent.")
 
 
 def is_job_verb(text: object) -> bool:
