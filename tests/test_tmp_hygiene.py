@@ -95,7 +95,8 @@ def test_tmp_hygiene_age_based_cleanup(tmp_path: Path) -> None:
     assert not old_so.exists()
     assert not old_so_sibling.exists()
     assert not old_pytest.exists()
-    assert not old_opencode.exists()
+    assert old_opencode.exists(), "the opencode container itself stays"
+    assert list(old_opencode.iterdir()) == []
     assert fresh_so.exists()
 
 
@@ -238,10 +239,10 @@ def test_tmp_hygiene_narrow_patterns(tmp_path: Path) -> None:
 
 def test_tmp_hygiene_keeps_old_dir_with_fresh_nested_file(tmp_path: Path) -> None:
     """Nested writes don't bump the top-level mtime, so a live agent writing deep in
-    /tmp/opencode must still count as fresh."""
+    an /tmp/opencode-* tree must still count as fresh."""
     tmp_dir = tmp_path / "tmp"
     tmp_dir.mkdir()
-    live = _make_old_dir(tmp_dir, "opencode")
+    live = _make_old_dir(tmp_dir, "opencode-live")
     deep = live / "a" / "b"
     deep.mkdir(parents=True)
     old_time = time.time() - 7200
@@ -314,6 +315,65 @@ def test_tmp_hygiene_keeps_tree_larger_than_walk_bound(
     assert big.exists()
     assert result.removed == 0
     assert result.errors == 1
+
+
+def _make_old_tree(parent: Path, name: str, files: int) -> Path:
+    """A directory holding *files* files, every mtime in it two hours old."""
+    d = parent / name
+    d.mkdir(parents=True)
+    old_time = time.time() - 7200
+    for n in range(files):
+        f = d / f"f{n}"
+        f.write_text("x")
+        os.utime(f, (old_time, old_time))
+    os.utime(d, (old_time, old_time))
+    return d
+
+
+def test_tmp_hygiene_reaps_stale_opencode_child_beside_live_one(tmp_path: Path) -> None:
+    """A live checkout in /tmp/opencode no longer shields its stale siblings."""
+    tmp_dir = tmp_path / "tmp"
+    container = tmp_dir / "opencode"
+    stale = _make_old_tree(container, "pr1268-a", files=2)
+    live = _make_old_tree(container, "pr1300", files=2)
+    (live / "state.db").write_text("live")
+
+    result = reap_tmp(tmp_dir=tmp_dir, max_age_s=3600)
+
+    assert not stale.exists()
+    assert live.exists()
+    assert container.exists()
+    assert (result.removed, result.skipped_fresh, result.errors) == (1, 1, 0)
+
+
+def test_tmp_hygiene_reaps_opencode_children_whose_sum_exceeds_walk_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each child is walked on its own, so checkouts that together exceed the walk
+    bound are still reaped. Before, the whole directory hit the bound and was kept."""
+    tmp_dir = tmp_path / "tmp"
+    container = tmp_dir / "opencode"
+    children = [_make_old_tree(container, f"pr{n}", files=3) for n in range(3)]
+    monkeypatch.setattr(tmp_hygiene, "_MAX_WALK_ENTRIES", 5)
+
+    result = reap_tmp(tmp_dir=tmp_dir, max_age_s=3600)
+
+    assert not any(c.exists() for c in children)
+    assert (result.removed, result.errors) == (3, 0)
+
+
+def test_tmp_hygiene_ignores_opencode_container_symlink(tmp_path: Path) -> None:
+    """A /tmp/opencode symlink is never followed, so its target's children stay."""
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+    outside = tmp_path / "elsewhere"
+    precious = _make_old_tree(outside, "keep", files=1)
+    (tmp_dir / "opencode").symlink_to(outside, target_is_directory=True)
+
+    result = reap_tmp(tmp_dir=tmp_dir, max_age_s=3600)
+
+    assert precious.exists()
+    assert result == tmp_hygiene.ReapResult()
 
 
 # ---------------------------------------------------------------------------
