@@ -91,6 +91,13 @@ from herdr_routines.repos import (
     ensure_repo,
     is_repo_less,
 )
+from herdr_routines.retry import (
+    RETRY_DROPPED_REASON,
+    pending_retry,
+    retry_decision,
+    retry_occurrence,
+    schedule_record,
+)
 from herdr_routines.routine_flow import (
     _run_routine,
 )
@@ -361,10 +368,9 @@ def _guard_open_run(
 
     A stale `running` record is reconciled to `interrupted_unknown`, but only while this
     tick holds the job's dispatch lock (issue 079). A held lock proves the run is alive,
-    since flock dies with its process: a retried run's record keeps the tick-start `ts`
-    for `(1 + retry_attempts)` timeouts, and a job dispatched late in a sequential tick
-    looks older than it is, so the record alone cannot tell. The lock is probed only when
-    a record looks stale, so a probe rarely meets a real dispatcher.
+    since flock dies with its process: a job dispatched late in a sequential tick looks
+    older than it is, so the record alone cannot tell. The lock is probed only when a
+    record looks stale, so a probe rarely meets a real dispatcher.
 
     A run still in flight (lock held, or a fresh `running` record) skips without writing
     anything, as before issue 079: a record here would be trigger-less, so it would count
@@ -574,6 +580,18 @@ def _fire_triggers(
     if live_check is None:
         live_check = _live_agent_exists
     event_trigger, event_is_gate = _event_trigger_for(job)
+    if not event_is_gate:
+        retry = _retry_pending_dispatch(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+            run_timeout_ms=run_timeout_ms,
+            live_check=live_check,
+        )
+        if retry is not None:
+            return retry
     cron_summary: str | None = None
     if not event_is_gate and job.cron is not None:
         last = last_scheduled_terminal_run(history_path, job.name)
@@ -894,6 +912,80 @@ DispatchRefusal = Literal[
 # record with the lock free belongs to a dead process, and refusing a retry for it would
 # strand the operator until the record goes stale.
 _PERSON_TRIGGERS: Final = frozenset({TRIGGER_MANUAL, TRIGGER_REQUEST})
+_SCHEDULABLE_TRIGGERS: Final = frozenset({TRIGGER_CRON, TRIGGER_EVENT})
+
+
+def _maybe_schedule_retry(job: Job, history_path: Path, occ: Occurrence) -> None:
+    if job.retry_attempts <= 0 or job.retry_on is None:
+        return
+    trigger = occ.extra.get("trigger")
+    if not isinstance(trigger, str) or trigger not in _SCHEDULABLE_TRIGGERS:
+        return
+    records = read_job(history_path, job.name)
+    failed = next((r for r in reversed(records) if r.state in TERMINAL_STATES), None)
+    if failed is None or failed.state != "failed" or failed.run_id is None:
+        return
+    extra = failed.extra or {}
+    reason = extra.get("reason")
+    attempt = extra.get("attempt", 0)
+    if (
+        not isinstance(reason, str)
+        or reason not in job.retry_on
+        or not isinstance(attempt, int)
+        or attempt >= job.retry_attempts
+        or pending_retry(records) is not None
+    ):
+        return
+    append(
+        history_path,
+        schedule_record(job, failed, attempt + 1, trigger=trigger),
+    )
+
+
+def _retry_pending_dispatch(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...],
+    run_timeout_ms: int,
+    live_check: Callable[[HerdrClient, Job], bool],
+) -> tuple[str, bool] | _PendingDispatch | None:
+    if job.retry_attempts <= 0:
+        return None
+    pending = pending_retry(read_job(history_path, job.name))
+    if pending is None:
+        return None
+    decision = retry_decision(pending, cron=job.cron, timezone=job.timezone, now=now)
+    if decision == "wait":
+        return f"{job.name}: retry pending", False
+    if decision == "drop":
+        append(
+            history_path,
+            HistoryRecord.new(
+                ts=now,
+                job=job.name,
+                state="skipped",
+                extra=HistoryExtra(
+                    reason=RETRY_DROPPED_REASON,
+                    trigger=pending.trigger,
+                    attempt=pending.attempt,
+                    retry_of=pending.run_id,
+                ),
+            ),
+        )
+        return None
+    occ = retry_occurrence(job, pending, now=now)
+    return _pending_occurrence(
+        job,
+        history_path,
+        occ,
+        client=client,
+        trusted_review_authors=trusted_review_authors,
+        run_timeout_ms=run_timeout_ms,
+        live_check=live_check,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1144,7 +1236,7 @@ def dispatch_occurrence(
         # An off-schedule run of a pipeline with an open run is refused by
         # `_dispatch_pending` (an `already_running` refusal); this entry point only ever
         # launches a firing the job-locked dispatch already cleared.
-        return _launch_pipeline_run(
+        summary, failed = _launch_pipeline_run(
             job,
             history_path,
             client=client,
@@ -1153,13 +1245,13 @@ def dispatch_occurrence(
             bare_run_id=_bare_pipeline_run_id(job.name, occ.run_id),
             running_extra=_occurrence_extra(occ),
         )
-    if job.kind == "audit":
+    elif job.kind == "audit":
         _append_running(job, history_path, occ, now=now)
-        return _audit_cycle(
+        summary, failed = _audit_cycle(
             job, history_path, client=client, now=now, run_id=occ.run_id
         )
-    if job.kind == "gated":
-        return _gated_cycle(
+    elif job.kind == "gated":
+        summary, failed = _gated_cycle(
             job,
             history_path,
             occ,
@@ -1167,14 +1259,17 @@ def dispatch_occurrence(
             now=now,
             trusted_review_authors=trusted_review_authors,
         )
-    return _run_routine(
-        job,
-        history_path,
-        occ,
-        client=client,
-        now=now,
-        trusted_review_authors=trusted_review_authors,
-    )
+    else:
+        summary, failed = _run_routine(
+            job,
+            history_path,
+            occ,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+        )
+    _maybe_schedule_retry(job, history_path, occ)
+    return summary, failed
 
 
 def _gated_cycle(
@@ -1383,6 +1478,12 @@ def _decide_pipeline_job(
             if state == "skipped":
                 return f"{job.name}: skipped", False
 
+            _maybe_schedule_retry(
+                job,
+                history_path,
+                Occurrence(open_run.run_id, HistoryExtra(trigger=TRIGGER_CRON)),
+            )
+
             # No run-level fallback_model relaunch, unlike the routine-job path: a quota
             # wedge already resumed the stage on `StageSpec.fallback_model` inside
             # `pipeline_run`, so a `quota_exhausted` report means that resume was not
@@ -1453,6 +1554,18 @@ def _decide_pipeline_job(
                 sound="request",
             )
         return f"{job.name}: failed (no_report)", True
+
+    retry = _retry_pending_dispatch(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        trusted_review_authors=DEFAULT_TRUSTED_REVIEW_AUTHORS,
+        run_timeout_ms=job.timeout_ms,
+        live_check=_live_agent_exists,
+    )
+    if retry is not None:
+        return retry
 
     if _live_agent_exists(client, job):
         append(

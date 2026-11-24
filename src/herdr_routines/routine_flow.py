@@ -1,11 +1,12 @@
-"""The `kind: routine` flow: run one agent occurrence, with retries, and record it.
+"""The `kind: routine` flow: run one agent occurrence, with the fallback model, and record
+it. Retries are scheduled by the tick on a later occurrence (issue 088); this flow only
+runs one attempt, so a tick never holds a lock while waiting for a backoff.
 
 Split out of `tick.py` (issue 060).
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -89,14 +90,19 @@ def _outcome_extra(
     return extra
 
 
-def _retry_eligible(outcome: RunOutcome, job: Job) -> bool:
-    """Check if this outcome is eligible for a retry attempt per the job's retry config."""
-    return (
-        outcome.state == "failed"
-        and outcome.reason is not None
-        and job.retry_on is not None
-        and outcome.reason in job.retry_on
-    )
+def _with_retry_meta(occ: Occurrence, extra: HistoryExtra) -> HistoryExtra:
+    """Stamp a record with the occurrence's trigger and retry bookkeeping, if any."""
+    stamped = _with_trigger(occ, extra)
+    attempt = occ.extra.get("attempt")
+    max_retries = occ.extra.get("max_retries")
+    retried_from = occ.extra.get("retried_from_run_id")
+    if isinstance(attempt, int):
+        stamped["attempt"] = attempt
+    if isinstance(max_retries, int):
+        stamped["max_retries"] = max_retries
+    if isinstance(retried_from, str):
+        stamped["retried_from_run_id"] = retried_from
+    return stamped
 
 
 def _run_routine(
@@ -109,9 +115,9 @@ def _run_routine(
     trusted_review_authors: tuple[str, ...],
 ) -> tuple[str, bool]:
     """One occurrence of a plain routine job: selector, `running` record, `execute_run` with
-    the fallback_model and retry loop, terminal record, notification. The tick and
-    `herdr-routines run` both land here (issue 074). A selector that returns several targets
-    (issue 076) fans out in `_run_routine_targets` instead."""
+    the fallback_model, terminal record, notification. The tick and `herdr-routines run`
+    both land here (issue 074). A selector that returns several targets (issue 076) fans out
+    in `_run_routine_targets` instead."""
     if job.pick in MULTI_TARGET_SELECTORS:
         return _run_routine_targets(
             job,
@@ -197,69 +203,15 @@ def _run_routine(
         target=target,
     )
     used_fallback = False
-    attempt = 0  # 0 = first try
 
-    # Per-job retry loop (issue 008): bounded synchronous retries within the same
-    # tick, gated on retry_on whitelist. The fallback_model quota retry runs inside
-    # each attempt so retried attempts also get the fallback treatment.
-    base_run_id = run_id
-    while True:
-        # Fallback_model quota retry (issue 008): runs inside each attempt so a
-        # retried attempt that hits quota_exhausted also gets the fallback.
-        if (
-            outcome.state == "failed"
-            and outcome.reason == "quota_exhausted"
-            and job.fallback_model
-            and job.fallback_model != job.model
-        ):
-            used_fallback = True
-            append(
-                history_path,
-                HistoryRecord.new(
-                    ts=now,
-                    job=job.name,
-                    state=outcome.state,
-                    run_id=run_id,
-                    extra=_with_trigger(occ, _outcome_extra(outcome, target=target)),
-                ),
-            )
-            log.info(
-                "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
-                job.name,
-                job.fallback_model,
-            )
-            fallback_run_id = make_run_id(f"{job.name}-fallback", now)
-            append(
-                history_path,
-                HistoryRecord.new(
-                    ts=now,
-                    job=job.name,
-                    state="running",
-                    run_id=fallback_run_id,
-                    extra=_with_trigger(
-                        occ,
-                        HistoryExtra(reason="fallback_retry", primary_run_id=run_id),
-                    ),
-                ),
-            )
-            run_id = fallback_run_id
-            outcome = execute_run(
-                replace(job, model=job.fallback_model),
-                client,
-                run_id=run_id,
-                trusted_review_authors=trusted_review_authors,
-                gh=gh,
-                target=target,
-            )
-
-        # Check if this outcome is eligible for a retry attempt
-        if not _retry_eligible(outcome, job) or attempt >= job.retry_attempts:
-            break
-
-        # Log the failed attempt as a distinct history record with attempt metadata
-        extra = _with_trigger(occ, _outcome_extra(outcome, target=target))
-        extra["attempt"] = attempt
-        extra["retry_eligible_reason"] = outcome.reason
+    # fallback_model is a same-tick recovery for a quota wall, not a scheduled retry.
+    if (
+        outcome.state == "failed"
+        and outcome.reason == "quota_exhausted"
+        and job.fallback_model
+        and job.fallback_model != job.model
+    ):
+        used_fallback = True
         append(
             history_path,
             HistoryRecord.new(
@@ -267,43 +219,30 @@ def _run_routine(
                 job=job.name,
                 state=outcome.state,
                 run_id=run_id,
-                extra=extra,
+                extra=_with_retry_meta(occ, _outcome_extra(outcome, target=target)),
             ),
         )
-        attempt += 1
-        run_id = f"{base_run_id}-retry{attempt}"
         log.info(
-            "%s: retry attempt %d/%d after %s",
+            "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
             job.name,
-            attempt,
-            job.retry_attempts,
-            outcome.reason,
+            job.fallback_model,
         )
-        # Brief backoff (reuses PROMPT_RETRY_DELAYS_S shape: 5s, 15s, ...)
-        backoff = (5.0, 15.0)[min(attempt - 1, 1)]
-        time.sleep(backoff)
-        # Append a running record for the retry attempt
+        fallback_run_id = make_run_id(f"{job.name}-fallback", now)
         append(
             history_path,
             HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="running",
-                run_id=run_id,
-                extra=_with_trigger(
-                    occ,
-                    HistoryExtra(
-                        attempt=attempt,
-                        max_retries=job.retry_attempts,
-                        retried_from_run_id=base_run_id
-                        if attempt == 1
-                        else f"{base_run_id}-retry{attempt - 1}",
-                    ),
+                run_id=fallback_run_id,
+                extra=_with_retry_meta(
+                    occ, HistoryExtra(reason="fallback_retry", primary_run_id=run_id)
                 ),
             ),
         )
+        run_id = fallback_run_id
         outcome = execute_run(
-            job,
+            replace(job, model=job.fallback_model),
             client,
             run_id=run_id,
             trusted_review_authors=trusted_review_authors,
@@ -311,11 +250,17 @@ def _run_routine(
             target=target,
         )
 
-    # Terminal record for final outcome (last retry or first attempt if no retries)
-    final_extra = _with_trigger(occ, _outcome_extra(outcome, target=target))
-    final_extra["attempt"] = attempt
-    final_extra["max_retries"] = job.retry_attempts
-    if attempt > 0:
+    # Terminal record for this attempt. A tick-scheduled retry carries its attempt index
+    # in the occurrence; a first run records zeros.
+    final_extra = _with_retry_meta(occ, _outcome_extra(outcome, target=target))
+    final_attempt = occ.extra.get("attempt")
+    final_extra["attempt"] = final_attempt if isinstance(final_attempt, int) else 0
+    final_extra["max_retries"] = (
+        occ.extra.get("max_retries", 0)
+        if isinstance(occ.extra.get("max_retries"), int)
+        else 0
+    )
+    if final_extra["attempt"] > 0:
         final_extra["final_attempt"] = True
     append(
         history_path,

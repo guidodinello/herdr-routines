@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1366,9 +1367,10 @@ def test_pipeline_deploy_example_loads_cleanly(tmp_path: Path) -> None:
 
 
 def test_retry_config_requires_explicit_eligible_reasons(tmp_config_path: Path) -> None:
-    """Acceptance criterion 1: retry_attempts > 0 without non-empty retry_on is rejected.
-    retry_on must contain known RunOutcome.reason strings; unlisted reasons are rejected."""
-    # retry_attempts > 0 with no retry_on → ConfigError
+    """retry_attempts > 0 with an explicit empty/null retry_on is rejected. retry_on must
+    contain known RunOutcome.reason strings; unlisted reasons are rejected. With the key
+    absent, the pre-agent reasons are derived instead (covered by the v2 acceptance test)."""
+    # retry_attempts > 0 with explicit null retry_on → ConfigError
     text = """
 version: 1
 jobs:
@@ -1376,6 +1378,7 @@ jobs:
     cron: "0 3 * * *"
     repo: /repo/a
     retry_attempts: 1
+    retry_on: null
 """
     with pytest.raises(
         ConfigError, match="retry_attempts.*requires non-empty 'retry_on'"
@@ -1432,9 +1435,9 @@ jobs:
 
 
 def test_retry_validation(tmp_config_path: Path) -> None:
-    """Acceptance criterion 6: validation rejects retry_attempts out of bounds / non-int /
-    bool, empty/null retry_on is valid, retry_on non-empty with retry_attempts == 0 warns,
-    and retry_attempts > 0 on workspace: root warns."""
+    """Validation rejects retry_attempts out of bounds / non-int / bool, an explicit empty
+    retry_on with attempts > 0 is invalid, retry_on non-empty with retry_attempts == 0 warns,
+    and retries on workspace: root are no longer warned about."""
     # retry_attempts negative
     text = """
 version: 1
@@ -1483,13 +1486,14 @@ jobs:
     with pytest.raises(ConfigError, match="retry_attempts.*must be an integer"):
         load_config(write(tmp_config_path, text))
 
-    # retry_on with empty list is valid (but inert)
+    # retry_on with empty list is valid (but inert) when attempts are explicitly 0
     text = """
 version: 1
 jobs:
   - name: a
     cron: "0 3 * * *"
     repo: /repo/a
+    retry_attempts: 0
     retry_on: []
 """
     cfg = load_config(write(tmp_config_path, text))
@@ -1515,7 +1519,7 @@ jobs:
     assert job.retry_attempts == 0
     assert job.retry_on == ("agent_start_failed",)
 
-    # retry_attempts > 0 on workspace: root → warns (not error)
+    # The workspace is not the risk: the agent having started is. No warning now.
     text = """
 version: 1
 jobs:
@@ -1527,8 +1531,10 @@ jobs:
     retry_on:
       - agent_start_failed
 """
-    with pytest.warns(UserWarning, match="'retry_attempts' > 0 on workspace: root"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         cfg = load_config(write(tmp_config_path, text))
+    assert not any("workspace: root" in str(w.message) for w in caught)
     job = cfg.job("a")
     assert job is not None
     assert job.retry_attempts == 1

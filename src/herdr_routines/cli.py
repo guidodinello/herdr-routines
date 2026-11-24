@@ -1188,18 +1188,16 @@ def _check_systemd_timeout(config: RoutinesConfig, unit_path: Path) -> list[str]
                     + job.max_workers_per_tick * gate_time_s
                 )
         else:
-            # Scale by (1 + retry_attempts) so the validate check accounts for
-            # the worst-case tick time when a routine job retries transient failures
-            # (issue 008), and by max_targets_per_run: a multi-target run (issue 076)
-            # runs one agent per target in turn, each bounded by start + run, plus the
-            # worktree/gh slop once. A tick still dispatches its jobs sequentially; only
-            # the lock it holds across them narrowed (issue 079).
+            # Scale by max_targets_per_run: a multi-target run (issue 076) acts on one
+            # target at a time, each bounded by start + run, plus the worktree/gh slop
+            # once. Retries run on later ticks (issue 088), so one tick never runs more
+            # than one attempt per job. Jobs are still dispatched sequentially; only the
+            # lock held across them narrowed (issue 079).
             total_job_seconds += (
                 GATE_SLOP_S if job.pick in MULTI_TARGET_SELECTORS else 0
             ) + (
                 max(1, job.max_targets_per_run)
                 * (job.start_timeout_ms + job.timeout_ms)
-                * (1 + job.retry_attempts)
             ) / 1000
     required_s = total_job_seconds + SYSTEMD_TIMEOUT_MARGIN_SECONDS
     if unit_timeout_s < required_s:

@@ -1,7 +1,8 @@
 """Run history: append-only JSONL, plus the read-back queries `schedule.py` needs.
 
 The file is a log of state transitions, not a mutable record set — see docs/plan-v1.md §5.
-States actually written: registered, running, done, failed, skipped, missed, interrupted_unknown.
+States actually written: registered, scheduled, running, done, failed, skipped, missed,
+interrupted_unknown. `scheduled` is a retry marker, not a run (issue 088).
 
 Rotation (issue 021) is non-destructive: `maybe_rotate` renames the live file to a
 timestamped sibling (`history-<YYYYMMDDTHHMMSSZ>.jsonl`) and leaves a fresh empty live
@@ -55,8 +56,14 @@ TRIGGER_MANUAL = "manual"
 #   - `collapsed_earlier_occurrences`: occurrences skipped before the one being dispatched.
 #   - `dispatch_in_flight`: a dispatcher lost the job's non-blocking dispatch lock.
 #   - `checkout_busy`: a `workspace: root` dispatch lost its checkout's lock to another job.
+#   - `retry_dropped`: a pending retry lost to the next cron occurrence (issue 088).
 NOT_A_RUN_REASONS: frozenset[str] = frozenset(
-    {"collapsed_earlier_occurrences", "dispatch_in_flight", "checkout_busy"}
+    {
+        "collapsed_earlier_occurrences",
+        "dispatch_in_flight",
+        "checkout_busy",
+        "retry_dropped",
+    }
 )
 
 
@@ -175,6 +182,8 @@ class HistoryExtra(TypedDict, total=False):
     primary_run_id: str
     retried_from_run_id: str
     retry_eligible_reason: str | None
+    retry_due_at: str
+    retry_of: str | None
     # pipeline
     pipeline_run_id: str
     unit: str
