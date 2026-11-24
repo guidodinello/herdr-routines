@@ -27,9 +27,16 @@ DEFAULT_MAX_AGE_S = 3600
 _LEAK_GLOBS: list[tuple[str, bool]] = [
     (".3cdc*", False),  # .3cdc*.so and siblings — files only (is_file guard)
     ("pytest-of-*", True),  # pytest temp dirs — recursive removal
-    ("opencode", True),  # opencode harness dir — recursive removal
     ("opencode-*", True),  # opencode sibling dirs
 ]
+
+# Shared directories whose direct children are reaped one by one; the directory itself
+# stays. opencode keeps unrelated work in /tmp/opencode side by side (agents clone one
+# PR checkout per review into it, ~3,500 entries each), so judging the whole directory
+# as one tree let one live child keep every stale sibling, and three checkouts push it
+# past _MAX_WALK_ENTRIES, which keeps it for good. The Pi's /tmp reached 95% on
+# 2026-11-22 with stale checkouts there while the reap logged one error a tick.
+_LEAK_CONTAINERS: tuple[str, ...] = ("opencode",)
 
 
 # Upper bound on entries inspected per directory tree. A tree this large that we cannot
@@ -88,7 +95,8 @@ def reap_tmp(
     its job lock, never the `tick.lock` the reap takes), and nested writes don't touch the
     top level. A tree that can't be fully inspected is kept and counted as an error.
 
-    Only matches files/dirs at the top level of *tmp_dir*. Follows no symlinks.
+    Only matches files/dirs at the top level of *tmp_dir*, plus the direct children of
+    each `_LEAK_CONTAINERS` directory. Follows no symlinks.
     Per-entry try/except ensures a single failure never aborts the sweep.
     """
     now = time.time()
@@ -97,37 +105,52 @@ def reap_tmp(
     skipped_fresh = 0
     errors = 0
 
-    for pattern, is_dir in _LEAK_GLOBS:
-        for entry in tmp_dir.glob(pattern):
-            # Top-level guard: glob should only match direct children, but belt-and-suspenders.
-            if entry.parent != tmp_dir:
-                continue
-            # Symlink safety: never follow or delete symlinks. Checked before any stat
-            # so a dangling or retargeted link is never judged by its target.
-            if entry.is_symlink():
-                continue
+    for entry in _candidates(tmp_dir):
+        # Symlink safety: never follow or delete symlinks. Checked before any stat
+        # so a dangling or retargeted link is never judged by its target.
+        if entry.is_symlink():
+            continue
 
-            try:
-                fresh = _is_fresh(entry, cutoff)
-            except (OSError, _WalkIncomplete):
-                errors += 1
-                continue
+        try:
+            fresh = _is_fresh(entry, cutoff)
+        except (OSError, _WalkIncomplete):
+            errors += 1
+            continue
 
-            if fresh:
-                skipped_fresh += 1
-                continue
+        if fresh:
+            skipped_fresh += 1
+            continue
 
-            if dry_run:
-                removed += 1
-                continue
+        if dry_run:
+            removed += 1
+            continue
 
-            try:
-                if entry.is_dir():
-                    shutil.rmtree(entry)
-                else:
-                    entry.unlink()
-                removed += 1
-            except OSError:
-                errors += 1
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed += 1
+        except OSError:
+            errors += 1
 
     return ReapResult(removed=removed, skipped_fresh=skipped_fresh, errors=errors)
+
+
+def _candidates(tmp_dir: Path) -> list[Path]:
+    """Every entry the reap judges: top-level glob matches, then the direct children of
+    each container. A container that is a symlink or not a directory contributes
+    nothing."""
+    found: list[Path] = []
+    for pattern, _is_dir in _LEAK_GLOBS:
+        # Top-level guard: glob should only match direct children, but belt-and-suspenders.
+        found.extend(e for e in tmp_dir.glob(pattern) if e.parent == tmp_dir)
+    for name in _LEAK_CONTAINERS:
+        container = tmp_dir / name
+        if container.is_symlink() or not container.is_dir():
+            continue
+        try:
+            found.extend(container.iterdir())
+        except OSError:
+            log.warning("tmp hygiene: cannot list %s", container)
+    return found
