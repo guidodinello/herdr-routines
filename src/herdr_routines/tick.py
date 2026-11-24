@@ -8,7 +8,7 @@ import fcntl
 import os
 from collections.abc import Callable, Generator, Iterable
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Literal
@@ -91,13 +91,19 @@ from herdr_routines.repos import (
     ensure_repo,
     is_repo_less,
 )
+from herdr_routines.retry import (
+    RETRY_DROPPED_REASON,
+    eligible_failure,
+    find_pending_retry,
+    pending_retry_record,
+)
 from herdr_routines.routine_flow import (
     _run_routine,
 )
 from herdr_routines.runner import (
     make_run_id,
 )
-from herdr_routines.schedule import Decision, decide
+from herdr_routines.schedule import Decision, decide, occurrences_since
 from herdr_routines.tmp_hygiene import reap_tmp
 
 log = get_logger(__name__)
@@ -361,9 +367,8 @@ def _guard_open_run(
 
     A stale `running` record is reconciled to `interrupted_unknown`, but only while this
     tick holds the job's dispatch lock (issue 079). A held lock proves the run is alive,
-    since flock dies with its process: a retried run's record keeps the tick-start `ts`
-    for `(1 + retry_attempts)` timeouts, and a job dispatched late in a sequential tick
-    looks older than it is, so the record alone cannot tell. The lock is probed only when
+    since flock dies with its process: a job dispatched late in a sequential tick looks
+    older than it is (its record keeps the tick-start `ts`), so the record alone cannot tell. The lock is probed only when
     a record looks stale, so a probe rarely meets a real dispatcher.
 
     A run still in flight (lock held, or a fresh `running` record) skips without writing
@@ -576,6 +581,18 @@ def _fire_triggers(
     event_trigger, event_is_gate = _event_trigger_for(job)
     cron_summary: str | None = None
     if not event_is_gate and job.cron is not None:
+        # A failed run's pending retry is due work, not a missed occurrence (issue 088).
+        retry_dispatch = _pending_retry_dispatch(
+            job,
+            history_path,
+            client=client,
+            now=now,
+            trusted_review_authors=trusted_review_authors,
+            run_timeout_ms=run_timeout_ms,
+            live_check=live_check,
+        )
+        if retry_dispatch is not None:
+            return retry_dispatch
         last = last_scheduled_terminal_run(history_path, job.name)
         registered_at = first_seen_at(history_path, job.name) or now
         result = decide(
@@ -705,7 +722,7 @@ def _poll_event_trigger(
     guards, but *before* the run starts (issue 079): a skipped dispatch leaves the event to
     fire later, and a crash mid-run never re-fires it. The poll itself (`ensure_repo` and
     `gh`) runs in the decision phase under the global tick lock, so that lock is held for
-    the poll's network round trips too, not only for the schedule decision. A failed run is retried by its own `retry_on` / `fallback_model`, not here.
+    the poll's network round trips too, not only for the schedule decision. A failed run is retried by its own `retry_on` (a later tick, issue 088) / `fallback_model`, not here.
     Every record this writes without a run_id carries `trigger: event`, so none of them
     counts toward `schedule.decide`. A poll failure fails closed (never "no events") and
     pages once per outage, not every tick.
@@ -920,6 +937,10 @@ class _PendingDispatch:
     # collapsed-earlier-occurrences record and a firing event poll's watermark. A skip
     # must leave the occurrence (and the event) owed, not recorded as handled.
     before_dispatch: tuple[HistoryRecord, ...] = ()
+    # The occurrence's own `extra` (trigger, scheduled_for, retry attempt): what a failed
+    # dispatch needs to queue its retry (issue 088). Empty for a gated event-target cycle,
+    # which never retries.
+    occurrence_extra: HistoryExtra = field(default_factory=lambda: HistoryExtra())
 
 
 @dataclass(frozen=True, slots=True)
@@ -956,6 +977,112 @@ def _pending_occurrence(
         run_id=occ.run_id,
         trigger=occ.extra.get("trigger") or TRIGGER_CRON,
         before_dispatch=before_dispatch,
+        occurrence_extra=occ.extra,
+    )
+
+
+def _pending_retry_dispatch(
+    job: Job,
+    history_path: Path,
+    *,
+    client: HerdrClient,
+    now: datetime,
+    trusted_review_authors: tuple[str, ...],
+    run_timeout_ms: int,
+    live_check: Callable[[HerdrClient, Job], bool],
+) -> _PendingDispatch | None:
+    """The retry this job is owed and that is due this tick, if any (issue 088).
+
+    A retry is dropped, with a `retry_dropped` record, when the job's next scheduled
+    occurrence has come in the meantime (the schedule decision then handles that
+    occurrence as a fresh run), or when the job no longer has retries left. One that is not
+    due yet stays pending. The retry runs as a new occurrence of the original
+    `scheduled_for`, with its own run id, so it gets its own history records."""
+    retry = find_pending_retry(read_job(history_path, job.name))
+    if retry is None:
+        return None
+    drop: str | None = None
+    if job.cron is None or retry.failed_attempt >= job.retry_attempts:
+        drop = "the job no longer has retries left"
+    elif occurrences_since(job.cron, job.timezone, retry.record.ts, now):
+        drop = "the next scheduled occurrence came first"
+    if drop is not None:
+        log.info("%s: pending retry dropped: %s", job.name, drop)
+        dropped = HistoryExtra(
+            reason=RETRY_DROPPED_REASON,
+            trigger=TRIGGER_CRON,
+            attempt=retry.failed_attempt,
+            error=drop,
+        )
+        if retry.failed_run_id is not None:
+            dropped["retried_from_run_id"] = retry.failed_run_id
+        append(
+            history_path,
+            HistoryRecord.new(ts=now, job=job.name, state="skipped", extra=dropped),
+        )
+        return None
+    if now < retry.due_at:
+        log.info(
+            "%s: retry %d/%d pending until %s",
+            job.name,
+            retry.failed_attempt + 1,
+            job.retry_attempts,
+            retry.due_at.isoformat(),
+        )
+        return None
+    extra = HistoryExtra(
+        trigger=TRIGGER_CRON,
+        attempt=retry.failed_attempt + 1,
+        max_retries=job.retry_attempts,
+    )
+    if retry.scheduled_for is not None:
+        extra["scheduled_for"] = retry.scheduled_for
+    if retry.failed_run_id is not None:
+        extra["retried_from_run_id"] = retry.failed_run_id
+    log.info(
+        "%s: retry attempt %d/%d after %s",
+        job.name,
+        retry.failed_attempt + 1,
+        job.retry_attempts,
+        (retry.record.extra or {}).get("retry_eligible_reason"),
+    )
+    return _pending_occurrence(
+        job,
+        history_path,
+        Occurrence(make_run_id(job.name, now), extra),
+        client=client,
+        trusted_review_authors=trusted_review_authors,
+        run_timeout_ms=run_timeout_ms,
+        live_check=live_check,
+    )
+
+
+def _queue_retry(
+    pending: _PendingDispatch, *, records_before: int, history_path: Path
+) -> None:
+    """After a dispatch, queue its retry when it ended in a failure `retry_on` lists and
+    attempts are left (issue 088). Only a cron-triggered run retries: a manual or request run
+    has an operator watching, and an event run is not polled again."""
+    job = pending.job
+    if pending.trigger != TRIGGER_CRON or job.retry_attempts <= 0:
+        return
+    failure = eligible_failure(read_job(history_path, job.name)[records_before:], job)
+    if failure is None:
+        return
+    record = pending_retry_record(
+        job,
+        failure,
+        failed_attempt=pending.occurrence_extra.get("attempt", 0),
+        occurrence_extra=pending.occurrence_extra,
+    )
+    if record is None:
+        return
+    append(history_path, record)
+    log.info(
+        "%s: %s, retry queued for %s",
+        job.name,
+        (failure.extra or {}).get("reason"),
+        (record.extra or {}).get("retry_due_at"),
     )
 
 
@@ -1070,6 +1197,7 @@ def _dispatch_pending(
                 return skip("checkout_busy", "skipped (checkout busy)")
             for record in pending.before_dispatch:
                 append(history_path, replace(record, ts=now))
+            records_before = len(read_job(history_path, job.name))
             try:
                 summary, failed = pending.dispatch(now)
             except CheckoutBusy as e:
@@ -1081,6 +1209,10 @@ def _dispatch_pending(
                     "checkout_busy",
                     "skipped (checkout busy)",
                     run_id=None if job.kind == "pipeline" else pending.run_id,
+                )
+            if failed:
+                _queue_retry(
+                    pending, records_before=records_before, history_path=history_path
                 )
         if pending.prefix is not None:
             summary = f"{pending.prefix}; {summary}"
@@ -1470,6 +1602,18 @@ def _decide_pipeline_job(
     # `/job` still gets reconciled; nothing to decide and nothing to report missed.
     if job.cron is None:
         return f"{job.name}: not due (request only)", False
+
+    retry_dispatch = _pending_retry_dispatch(
+        job,
+        history_path,
+        client=client,
+        now=now,
+        trusted_review_authors=DEFAULT_TRUSTED_REVIEW_AUTHORS,
+        run_timeout_ms=job.timeout_ms,
+        live_check=_live_agent_exists,
+    )
+    if retry_dispatch is not None:
+        return retry_dispatch
 
     last = last_scheduled_terminal_run(history_path, job.name)
     registered_at = first_seen_at(history_path, job.name) or now

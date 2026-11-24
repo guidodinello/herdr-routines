@@ -1,7 +1,7 @@
 ---
 id: "088"
 title: "Retries: work for every job kind, back off across ticks, retry pre-agent failures by default"
-status: open
+status: done
 priority: medium
 area: runner
 ---
@@ -74,3 +74,22 @@ Two decisions, made on 2026-11-22:
   failure. No job on the Pi sets `retry_attempts` today.
 - **2026-11-22**: design added: tick-based exponential backoff, and one retry by default for
   pre-agent failures only.
+- **2026-11-24**: built. `src/herdr_routines/retry.py` holds the backoff and the pending-retry
+  record; `tick._dispatch_pending` queues a retry after any cron-triggered dispatch that ends
+  in a `retry_on` failure, and `_fire_triggers` / the pipeline decision run it when due.
+  Decisions the issue left open:
+  - The pending retry is a non-terminal `scheduled` record (`reason: retry_pending`), not a
+    change to the failed record, so every kind's own failure writer stays as it was. Due time
+    is stored as `retry_due_at`; it is the next 5-minute tick boundary after the failure, plus
+    2^(N-1) - 1 further ticks.
+  - A retry is a new occurrence with a fresh run id (`make_run_id(job, now)`), the original
+    `scheduled_for`, `attempt: N` and `retried_from_run_id`. The drop is a `skipped` record
+    with `reason: retry_dropped`, listed in `history.NOT_A_RUN_REASONS`, so it never consumes a
+    cron occurrence. Any cron occurrence between the failure and now drops the retry.
+  - Only cron-triggered runs retry. `validate` rejects a `retry_attempts` / `retry_on` the job
+    sets itself where it could not be honored (no cron, multi-target `pick`, a `github_event`
+    gated job, a pipeline `retry_on` with a post-agent reason); the default is switched off
+    there without an error. A `retry_on` list replaces the default set rather than extending it.
+  - A gated PR cycle retries as a whole when its last record is an eligible failure.
+  - Not done: a failed attempt still sends its own failure notification, because the flows
+    notify where they write the failure.

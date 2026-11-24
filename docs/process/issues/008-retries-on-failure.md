@@ -33,3 +33,6 @@ and must not retry a job that is not idempotent.
   data") waived by decision 2026-08-27 — several days of real Pi runs have
   accrued; the failure-reaping work (issues 005, phase 1 PR #25) already
   classifies failure reasons, which is the input this needs.
+- **2026-11-24**: issue 088 changed two things here: the default is now one retry for the
+  pre-agent reasons (not "no retries"), and retries run on a later tick instead of
+  back-to-back inside the tick.

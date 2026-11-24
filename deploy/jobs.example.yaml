@@ -68,6 +68,12 @@ jobs:
     start_timeout_ms: 120000
     catch_up_minutes: 120
     on_missed: log
+    # Retries (issue 088): by default a run that fails before its agent starts (clone, repo
+    # sync, pane, agent start, report dir) is retried once, on a later tick (1, 2, then 4
+    # ticks after the failure). Uncomment to change that; see deploy/README.md.
+    # retry_attempts: 0   # opt out; 1..3 = retries, each backed off across ticks
+    # retry_on: [repo_sync_failed, no_report] # replaces the pre-agent default; a post-agent
+    #                                         # reason like no_report is opt-in only
   # auto-fix job: the pipeline only opens a PR branch to fix pre-existing CI/lint failures
   # or unresolved review threads on an *existing* PR — it never creates new PRs on its own.
   # A job is conditional when it has `checks:` — ordered, all must pass; any failure dispatches

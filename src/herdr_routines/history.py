@@ -55,8 +55,15 @@ TRIGGER_MANUAL = "manual"
 #   - `collapsed_earlier_occurrences`: occurrences skipped before the one being dispatched.
 #   - `dispatch_in_flight`: a dispatcher lost the job's non-blocking dispatch lock.
 #   - `checkout_busy`: a `workspace: root` dispatch lost its checkout's lock to another job.
+#   - `retry_dropped`: a pending retry (issue 088) was discarded because the job's next
+#     scheduled occurrence came first; no run happened.
 NOT_A_RUN_REASONS: frozenset[str] = frozenset(
-    {"collapsed_earlier_occurrences", "dispatch_in_flight", "checkout_busy"}
+    {
+        "collapsed_earlier_occurrences",
+        "dispatch_in_flight",
+        "checkout_busy",
+        "retry_dropped",
+    }
 )
 
 
@@ -175,6 +182,8 @@ class HistoryExtra(TypedDict, total=False):
     primary_run_id: str
     retried_from_run_id: str
     retry_eligible_reason: str | None
+    retry_due_at: str
+    retry_after_ticks: int
     # pipeline
     pipeline_run_id: str
     unit: str

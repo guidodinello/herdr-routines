@@ -157,6 +157,25 @@ VALID_RETRY_REASONS = frozenset(
     }
 )
 
+# The reasons raised before any agent has started (issue 088). Rerunning the job after one
+# of these cannot post or push twice, so they are the only ones retried by default; the rest
+# of VALID_RETRY_REASONS stays opt-in through `retry_on`. A subset of VALID_RETRY_REASONS,
+# and the one place that says which reasons are pre-agent.
+PRE_AGENT_RETRY_REASONS = frozenset(
+    {
+        "clone_failed",
+        "repo_sync_failed",
+        "pane_creation_failed",
+        "agent_start_failed",
+        "report_dir_creation_failed",
+    }
+)
+assert PRE_AGENT_RETRY_REASONS <= VALID_RETRY_REASONS
+
+# A job's retry defaults (issue 088): one retry, for the pre-agent reasons only.
+DEFAULT_RETRY_ATTEMPTS = 1
+DEFAULT_RETRY_ON: tuple[str, ...] = tuple(sorted(PRE_AGENT_RETRY_REASONS))
+
 # A pipeline job's fixed catch_up_minutes. NOT 0: `schedule.decide()`'s grace window is a
 # strict `late <= grace`, and tick only samples every 5 minutes and evaluates jobs
 # sequentially under one lock — a job listed after a slow gated job (e.g. babysit-prs
@@ -315,7 +334,7 @@ _JOB_DEFAULTS = {
     "prompt_file": None,
     "deadline_ms": None,
     "tmp_hygiene": None,
-    "retry_attempts": 0,
+    "retry_attempts": DEFAULT_RETRY_ATTEMPTS,
     "retry_on": None,
     "verify": None,
     "pick": None,
@@ -527,12 +546,13 @@ class Job:
     # only. The tick's reap reads `RoutinesConfig.tmp_hygiene`; a per-job value is
     # ignored because the reap runs once per tick, not per job.
     tmp_hygiene: TmpHygieneConfig | None = None
-    # Per-job retry for transient failures (issue 008): total extra attempts after
-    # the first failure. 0 = no retries (default). NOT inheritable via defaults.yaml.
-    retry_attempts: int = 0
-    # Whitelist of RunOutcome.reason values eligible for retry. None = no eligible
-    # reasons (so retry_attempts is inert). NOT inheritable via defaults.yaml.
-    retry_on: tuple[str, ...] | None = None
+    # Per-job retry for transient failures (issues 008, 088): total extra attempts after
+    # the first failure, each on a later tick (1, 2, then 4 ticks later). 0 = no retries.
+    # NOT inheritable via defaults.yaml.
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
+    # Whitelist of failure reasons eligible for retry. Defaults to the pre-agent reasons;
+    # an explicit `retry_on` replaces that set. NOT inheritable via defaults.yaml.
+    retry_on: tuple[str, ...] = DEFAULT_RETRY_ON
     # -- kind: audit (issue 057) ---------------------------------------------------
     # The audit command/skill and its own timeout. Required for kind: audit, None
     # otherwise. NOT inheritable via defaults.yaml (per-job identity).
@@ -1820,13 +1840,24 @@ def _build_target(
     return target
 
 
-# retry_attempts / retry_on (issue 008)
+# retry_attempts / retry_on (issues 008, 088)
 #
 # Per-job only — NOT inheritable via defaults.yaml (same precedent as kind/checks
-# in issue 049). retry_attempts is bounded 0..3 to prevent tick-hogging.
+# in issue 049). retry_attempts is bounded 0..3. The defaults are one retry, for the
+# pre-agent reasons; a key the job sets itself must be one the run can honor, so it is
+# rejected where the job cannot retry, never accepted and ignored. The default is merely
+# switched off there.
 def _build_retry(
-    merged: Mapping[str, object], label: str, workspace: object
-) -> tuple[int, tuple[str, ...] | None]:
+    merged: Mapping[str, object],
+    raw_job: Mapping[str, object],
+    label: str,
+    workspace: object,
+    *,
+    kind: str,
+    cron: str | None,
+    checks: tuple[GateCheck, ...] | None,
+    pick: object,
+) -> tuple[int, tuple[str, ...]]:
     """Resolve `(retry_attempts, retry_on)`."""
     retry_attempts = merged["retry_attempts"]
     if not isinstance(retry_attempts, int) or isinstance(retry_attempts, bool):
@@ -1837,7 +1868,7 @@ def _build_retry(
         )
 
     retry_on_raw = merged.get("retry_on")
-    retry_on: tuple[str, ...] | None = None
+    retry_on: tuple[str, ...] = DEFAULT_RETRY_ON
     if retry_on_raw is not None:
         if not isinstance(retry_on_raw, list):
             raise ConfigError(f"{label}: 'retry_on' must be null or a list of strings")
@@ -1851,29 +1882,74 @@ def _build_retry(
                     f"{label}: 'retry_on' contains unknown reason {reason!r} — "
                     f"valid reasons: {sorted(VALID_RETRY_REASONS)}"
                 )
-        retry_on = tuple(retry_on_raw) if retry_on_raw else None
+        if not retry_on_raw and retry_attempts > 0:
+            if "retry_attempts" in raw_job:
+                raise ConfigError(
+                    f"{label}: 'retry_attempts' requires non-empty 'retry_on' — "
+                    "list the reasons to retry, or set 'retry_attempts: 0'"
+                )
+            retry_attempts = 0  # `retry_on: []` alone means: retry nothing
+        retry_on = tuple(retry_on_raw)
 
-    # retry_attempts > 0 with empty/null retry_on is a hard error
-    if retry_attempts > 0 and not retry_on:
-        raise ConfigError(
-            f"{label}: 'retry_attempts' requires non-empty 'retry_on' — "
-            "declare which reasons are retry-eligible"
-        )
-    # retry_on non-empty with retry_attempts == 0 is allowed but inert
-    if retry_on and retry_attempts == 0:
+    explicit = "retry_attempts" in raw_job or "retry_on" in raw_job
+    why_not = _retry_unsupported_reason(
+        kind=kind, cron=cron, checks=checks, pick=pick, retry_on=retry_on
+    )
+    if why_not is not None and retry_attempts > 0:
+        if explicit:
+            raise ConfigError(f"{label}: retries are not supported — {why_not}")
+        retry_attempts = 0  # the default, switched off where it cannot apply
+
+    # retry_on set with retry_attempts == 0 is allowed but inert
+    if retry_on and "retry_on" in raw_job and retry_attempts == 0:
         warnings.warn(
             f"{label}: 'retry_on' is set but 'retry_attempts' is 0 — "
             "retry_on is inert (no retries will occur)",
             stacklevel=3,
         )
     # workspace: root with retries is a soft warning
-    if retry_attempts > 0 and workspace == "root":
+    if "retry_attempts" in raw_job and retry_attempts > 0 and workspace == "root":
         warnings.warn(
             f"{label}: 'retry_attempts' > 0 on workspace: root — "
             "retries are only safe for idempotent jobs",
             stacklevel=3,
         )
     return retry_attempts, retry_on
+
+
+def _retry_unsupported_reason(
+    *,
+    kind: str,
+    cron: str | None,
+    checks: tuple[GateCheck, ...] | None,
+    pick: object,
+    retry_on: tuple[str, ...],
+) -> str | None:
+    """Why a job with these properties cannot retry, or None when it can (issue 088)."""
+    if isinstance(pick, str) and pick in MULTI_TARGET_SELECTORS:
+        return (
+            "a multi-target selector gives each target one attempt, since a retry "
+            "could post a second review"
+        )
+    if kind == "gated" and any(c.kind == "github_event" for c in checks or ()):
+        return (
+            "a gated job whose gate is a github_event check runs once per event, "
+            "and that event is not polled again"
+        )
+    if cron is None:
+        return (
+            "only a cron-triggered run is retried (on a later tick, and dropped when "
+            "the next scheduled occurrence comes first), and this job has no cron"
+        )
+    if kind == "pipeline":
+        post_agent = sorted(set(retry_on) - PRE_AGENT_RETRY_REASONS)
+        if post_agent:
+            return (
+                "a pipeline run is retried only for the pre-agent reasons "
+                f"{sorted(PRE_AGENT_RETRY_REASONS)}; a relaunch after {post_agent} "
+                "would redo a whole night's run"
+            )
+    return None
 
 
 # verify (issue 071)
@@ -2168,7 +2244,16 @@ def _build_job(
         else None
     )
 
-    retry_attempts, retry_on = _build_retry(merged, label, workspace)
+    retry_attempts, retry_on = _build_retry(
+        merged,
+        raw_job,
+        label,
+        workspace,
+        kind=kind,
+        cron=cron,
+        checks=checks,
+        pick="my_open_prs" if reviews_my_prs else merged["pick"],
+    )
     verify, ignored_verify = _build_verify(
         merged, raw_job, label, kind=kind, review_sugar=review_sugar
     )
@@ -2182,13 +2267,6 @@ def _build_job(
             f"{label}: 'max_targets_per_run' above 1 needs a multi-target selector "
             f"({sorted(MULTI_TARGET_SELECTORS)}) under 'pick'"
         )
-    if retry_attempts > 0 and pick in MULTI_TARGET_SELECTORS:
-        warnings.warn(
-            f"{label}: 'retry_attempts' is ignored for a multi-target selector — "
-            "each target gets one attempt, since a retry could post a second review",
-            stacklevel=2,
-        )
-
     return Job(
         name=name,
         enabled=enabled,

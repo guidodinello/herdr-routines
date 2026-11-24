@@ -8,8 +8,12 @@ from pathlib import Path
 import pytest
 
 from herdr_routines.config import (
+    DEFAULT_RETRY_ATTEMPTS,
+    DEFAULT_RETRY_ON,
     DEFAULT_TRUSTED_REVIEW_AUTHORS,
     PIPELINE_CATCH_UP_MINUTES,
+    PRE_AGENT_RETRY_REASONS,
+    VALID_RETRY_REASONS,
     ConfigError,
     Job,
     JobInvariantError,
@@ -1368,19 +1372,19 @@ def test_pipeline_deploy_example_loads_cleanly(tmp_path: Path) -> None:
 def test_retry_config_requires_explicit_eligible_reasons(tmp_config_path: Path) -> None:
     """Acceptance criterion 1: retry_attempts > 0 without non-empty retry_on is rejected.
     retry_on must contain known RunOutcome.reason strings; unlisted reasons are rejected."""
-    # retry_attempts > 0 with no retry_on → ConfigError
+    # retry_attempts > 0 with no retry_on → the pre-agent default (issue 088)
     text = """
 version: 1
 jobs:
   - name: a
     cron: "0 3 * * *"
     repo: /repo/a
-    retry_attempts: 1
+    retry_attempts: 2
 """
-    with pytest.raises(
-        ConfigError, match="retry_attempts.*requires non-empty 'retry_on'"
-    ):
-        load_config(write(tmp_config_path, text))
+    cfg = load_config(write(tmp_config_path, text))
+    job = cfg.job("a")
+    assert job is not None
+    assert (job.retry_attempts, job.retry_on) == (2, DEFAULT_RETRY_ON)
 
     # retry_attempts > 0 with retry_on: [] → ConfigError (empty list = null)
     text = """
@@ -1495,7 +1499,8 @@ jobs:
     cfg = load_config(write(tmp_config_path, text))
     job = cfg.job("a")
     assert job is not None
-    assert job.retry_on is None  # empty list collapses to None
+    assert job.retry_on == ()
+    assert job.retry_attempts == 0  # `retry_on: []` alone means: retry nothing
 
     # retry_on non-empty with retry_attempts == 0 → warns (not error)
     text = """
@@ -1546,6 +1551,113 @@ jobs:
 """
     with pytest.raises(ConfigError, match="unknown key.*retry_attempts"):
         load_config(write(tmp_config_path, text))
+
+
+def _retry_job(tmp_config_path: Path, extra: str, *, head: str = "") -> Job:
+    text = f"""
+version: 1
+jobs:
+  - name: a
+    repo: /repo/a
+{head or '    cron: "0 3 * * *"'}
+{extra}
+"""
+    job = load_config(write(tmp_config_path, text)).job("a")
+    assert job is not None
+    return job
+
+
+def test_retry_defaults_to_one_retry_of_the_pre_agent_reasons(
+    tmp_config_path: Path,
+) -> None:
+    """Issue 088: with no retry keys, a job retries once, for the five pre-agent
+    reasons only, declared once as PRE_AGENT_RETRY_REASONS."""
+    job = _retry_job(tmp_config_path, "")
+    assert job.retry_attempts == DEFAULT_RETRY_ATTEMPTS == 1
+    assert (
+        set(job.retry_on)
+        == PRE_AGENT_RETRY_REASONS
+        == {
+            "clone_failed",
+            "repo_sync_failed",
+            "pane_creation_failed",
+            "agent_start_failed",
+            "report_dir_creation_failed",
+        }
+    )
+    assert PRE_AGENT_RETRY_REASONS <= VALID_RETRY_REASONS
+    # the post-agent reasons stay opt-in
+    assert not {"no_report", "blocked", "quota_exhausted", "tmp_full"} & set(
+        job.retry_on
+    )
+
+
+def test_retry_can_be_turned_off_or_opted_into_post_agent_reasons(
+    tmp_config_path: Path,
+) -> None:
+    assert _retry_job(tmp_config_path, "    retry_attempts: 0").retry_attempts == 0
+    opted_in = _retry_job(tmp_config_path, "    retry_on: [no_report]")
+    assert (opted_in.retry_attempts, opted_in.retry_on) == (1, ("no_report",))
+
+
+@pytest.mark.parametrize("kind", ["audit", "gated", "pipeline", "routine"])
+def test_every_cron_job_kind_accepts_retry_attempts(
+    tmp_config_path: Path, kind: str
+) -> None:
+    """No kind with a cron accepts `retry_attempts` and then ignores it (issue 088)."""
+    extra = {
+        "routine": "    kind: routine",
+        "audit": '    kind: audit\n    audit: {command: "true"}\n    base: main',
+        "gated": (
+            "    kind: gated\n    target: base\n    base: main\n"
+            '    checks: [{command: "true"}]'
+        ),
+        "pipeline": "    kind: pipeline\n    deadline_ms: 3600000\n    prompt_file: p.md",
+    }[kind]
+    job = _retry_job(tmp_config_path, f"{extra}\n    retry_attempts: 2")
+    assert job.kind == kind
+    assert job.retry_attempts == 2
+
+
+@pytest.mark.parametrize(
+    ("extra", "head", "match"),
+    [
+        (
+            "    pick: my_open_prs\n    select: [author]\n    retry_attempts: 1",
+            "",
+            "multi-target selector",
+        ),
+        ("    retry_attempts: 1", "    trigger: {request: true}", "has no cron"),
+        (
+            (
+                "    kind: pipeline\n    deadline_ms: 3600000\n    prompt_file: p.md\n"
+                "    retry_on: [no_report]"
+            ),
+            "",
+            "pre-agent reasons",
+        ),
+    ],
+)
+def test_explicit_retry_attempts_is_rejected_where_the_job_cannot_retry(
+    tmp_config_path: Path, extra: str, head: str, match: str
+) -> None:
+    with pytest.raises(ConfigError, match=match):
+        _retry_job(tmp_config_path, extra, head=head)
+
+
+def test_default_retry_is_switched_off_where_the_job_cannot_retry(
+    tmp_config_path: Path,
+) -> None:
+    """The default is not a key the job set, so it does not reject the job: it just does
+    not apply."""
+    assert (
+        _retry_job(
+            tmp_config_path, "    pick: my_open_prs\n    select: [author]"
+        ).retry_attempts
+        == 0
+    )
+    request_only = _retry_job(tmp_config_path, "", head="    trigger: {request: true}")
+    assert request_only.retry_attempts == 0
 
 
 # ---------------------------------------------------------------------------

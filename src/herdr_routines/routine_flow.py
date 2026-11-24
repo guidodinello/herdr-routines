@@ -1,11 +1,10 @@
-"""The `kind: routine` flow: run one agent occurrence, with retries, and record it.
+"""The `kind: routine` flow: run one agent occurrence, with its model fallback, and record it.
 
 Split out of `tick.py` (issue 060).
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -89,16 +88,6 @@ def _outcome_extra(
     return extra
 
 
-def _retry_eligible(outcome: RunOutcome, job: Job) -> bool:
-    """Check if this outcome is eligible for a retry attempt per the job's retry config."""
-    return (
-        outcome.state == "failed"
-        and outcome.reason is not None
-        and job.retry_on is not None
-        and outcome.reason in job.retry_on
-    )
-
-
 def _run_routine(
     job: Job,
     history_path: Path,
@@ -109,7 +98,7 @@ def _run_routine(
     trusted_review_authors: tuple[str, ...],
 ) -> tuple[str, bool]:
     """One occurrence of a plain routine job: selector, `running` record, `execute_run` with
-    the fallback_model and retry loop, terminal record, notification. The tick and
+    the fallback_model retry, terminal record, notification. The tick and
     `herdr-routines run` both land here (issue 074). A selector that returns several targets
     (issue 076) fans out in `_run_routine_targets` instead."""
     if job.pick in MULTI_TARGET_SELECTORS:
@@ -197,69 +186,17 @@ def _run_routine(
         target=target,
     )
     used_fallback = False
-    attempt = 0  # 0 = first try
 
-    # Per-job retry loop (issue 008): bounded synchronous retries within the same
-    # tick, gated on retry_on whitelist. The fallback_model quota retry runs inside
-    # each attempt so retried attempts also get the fallback treatment.
-    base_run_id = run_id
-    while True:
-        # Fallback_model quota retry (issue 008): runs inside each attempt so a
-        # retried attempt that hits quota_exhausted also gets the fallback.
-        if (
-            outcome.state == "failed"
-            and outcome.reason == "quota_exhausted"
-            and job.fallback_model
-            and job.fallback_model != job.model
-        ):
-            used_fallback = True
-            append(
-                history_path,
-                HistoryRecord.new(
-                    ts=now,
-                    job=job.name,
-                    state=outcome.state,
-                    run_id=run_id,
-                    extra=_with_trigger(occ, _outcome_extra(outcome, target=target)),
-                ),
-            )
-            log.info(
-                "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
-                job.name,
-                job.fallback_model,
-            )
-            fallback_run_id = make_run_id(f"{job.name}-fallback", now)
-            append(
-                history_path,
-                HistoryRecord.new(
-                    ts=now,
-                    job=job.name,
-                    state="running",
-                    run_id=fallback_run_id,
-                    extra=_with_trigger(
-                        occ,
-                        HistoryExtra(reason="fallback_retry", primary_run_id=run_id),
-                    ),
-                ),
-            )
-            run_id = fallback_run_id
-            outcome = execute_run(
-                replace(job, model=job.fallback_model),
-                client,
-                run_id=run_id,
-                trusted_review_authors=trusted_review_authors,
-                gh=gh,
-                target=target,
-            )
-
-        # Check if this outcome is eligible for a retry attempt
-        if not _retry_eligible(outcome, job) or attempt >= job.retry_attempts:
-            break
-
-        # Log the failed attempt as a distinct history record with attempt metadata
-        extra = _with_trigger(occ, _outcome_extra(outcome, target=target))
-        extra["attempt"] = attempt
-        extra["retry_eligible_reason"] = outcome.reason
+    # Fallback_model quota retry (issue 008): within this tick, since the model, not the
+    # environment, is what changes. Any other retry is the tick's (issue 088): a failed
+    # occurrence is queued by `tick._dispatch_pending` and runs on a later tick.
+    if (
+        outcome.state == "failed"
+        and outcome.reason == "quota_exhausted"
+        and job.fallback_model
+        and job.fallback_model != job.model
+    ):
+        used_fallback = True
         append(
             history_path,
             HistoryRecord.new(
@@ -267,43 +204,31 @@ def _run_routine(
                 job=job.name,
                 state=outcome.state,
                 run_id=run_id,
-                extra=extra,
+                extra=_with_trigger(occ, _outcome_extra(outcome, target=target)),
             ),
         )
-        attempt += 1
-        run_id = f"{base_run_id}-retry{attempt}"
         log.info(
-            "%s: retry attempt %d/%d after %s",
+            "%s: primary model quota_exhausted, retrying once with fallback_model=%r",
             job.name,
-            attempt,
-            job.retry_attempts,
-            outcome.reason,
+            job.fallback_model,
         )
-        # Brief backoff (reuses PROMPT_RETRY_DELAYS_S shape: 5s, 15s, ...)
-        backoff = (5.0, 15.0)[min(attempt - 1, 1)]
-        time.sleep(backoff)
-        # Append a running record for the retry attempt
+        fallback_run_id = make_run_id(f"{job.name}-fallback", now)
         append(
             history_path,
             HistoryRecord.new(
                 ts=now,
                 job=job.name,
                 state="running",
-                run_id=run_id,
+                run_id=fallback_run_id,
                 extra=_with_trigger(
                     occ,
-                    HistoryExtra(
-                        attempt=attempt,
-                        max_retries=job.retry_attempts,
-                        retried_from_run_id=base_run_id
-                        if attempt == 1
-                        else f"{base_run_id}-retry{attempt - 1}",
-                    ),
+                    HistoryExtra(reason="fallback_retry", primary_run_id=run_id),
                 ),
             ),
         )
+        run_id = fallback_run_id
         outcome = execute_run(
-            job,
+            replace(job, model=job.fallback_model),
             client,
             run_id=run_id,
             trusted_review_authors=trusted_review_authors,
@@ -311,8 +236,9 @@ def _run_routine(
             target=target,
         )
 
-    # Terminal record for final outcome (last retry or first attempt if no retries)
+    # Terminal record for the final outcome.
     final_extra = _with_trigger(occ, _outcome_extra(outcome, target=target))
+    attempt = occ.extra.get("attempt", 0)  # 0 = first try, N = the Nth tick-based retry
     final_extra["attempt"] = attempt
     final_extra["max_retries"] = job.retry_attempts
     if attempt > 0:

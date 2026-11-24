@@ -186,6 +186,34 @@ replaces that default, and `[]` means "only the gh user". In a `jobs.d/` layout 
 in its own `trusted_review_authors.yaml` whose whole document is the list. See the
 commented block in [`jobs.example.yaml`](jobs.example.yaml).
 
+## Retries (issues 008, 088)
+
+A scheduled run that fails before its agent starts is retried once, by default, for every job
+kind (routine, audit, gated, pipeline). The retry never sleeps inside the tick: the failed run
+leaves a `scheduled` history record (`reason: retry_pending`, with `attempt`, `retry_due_at` and
+`retry_after_ticks`), and a later tick runs it. Retry N is due 2^(N-1) ticks after the failure,
+counted from the next 5-minute tick boundary: 1, 2, then 4 ticks (5, 10, 20 minutes). Each
+attempt has its own run id and `running` / terminal records (`attempt`,
+`retried_from_run_id`). A pending retry is dropped, with a `skipped` record (`reason:
+retry_dropped`), when the job's next cron occurrence arrives first, so a retry never runs on top
+of a fresh run, and it is never counted as a missed occurrence.
+
+- Default: `retry_attempts: 1`, `retry_on:` the pre-agent reasons `clone_failed`,
+  `repo_sync_failed`, `pane_creation_failed`, `agent_start_failed`,
+  `report_dir_creation_failed` (`config.PRE_AGENT_RETRY_REASONS`). Rerunning after one of these
+  cannot post or push twice.
+- `retry_attempts: 0` opts out. `retry_attempts` is 0..3. A `retry_on:` list replaces the
+  default set, so it is how a job opts into a post-agent reason (`no_report`, `blocked`,
+  `agent_prompt_failed`, `quota_exhausted`, `agent_not_interactive`, `tmp_full`).
+- Only cron-triggered runs retry. A `retry_attempts` the job sets itself is rejected by
+  `validate` where it could not be honored: no cron, a multi-target selector (`pick:
+  my_open_prs`), a gated job whose gate is a `github_event` check, or a pipeline job whose
+  `retry_on` lists a post-agent reason (a relaunch would redo the whole night). The default is
+  simply off there.
+- The timer period (`OnCalendar=*:0/5`) is the tick: if it changes, change
+  `retry.TICK_PERIOD` too. `fallback_model` still retries within the same tick.
+- Each failed attempt still sends its own failure notification.
+
 ## Cold-start spawn from Telegram (issue 024)
 
 The Telegram bot (issue 023) steers *existing* panes by replying to a notification. The cold-start path complements it: a `/run <alias>` or `/start <alias>`

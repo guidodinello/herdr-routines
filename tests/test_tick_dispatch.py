@@ -32,7 +32,9 @@ from herdr_routines.config import Job
 from herdr_routines.findings import ledger_path, load_ledger
 from herdr_routines.herdr import HerdrCliError
 from herdr_routines.history import STALE_MARGIN, HistoryRecord, append, read_job
+from herdr_routines.retry import find_pending_retry
 from tests.dispatch_modules import patch_dispatch
+from tests.retry_clock import FrozenClock
 from tests.test_audit_dispatch import _FakeHerdr, _finding, _git
 from tests.test_audit_dispatch import _job as _audit_job
 from tests.test_review_scan import (
@@ -908,7 +910,8 @@ def _auditor(
 
 
 def _last_audit(history: Path) -> tuple[HistoryRecord, Mapping[str, Any]]:
-    record = read_job(history, AUDIT_JOB)[-1]
+    # Skip the `scheduled` retry-pending marker an eligible failure leaves behind (issue 088).
+    record = [r for r in read_job(history, AUDIT_JOB) if r.state != "scheduled"][-1]
     return record, record.extra or {}
 
 
@@ -1014,6 +1017,69 @@ def test_audit_repo_that_cannot_be_prepared_fails_before_any_agent_starts(
     )
     assert client.agents == []
     assert client.notifications == ["herdr-routines: audit-type-health failed"]
+
+
+def test_audit_whose_first_sync_fails_is_retried_on_a_later_tick(
+    audit_repo: Path, history: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 088: `audit-type-health` lost a week to one dropped DNS lookup. The failed run
+    leaves a pending retry; the tick one boundary later runs it, as its own run."""
+    clock = FrozenClock(monkeypatch, NOW)
+    syncs: list[Path] = []
+
+    def flaky_sync(job: Job) -> Path:
+        syncs.append(job.repo)
+        if len(syncs) == 1:
+            raise RuntimeError("fatal: Could not resolve host: github.com")
+        return job.repo
+
+    patch_dispatch(monkeypatch, "ensure_repo", flaky_sync)
+    job = _due_audit_job(audit_repo, history)
+    retry_run_id = runner.make_run_id(AUDIT_JOB, NOW + timedelta(minutes=5))
+
+    def on_prompt(agent: Any) -> str:
+        # The retry is a run of its own, so its manifest is under its own run id.
+        manifest = runner.default_reports_dir() / f"{retry_run_id}-findings.json"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(
+            json.dumps({"version": 1, "check": "type-health", "findings": []})
+        )
+        return "idle"
+
+    client = _FakeHerdr(on_prompt)
+
+    summary, failed = _run_audit_job(job, history, client)
+    assert (summary, failed) == ("audit-type-health: failed (repo_sync_failed)", True)
+    pending = find_pending_retry(read_job(history, AUDIT_JOB))
+    assert pending is not None
+    assert pending.due_at == NOW + timedelta(minutes=5)
+
+    retry_at = NOW + timedelta(minutes=5)
+    clock.value = retry_at
+    summary, failed = tick._process_audit_job(
+        job,
+        history,
+        client=client,  # type: ignore[arg-type]
+        now=retry_at,
+    )
+
+    assert failed is False
+    assert len(syncs) == 2
+    records = read_job(history, AUDIT_JOB)
+    assert [r.state for r in records] == [
+        "registered",
+        "running",  # the first attempt
+        "failed",
+        "scheduled",  # the retry, queued
+        "running",  # the retry
+        "done",
+    ]
+    assert records[1].run_id == records[2].run_id == AUDIT_RUN_ID
+    assert records[4].run_id == records[5].run_id != AUDIT_RUN_ID
+    assert records[4].extra is not None
+    assert records[4].extra["attempt"] == 1
+    assert records[4].extra["retried_from_run_id"] == AUDIT_RUN_ID
+    assert find_pending_retry(records) is None
 
 
 def test_audit_whose_base_cannot_be_checked_out_fails_with_worktree_creation_failed(

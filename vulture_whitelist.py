@@ -28,6 +28,8 @@ HistoryExtra.manifest_path
 HistoryExtra.audit_output_path
 HistoryExtra.failed_checks
 HistoryExtra.max_retries
+HistoryExtra.retry_due_at
+HistoryExtra.retry_after_ticks
 HistoryExtra.final_attempt
 HistoryExtra.primary_run_id
 HistoryExtra.retried_from_run_id
