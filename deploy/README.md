@@ -224,6 +224,25 @@ The harness must be a known `agent_kind`. A model works only with claude, codex 
 must start with a letter or digit, so it never reads as a flag. A malformed `/run` from the allowed
 chat gets a usage reply listing the aliases; any other chat gets the generic refusal.
 
+**Starting with a prompt.** Put a first prompt on the lines after the command, or after a `--`
+token on the same line. It is sent to the agent once it has started, without waiting for the
+agent to finish:
+
+```text
+/run nightly opencode
+review the auth middleware for token leaks
+```
+
+```text
+/run nightly -- fix the flaky login test
+```
+
+The prompt reaches Herdr as a single argv element and never passes through a shell. It is capped
+at 4096 characters. If sending the prompt fails, the agent keeps running and the reply says so:
+reply to that message to send the prompt again. The bot must forward the message body with its
+newlines intact; `herdr-remote` commits before the one that preserves the body drop everything
+after the first line.
+
 `uv run herdr-routines validate` rejects an empty `allowed_chat_id`, a non-private one, a
 duplicate alias, and an alias whose `repo` does not exist or is not a git checkout — at load
 time, not at spawn time on someone's phone. Only the chat id reaches the entrypoint, not the

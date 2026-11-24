@@ -97,6 +97,7 @@ class FakeSpawnClient:
         self.workspace_calls: list[dict[str, Any]] = []
         self.agent_calls: list[dict[str, Any]] = []
         self.tab_calls: list[dict[str, Any]] = []
+        self.prompt_calls: list[dict[str, Any]] = []
 
     def worktree_create_full(
         self, *, cwd: str, branch: str, base: str, label: str | None = None
@@ -113,6 +114,11 @@ class FakeSpawnClient:
     def tab_create(self, *, cwd: str, label: str | None = None) -> str:
         self.tab_calls.append({"cwd": cwd, "label": label})
         return self.pane_id
+
+    def agent_prompt(self, *, target: str, text: str) -> None:
+        self.prompt_calls.append({"target": target, "text": text})
+        if self.fail_at == "agent_prompt":
+            raise self.fail_with or HerdrCliError("prompt refused", exit_code=1)
 
     def agent_start(
         self,
@@ -1153,3 +1159,91 @@ def test_ci_green_with_blocking_tests_run_first() -> None:
         cwd=repo_root,
     )
     assert blocking.returncode == 0, blocking.stdout + blocking.stderr
+
+
+def test_spawn_parses_a_first_prompt_on_the_next_lines_or_after_dashes() -> None:
+    parse = _spawn_module().parse_spawn_command
+
+    def parsed(text: str) -> tuple[str, str | None, str | None, str | None]:
+        cmd = parse(text)
+        assert cmd is not None, f"{text!r} must parse"
+        return cmd.target, cmd.agent_kind, cmd.model, cmd.prompt
+
+    assert parsed("/run x") == ("x", None, None, None)
+    assert parsed("/run x opencode\nreview  the auth\nmiddleware") == (
+        "x",
+        "opencode",
+        None,
+        "review  the auth\nmiddleware",
+    )
+    assert parsed("/run x claude opus -- fix  the 'flaky' test; rm -rf /") == (
+        "x",
+        "claude",
+        "opus",
+        "fix  the 'flaky' test; rm -rf /",
+    )
+    assert parsed("/run x -- one\ntwo") == ("x", None, None, "one\ntwo")
+    # An empty prompt is no prompt.
+    assert parsed("/run x --") == ("x", None, None, None)
+    assert parsed("/run x\n   \n") == ("x", None, None, None)
+
+
+def test_spawn_prompt_does_not_loosen_the_command_line_parse() -> None:
+    parse = _spawn_module().parse_spawn_command
+    # Extra tokens before the prompt are still refused, and the prompt cap holds.
+    assert parse("/run x claude opus extra -- hi") is None
+    assert parse("/run -- hi") is None
+    assert parse("/run x\n" + "a" * 5000) is None
+
+
+def test_spawn_sends_the_first_prompt_to_the_started_agent(tmp_path: Path) -> None:
+    mod = _spawn_module()
+    client = FakeSpawnClient()
+
+    result, _ = _handle(
+        mod,
+        "/run nightly-audit opencode\nreview the auth middleware",
+        12345,
+        allowed_chat_id=12345,
+        aliases=_aliases(_git_repo(tmp_path / "repo")),
+        client=client,
+    )
+
+    name = client.agent_calls[0]["name"]
+    assert client.prompt_calls == [
+        {"target": name, "text": "review the auth middleware"}
+    ]
+    assert ", pane w7:p1. Reply to this message" in result
+    assert "Prompt sent." in result
+
+
+def test_spawn_without_a_prompt_sends_none(tmp_path: Path) -> None:
+    mod = _spawn_module()
+    client = FakeSpawnClient()
+    _handle(
+        mod,
+        "/run nightly-audit",
+        12345,
+        allowed_chat_id=12345,
+        aliases=_aliases(_git_repo(tmp_path / "repo")),
+        client=client,
+    )
+    assert client.prompt_calls == []
+
+
+def test_spawn_prompt_failure_keeps_the_agent_and_says_so(tmp_path: Path) -> None:
+    mod = _spawn_module()
+    client = FakeSpawnClient(fail_at="agent_prompt")
+
+    result, _ = _handle(
+        mod,
+        "/run nightly-audit -- hello",
+        12345,
+        allowed_chat_id=12345,
+        aliases=_aliases(_git_repo(tmp_path / "repo")),
+        client=client,
+    )
+
+    assert len(client.agent_calls) == 1
+    assert ", pane w7:p1. Reply to this message" in result
+    assert "sending it failed: prompt refused" in result

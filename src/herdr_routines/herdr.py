@@ -423,6 +423,11 @@ class HerdrClient:
         )
         self._call(args, timeout_s=start_timeout_ms / 1000 + 10)
 
+    def agent_prompt(self, *, target: str, text: str) -> None:
+        """Sends a prompt and returns once Herdr has accepted it, without waiting for the
+        agent to settle (the Telegram cold-start path, issue 024)."""
+        self._call(["agent", "prompt", target, text])
+
     def agent_prompt_wait(
         self, *, target: str, text: str, timeout_ms: int
     ) -> AgentStatus | None:
