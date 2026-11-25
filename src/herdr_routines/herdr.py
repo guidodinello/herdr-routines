@@ -34,6 +34,9 @@ OPENCODE_FALLBACK_BIN = Path.home() / ".opencode" / "bin" / "opencode"
 # (verified 2026-11-24), which takes a few seconds.
 OPENCODE_API_TIMEOUT_S = 60.0
 
+# Budget for one `opencode models` listing.
+OPENCODE_MODELS_TIMEOUT_S = 60
+
 
 def opencode_bin() -> str:
     """The opencode executable: PATH first, then opencode's own install dir. Raises OSError
@@ -45,6 +48,22 @@ def opencode_bin() -> str:
     if OPENCODE_FALLBACK_BIN.is_file():
         return str(OPENCODE_FALLBACK_BIN)
     raise OSError(f"opencode not found on PATH or at {OPENCODE_FALLBACK_BIN}")
+
+
+def list_opencode_models(runner: CommandRunner | None = None) -> set[str]:
+    """Every `provider/model` id `opencode models` lists on this host. Raises
+    `RuntimeError` if the listing cannot be produced (binary missing, non-zero exit,
+    timeout) — the caller must treat that as "unverifiable", not as "all present"."""
+    run = runner or _subprocess_runner
+    try:
+        exit_code, stdout, stderr = run(
+            [opencode_bin(), "models"], timeout_s=OPENCODE_MODELS_TIMEOUT_S
+        )
+    except OSError as e:
+        raise RuntimeError(f"opencode models: {e}") from e
+    if exit_code != 0:
+        raise RuntimeError(f"opencode models exited {exit_code}: {stderr.strip()}")
+    return {line.strip() for line in stdout.splitlines() if line.strip()}
 
 
 def opencode_session_create_args(model: str, directory: str) -> list[str]:
@@ -457,6 +476,7 @@ class HerdrClient:
             # opencode 2 has no model flag; the model lives on the session the TUI opens.
             split_provider_model(model)  # a bare id fails before any call is made
             self._require_opencode_service()
+            self._require_opencode_model(model)
             if session_id is None:
                 created = session_id = self._opencode_create_session(pane_id, model)
             else:
@@ -503,6 +523,31 @@ class HerdrClient:
                 "provider keys and die with the unit. Start opencode-service.service "
                 "(deploy/systemd)",
                 exit_code=exit_code or 1,
+            )
+
+    def _require_opencode_model(self, model: str) -> None:
+        """Raises HerdrCliError when `model` is not in this host's `opencode models`.
+
+        The server accepts an unknown id on `session.create` and `session.switchModel`
+        (200); the TUI then shows `<id> (unavailable)` and the failure surfaces only at
+        the first prompt. An unreadable catalog is "unverifiable" and never blocks a
+        start (the same rule as `pipeline_prepare`)."""
+        try:
+            listed = list_opencode_models(self.runner)
+        except RuntimeError as e:
+            log.warning(
+                "cannot verify opencode model %r (starting anyway): %s", model, e
+            )
+            return
+        if not listed:
+            # Exit 0 with no ids (seen with an empty opencode state): not a catalog.
+            log.warning("opencode models listed nothing; cannot verify %r", model)
+            return
+        if model not in listed:
+            raise HerdrCliError(
+                f"opencode model {model!r} is not in this host's catalog "
+                "(`opencode models`): check the job's model / fallback_model",
+                exit_code=1,
             )
 
     def _opencode_create_session(self, pane_id: str, model: str) -> str:

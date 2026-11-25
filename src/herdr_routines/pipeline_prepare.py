@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -33,7 +32,7 @@ from typing import Literal
 
 from logger import get_logger
 
-from herdr_routines.herdr import HerdrClient, HerdrCliError, opencode_bin
+from herdr_routines.herdr import HerdrClient, HerdrCliError, list_opencode_models
 from herdr_routines.pick_feature import (
     IssueParseError,
     ReclaimedPick,
@@ -56,28 +55,11 @@ EXIT_PREPARED = 0
 EXIT_FAILURE = 1
 EXIT_NO_FEATURE = 3
 
-OPENCODE_MODELS_TIMEOUT_S = 60
-
 
 def opencode_models() -> set[str]:
-    """Every `provider/model` id `opencode models` lists on this host. Raises
-    `RuntimeError` if the listing cannot be produced (binary missing, non-zero exit,
-    timeout) — the caller must treat that as "unverifiable", not as "all present"."""
-    try:
-        proc = subprocess.run(
-            [opencode_bin(), "models"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=OPENCODE_MODELS_TIMEOUT_S,
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise RuntimeError(f"opencode models: {e}") from e
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"opencode models exited {proc.returncode}: {proc.stderr.strip()}"
-        )
-    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    """Every model id `opencode models` lists; raises `RuntimeError` when unverifiable
+    (see `herdr.list_opencode_models`)."""
+    return list_opencode_models()
 
 
 @dataclass(frozen=True, slots=True)

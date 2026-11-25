@@ -1,7 +1,7 @@
 ---
 id: "093"
 title: "Fail a start clearly when an opencode model id is not in the catalog"
-status: open
+status: done
 priority: low
 area: infra
 ---
@@ -29,3 +29,12 @@ not.
 ## Log
 
 - **2026-11-24**: filed as a follow-up of PR #286.
+- **2026-11-24**: done. `HerdrClient.agent_start` checks an opencode model against
+  `opencode models` (one listing per start, ~1 s on the laptop, 927 ids) after the service
+  check and before `session.create`/`session.switchModel`, so every start path (routine,
+  `fallback_model` retry, Telegram `/run`, pipeline stages) fails `agent_start_failed`
+  naming the model. A failed, timed-out or empty listing is "unverifiable" and starts
+  anyway; `pipeline_prepare.opencode_models()` now shares `herdr.list_opencode_models`.
+  `validate` deliberately does not report it: the catalog is per host and `validate`
+  also runs where the job will not. A missing primary model fails the start and does not
+  trigger `fallback_model` (quota-only); a missing fallback fails the retry at start.
