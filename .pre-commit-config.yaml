@@ -16,6 +16,12 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-json
+      # Copier leaves inline conflict markers in a sync PR it couldn't merge
+      # (dev-standards' sync.py). --assume-in-merge makes the hook check every file
+      # even outside a git merge, so CI stays red on markers in any file, not only
+      # the ones check-yaml parses.
+      - id: check-merge-conflict
+        args: [--assume-in-merge]
       - id: check-added-large-files
       - id: debug-statements
         language_version: python3.13
