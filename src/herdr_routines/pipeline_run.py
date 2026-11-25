@@ -1638,7 +1638,11 @@ def _start_and_prompt(
             kind=STAGE_AGENT_KIND,
             pane_id=pane_id,
             start_timeout_ms=spec.start_timeout_ms,
-            model=model,
+            # A resumed session keeps the model it last ran on, as it did under opencode
+            # 1 (where `-m` was ignored on `-s`). Passing `spec.model` here would
+            # `switchModel` stage 7 / a CI round back to the primary after stage 4 fell
+            # back, i.e. onto the model that just ran out of quota.
+            model=None if session_id is not None else model,
             session_id=session_id,
         )
     except (HerdrCliError, OSError, ValueError) as e:

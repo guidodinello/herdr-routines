@@ -1,7 +1,7 @@
 [Unit]
 Description=herdr-routines tick
-After=herdr-server.service
-Wants=herdr-server.service
+After=herdr-server.service opencode-service.service
+Wants=herdr-server.service opencode-service.service
 
 [Service]
 Type=oneshot

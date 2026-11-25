@@ -15,8 +15,9 @@ timezone: America/Montevideo
 #                                          # model's run fails with reason quota_exhausted —
 #                                          # point it at a second free-tier provider so one
 #                                          # exhausted pool doesn't stall every job using it.
-#                                          # Only valid for agent_kind in AGENT_MODEL_FLAGS
-#                                          # (claude, opencode).
+#                                          # Only valid for agent_kind in MODEL_SELECTABLE_KINDS
+#                                          # (claude, codex, opencode); an opencode model
+#                                          # is "provider/model".
 # notify_policy: terminal # optional (issue 009): always | terminal | on-finding |
 #                                          # on-failure. "terminal" (default) reproduces
 #                                          # pre-issue-009 behavior: one notification per

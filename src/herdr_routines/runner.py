@@ -5,7 +5,6 @@ contract and the post-run verification rationale.
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 import time
@@ -20,7 +19,6 @@ from herdr_routines.config import (
     DEFAULT_TRUSTED_REVIEW_AUTHORS,
     OPENCODE_KIND,
     Job,
-    split_provider_model,
 )
 from herdr_routines.herdr import (
     AGENT_STATUS_BLOCKED,
@@ -31,6 +29,7 @@ from herdr_routines.herdr import (
     HerdrCliError,
     PromptWatchdogKilled,
     build_agent_start_args,
+    opencode_session_create_args,
 )
 from herdr_routines.repos import CheckoutBusy, ensure_repo
 from herdr_routines.signing import ResignError, resign_unsigned_branch
@@ -504,21 +503,13 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
     session_id: str | None = None
     if job.agent_kind == OPENCODE_KIND and job.model is not None:
         # opencode 2 has no model flag: the real run creates the session first
-        # (HerdrClient._opencode_session_for) and opens the TUI on it.
-        provider, model_id = split_provider_model(job.model)
+        # (HerdrClient._opencode_create_session) and opens the TUI on it.
         session_id = "<session_id>"
         argv.append(
             [
                 "opencode",
                 "api",
-                "session.create",
-                "-d",
-                json.dumps(
-                    {
-                        "model": {"providerID": provider, "id": model_id},
-                        "location": {"directory": "<pane_cwd>"},
-                    }
-                ),
+                *opencode_session_create_args(job.model, "<pane_cwd>"),
             ]
         )
     argv.append(

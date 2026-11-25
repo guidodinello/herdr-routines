@@ -218,7 +218,7 @@ Provider/model switching on quota exhaustion shipped 2026-08-31 as a scoped v1 (
 
 `Job.fallback_model: str | None`, added to `_DEFAULTS_ALLOWED_KEYS` (unlike `model`, so one
 `defaults.yaml` entry covers every job sharing a provider's free-tier pool) and validated the
-same way as `model` (string or null, only for `agent_kind` in `AGENT_MODEL_FLAGS`).
+same way as `model` (string or null, only for `agent_kind` in `MODEL_SELECTABLE_KINDS`: claude, codex, opencode).
 
 In `tick._process_job`, when the primary `execute_run` settles `state="failed",
 reason="quota_exhausted"` and `job.fallback_model` is set and differs from `job.model`, the
