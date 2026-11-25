@@ -31,6 +31,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Superseded pull_request runs are cancelled. Every other event (push to main,
+# workflow_dispatch) gets a unique group, so it is never cancelled or replaced
+# by a newer pending run -- GitHub drops a pending run in the same group even
+# with cancel-in-progress false, which could leave a main commit with no CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Default GITHUB_TOKEN scope for every job below — neither lints nor tests
 # writes anything (no comments, no pushes, no packages). Least privilege.
 permissions:
