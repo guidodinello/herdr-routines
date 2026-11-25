@@ -22,10 +22,14 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 
+from herdr_routines.config import OPENCODE_KIND
 from herdr_routines.herdr import (
+    AGENT_STATUS_WORKING,
+    SETTLED_AGENT_STATUSES,
     AgentStatus,
     HerdrClient,
     HerdrCliError,
+    OpencodeJobsUnsupported,
     PromptWatchdogKilled,
 )
 
@@ -35,6 +39,13 @@ log = logging.getLogger(__name__)
 # waits. Mirrors herdr.py's PROMPT_WATCHDOG_POLL_S default; module-level so tests can
 # adjust it, same style as runner.READY_POLL_INTERVAL_S.
 WATCHDOG_POLL_INTERVAL_S = 30.0
+
+# Issue 094: how long to wait between polls while an opencode session still has background
+# subagents, and between the two quiet polls that confirm it has none (the parent wakes
+# ~10 ms after its last child ends, so one quiet poll can fall in that gap).
+OPENCODE_DRAIN_POLL_S = 15.0
+OPENCODE_DRAIN_CONFIRM_S = 2.0
+_DRAIN_QUIET_POLLS = 2
 
 # Retries for the prompt send itself (see prompt_with_watchdog's docstring).
 PROMPT_RETRY_DELAYS_S = (5.0, 15.0)
@@ -92,6 +103,108 @@ def matched_failure_marker(
     return None
 
 
+def drain_opencode_background(
+    client: HerdrClient,
+    *,
+    job_name: str,
+    target: str,
+    agent_kind: str,
+    status: AgentStatus | None,
+    deadline: float,
+    scan: Callable[[str], str | None] | None = None,
+) -> AgentStatus | None:
+    """Issue 094: for an opencode agent that herdr reports settled, wait until its session
+    has no background subagent left, and return the status to act on.
+
+    opencode 2 runs subagents in the background; its parent session goes `idle` while they
+    run, which herdr reports as `idle`/`done`. Finished means herdr settled AND
+    `opencode_background_busy` is False on two consecutive polls. Any other kind, or an
+    unsettled `status`, comes back untouched, so claude and codex never see the opencode API.
+
+    `deadline` is a `time.monotonic()` instant. Reaching it returns `working` (callers file
+    that as unsettled). If the first poll cannot read the background state (service
+    stopped, opencode without `experimental.job.list`, no session id) it logs and returns
+    `status`: unverifiable never blocks, which is the behaviour before this existed. A
+    later read error counts as busy. `scan` is the watchdog's per-poll closure, so the
+    heartbeat and failure-marker gate keep running; a confirmed marker raises
+    PromptWatchdogKilled exactly as during the main wait."""
+    if agent_kind != OPENCODE_KIND or status not in SETTLED_AGENT_STATUSES:
+        return status
+    session_id = client.agent_session_id(target)
+    if session_id is None:
+        log.warning("%s: no opencode session id; not waiting for subagents", job_name)
+        return status
+    started = time.monotonic()
+    quiet = 0
+    first_poll = True
+    announced = False
+    while True:
+        try:
+            current = client.agent_current_status(target)
+            if current not in SETTLED_AGENT_STATUSES and current not in (
+                None,
+                AGENT_STATUS_WORKING,
+            ):
+                return current  # blocked/unknown: the caller's existing handling
+            busy = client.opencode_background_busy(session_id) or (
+                current not in SETTLED_AGENT_STATUSES
+            )
+        except OpencodeJobsUnsupported as e:
+            log.warning("%s: %s; not waiting for subagents", job_name, e)
+            return status
+        except (HerdrCliError, OSError) as e:
+            if first_poll:
+                log.warning(
+                    "%s: cannot read opencode background state (%s); not waiting",
+                    job_name,
+                    e,
+                )
+                return status
+            busy = True
+        first_poll = False
+        if not busy:
+            quiet += 1
+            if quiet >= _DRAIN_QUIET_POLLS:
+                if announced:
+                    log.info(
+                        "%s: opencode background work finished after %.0fs",
+                        job_name,
+                        time.monotonic() - started,
+                    )
+                return current
+        else:
+            quiet = 0
+            if not announced:
+                announced = True
+                log.info(
+                    "%s: opencode session %s has background work; waiting up to %.0fs",
+                    job_name,
+                    session_id,
+                    max(deadline - time.monotonic(), 0.0),
+                )
+        wait = OPENCODE_DRAIN_CONFIRM_S if quiet else OPENCODE_DRAIN_POLL_S
+        if time.monotonic() + wait >= deadline:
+            log.warning(
+                "%s: opencode background work still running at the deadline (%.0fs)",
+                job_name,
+                time.monotonic() - started,
+            )
+            return AGENT_STATUS_WORKING
+        time.sleep(wait)
+        if scan is not None:
+            try:
+                screen = client.agent_read_visible(target)
+            except (HerdrCliError, OSError):
+                screen = ""
+            marker = scan(screen)
+            if marker is not None:
+                raise PromptWatchdogKilled(
+                    f"failure marker matched during subagent wait: {marker!r}",
+                    marker=marker,
+                    screen_text=screen,
+                )
+
+
 def prompt_with_watchdog(
     client: HerdrClient,
     *,
@@ -101,6 +214,7 @@ def prompt_with_watchdog(
     timeout_ms: int,
     markers: Sequence[str],
     prompt_text: str,
+    agent_kind: str,
     on_poll_hook: Callable[[], None] | None = None,
     retry_delays_s: Sequence[float] = PROMPT_RETRY_DELAYS_S,
 ) -> AgentStatus | None:
@@ -116,13 +230,16 @@ def prompt_with_watchdog(
     PromptWatchdogKilled for the caller's fast-fail classification. Poll reads that fail are
     inert (the callback sees "", which matches nothing). Raises the last error if every
     attempt fails. Returns the settled agent_status, or None when herdr reports a value
-    outside its schema. `target` is the agent name; `job_name` only labels log lines.
+    outside its schema. For an opencode agent a settle is only final once its background
+    subagents are done (`drain_opencode_background`, issue 094), within `timeout_ms` of the
+    call. `target` is the agent name; `job_name` only labels log lines.
 
     `on_poll_hook` (a no-arg callback) fires inside the same `scan` closure that scans
     for markers, once per poll. `pipeline_run` uses it to write its liveness heartbeat —
     the watchdog reads that file, so it must advance on every poll of every stage.
     """
     previous_hit: str | None = None
+    deadline = time.monotonic() + timeout_ms / 1000
 
     def scan(screen_text: str) -> str | None:
         nonlocal previous_hit
@@ -146,7 +263,7 @@ def prompt_with_watchdog(
                 "%s: retrying prompt (attempt %d/%d)", job_name, i + 1, len(delays)
             )
         try:
-            return client.agent_prompt_wait_with_watchdog(
+            status = client.agent_prompt_wait_with_watchdog(
                 target=target,
                 text=text,
                 timeout_ms=timeout_ms,
@@ -160,6 +277,17 @@ def prompt_with_watchdog(
         except HerdrCliError as e:
             if not is_retryable_prompt_error(e) or i == len(delays) - 1:
                 raise
+        else:
+            # Outside the try: nothing the drain raises may reach the resend whitelist.
+            return drain_opencode_background(
+                client,
+                job_name=job_name,
+                target=target,
+                agent_kind=agent_kind,
+                status=status,
+                deadline=deadline,
+                scan=scan,
+            )
     raise AssertionError(
         "unreachable"
     )  # for the type checker; loop always returns/raises

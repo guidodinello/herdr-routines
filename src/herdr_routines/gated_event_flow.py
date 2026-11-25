@@ -799,6 +799,7 @@ def _dispatch_event_worker(
             timeout_ms=job.timeout_ms,
             markers=job.failure_markers or ("Free usage exceeded",),
             prompt_text=prompt_text,
+            agent_kind=job.agent_kind,
         )
     except Exception as e:  # noqa: BLE001
         _capture_visible_tail(

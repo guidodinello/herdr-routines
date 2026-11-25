@@ -1658,6 +1658,7 @@ def _start_and_prompt(
             timeout_ms=spec.timeout_ms,
             markers=failure_markers,
             prompt_text=text,
+            agent_kind=STAGE_AGENT_KIND,
             on_poll_hook=_heartbeat_hook(heartbeat, spec.stage, clock),
             # Every stage prompt IS a just-started agent's first prompt, which is exactly
             # the start race this retry exists for: herdr rejects it with
