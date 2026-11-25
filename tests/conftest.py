@@ -67,6 +67,25 @@ def _hermetic_state_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_opencode_highlights(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Keep `HerdrClient.agent_start` from touching opencode's real state (issue 089).
+
+    For an opencode agent it runs `opencode --version` through the injected runner and
+    writes `$XDG_STATE_HOME/opencode/latest/tui/highlights.json`. Unstubbed, every test
+    that starts an opencode agent would gain a runner call (shifting the call sequences
+    they assert) and, with a real runner, rewrite the developer's own file. The stub is
+    the default; `tests/test_herdr.py` restores the real method for its own tests, and
+    the state dir is pinned either way."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    monkeypatch.setattr(
+        "herdr_routines.herdr.HerdrClient._mark_opencode_highlights_seen",
+        lambda _self: None,
+    )
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hide the host's global and system git config from every test.
 

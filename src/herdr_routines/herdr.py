@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import shutil
 import subprocess
 import time
@@ -48,6 +50,57 @@ def opencode_bin() -> str:
     if OPENCODE_FALLBACK_BIN.is_file():
         return str(OPENCODE_FALLBACK_BIN)
     raise OSError(f"opencode not found on PATH or at {OPENCODE_FALLBACK_BIN}")
+
+
+# opencode 2 opens a one-time "What's new in <version>" dialog on the first launch after an
+# upgrade. It swallows typed input until dismissed, while herdr reports the agent `idle` with
+# `interactive_ready: true`, so a job's first prompt is typed into the dialog and lost (issue
+# 089, reproduced live on 2.1.4: the prompt vanished, nothing was sent, the status stayed
+# `idle`). opencode shows it only when the running version is newer than `seen` in this
+# file (and that release has highlights), and records `seen` the moment it shows it. So
+# writing `seen` first is enough. `latest` is the release channel's directory: the TUI wrote
+# it on an empty state dir on the laptop, and the Pi has the same layout.
+OPENCODE_CHANNEL_DIR = "latest"
+
+# `opencode --version` prints `opencode v2.1.4`. opencode itself only compares plain
+# `X.Y.Z` versions (a prerelease never shows the dialog), so anything else is not matched.
+_OPENCODE_VERSION = re.compile(r"(?<![\w.])v?(\d+\.\d+\.\d+)(?![\w.-])")
+
+
+def opencode_highlights_path() -> Path:
+    state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(state_home) if state_home else Path.home() / ".local" / "state"
+    return base / "opencode" / OPENCODE_CHANNEL_DIR / "tui" / "highlights.json"
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def mark_opencode_highlights_seen(version: str) -> bool:
+    """Records `version` as the release whose highlights were seen, unless the file already
+    says that version or a newer one. Other keys in the file are kept; a missing or corrupt
+    file is replaced. Returns True when it wrote. OSError propagates."""
+    path = opencode_highlights_path()
+    try:
+        state = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    seen = state.get("seen")
+    if (
+        isinstance(seen, str)
+        and re.fullmatch(r"\d+\.\d+\.\d+", seen)
+        and _version_key(seen) >= _version_key(version)
+    ):
+        return False
+    state["seen"] = version
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(state))
+    tmp.replace(path)
+    return True
 
 
 def list_opencode_models(runner: CommandRunner | None = None) -> set[str]:
@@ -471,6 +524,8 @@ class HerdrClient:
         model: str | None = None,
         session_id: str | None = None,
     ) -> None:
+        if kind == OPENCODE_KIND:
+            self._mark_opencode_highlights_seen()
         created: str | None = None
         if kind == OPENCODE_KIND and model is not None:
             # opencode 2 has no model flag; the model lives on the session the TUI opens.
@@ -499,6 +554,26 @@ class HerdrClient:
             # retry creates its own. A resumed session is never ours to delete.
             if created is not None and not started:
                 self._opencode_remove_session(created)
+
+    def _mark_opencode_highlights_seen(self) -> None:
+        """Best-effort (issue 089): keeps opencode's one-time "What's new" dialog from
+        swallowing the first prompt after an upgrade. A failure only logs: the start itself
+        reports whatever is really wrong (a missing binary raises there)."""
+        try:
+            exit_code, stdout, _stderr = self.runner(
+                [opencode_bin(), "--version"], timeout_s=OPENCODE_API_TIMEOUT_S
+            )
+            match = _OPENCODE_VERSION.search(stdout) if exit_code == 0 else None
+            if match is None:
+                log.warning(
+                    "cannot read the opencode version (%r); the what's-new dialog "
+                    "may block the first prompt",
+                    stdout.strip()[:80],
+                )
+            elif mark_opencode_highlights_seen(match.group(1)):
+                log.info("marked opencode %s highlights as seen", match.group(1))
+        except OSError as e:
+            log.warning("could not mark opencode highlights as seen: %s", e)
 
     def _require_opencode_service(self) -> None:
         """Raises HerdrCliError unless opencode's background service is already running.

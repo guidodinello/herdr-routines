@@ -18,6 +18,7 @@ from herdr_routines.herdr import (
     HerdrCliError,
     PromptWatchdogKilled,
     _RealWatchdogProcess,
+    mark_opencode_highlights_seen,
     opencode_bin,
 )
 
@@ -261,6 +262,7 @@ AGENT_STARTED = {"result": {"agent": {"agent_status": "idle"}}}
 
 
 _REAL_OPENCODE_BIN = opencode_bin
+_REAL_MARK_HIGHLIGHTS = HerdrClient._mark_opencode_highlights_seen
 
 
 @pytest.fixture(autouse=True)
@@ -1742,3 +1744,131 @@ def test_hung_server_surfaces_as_cli_error_instead_of_blocking() -> None:
     with pytest.raises(HerdrCliError) as exc_info:
         client.tab_create(cwd="/repo")
     assert exc_info.value.exit_code == 124
+
+
+# -- opencode's one-time "What's new" dialog (issue 089) ----------------------------------------
+
+
+@pytest.fixture
+def highlights_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The file opencode keeps the last-seen release in, under a pinned state dir, with the
+    real `_mark_opencode_highlights_seen` restored (conftest stubs it for every test)."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        HerdrClient, "_mark_opencode_highlights_seen", _REAL_MARK_HIGHLIGHTS
+    )
+    return tmp_path / "opencode" / "latest" / "tui" / "highlights.json"
+
+
+def test_highlights_marked_seen_when_the_file_is_missing(highlights_file: Path) -> None:
+    assert mark_opencode_highlights_seen("2.1.4") is True
+    assert json.loads(highlights_file.read_text()) == {"seen": "2.1.4"}
+
+
+def test_highlights_stale_seen_is_raised_and_other_keys_are_kept(
+    highlights_file: Path,
+) -> None:
+    """The state captured live on 2.1.4: `seen` 2.0.0 shows the dialog."""
+    highlights_file.parent.mkdir(parents=True)
+    highlights_file.write_text(json.dumps({"seen": "2.0.0", "other": 1}))
+    assert mark_opencode_highlights_seen("2.1.4") is True
+    assert json.loads(highlights_file.read_text()) == {"seen": "2.1.4", "other": 1}
+    assert not list(highlights_file.parent.glob("*.tmp")), "temp file left behind"
+
+
+@pytest.mark.parametrize("seen", ["2.1.4", "2.4.1", "10.0.0"])
+def test_highlights_current_or_newer_seen_is_left_alone(
+    highlights_file: Path, seen: str
+) -> None:
+    """A downgrade (seen newer than the binary) never shows the dialog: no write."""
+    highlights_file.parent.mkdir(parents=True)
+    highlights_file.write_text(json.dumps({"seen": seen}))
+    assert mark_opencode_highlights_seen("2.1.4") is False
+    assert json.loads(highlights_file.read_text()) == {"seen": seen}
+
+
+@pytest.mark.parametrize("content", ["not json", "[]", '{"seen": 7}', '{"seen": "x"}'])
+def test_highlights_unusable_content_is_replaced(
+    highlights_file: Path, content: str
+) -> None:
+    highlights_file.parent.mkdir(parents=True)
+    highlights_file.write_text(content)
+    assert mark_opencode_highlights_seen("2.1.4") is True
+    assert json.loads(highlights_file.read_text()) == {"seen": "2.1.4"}
+
+
+def test_highlights_version_compares_numerically_not_as_text(
+    highlights_file: Path,
+) -> None:
+    highlights_file.parent.mkdir(parents=True)
+    highlights_file.write_text(json.dumps({"seen": "2.9.0"}))
+    assert mark_opencode_highlights_seen("2.10.0") is True
+
+
+def test_highlights_without_xdg_state_home_use_the_home_state_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("XDG_STATE_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert mark_opencode_highlights_seen("2.1.4") is True
+    written = tmp_path / ".local/state/opencode/latest/tui/highlights.json"
+    assert json.loads(written.read_text()) == {"seen": "2.1.4"}
+
+
+def test_agent_start_opencode_marks_highlights_seen_before_starting(
+    highlights_file: Path,
+) -> None:
+    """The wiring: `opencode --version` runs first, the file holds that version by the
+    time `herdr agent start` runs, so the dialog never opens over the first prompt."""
+    seen_at_start: list[str] = []
+
+    def runner(argv: list[str], *, timeout_s: float | None) -> tuple[int, str, str]:
+        if argv[1:3] == ["agent", "start"]:
+            seen_at_start.append(highlights_file.read_text())
+            return ok(AGENT_STARTED)
+        assert argv == ["/x/opencode", "--version"]
+        highlights_file.parent.mkdir(parents=True)
+        highlights_file.write_text('{"seen": "2.0.0"}')
+        return 0, "opencode v2.1.4\n", ""
+
+    HerdrClient(runner=runner).agent_start(
+        name="rt-a", kind="opencode", pane_id="w1:p1", start_timeout_ms=120_000
+    )
+    assert json.loads(seen_at_start[0]) == {"seen": "2.1.4"}
+
+
+def test_agent_start_other_kinds_do_not_touch_opencode_state(
+    highlights_file: Path,
+) -> None:
+    runner = FakeRunner([ok(AGENT_STARTED)])
+    HerdrClient(runner=runner).agent_start(
+        name="rt-a", kind="claude", pane_id="w1:p1", start_timeout_ms=120_000
+    )
+    assert [argv[1:3] for argv in runner.calls] == [["agent", "start"]]
+    assert not highlights_file.exists()
+
+
+def test_agent_start_opencode_still_starts_when_the_version_is_unreadable(
+    highlights_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    runner = FakeRunner([(0, "opencode vnext\n", ""), ok(AGENT_STARTED)])
+    with caplog.at_level(logging.WARNING, logger="herdr_routines.herdr"):
+        HerdrClient(runner=runner).agent_start(
+            name="rt-a", kind="opencode", pane_id="w1:p1", start_timeout_ms=120_000
+        )
+    assert runner.calls[-1][1:3] == ["agent", "start"]
+    assert not highlights_file.exists()
+    assert "cannot read the opencode version" in caplog.text
+
+
+def test_agent_start_opencode_still_starts_when_the_state_file_is_unwritable(
+    highlights_file: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    highlights_file.parent.parent.parent.write_text("a file, not a directory")
+    runner = FakeRunner([(0, "opencode v2.1.4\n", ""), ok(AGENT_STARTED)])
+    with caplog.at_level(logging.WARNING, logger="herdr_routines.herdr"):
+        HerdrClient(runner=runner).agent_start(
+            name="rt-a", kind="opencode", pane_id="w1:p1", start_timeout_ms=120_000
+        )
+    assert runner.calls[-1][1:3] == ["agent", "start"]
+    assert "could not mark opencode highlights as seen" in caplog.text
