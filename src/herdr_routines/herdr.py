@@ -10,15 +10,54 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final, Literal, Protocol, TypedDict, TypeIs, get_args
 
-from herdr_routines.config import AGENT_MODEL_FLAGS
+from herdr_routines.config import (
+    AGENT_MODEL_FLAGS,
+    OPENCODE_KIND,
+    split_provider_model,
+)
 
 HERDR_BIN = "herdr"
+
+# opencode's installer puts the binary here, which is on no systemd unit's PATH
+# (herdr-routines.service, herdr-telegram.service): only a pane's login shell had it.
+OPENCODE_FALLBACK_BIN = Path.home() / ".opencode" / "bin" / "opencode"
+
+# Budget for one `opencode api` call. It auto-starts the background service when stopped
+# (verified 2026-11-24), which takes a few seconds.
+OPENCODE_API_TIMEOUT_S = 60.0
+
+
+def opencode_bin() -> str:
+    """The opencode executable: PATH first, then opencode's own install dir. Raises OSError
+    when neither exists, which every `agent_start` caller already maps to
+    `agent_start_failed`."""
+    found = shutil.which("opencode")
+    if found:
+        return found
+    if OPENCODE_FALLBACK_BIN.is_file():
+        return str(OPENCODE_FALLBACK_BIN)
+    raise OSError(f"opencode not found on PATH or at {OPENCODE_FALLBACK_BIN}")
+
+
+def opencode_session_create_args(model: str, directory: str) -> list[str]:
+    """The `opencode api` args that create a session on `model` (`provider/model`) in
+    `directory`. The one definition of the request body: `HerdrClient` runs it and
+    `runner.build_dry_run_argv` prints it."""
+    provider, model_id = split_provider_model(model)
+    body = {
+        "model": {"providerID": provider, "id": model_id},
+        "location": {"directory": directory},
+    }
+    return ["session.create", "-d", json.dumps(body)]
+
 
 log = logging.getLogger(__name__)
 
@@ -413,15 +452,105 @@ class HerdrClient:
         model: str | None = None,
         session_id: str | None = None,
     ) -> None:
-        args = build_agent_start_args(
-            name=name,
-            kind=kind,
-            pane_id=pane_id,
-            start_timeout_ms=start_timeout_ms,
-            model=model,
-            session_id=session_id,
+        created: str | None = None
+        if kind == OPENCODE_KIND and model is not None:
+            # opencode 2 has no model flag; the model lives on the session the TUI opens.
+            split_provider_model(model)  # a bare id fails before any call is made
+            self._require_opencode_service()
+            if session_id is None:
+                created = session_id = self._opencode_create_session(pane_id, model)
+            else:
+                self._opencode_switch_model(session_id, model)
+        started = False
+        try:
+            args = build_agent_start_args(
+                name=name,
+                kind=kind,
+                pane_id=pane_id,
+                start_timeout_ms=start_timeout_ms,
+                model=model,
+                session_id=session_id,
+            )
+            self._call(args, timeout_s=start_timeout_ms / 1000 + 10)
+            started = True
+        finally:
+            # A session this call created is orphaned when its TUI never opened (an
+            # `agent_name_taken` collision that the caller retries, a start timeout): the
+            # retry creates its own. A resumed session is never ours to delete.
+            if created is not None and not started:
+                self._opencode_remove_session(created)
+
+    def _require_opencode_service(self) -> None:
+        """Raises HerdrCliError unless opencode's background service is already running.
+
+        `opencode api` starts the service when it is stopped, in the caller's cgroup and
+        environment (verified 2026-11-24 with `systemd-run --user`): started from the tick
+        unit it would lack the provider keys that only `herdr-server.service`'s
+        EnvironmentFile carries, and a oneshot unit's exit kills it, taking every pane's
+        opencode with it. So this process never starts it: `service status` is read-only
+        and prints the URL when running, `stopped` otherwise. (Racy by milliseconds if the
+        service dies between this check and the call; `deploy/systemd/opencode-service
+        .service` keeps it up.)"""
+        exit_code, stdout, stderr = self.runner(
+            [opencode_bin(), "service", "status"], timeout_s=OPENCODE_API_TIMEOUT_S
         )
-        self._call(args, timeout_s=start_timeout_ms / 1000 + 10)
+        status = stdout.strip().splitlines()[0] if stdout.strip() else ""
+        if exit_code != 0 or not status.startswith("http"):
+            raise HerdrCliError(
+                "opencode background service is not running "
+                f"(`opencode service status`: {(status or stderr.strip())[:120]!r}); "
+                "refusing to start it from this process, where it would lack the "
+                "provider keys and die with the unit. Start opencode-service.service "
+                "(deploy/systemd)",
+                exit_code=exit_code or 1,
+            )
+
+    def _opencode_create_session(self, pane_id: str, model: str) -> str:
+        """A new session on `model`, in the pane's cwd (without a location the server
+        files it under its own default directory). Verified live on opencode 2.4.1: the
+        session's model wins over the global config and the TUI's remembered model."""
+        body = self._opencode_api(
+            opencode_session_create_args(model, self.pane_cwd(pane_id))
+        )
+        return _extract_str(body, path=("data", "id"))
+
+    def _opencode_switch_model(self, session_id: str, model: str) -> None:
+        provider, model_id = split_provider_model(model)
+        self._opencode_api(
+            [
+                "session.switchModel",
+                "--param",
+                f"sessionID={session_id}",
+                "-d",
+                json.dumps({"model": {"providerID": provider, "id": model_id}}),
+            ]
+        )
+
+    def _opencode_remove_session(self, session_id: str) -> None:
+        """Best-effort: a failed cleanup must not replace the start error being raised."""
+        try:
+            self._opencode_api(["session.remove", "--param", f"sessionID={session_id}"])
+        except (HerdrCliError, OSError) as e:
+            log.warning(
+                "could not remove orphaned opencode session %s: %s", session_id, e
+            )
+
+    def pane_cwd(self, pane_id: str) -> str:
+        body = self._call(["pane", "get", pane_id], timeout_s=10)
+        return _extract_str(body, path=("result", "pane", "cwd"))
+
+    def _opencode_api(self, args: list[str]) -> dict[str, object]:
+        """One `opencode api` call. Exits 1 and prints the error body on an HTTP error, so
+        any failure surfaces as HerdrCliError and keeps the `agent_start_failed` path."""
+        argv = [opencode_bin(), "api", *args]
+        exit_code, stdout, stderr = self.runner(argv, timeout_s=OPENCODE_API_TIMEOUT_S)
+        if exit_code != 0:
+            raise HerdrCliError(
+                f"opencode api {args[0]} failed (exit {exit_code}): "
+                f"{(stdout or stderr).strip()[:300]}",
+                exit_code=exit_code,
+            )
+        return _try_parse_json(stdout) or {}
 
     def agent_prompt(self, *, target: str, text: str) -> None:
         """Sends a prompt and returns once Herdr has accepted it, without waiting for the
@@ -681,13 +810,14 @@ def build_agent_start_args(
     """Builds the `agent start` argv (without the leading `herdr` binary). Shared by
     `HerdrClient.agent_start` and `runner.build_dry_run_argv` so the two can't drift.
 
-    `session_id` emits `-s <id>`, the documented resume form (`docs/pipeline/design.md`'s
-    stage 7), so an operator can pick up a wedged stage-7 pane's conversation in their own
-    terminal. It is appended inside the `model is not None` branch on purpose: that branch
-    is the only one emitting the `--` separator the model's own flags follow, and `-m <model>
-    -s <session_id>` has to reach opencode as one argument list after it. A `session_id`
-    with no `model` is rejected rather than silently dropped — there is no separator-less
-    documented form to put it after, and emitting one would be a guess."""
+    claude/codex: a model emits `--model <model>` after the `--` separator, and
+    `session_id` emits `-s <id>` after it (the documented resume form, stage 7 in
+    `docs/pipeline/design.md`). A `session_id` with no `model` is rejected rather than
+    silently dropped.
+
+    opencode: there is no model flag (opencode 2 rejects `-m`). The model is set on the
+    session beforehand by `HerdrClient.agent_start`, so this only emits `-- -s <id>`;
+    a model without a session id is a caller bug."""
     args = [
         "agent",
         "start",
@@ -699,6 +829,15 @@ def build_agent_start_args(
         "--timeout",
         str(start_timeout_ms),
     ]
+    if kind == OPENCODE_KIND:
+        if model is not None and session_id is None:
+            raise ValueError(
+                "opencode selects its model on the session: create or switch it first "
+                "and pass its session_id"
+            )
+        if session_id is not None:
+            args += ["--", "-s", session_id]
+        return args
     if model is not None:
         flag = AGENT_MODEL_FLAGS.get(kind)
         if flag is None:
@@ -712,8 +851,8 @@ def build_agent_start_args(
     elif session_id is not None:
         raise ValueError(
             f"agent_start(session_id={session_id!r}) requires a model: the documented "
-            f"resume form is `-m <model> -s <session_id>`, which only exists after the "
-            f"`--` separator emitted for a model flag"
+            f"resume form is `--model <model> -s <session_id>`, which only exists after "
+            f"the `--` separator emitted for a model flag"
         )
     return args
 

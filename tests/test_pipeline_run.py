@@ -1144,6 +1144,10 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_provider_err
     fallback_session = f"{SESSION_IDS[4]}fb2"
     assert prepared.state()["stage_sessions"]["4"] == fallback_session
     assert prepared.state()["stage_sessions"]["7"] == fallback_session
+    # Stage 7 resumes with no model: a `switchModel` to the primary would put the session
+    # back on the model that just ran out of quota, and the prompt would fail.
+    stage7 = [c for c in client.started if c["name"] == f"pl-7-{RUN_ID}".lower()]
+    assert [(c["model"], c["session_id"]) for c in stage7] == [(None, fallback_session)]
     report_text = prepared.report.read_text()
     assert "## Outcome: ok" in report_text
     assert f"retried in a fresh session on {AUTHOR_FALLBACK_MODEL}" in report_text

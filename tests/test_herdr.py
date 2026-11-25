@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +18,7 @@ from herdr_routines.herdr import (
     HerdrCliError,
     PromptWatchdogKilled,
     _RealWatchdogProcess,
+    opencode_bin,
 )
 
 
@@ -244,18 +246,247 @@ def test_agent_start_passes_claude_model_via_native_flag() -> None:
     assert argv[-3:] == ["--", "--model", "opus"]
 
 
-def test_agent_start_passes_opencode_model_via_native_flag() -> None:
-    runner = FakeRunner([ok({"result": {"agent": {"agent_status": "idle"}}})])
-    client = HerdrClient(runner=runner)
-    client.agent_start(
+def pane_response(cwd: str) -> dict:
+    return {"result": {"pane": {"pane_id": "w1:p1", "cwd": cwd}}}
+
+
+SERVICE_UP = (0, "http://127.0.0.1:49374\n", "")
+AGENT_STARTED = {"result": {"agent": {"agent_status": "idle"}}}
+
+
+_REAL_OPENCODE_BIN = opencode_bin
+
+
+@pytest.fixture(autouse=True)
+def _opencode_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("herdr_routines.herdr.opencode_bin", lambda: "/x/opencode")
+
+
+def test_agent_start_opencode_creates_session_on_model_then_opens_it() -> None:
+    """opencode 2 has no model flag: the session is created on the model in the pane's cwd
+    (`pane get` -> `opencode api session.create`), then the TUI opens it with `-s`."""
+    from herdr_routines.herdr import opencode_session_create_args
+
+    runner = FakeRunner(
+        [
+            SERVICE_UP,
+            ok(pane_response("/work/repo")),
+            ok({"data": {"id": "ses_new1"}}),
+            ok(AGENT_STARTED),
+        ]
+    )
+    HerdrClient(runner=runner).agent_start(
         name="rt-a",
         kind="opencode",
         pane_id="w1:p1",
         start_timeout_ms=120_000,
         model="opencode/big-pickle",
     )
-    argv = runner.calls[0]
-    assert argv[-3:] == ["--", "-m", "opencode/big-pickle"]
+    status, pane_get, create, start = runner.calls
+    assert status == ["/x/opencode", "service", "status"]
+    assert pane_get[1:] == ["pane", "get", "w1:p1"]
+    assert create == [
+        "/x/opencode",
+        "api",
+        *opencode_session_create_args("opencode/big-pickle", "/work/repo"),
+    ]
+    assert json.loads(create[4]) == {
+        "model": {"providerID": "opencode", "id": "big-pickle"},
+        "location": {"directory": "/work/repo"},
+    }
+    assert start[1:3] == ["agent", "start"]
+    assert start[-3:] == ["--", "-s", "ses_new1"]
+    assert "-m" not in start
+
+
+def test_agent_start_opencode_splits_provider_at_first_slash_only() -> None:
+    runner = FakeRunner(
+        [
+            SERVICE_UP,
+            ok(pane_response("/r")),
+            ok({"data": {"id": "ses_n"}}),
+            ok(AGENT_STARTED),
+        ]
+    )
+    HerdrClient(runner=runner).agent_start(
+        name="rt-a",
+        kind="opencode",
+        pane_id="w1:p1",
+        start_timeout_ms=1000,
+        model="openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+    )
+    assert json.loads(runner.calls[2][4])["model"] == {
+        "providerID": "openrouter",
+        "id": "nvidia/nemotron-3-ultra-550b-a55b:free",
+    }
+
+
+def test_agent_start_opencode_resume_switches_model_then_opens_session() -> None:
+    # `session.switchModel` prints nothing on success (verified live).
+    runner = FakeRunner([SERVICE_UP, (0, "", ""), ok(AGENT_STARTED)])
+    HerdrClient(runner=runner).agent_start(
+        name="pl-7-run",
+        kind="opencode",
+        pane_id="w1:p1",
+        start_timeout_ms=120_000,
+        model="opencode/big-pickle",
+        session_id="ses_old",
+    )
+    _status, switch, start = runner.calls
+    assert switch[1:5] == ["api", "session.switchModel", "--param", "sessionID=ses_old"]
+    assert json.loads(switch[6]) == {
+        "model": {"providerID": "opencode", "id": "big-pickle"}
+    }
+    assert start[-3:] == ["--", "-s", "ses_old"]
+
+
+def test_agent_start_opencode_api_failure_is_a_herdr_cli_error() -> None:
+    """Keeps the callers' `except HerdrCliError` -> agent_start_failed mapping, and never
+    reaches `agent start`."""
+    runner = FakeRunner(
+        [SERVICE_UP, ok(pane_response("/r")), (1, '{"_tag":"Boom"}\nHTTP 500', "")]
+    )
+    with pytest.raises(HerdrCliError, match="session.create failed"):
+        HerdrClient(runner=runner).agent_start(
+            name="rt-a",
+            kind="opencode",
+            pane_id="w1:p1",
+            start_timeout_ms=1000,
+            model="opencode/big-pickle",
+        )
+    assert len(runner.calls) == 3
+
+
+@pytest.mark.parametrize("status", [(0, "stopped\n", ""), (1, "", "boom"), (0, "", "")])
+def test_agent_start_opencode_refuses_to_start_a_stopped_service(
+    status: tuple[int, str, str],
+) -> None:
+    """`opencode api` would start it in this process's cgroup and env (no provider keys,
+    killed when the tick unit exits), so a stopped service fails the start instead, and
+    nothing past `service status` runs."""
+    runner = FakeRunner([status])
+    with pytest.raises(HerdrCliError, match="service is not running"):
+        HerdrClient(runner=runner).agent_start(
+            name="rt-a",
+            kind="opencode",
+            pane_id="w1:p1",
+            start_timeout_ms=1000,
+            model="opencode/big-pickle",
+        )
+    assert runner.calls == [["/x/opencode", "service", "status"]]
+
+
+def test_agent_start_opencode_removes_the_session_it_created_when_start_fails() -> None:
+    """The `agent_name_taken` retry and a start timeout would otherwise leave an empty
+    server-side session behind per attempt."""
+    runner = FakeRunner(
+        [
+            SERVICE_UP,
+            ok(pane_response("/r")),
+            ok({"data": {"id": "ses_orphan"}}),
+            (1, json.dumps({"error": {"code": "agent_name_taken"}}), ""),
+            (0, "", ""),  # session.remove
+        ]
+    )
+    with pytest.raises(HerdrCliError):
+        HerdrClient(runner=runner).agent_start(
+            name="rt-a",
+            kind="opencode",
+            pane_id="w1:p1",
+            start_timeout_ms=1000,
+            model="opencode/big-pickle",
+        )
+    assert runner.calls[-1] == [
+        "/x/opencode",
+        "api",
+        "session.remove",
+        "--param",
+        "sessionID=ses_orphan",
+    ]
+
+
+def test_agent_start_opencode_cleanup_failure_does_not_mask_the_start_error() -> None:
+    runner = FakeRunner(
+        [
+            SERVICE_UP,
+            ok(pane_response("/r")),
+            ok({"data": {"id": "ses_orphan"}}),
+            (1, json.dumps({"error": {"code": "agent_name_taken"}}), ""),
+            (1, "HTTP 404", ""),  # session.remove fails too
+        ]
+    )
+    with pytest.raises(HerdrCliError, match="agent_name_taken|agent start"):
+        HerdrClient(runner=runner).agent_start(
+            name="rt-a",
+            kind="opencode",
+            pane_id="w1:p1",
+            start_timeout_ms=1000,
+            model="opencode/big-pickle",
+        )
+
+
+def test_agent_start_opencode_never_removes_a_resumed_session() -> None:
+    runner = FakeRunner([SERVICE_UP, (0, "", ""), (1, json.dumps({"error": {}}), "")])
+    with pytest.raises(HerdrCliError):
+        HerdrClient(runner=runner).agent_start(
+            name="rt-a",
+            kind="opencode",
+            pane_id="w1:p1",
+            start_timeout_ms=1000,
+            model="opencode/big-pickle",
+            session_id="ses_keep",
+        )
+    assert not any("session.remove" in c for c in runner.calls)
+
+
+def test_agent_start_opencode_rejects_bare_model_id() -> None:
+    runner = FakeRunner([])
+    with pytest.raises(ValueError, match="provider/model"):
+        HerdrClient(runner=runner).agent_start(
+            name="rt-a",
+            kind="opencode",
+            pane_id="w1:p1",
+            start_timeout_ms=1000,
+            model="big-pickle",
+        )
+    assert runner.calls == []
+
+
+def test_agent_start_opencode_without_model_starts_plain() -> None:
+    runner = FakeRunner([ok({"result": {"agent": {"agent_status": "idle"}}})])
+    HerdrClient(runner=runner).agent_start(
+        name="rt-a", kind="opencode", pane_id="w1:p1", start_timeout_ms=1000
+    )
+    assert runner.calls[0][-2:] == ["--timeout", "1000"]
+
+
+def test_build_agent_start_args_opencode_session_without_model_resumes() -> None:
+    from herdr_routines.herdr import build_agent_start_args
+
+    args = build_agent_start_args(
+        name="rt-a",
+        kind="opencode",
+        pane_id="w1:p1",
+        start_timeout_ms=1000,
+        session_id="ses_x",
+    )
+    assert args[-3:] == ["--", "-s", "ses_x"]
+
+
+def test_opencode_bin_falls_back_to_install_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The systemd units' PATH lacks ~/.opencode/bin, where opencode installs itself."""
+    from herdr_routines import herdr
+
+    fake = tmp_path / "opencode"
+    fake.write_text("")
+    monkeypatch.setattr(herdr.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(herdr, "OPENCODE_FALLBACK_BIN", fake)
+    assert _REAL_OPENCODE_BIN() == str(fake)
+    monkeypatch.setattr(herdr, "OPENCODE_FALLBACK_BIN", tmp_path / "missing")
+    with pytest.raises(OSError, match="opencode not found"):
+        _REAL_OPENCODE_BIN()
 
 
 def test_build_agent_start_args_codex_includes_model_flag() -> None:
@@ -1322,7 +1553,7 @@ def test_build_agent_start_args_never_emits_skip_permissions() -> None:
         "allow_dangerous",
     }
     for kind in ("claude", "opencode", "codex", "gemini"):
-        # Only kinds with known model flags accept a model arg; others raise ValueError.
+        # Only kinds with a native model flag accept a model arg; others raise ValueError.
         model = "opus" if kind in ("claude",) else None
         args = build_agent_start_args(
             name="rt-test",

@@ -123,13 +123,15 @@ adapter that shells out — with two implementations, real and faked, behind the
 **Fig. B — one tick, traced.** The control flow described across §3–§6, start to finish, for a
 single due job.
 
-![Side-by-side comparison: a Herdr API change touches herdr.py directly and conditionally touches config.py's kind list and runner.py's status policy, leaving the scheduler and pure core untouched. An agent CLI change only touches the small AGENT_MODEL_FLAGS map shared by config.py and herdr.py, because Herdr absorbs the rest of the provider surface first.](diagrams/blast-radius.svg)
+![Side-by-side comparison: a Herdr API change touches herdr.py directly and conditionally touches config.py's kind list and runner.py's status policy, leaving the scheduler and pure core untouched. An agent CLI change only touches how herdr.py selects a model (the small AGENT_MODEL_FLAGS map for claude and codex, the session calls for opencode), because Herdr absorbs the rest of the provider surface first.](diagrams/blast-radius.svg)
 
 **Fig. C — blast radius of a Herdr change vs. an agent-CLI change.** The practical payoff of the
 adapter seam: a Herdr API change is a small, localized edit; a provider (OpenCode / Claude Code)
-CLI change reaches this codebase only at the single `AGENT_MODEL_FLAGS` mapping (`config.py`,
-consumed by `herdr.build_agent_start_args`) that names each kind's native model flag — see
-`Job.model`, wired into `agent_start` below.
+CLI change reaches this codebase only where `herdr.py` selects a model: the `AGENT_MODEL_FLAGS`
+mapping (`config.py`, consumed by `herdr.build_agent_start_args`) for kinds with a native flag
+(claude, codex), and `HerdrClient`'s opencode session calls (`opencode_session_create_args`,
+`_opencode_switch_model`) because opencode 2 has no model flag — see `Job.model`, wired into
+`agent_start` below.
 
 ---
 
@@ -235,9 +237,12 @@ Notes on the schema:
   message since they fail earlier as `agent_prompt_failed` rather than `no_report` — and
   checks the systemd unit's `TimeoutStartSec` covers the worst-case tick duration.
 - `model` is passed as a native arg after `--`, using the flag pinned down per `agent_kind` in
-  `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `-m` for `opencode`, `--model` for
-  `codex` (see `codex --help`). Config load rejects a non-null `model` for any other
-  `agent_kind` rather than guessing its flag.
+  `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `--model` for
+  `codex` (see `codex --help`).
+  opencode 2 has no model flag: `HerdrClient.agent_start` creates a session on the model
+  (`opencode api session.create`, in the pane's cwd; `session.switchModel` on a resume) and opens
+  the TUI on it with `-- -s <session_id>`. An opencode `model` must be `provider/model`. Config load
+  rejects a non-null `model` for any other `agent_kind` (`MODEL_SELECTABLE_KINDS`).
 
 ---
 

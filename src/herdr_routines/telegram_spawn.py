@@ -32,12 +32,14 @@ from typing import Protocol
 from logger import get_logger
 
 from herdr_routines.config import (
-    AGENT_MODEL_FLAGS,
+    MODEL_SELECTABLE_KINDS,
     NAME_RE,
+    OPENCODE_KIND,
     VALID_AGENT_KINDS,
     SpawnAlias,
     TelegramSpawn,
     is_private_chat_id,
+    split_provider_model,
 )
 from herdr_routines.herdr import HerdrCliError, WorktreeInfo
 from herdr_routines.runner import _is_agent_name_taken
@@ -245,7 +247,7 @@ def handle_spawn_message(
         return _reply(
             reply,
             f"{_USAGE}. Targets: {valid}. A model needs one of: "
-            f"{', '.join(sorted(AGENT_MODEL_FLAGS))}.",
+            f"{', '.join(sorted(MODEL_SELECTABLE_KINDS))}.",
         )
     target = command.target
 
@@ -262,12 +264,17 @@ def handle_spawn_message(
     # The alias's default model belongs to its own harness; picking another harness
     # without a model starts that harness on its default.
     model = command.model or (spec.model if kind == alias_kind else None)
-    if model is not None and kind not in AGENT_MODEL_FLAGS:
+    if model is not None and kind not in MODEL_SELECTABLE_KINDS:
         return _reply(
             reply,
             f"Harness {kind!r} takes no model. A model needs one of: "
-            f"{', '.join(sorted(AGENT_MODEL_FLAGS))}.",
+            f"{', '.join(sorted(MODEL_SELECTABLE_KINDS))}.",
         )
+    if model is not None and kind == OPENCODE_KIND:
+        try:
+            split_provider_model(model)
+        except ValueError as e:
+            return _reply(reply, str(e))
     mode = spec.workspace
     base = spec.base
     stamp = int(time.time())

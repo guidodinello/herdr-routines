@@ -3,6 +3,7 @@ involved). See docs/plan-v1.md §7."""
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -232,11 +233,26 @@ def test_build_dry_run_argv_passes_claude_model_flag(tmp_path: Path) -> None:
     assert agent_start_argv[-3:] == ["--", "--model", "opus"]
 
 
-def test_build_dry_run_argv_passes_opencode_model_flag(tmp_path: Path) -> None:
+def test_build_dry_run_argv_creates_opencode_session_on_model(tmp_path: Path) -> None:
+    """opencode 2 has no model flag, so the dry run shows the session-create step and an
+    `agent start` that opens the session it returns. The request body comes from the same
+    builder the real start uses, so `location` is in it."""
+    from herdr_routines.herdr import opencode_session_create_args
+
     job = make_job(tmp_path, agent_kind="opencode", model="opencode/big-pickle")
     commands = build_dry_run_argv(job, run_id="a-1")
-    agent_start_argv = commands[1]
-    assert agent_start_argv[-3:] == ["--", "-m", "opencode/big-pickle"]
+    create_argv, agent_start_argv = commands[1], commands[2]
+    assert create_argv == [
+        "opencode",
+        "api",
+        *opencode_session_create_args("opencode/big-pickle", "<pane_cwd>"),
+    ]
+    assert json.loads(create_argv[4]) == {
+        "model": {"providerID": "opencode", "id": "big-pickle"},
+        "location": {"directory": "<pane_cwd>"},
+    }
+    assert agent_start_argv[-3:] == ["--", "-s", "<session_id>"]
+    assert "-m" not in agent_start_argv
 
 
 def test_execute_run_passes_model_through_to_agent_start(tmp_path: Path) -> None:

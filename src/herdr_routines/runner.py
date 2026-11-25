@@ -15,7 +15,11 @@ from pathlib import Path
 from typing import Final, Literal, NotRequired, TypedDict
 
 from herdr_routines.auto_fix import GhClient, RealGhClient
-from herdr_routines.config import DEFAULT_TRUSTED_REVIEW_AUTHORS, Job
+from herdr_routines.config import (
+    DEFAULT_TRUSTED_REVIEW_AUTHORS,
+    OPENCODE_KIND,
+    Job,
+)
 from herdr_routines.herdr import (
     AGENT_STATUS_BLOCKED,
     AGENT_STATUS_UNKNOWN,
@@ -25,6 +29,7 @@ from herdr_routines.herdr import (
     HerdrCliError,
     PromptWatchdogKilled,
     build_agent_start_args,
+    opencode_session_create_args,
 )
 from herdr_routines.repos import CheckoutBusy, ensure_repo
 from herdr_routines.signing import ResignError, resign_unsigned_branch
@@ -495,6 +500,18 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
             ]
         )
 
+    session_id: str | None = None
+    if job.agent_kind == OPENCODE_KIND and job.model is not None:
+        # opencode 2 has no model flag: the real run creates the session first
+        # (HerdrClient._opencode_create_session) and opens the TUI on it.
+        session_id = "<session_id>"
+        argv.append(
+            [
+                "opencode",
+                "api",
+                *opencode_session_create_args(job.model, "<pane_cwd>"),
+            ]
+        )
     argv.append(
         [
             "herdr",
@@ -504,6 +521,7 @@ def build_dry_run_argv(job: Job, *, run_id: str) -> list[list[str]]:
                 pane_id="<pane_id>",
                 start_timeout_ms=job.start_timeout_ms,
                 model=job.model,
+                session_id=session_id,
             ),
         ]
     )

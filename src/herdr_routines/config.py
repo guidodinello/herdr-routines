@@ -59,14 +59,46 @@ VALID_AGENT_KINDS = frozenset(
 
 # Native model-selection flag per agent kind, passed as a native arg after `--`. Confirmed
 # empirically against herdr 0.8.2 (see docs/plan-v1.md): only these kinds have a pinned-down
-# flag — a job's 'model' is rejected for any other agent_kind rather than guessing. Also consumed
-# by herdr.py's `build_agent_start_args`, which is where the flag is actually applied.
+# flag. Consumed by herdr.py's `build_agent_start_args`, which is where the flag is applied.
 # codex 0.52.0 --help: --model <model> (confirmed 2026-09-14)
+# opencode is deliberately absent: opencode 2's TUI has no model flag (`-m` is rejected), so
+# `HerdrClient.agent_start` picks its model through the server API instead (see
+# `MODEL_SELECTABLE_KINDS`).
 AGENT_MODEL_FLAGS: dict[str, str] = {
     "claude": "--model",
-    "opencode": "-m",
     "codex": "--model",
 }
+
+# Agent kinds a job's `model` is accepted for: the native-flag kinds plus opencode, whose model
+# is set on the session (`opencode api session.create` / `session.switchModel`, then
+# `agent start -- -s <session>`), verified live on opencode 2.4.1 (2026-11-24).
+OPENCODE_KIND = "opencode"
+MODEL_SELECTABLE_KINDS: frozenset[str] = frozenset(AGENT_MODEL_FLAGS) | {OPENCODE_KIND}
+
+
+def split_provider_model(model: str) -> tuple[str, str]:
+    """`provider/model` -> `(provider, model)`, split at the FIRST `/` only: openrouter ids
+    carry more (`openrouter/nvidia/nemotron-...:free`). A bare id raises ValueError: opencode 1
+    tolerated `-m big-pickle` because the global default happened to match, but a session is
+    created for an explicit provider."""
+    provider, sep, model_id = model.partition("/")
+    if not sep or not provider or not model_id:
+        raise ValueError(
+            f"opencode model {model!r} must be 'provider/model' (e.g. opencode/big-pickle)"
+        )
+    return provider, model_id
+
+
+def _check_model_form(model: str, agent_kind: object) -> str | None:
+    """The reason an opencode `model` is malformed, else None. Other kinds pass through."""
+    if agent_kind != OPENCODE_KIND:
+        return None
+    try:
+        split_provider_model(model)
+    except ValueError as e:
+        return str(e)
+    return None
+
 
 WorkspaceMode = Literal["worktree", "root"]
 VALID_WORKSPACE_MODES: frozenset[WorkspaceMode] = frozenset(get_args(WorkspaceMode))
@@ -1128,11 +1160,13 @@ def _build_spawn_alias(raw: object, *, label: str) -> SpawnAlias:
     model = raw.get("model")
     if model is not None and (not isinstance(model, str) or not model):
         raise ConfigError(f"{label} ({alias!r}): 'model' must be a non-empty string")
-    if model is not None and agent_kind not in AGENT_MODEL_FLAGS:
+    if model is not None and agent_kind not in MODEL_SELECTABLE_KINDS:
         raise ConfigError(
             f"{label} ({alias!r}): 'model' is not supported for agent_kind "
-            f"{agent_kind!r} (supported: {sorted(AGENT_MODEL_FLAGS)})"
+            f"{agent_kind!r} (supported: {sorted(MODEL_SELECTABLE_KINDS)})"
         )
+    if model is not None and (bad := _check_model_form(model, agent_kind)):
+        raise ConfigError(f"{label} ({alias!r}): {bad}")
     return SpawnAlias(
         alias=alias,
         repo=repo,
@@ -1376,28 +1410,34 @@ def _build_models(
     model = merged["model"]
     if model is not None and not isinstance(model, str):
         raise ConfigError(f"{label}: 'model' must be a string or null")
-    if model is not None and agent_kind not in AGENT_MODEL_FLAGS:
+    if model is not None and agent_kind not in MODEL_SELECTABLE_KINDS:
         raise ConfigError(
             f"{label}: 'model' is not supported for agent_kind {agent_kind!r} "
-            f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
+            f"(supported: {sorted(MODEL_SELECTABLE_KINDS)})"
         )
+    if model is not None and (bad := _check_model_form(model, agent_kind)):
+        raise ConfigError(f"{label}: 'model': {bad}")
 
     fallback_model = merged["fallback_model"]
     if fallback_model is not None and not isinstance(fallback_model, str):
         raise ConfigError(f"{label}: 'fallback_model' must be a string or null")
-    if fallback_model is not None and agent_kind not in AGENT_MODEL_FLAGS:
+    if fallback_model is not None and agent_kind not in MODEL_SELECTABLE_KINDS:
         if "fallback_model" in raw_job:
             # The job itself asked for this — an explicit mistake, not something a shared
             # default should paper over.
             raise ConfigError(
                 f"{label}: 'fallback_model' is not supported for agent_kind {agent_kind!r} "
-                f"(supported: {sorted(AGENT_MODEL_FLAGS)})"
+                f"(supported: {sorted(MODEL_SELECTABLE_KINDS)})"
             )
         # Inherited from defaults.yaml, which is deliberately shared across every job
         # (unlike `model`) so one entry can cover a whole provider's job set. A job whose
         # agent_kind doesn't support model selection at all shouldn't fail to load just
         # because the default doesn't apply to it — it's simply inert here.
         fallback_model = None
+    if fallback_model is not None and (
+        bad := _check_model_form(fallback_model, agent_kind)
+    ):
+        raise ConfigError(f"{label}: 'fallback_model': {bad}")
     return model, fallback_model
 
 

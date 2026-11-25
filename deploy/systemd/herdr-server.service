@@ -1,5 +1,9 @@
 [Unit]
 Description=Herdr headless server
+# Up before the panes' opencode TUIs, so they find opencode-service.service instead of
+# starting a second service inside this unit's cgroup.
+After=opencode-service.service
+Wants=opencode-service.service
 
 [Service]
 Type=simple

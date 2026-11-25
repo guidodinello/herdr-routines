@@ -1,0 +1,19 @@
+[Unit]
+Description=opencode background service (shared by herdr panes and herdr-routines)
+# herdr-routines starts opencode sessions through `opencode api`, which talks to this
+# service. `opencode api` would start the service itself if it were stopped, but then in
+# the caller's cgroup and environment: from the tick unit that means no provider keys and
+# a service killed when the oneshot exits (verified with systemd-run --user, 2026-11-24).
+# So herdr-routines refuses to start it (HerdrClient._require_opencode_service); this unit
+# is what keeps it up, with the same keys as herdr-server.service.
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/herdr/secrets.env
+# The port is opencode's own `service set port` config (default 49374); `serve --service`
+# registers in service.json, so `opencode service status` and the panes' TUIs find it.
+ExecStart=%h/.opencode/bin/opencode serve --service
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -1,6 +1,6 @@
 # Deploying herdr-routines
 
-Five systemd **user** unit pairs drive this tool — no daemon of our own, no root required. See
+Six systemd **user** units (five of them with timers) drive this tool — no daemon of our own, no root required. See
 [`../docs/plan-v1.md`](../docs/plan-v1.md) §3 for the full rationale.
 
 ## Install
@@ -11,7 +11,7 @@ copying the unit to a host with a different checkout path or `uv` install locati
 
 ```sh
 mkdir -p ~/.config/systemd/user
-cp systemd/herdr-server.service systemd/herdr-routines.timer systemd/herdr-routines.service \
+cp systemd/herdr-server.service systemd/opencode-service.service systemd/herdr-routines.timer systemd/herdr-routines.service \
    systemd/herdr-routines-watchdog.timer systemd/herdr-routines-watchdog.service \
    systemd/herdr-routines-digest.timer systemd/herdr-routines-digest.service \
    systemd/herdr-routines-update.timer systemd/herdr-routines-update.service \
@@ -103,6 +103,7 @@ uv sync
 uv run herdr-routines validate
 uv run herdr-routines tmp-hygiene --dry-run  # optional: preview /tmp cleanup
 uv run herdr-routines prune reports --dry-run  # optional: preview state-dir cleanup (issue 021)
+systemctl --user enable --now opencode-service.service
 systemctl --user enable --now herdr-server.service
 systemctl --user enable --now herdr-routines.timer
 systemctl --user enable --now herdr-routines-watchdog.timer
@@ -111,6 +112,23 @@ systemctl --user enable --now herdr-routines-update.timer
 systemctl --user enable --now herdr-routines-tmp-sweep.timer  # skip if /tmp is on disk and roomy
 uv run herdr-routines host-check   # must print "ok: no host drift"
 ```
+
+### opencode's background service
+
+opencode 2 runs one background service (`opencode serve --service`), and herdr-routines
+creates every opencode session through `opencode api` against it. `opencode api` starts that
+service itself when it is stopped, but in the caller's cgroup and environment. Started from
+`herdr-routines.service` (or the Telegram bot) it would have no provider keys (those come
+from `herdr-server.service`'s `EnvironmentFile`) and a oneshot unit's exit would kill it,
+taking the panes' opencode with it (verified with `systemd-run --user`, 2026-11-24). So
+herdr-routines never starts it: `HerdrClient` checks `opencode service status` first and
+fails the start (`agent_start_failed`) with a message when it is stopped.
+`opencode-service.service` keeps it up with the same `secrets.env`.
+
+Moving a host that already has a service running inside `herdr-server.service` (the Pi:
+started there by a pane's TUI): `opencode service stop` (every opencode pane loses its server
+for a moment, so do it between runs), then `systemctl --user enable --now opencode-service.service`.
+`systemctl --user show -p ControlGroup` on the `serve --service` pid shows which unit owns it.
 
 ### After a `deploy/systemd/` change merges
 
@@ -221,7 +239,8 @@ The message can pick the harness and model: `/run <alias> [harness] [model]`.
 | `/run nightly opencode opencode/big-pickle` | opencode with that model |
 
 The harness must be a known `agent_kind`. A model works only with claude, codex and opencode, and
-must start with a letter or digit, so it never reads as a flag. A malformed `/run` from the allowed
+must start with a letter or digit, so it never reads as a flag. An opencode model must be `provider/model`
+(`opencode/big-pickle`), since opencode 2 has no model flag and the session is created on that provider. A malformed `/run` from the allowed
 chat gets a usage reply listing the aliases; any other chat gets the generic refusal.
 
 **Starting with a prompt.** Put a first prompt on the lines after the command, or after a `--`

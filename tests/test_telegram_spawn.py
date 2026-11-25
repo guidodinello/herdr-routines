@@ -731,6 +731,24 @@ def test_spawn_starts_the_requested_harness_and_model(tmp_path: Path) -> None:
     assert ", pane w7:p1. Reply to this message" in result
 
 
+def test_spawn_rejects_a_bare_opencode_model(tmp_path: Path) -> None:
+    mod = _spawn_module()
+    client = FakeSpawnClient()
+
+    result, _ = _handle(
+        mod,
+        "/run nightly-audit opencode big-pickle",
+        12345,
+        allowed_chat_id=12345,
+        aliases=_aliases(_git_repo(tmp_path / "repo")),
+        client=client,
+    )
+
+    assert "provider/model" in result
+    assert client.agent_calls == []
+    assert client.workspace_calls == []
+
+
 def test_spawn_alias_model_applies_only_to_its_own_harness(tmp_path: Path) -> None:
     mod = _spawn_module()
     aliases = _aliases(_git_repo(tmp_path / "repo"))
