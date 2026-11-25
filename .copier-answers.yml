@@ -1,0 +1,9 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: f21152d
+_src_path: https://github.com/guidodinello/dev-standards.git
+branch: main
+dev_style: groups
+include_tests: true
+locked: true
+python_version: '3.13'
+release: false
