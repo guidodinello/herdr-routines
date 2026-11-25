@@ -95,8 +95,23 @@ jobs:
       - name: pre-commit hooks
         run: uv run pre-commit run --all-files --show-diff-on-failure
 
+<<<<<<< before updating
   typecheck-python:
     name: Typecheck Python
+=======
+  # Audits the workflow files with zizmor. It is in the `CI` job's needs:, so a
+  # finding blocks the merge. The version is pinned so a new upstream audit
+  # cannot turn this red between runs; Dependabot does not bump a `uvx` pin, so
+  # bump it by hand.
+  # Runs the auditor persona, a superset of the default one, so findings the default
+  # hides (undocumented permissions, missing concurrency, unnamed jobs, secrets
+  # outside an environment) fail CI too. An intentional exception is an inline
+  # `# zizmor: ignore[<rule>] <reason>` comment inside the finding's span.
+  # GH_TOKEN is the read-only workflow token; it enables the online audits that
+  # check each pinned SHA really belongs to the tagged repo.
+  audit-workflows:
+    name: Audit workflows
+>>>>>>> after updating
     runs-on: ${{ fromJSON(vars.CI_RUNNERS || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -111,6 +126,7 @@ jobs:
           enable-cache: ${{ !contains(runner.name, 'homelab') }}
           cache-dependency-glob: "uv.lock"
 
+<<<<<<< before updating
       - name: Install dependencies
         run: uv sync --locked --dev
 
@@ -118,6 +134,12 @@ jobs:
       # pyproject.toml, so this matches what `uv run mypy` does locally.
       - name: mypy
         run: scripts/ci-check.sh typecheck
+=======
+      - name: zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uvx zizmor@1.31.1 --persona auditor --format=github .github/workflows
+>>>>>>> after updating
 
   test-python:
     name: Tests (Python)
