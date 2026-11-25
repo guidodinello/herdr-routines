@@ -244,6 +244,18 @@ considered met). One-liner index; full detail in the issue file.
   only for routines and retries back-to-back; a single DNS failure cost
   `audit-type-health` a week. →
   [`088`](docs/process/issues/088-retries-ignored-outside-routines.md)
+- **opencode 2's "what's new" dialog** — blocks input after an upgrade, so the next job
+  can stall. →
+  [`089`](docs/process/issues/089-opencode2-whats-new-dialog.md)
+- **opencode 2 `--auto`** — decide whether herdr-routines may ever auto-approve. →
+  [`090`](docs/process/issues/090-opencode2-auto-permissions-flag.md)
+- **Failure markers on opencode 2 screens** — quota/API-error text was collected from
+  opencode 1. →
+  [`091`](docs/process/issues/091-opencode2-failure-markers.md)
+- **`agent_prompt_stalled` after an opencode 2 start** — expected gone; confirm over a week. →
+  [`092`](docs/process/issues/092-opencode2-prompt-stalled-after-start.md)
+- **Unknown opencode model ids fail late** — `session.create` accepts them silently. →
+  [`093`](docs/process/issues/093-opencode-unknown-model-preflight.md)
 
 ## Later
 
