@@ -1,0 +1,52 @@
+
+     Switched agent to Build                                                                                    Greeting
+
+  ┃                                                                                                             Context
+  ┃  say hi in one word                                                                                         11,865 tokens
+  ┃                                                                                                             6% used
+
+     Hi
+
+     Build · Big Pickle · 2.9s · 1.1 tok/s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                  ⬖ Getting started                ✕
+
+                                                                                                                    OpenCode includes free models so
+                                                                                                                    you can start immediately.
+
+                                                                                                                    Connect from 75+ providers to
+                                                                                                                    use other models, including
+  ┃                                                                                                                 Claude, GPT, Gemini etc
+  ┃
+  ┃                                                                                                                 Connect provider        /connect
+  ┃  Build · Big Pickle OpenCode
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  /…/scratch  11.9K (6%)  ctrl+p commands    /…/scratch

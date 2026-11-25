@@ -1222,6 +1222,90 @@ def test_watchdog_fast_fails_on_quota_marker_before_timeout(
     assert client.calls[-1] == "pane_close"
 
 
+# Real opencode 2.1.4 screens, captured 2026-11-24 through herdr 0.9.5 (`herdr agent read
+# --source visible`) in an isolated XDG dir (issue 091). All were produced by the same prompt
+# ("say hi in one word"); only the footer's scratch path was redacted. How each was made:
+#   quota_shaped_*         a local stub upstream answered HTTP 429 with the body message
+#                          "Free usage exceeded, subscribe to Go". SYNTHETIC upstream text: no
+#                          real opencode Zen quota screen could be provoked on the laptop, so
+#                          these prove how opencode 2 *renders* a provider message, not what
+#                          Zen's own quota message says today.
+#   http_401_settled_error stub upstream HTTP 401 ("Invalid API key").
+#   http_500_retry         stub upstream HTTP 500 ("upstream exploded"), mid-retry.
+#   model_unavailable      session created on `opencode/does-not-exist-9x`, a model missing from
+#                          the catalog.
+#   normal_reply           `opencode/big-pickle` answering "Hi".
+#   foreign_session_failed_toast  the pane's own session is retrying a 500; the "Session failed"
+#                          toast on top belongs to ANOTHER session on the shared service.
+OPENCODE2_SCREENS = Path(__file__).parent / "fixtures" / "opencode2_screens"
+
+
+def opencode2_screen(name: str) -> str:
+    return (OPENCODE2_SCREENS / f"{name}.txt").read_text()
+
+
+@pytest.mark.parametrize(
+    "fixture", ["quota_shaped_retry", "quota_shaped_settled_error"]
+)
+def test_watchdog_fast_fails_on_opencode2_quota_screens(
+    tmp_path: Path, _isolated_reports_dir: Path, fixture: str
+) -> None:
+    """opencode 2 prints the provider's message verbatim, both in the `Retrying in ... ·
+    attempt N · <message>` line while it retries and in `Error: <message>` once it gives
+    up, so the default marker still matches (issue 091)."""
+    screen = opencode2_screen(fixture)
+    client = WatchdogClient(polls=(screen, screen), settle_status=None)
+    job = make_job(tmp_path, timeout_ms=5_400_000)
+    outcome = execute_run(job, client, run_id=f"a-oc2-{fixture}")  # type: ignore[arg-type]
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert "'Free usage exceeded'" in (outcome.error or "")
+    assert client.terminate_calls == 1
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["normal_reply", "model_unavailable", "http_401_settled_error", "http_500_retry"],
+)
+def test_watchdog_does_not_call_other_opencode2_screens_quota(
+    tmp_path: Path, _isolated_reports_dir: Path, fixture: str
+) -> None:
+    """A bad key, a missing model or a 5xx is not an exhausted quota: reaping one as
+    `quota_exhausted` would send the job to its fallback model for the wrong reason.
+    (A 5xx retry loop and an unavailable model therefore still wait out the timeout; the
+    unavailable model is caught earlier, at start, by issue 093.)"""
+    screen = opencode2_screen(fixture)
+    run_id = f"a-oc2-{fixture}"
+    client = WatchdogClient(
+        polls=(screen, screen),
+        settle_status="idle",
+        write_report_at=_isolated_reports_dir / f"{run_id}.md",
+    )
+    outcome = execute_run(make_job(tmp_path), client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert client.terminate_calls == 0
+
+
+def test_watchdog_ignores_a_single_sighting_from_another_sessions_toast(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """opencode's background service is shared: a "Session failed" toast for a quota-failed
+    session of another job rendered over this pane (observed live). The marker is on screen,
+    but only for as long as the toast lives, so the two-consecutive-polls gate must not reap
+    this healthy run."""
+    toast = opencode2_screen("foreign_session_failed_toast")
+    assert "Free usage exceeded" in toast
+    run_id = "a-oc2-toast"
+    client = WatchdogClient(
+        polls=(toast, opencode2_screen("http_500_retry")),
+        settle_status="idle",
+        write_report_at=_isolated_reports_dir / f"{run_id}.md",
+    )
+    outcome = execute_run(make_job(tmp_path), client, run_id=run_id)  # type: ignore[arg-type]
+    assert outcome.state == "done"
+    assert client.terminate_calls == 0
+
+
 def test_watchdog_does_not_fire_on_slow_run_without_marker(
     tmp_path: Path, _isolated_reports_dir: Path
 ) -> None:
