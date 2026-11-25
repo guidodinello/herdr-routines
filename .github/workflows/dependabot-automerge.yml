@@ -1,4 +1,5 @@
-# Auto-merges Dependabot's own PRs — patch/minor only, major stays manual.
+# Auto-merges Dependabot's own PRs — patch/minor only; majors and every
+# github-actions bump stay manual (see the merge step for why).
 #
 # Requires a GitHub App to mint the actual merge token — see below for why,
 # and docs/github-standard.md § Dependabot for the exact setup steps
@@ -6,21 +7,39 @@
 # App configured, this workflow degrades gracefully: it reports "not
 # configured" and leaves the PR for a manual merge, rather than failing.
 #
-# Adopt: cp to .github/workflows/dependabot-automerge.yml. Fully generic,
+# Rendered by dev-standards' init.py, verbatim. Fully generic,
 # no per-repo edits needed — the App ID/key come from secrets, not this file.
 name: Dependabot auto-merge
 
 on: pull_request
 
+# One run at a time per PR, never cancelled: a run for another PR is never touched, and
+# a run that may already be queueing the merge is left to finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 # The merge is performed with the App token below, so this workflow's own GITHUB_TOKEN
 # only needs read access. Dependabot-triggered runs get a read-only one regardless.
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: read # fetch-metadata reads the PR's details
 
 jobs:
-  auto-merge:
-    runs-on: ubuntu-latest
+  # secrets-outside-env is ignored: a Dependabot-triggered pull_request run gets only
+  # Dependabot secrets ("GitHub Actions secrets are not available", docs.github.com/en/
+  # code-security/reference/supply-chain-security/dependabot-on-actions). Environment
+  # secrets are Actions secrets and Dependabot secrets can't be scoped to an environment,
+  # so moving the App secrets into one would leave them empty and silently stop auto-merge.
+  auto-merge: # zizmor: ignore[secrets-outside-env] Dependabot runs get no environment secrets
+    name: Auto-merge
+    # Same CI_RUNNERS switch as the CI workflow (see dev-standards' README § CI runners) —
+    # a private repo's GitHub-hosted minutes running out blocks this job exactly like
+    # any other, and it isn't a required check, so an offline self-hosted runner only
+    # delays a merge rather than blocking one.
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS || '["ubuntu-latest"]') }}
+    # The PR author, not github.actor: actor is whoever triggered this run (a human
+    # re-running the job becomes the actor), the PR author cannot be changed.
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     # Surfaced as env rather than read inline so the steps below can branch on whether the
     # App is configured: the `secrets` context is not available in a step `if`, but `env` is.
@@ -29,7 +48,7 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3
 
       # A merge made with GITHUB_TOKEN triggers no further workflow runs — GitHub
       # suppresses that to prevent a workflow from triggering itself in an infinite loop.
@@ -47,13 +66,19 @@ jobs:
         with:
           app-id: ${{ env.APP_ID }}
           private-key: ${{ secrets.AUTOMERGE_APP_PRIVATE_KEY }}
-          # Only what `gh pr merge --auto` needs. No `workflows` permission, so Dependabot
-          # bumps that edit workflow files (github-actions) need a manual merge.
+          # Only what `gh pr merge --auto --squash` needs; without these the token
+          # inherits every permission of the installation.
           permission-contents: write
           permission-pull-requests: write
 
       # `--auto` queues the merge behind the required CI check rather than merging
       # immediately, so the branch ruleset still decides whether it lands.
+      #
+      # github-actions bumps are left for a human. Actions are SHA-pinned, so every patch and
+      # minor release of one becomes a PR, and auto-merging those would be the unreviewed-bump
+      # path into workflows that run on the CI runner pool. Merging a PR that edits
+      # .github/workflows/ with an App token likely also needs `workflows: write`, which is
+      # untested. (fetch-metadata reports the ecosystem with an underscore.)
       #
       # Gated on the mint step's outcome rather than on APP_ID. `outcome == 'success'`
       # subsumes the APP_ID check (an unset id leaves this 'skipped') and states the real
@@ -63,6 +88,7 @@ jobs:
       - name: Auto-merge patch and minor updates
         if: |
           steps.app-token.outcome == 'success' &&
+          steps.metadata.outputs.package-ecosystem != 'github_actions' &&
           (steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
            steps.metadata.outputs.update-type == 'version-update:semver-minor')
         run: gh pr merge --auto --squash "$PR_URL"
@@ -70,7 +96,7 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
 
-      # Three outcomes, each reported distinctly. "Auto-merge quietly stopped working" is
+      # Four outcomes, each reported distinctly. "Auto-merge quietly stopped working" is
       # the exact failure this workflow exists to prevent, so it must not fail that way
       # itself.
       #
@@ -93,6 +119,17 @@ jobs:
             echo
             echo "- \`AUTOMERGE_APP_ID\`"
             echo "- \`AUTOMERGE_APP_PRIVATE_KEY\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Report that github-actions bumps are left for review
+        if: steps.metadata.outputs.package-ecosystem == 'github_actions'
+        run: |
+          echo "::notice title=Dependabot auto-merge skipped::github-actions bumps are reviewed by hand, so this PR will not auto-merge."
+          {
+            echo "### Dependabot auto-merge: skipped by policy"
+            echo
+            echo "github-actions bumps are SHA-pinned, so every patch and minor release opens a PR."
+            echo "They are reviewed and merged by hand rather than auto-merged."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Configured but unusable: the mint step has already failed the job, so the signal is
