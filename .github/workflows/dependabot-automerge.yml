@@ -12,15 +12,38 @@ name: Dependabot auto-merge
 
 on: pull_request
 
+# One run at a time per PR, never cancelled: a run for another PR is never touched, and
+# a run that may already be queueing the merge is left to finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 # The merge is performed with the App token below, so this workflow's own GITHUB_TOKEN
 # only needs read access. Dependabot-triggered runs get a read-only one regardless.
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: read # fetch-metadata reads the PR's details
 
 jobs:
+<<<<<<< before updating
   auto-merge:
     runs-on: ubuntu-latest
+=======
+  # secrets-outside-env is ignored: a Dependabot-triggered pull_request run gets only
+  # Dependabot secrets ("GitHub Actions secrets are not available", docs.github.com/en/
+  # code-security/reference/supply-chain-security/dependabot-on-actions). Environment
+  # secrets are Actions secrets and Dependabot secrets can't be scoped to an environment,
+  # so moving the App secrets into one would leave them empty and silently stop auto-merge.
+  auto-merge: # zizmor: ignore[secrets-outside-env] Dependabot runs get no environment secrets
+    name: Auto-merge
+    # Same CI_RUNNERS switch as the CI workflow (see dev-standards' README § CI runners) —
+    # a private repo's GitHub-hosted minutes running out blocks this job exactly like
+    # any other, and it isn't a required check, so an offline self-hosted runner only
+    # delays a merge rather than blocking one.
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS || '["ubuntu-latest"]') }}
+    # The PR author, not github.actor: actor is whoever triggered this run (a human
+    # re-running the job becomes the actor), the PR author cannot be changed.
+>>>>>>> after updating
     if: github.event.pull_request.user.login == 'dependabot[bot]'
     # Surfaced as env rather than read inline so the steps below can branch on whether the
     # App is configured: the `secrets` context is not available in a step `if`, but `env` is.
