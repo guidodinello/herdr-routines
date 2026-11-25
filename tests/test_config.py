@@ -307,6 +307,37 @@ jobs:
     assert job.model == model
 
 
+@pytest.mark.parametrize("field", ["model", "fallback_model"])
+def test_opencode_bare_model_id_is_rejected(tmp_config_path: Path, field: str) -> None:
+    """opencode 2 creates the session on an explicit provider; a bare `big-pickle` only
+    worked under opencode 1 because the global default happened to match."""
+    text = f"""
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: opencode
+    {field}: big-pickle
+"""
+    with pytest.raises(ConfigError, match=f"{field}.*provider/model"):
+        load_config(write(tmp_config_path, text))
+
+
+def test_claude_model_needs_no_provider_prefix(tmp_config_path: Path) -> None:
+    text = """
+version: 1
+jobs:
+  - name: a
+    cron: "0 3 * * *"
+    repo: /repo/a
+    agent_kind: claude
+    model: opus
+    fallback_model: sonnet
+"""
+    assert load_config(write(tmp_config_path, text)).job("a") is not None
+
+
 def test_model_raises_for_unsupported_agent_kind(tmp_config_path: Path) -> None:
     text = """
 version: 1
@@ -340,7 +371,7 @@ jobs:
 def test_model_rejected_for_unsupported_kind_mentions_supported_list(
     tmp_config_path: Path,
 ) -> None:
-    from herdr_routines.config import AGENT_MODEL_FLAGS
+    from herdr_routines.config import MODEL_SELECTABLE_KINDS
 
     text = """
 version: 1
@@ -354,7 +385,7 @@ jobs:
     with pytest.raises(ConfigError, match="supported") as exc_info:
         load_config(write(tmp_config_path, text))
     msg = str(exc_info.value)
-    for kind in sorted(AGENT_MODEL_FLAGS):
+    for kind in sorted(MODEL_SELECTABLE_KINDS):
         assert kind in msg
 
 

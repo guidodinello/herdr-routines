@@ -235,9 +235,12 @@ Notes on the schema:
   message since they fail earlier as `agent_prompt_failed` rather than `no_report` — and
   checks the systemd unit's `TimeoutStartSec` covers the worst-case tick duration.
 - `model` is passed as a native arg after `--`, using the flag pinned down per `agent_kind` in
-  `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `-m` for `opencode`, `--model` for
-  `codex` (see `codex --help`). Config load rejects a non-null `model` for any other
-  `agent_kind` rather than guessing its flag.
+  `AGENT_MODEL_FLAGS` (`config.py`): `--model` for `claude`, `--model` for
+  `codex` (see `codex --help`).
+  opencode 2 has no model flag: `HerdrClient.agent_start` creates a session on the model
+  (`opencode api session.create`, in the pane's cwd; `session.switchModel` on a resume) and opens
+  the TUI on it with `-- -s <session_id>`. An opencode `model` must be `provider/model`. Config load
+  rejects a non-null `model` for any other `agent_kind` (`MODEL_SELECTABLE_KINDS`).
 
 ---
 

@@ -221,7 +221,8 @@ The message can pick the harness and model: `/run <alias> [harness] [model]`.
 | `/run nightly opencode opencode/big-pickle` | opencode with that model |
 
 The harness must be a known `agent_kind`. A model works only with claude, codex and opencode, and
-must start with a letter or digit, so it never reads as a flag. A malformed `/run` from the allowed
+must start with a letter or digit, so it never reads as a flag. An opencode model must be `provider/model`
+(`opencode/big-pickle`), since opencode 2 has no model flag and the session is created on that provider. A malformed `/run` from the allowed
 chat gets a usage reply listing the aliases; any other chat gets the generic refusal.
 
 **Starting with a prompt.** Put a first prompt on the lines after the command, or after a `--`

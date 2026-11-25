@@ -33,7 +33,7 @@ from typing import Literal
 
 from logger import get_logger
 
-from herdr_routines.herdr import HerdrClient, HerdrCliError
+from herdr_routines.herdr import HerdrClient, HerdrCliError, opencode_bin
 from herdr_routines.pick_feature import (
     IssueParseError,
     ReclaimedPick,
@@ -65,7 +65,7 @@ def opencode_models() -> set[str]:
     timeout) — the caller must treat that as "unverifiable", not as "all present"."""
     try:
         proc = subprocess.run(
-            ["opencode", "models"],
+            [opencode_bin(), "models"],
             capture_output=True,
             text=True,
             check=False,
@@ -199,7 +199,8 @@ def prepare_run(
     # hours into the night after the issue is claimed. Checked before the claim so a
     # bad model costs a report and nothing else. Membership only — a listed model whose
     # free quota is gone is the stage loop's quota fast-fail to catch. Fallbacks too:
-    # opencode starts an unlisted `-m` on its default model without an error, so run
+    # opencode 1 started an unlisted `-m` on its default model without an error (opencode 2
+    # accepts an unlisted id on `session.create` and fails at the first prompt), so run
     # 20261110T050000Z's fallback to a withdrawn kimi-k3 silently retried big-pickle,
     # the model whose quota had just run out.
     stage_models = sorted(

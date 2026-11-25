@@ -99,9 +99,8 @@ from herdr_routines.wait_loop import PROMPT_RETRY_DELAYS_S, prompt_with_watchdog
 
 log = get_logger(__name__)
 
-# The agent kind every stage starts. `opencode` is the only kind
-# `build_agent_start_args` knows a native model flag for (AGENT_MODEL_FLAGS), and it is
-# what every row of the prompt's harness table uses.
+# The agent kind every stage starts: what every row of the prompt's harness table uses.
+# `HerdrClient.agent_start` sets its model on the session (opencode 2 has no model flag).
 STAGE_AGENT_KIND = "opencode"
 
 # `pipeline_prepare.EXIT_*` is the convention: 0 ok, 1 partial-or-failed, 2 argparse
@@ -1474,11 +1473,13 @@ def _prompt_with_fallback(
         else (None, None)
     )
     if spec.fallback_model and failed_session and provider_error:
-        # A fresh session, never a resume of the failed one. On resume (`-m <fallback>
-        # -s <failed id>`) opencode 1.19.0 ignores `-m` and keeps the session's stored
-        # model (measured on the Pi 2026-11-01), so a resume would retry the very model
-        # that just failed. Partial work survives in the shared worktree, so the
-        # preamble points the new session at it.
+        # A fresh session, never a resume of the failed one. On opencode 1.19.0 a resume
+        # (`-m <fallback> -s <failed id>`) ignored `-m` and kept the session's stored
+        # model (measured on the Pi 2026-11-01), so it would retry the very model that
+        # just failed; kept fresh under opencode 2 (where `agent_start` switches the
+        # resumed session's model) so the failed session's context is not carried over.
+        # Partial work survives in the shared worktree, so the preamble points the new
+        # session at it.
         _close_pane(client, pane_id)
         note = (
             f"stage {spec.stage}: {model} failed ({provider_error}); "
