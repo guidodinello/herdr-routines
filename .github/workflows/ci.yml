@@ -160,7 +160,7 @@ jobs:
       - name: zizmor
         env:
           GH_TOKEN: ${{ github.token }}
-        run: uvx zizmor@1.31.1 --format=github .github/workflows
+        run: uvx zizmor@1.31.1 --persona auditor --format=github .github/workflows
 
   # Single stable check name for the branch ruleset (see dev-standards
   # templates/ci/python-ci.yml). if: always() so it still runs (and fails) when a
