@@ -1,0 +1,52 @@
+
+     Switched agent to Build                                                                                ┃                                        ┃
+                                                                                                            ┃  Session failed                › Open  ┃
+  ┃                                                                                                         ┃                                        ┃
+  ┃  say hi in one word                                                                                     ┃  Free usage exceeded, subscribe to Go  ┃
+  ┃                                                                                                         ┃                                        ┃
+
+     ⚠ Retrying in 1s · attempt 4 · upstream exploded
+
+     Build · m500
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                  ⬖ Getting started                ✕
+
+                                                                                                                    OpenCode includes free models so
+                                                                                                                    you can start immediately.
+
+                                                                                                                    Connect from 75+ providers to
+                                                                                                                    use other models, including
+  ┃                                                                                                                 Claude, GPT, Gemini etc
+  ┃
+  ┃                                                                                                                 Connect provider        /connect
+  ┃  Build · m500 Stub
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+   ⬝⬝⬝⬝⬝⬝⬝⬝ esc interrupt                                                  shift+tab agents  ctrl+p commands    /…/scratch

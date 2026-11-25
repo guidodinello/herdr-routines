@@ -25,3 +25,9 @@ completed without error (the prompt retry would hide a stall that it absorbed), 
 ## Log
 
 - **2026-11-24**: filed as a follow-up of PR #286.
+- **2026-11-25**: first evidence after the deploy of #286 to the Pi (~00:48Z). No
+  `agent_prompt_stalled` in `herdr-routines.log*`, and no failed or stalled record in
+  `history.jsonl` since. Runs on the new code: the scheduled 22:00 (local) `issue-refinement`
+  (`done`, 34 s), two smoke runs (one under the tick unit's environment), and nine
+  Telegram `/run` opencode spawns (prompt sent right after start every time). Still too few
+  to close; check again after a week of scheduled runs.

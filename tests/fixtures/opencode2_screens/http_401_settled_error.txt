@@ -1,0 +1,52 @@
+
+     Switched agent to Build                                                                                    New session - 2026-11-25T02:05:48.
+                                                                                                                096Z
+  ┃
+  ┃  say hi in one word
+  ┃
+
+     Error: Invalid API key
+
+     Build · m401 · 24ms
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                  ⬖ Getting started                ✕
+
+                                                                                                                    OpenCode includes free models so
+                                                                                                                    you can start immediately.
+
+                                                                                                                    Connect from 75+ providers to
+                                                                                                                    use other models, including
+  ┃                                                                                                                 Claude, GPT, Gemini etc
+  ┃
+  ┃                                                                                                                 Connect provider        /connect
+  ┃  Build · m401 Stub
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  /…/scratch  shift+tab agents  ctrl+p commands    /…/scratch
