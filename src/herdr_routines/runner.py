@@ -84,8 +84,9 @@ READY_POLL_INTERVAL_S = 1.0
 # They are re-exported here under their original names because they are module-level test
 # seams for the routine-job path, which is what every existing test monkeypatches.
 
-# Screen markers scanned once after a failed prompt wait (docs/failure-reaping.md §3.2). The
-# first observed wedge cause: OpenCode's free-tier limit renders a "Free usage exceeded" modal
+# Screen markers scanned once after a failed prompt wait (docs/failure-reaping.md §3.2), and
+# once after a settled opencode run that wrote no report (issue 091), besides the in-flight
+# watchdog's two-poll scan. The first observed wedge cause: OpenCode's free-tier limit renders a "Free usage exceeded" modal
 # and retries forever instead of settling. A job's `failure_markers` config overrides this
 # tuple wholesale (config.py); markers appearing verbatim in the job's own prompt are skipped —
 # the visible screen contains the prompt echo, so scanning would self-match.
@@ -929,12 +930,15 @@ def execute_run(
         # Issue 091: opencode 2's terminal quota screen exists only AFTER the wait returns.
         # The run is already failing here (settled success with no usable report), so this is
         # the one place a settle-time scan is allowed; a written report is never scanned.
-        settled_quota_marker, settled_tail = settled_screen_marker(
-            client,
-            target=agent_name,
-            markers=effective_markers,
-            prompt_text=prompt,
-        )
+        # opencode only: that is the TUI the screens were captured from.
+        settled_tail = ""
+        if job.agent_kind == OPENCODE_KIND:
+            settled_quota_marker, settled_tail = settled_screen_marker(
+                client,
+                target=agent_name,
+                markers=effective_markers,
+                prompt_text=prompt,
+            )
         if settled_quota_marker is not None and settled_tail:
             try:
                 (report_path.parent / f"{run_id}.tail.txt").write_text(settled_tail)
@@ -943,8 +947,8 @@ def execute_run(
             # The scan's last read is the tail; do not read a third time.
             tail_written = True
 
-        # The two reads can be a poll interval apart: a report landing in that window wins.
-        # Re-stat before deciding to nudge or to file quota_exhausted.
+        # A report can land while the scan reads: it wins. Re-stat before deciding to nudge
+        # or to file quota_exhausted.
         report_written = report_path.exists()
         report_bytes = report_path.stat().st_size if report_written else 0
         common["report_written"] = report_written

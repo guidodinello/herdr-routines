@@ -89,7 +89,7 @@ from herdr_routines.pipeline_watchdog import (
     heartbeat_log_path,
     validate_stage_sessions,
 )
-from herdr_routines.runner import SUCCESS_AGENT_STATUSES
+from herdr_routines.runner import DEFAULT_FAILURE_MARKERS, SUCCESS_AGENT_STATUSES
 from herdr_routines.runner_seam import BoundedRunner as Runner
 from herdr_routines.signing import (
     ResignError,
@@ -1927,7 +1927,7 @@ def run_pipeline(
     state_json: Path,
     report: Path,
     prompts_dir: Path,
-    failure_markers: Sequence[str] = ("Free usage exceeded",),
+    failure_markers: Sequence[str] = DEFAULT_FAILURE_MARKERS,
     client: HerdrClient | None = None,
     gh: GhClient | None = None,
     heartbeat_dir: Path | None = None,

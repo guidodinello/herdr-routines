@@ -54,6 +54,7 @@ from herdr_routines.repos import (
     ensure_repo,
 )
 from herdr_routines.runner import (
+    DEFAULT_FAILURE_MARKERS,
     default_reports_dir,
 )
 
@@ -255,10 +256,9 @@ def _build_pipeline_launch_argv(
     ]
     if job.model:
         argv += ["--model", job.model]
-    # Same default the routine-job watchdog uses (tick.py's other call site, runner.py's
-    # DEFAULT_FAILURE_MARKERS) — the launcher polls the orchestrator's visible screen for
-    # this so a quota-exhaustion wedge fails fast instead of burning the full deadline.
-    for marker in job.failure_markers or ("Free usage exceeded",):
+    # Same default the routine-job watchdog uses (runner.DEFAULT_FAILURE_MARKERS) — the
+    # launcher polls the orchestrator's visible screen for this so a quota-exhaustion wedge fails fast instead of burning the full deadline.
+    for marker in job.failure_markers or DEFAULT_FAILURE_MARKERS:
         argv += ["--failure-marker", marker]
     return argv
 

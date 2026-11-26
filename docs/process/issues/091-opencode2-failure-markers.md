@@ -85,3 +85,10 @@ falling back, which is the failure mode `fallback_model` exists to prevent.
   settled-screen layout. **Not verified:** how the opencode 2 TUI lays that message out on
   screen; no real screen was captured (the model was still rate limited and the run's
   screen was never saved). Tracked in [096](096-zen-quota-screen-wording.md).
+- **2026-11-26** (review of #301): the settle scan reads the screen once, not twice 30 s
+  apart. A settled screen is static, so the second read only added 30 s to every no-report
+  run. Trade-off: the in-flight watchdog's two-poll protection against a foreign session's
+  toast is gone on this path; the run has already failed with no report, so a false match
+  only changes its reason to `quota_exhausted` and skips the nudge. The scan is limited to
+  opencode agents and skipped when `failure_markers` is empty. The pipeline launcher's
+  default markers now come from `runner.DEFAULT_FAILURE_MARKERS` too.

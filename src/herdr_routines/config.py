@@ -537,8 +537,8 @@ class Job:
     notify_policy: NotifyPolicy = "terminal"
     # Optional git URL for managed clone lifecycle.
     repository: str | None = None
-    # Screen markers scanned after a failed prompt wait (docs/failure-reaping.md §3.2).
-    # None = runner.DEFAULT_FAILURE_MARKERS.
+    # Screen markers scanned after a failed prompt wait and after a settled opencode run with
+    # no report (docs/failure-reaping.md §3.2). None = runner.DEFAULT_FAILURE_MARKERS.
     failure_markers: tuple[str, ...] | None = None
     # Model retried once, under a fresh run_id, when the primary run fails with reason
     # "quota_exhausted" (tick._process_job). None = no fallback attempt. Usually set under

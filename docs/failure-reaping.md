@@ -112,11 +112,13 @@ opencode 2's captured corpus (issue 091, fixtures under
 | Shape | Fixture | Detection path |
 | ----- | ------- | -------------- |
 | retry line while the prompt is in flight (`working`, `⚠ Retrying in 5s · attempt 5 · Free usage exceeded, subscribe to Go`) | `quota_shaped_retry.txt` | the in-flight `wait_loop.prompt_with_watchdog` watchdog scan — same marker on two consecutive polls |
-| terminal line after the wait returns (`idle`, `Error: Free usage exceeded, subscribe to Go`) | `quota_shaped_settled_error.txt` | `wait_loop.settled_screen_marker` called by `runner.execute_run`, only on the settled-success + missing/empty-report path |
+| terminal line after the wait returns (`idle`, `Error: Free usage exceeded, subscribe to Go`) | `quota_shaped_settled_error.txt` | `wait_loop.settled_screen_marker` called by `runner.execute_run`: one read (a settled screen is static, so a second read adds nothing), only for opencode agents, only on the settled-success + missing/empty-report path |
 
-`foreign_session_failed_toast.txt` has the marker too, but one sighting is inert: both paths
-require the same marker on two consecutive reads/watches, so a foreign session's toast cannot
-reap a healthy run. `normal_reply.txt`, `model_unavailable.txt`, `http_401_settled_error.txt`
+`foreign_session_failed_toast.txt` has the marker too. The in-flight watchdog requires the
+same marker on two consecutive polls, so a foreign session's toast cannot reap a healthy
+run. The settle scan reads once, so a toast on a settled no-report run is classified quota
+(a run that already failed, so only its reason and the skipped nudge change); a run that
+wrote a report is never scanned. `normal_reply.txt`, `model_unavailable.txt`, `http_401_settled_error.txt`
 and `http_500_retry.txt` contain no marker and are never reaped as quota exhaustion — a bad
 key, a 5xx or a missing model must keep their own failure reasons.
 
@@ -273,8 +275,7 @@ for tests:
   whichever finishes first — a naive `kill -0`-then-`sleep` loop leaves the prompt job a
   zombie forever visible to `kill -0`, spinning indefinitely) and polls `herdr agent read
   --source visible` for `--failure-marker` text (same `job.failure_markers` config,
-  `pipeline_flow._build_pipeline_launch_argv` passes it through; defaults to `("Free usage
-  exceeded", "Free usage limit reached")`). Same two-consecutive-poll stability gate as §8. On a confirmed match: the
+  `pipeline_flow._build_pipeline_launch_argv` passes it through; defaults to `runner.DEFAULT_FAILURE_MARKERS`). Same two-consecutive-poll stability gate as §8. On a confirmed match: the
   wait job is killed, and the stub report's `## Outcome:` line reads `failed
   (quota_exhausted)` instead of the generic `failed` — pointing tick at the actual reason
   instead of the `orchestrator_failed` catch-all.

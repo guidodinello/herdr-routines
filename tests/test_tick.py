@@ -446,11 +446,11 @@ def test_fallback_model_retried_after_settled_quota_screen(
     settles idle with `Error: Free usage exceeded, subscribe to Go` on screen and no report,
     the settle-time scan records quota_exhausted, and the job re-runs on fallback_model."""
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
-    monkeypatch.setattr("herdr_routines.wait_loop.WATCHDOG_POLL_INTERVAL_S", 0.0)
     history_path = tmp_path / "state" / "history.jsonl"
     primary_model = "opencode/muse-spark-1.2-contributor-free"
     job = make_job(
         tmp_path,
+        agent_kind="opencode",
         model=primary_model,
         fallback_model="openrouter/free",
     )
