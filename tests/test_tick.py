@@ -451,6 +451,7 @@ def test_fallback_model_retried_after_settled_quota_screen(
     primary_model = "opencode/muse-spark-1.2-contributor-free"
     job = make_job(
         tmp_path,
+        agent_kind="opencode",
         model=primary_model,
         fallback_model="openrouter/free",
     )

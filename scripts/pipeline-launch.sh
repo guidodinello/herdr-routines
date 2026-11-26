@@ -98,7 +98,7 @@ if [ -z "$DEADLINE_EPOCH" ]; then
 fi
 
 if [ ${#FAILURE_MARKERS[@]} -eq 0 ]; then
-  FAILURE_MARKERS=("Free usage exceeded")
+  FAILURE_MARKERS=("Free usage exceeded" "Free usage limit reached")
 fi
 
 for required in RUN_ID REPO_PARENT REPORT AGENT_NAME; do

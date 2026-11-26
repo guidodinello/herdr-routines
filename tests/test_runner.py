@@ -172,6 +172,14 @@ class ScriptedClient:
 
 
 @pytest.fixture(autouse=True)
+def _fast_settle_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue 091's settle scan sleeps WATCHDOG_POLL_INTERVAL_S between its two reads;
+    collapse it so no-report-path tests don't each pay a real 30 s."""
+    monkeypatch.setattr("herdr_routines.runner.WATCHDOG_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr("herdr_routines.wait_loop.WATCHDOG_POLL_INTERVAL_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _isolated_reports_dir(tmp_path, monkeypatch):
     reports_dir = tmp_path / "state" / "reports"
     monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
@@ -351,7 +359,7 @@ def test_execute_run_nudge_success_ends_done_and_records_nudged(
 ) -> None:
     """Acceptance: if the one-shot nudge produces a non-empty report, the run ends `done` (not
     `no_report`), and the outcome records that a nudge was needed."""
-    job = make_job(tmp_path)
+    job = make_job(tmp_path, agent_kind="opencode")
     run_id = "a-run-nudge-ok"
     report_path = _isolated_reports_dir / f"{run_id}.md"
     client = NudgeWritesReportClient(agent_status="idle", report_path=report_path)
@@ -1789,7 +1797,7 @@ def test_settled_quota_screen_is_quota_exhausted_without_the_nudge(
     the scan replaces it, persists the matched screen as the tail, and the run still closes
     its pane."""
     monkeypatch.setattr("herdr_routines.wait_loop.WATCHDOG_POLL_INTERVAL_S", 0.0)
-    job = make_job(tmp_path)
+    job = make_job(tmp_path, agent_kind="opencode")
     run_id = "a-settled-quota"
     screen = _opencode2_screen("quota_shaped_settled_error")
     client = SettledScreenClient(agent_status="idle", screens=(screen, screen))
@@ -1817,7 +1825,7 @@ def test_settled_quota_screen_never_downgrades_a_written_report(
     """A written, non-empty report wins over the same quota screen: the run stays done and
     the settle scan never reads the screen (zero extra reads beyond the success tail)."""
     monkeypatch.setattr("herdr_routines.wait_loop.WATCHDOG_POLL_INTERVAL_S", 0.0)
-    job = make_job(tmp_path)
+    job = make_job(tmp_path, agent_kind="opencode")
     run_id = "a-settled-quota-done"
     report_path = _isolated_reports_dir / f"{run_id}.md"
     screen = _opencode2_screen("quota_shaped_settled_error")
@@ -1843,7 +1851,7 @@ def test_settled_quota_screen_does_not_downgrade_a_report_written_during_the_sca
     reads wins over the marker seen in that same window, so the run ends done. Without the
     post-scan re-stat a foreign toast could turn a just-completed run into quota_exhausted."""
     monkeypatch.setattr("herdr_routines.wait_loop.WATCHDOG_POLL_INTERVAL_S", 0.0)
-    job = make_job(tmp_path)
+    job = make_job(tmp_path, agent_kind="opencode")
     run_id = "a-settled-quota-race"
     report_path = _isolated_reports_dir / f"{run_id}.md"
     screen = _opencode2_screen("quota_shaped_settled_error")
@@ -1883,7 +1891,7 @@ def test_settled_non_quota_screens_stay_no_report(
     exhausted quota: no settle marker matches, so today's nudge-then-no_report path is
     unchanged."""
     monkeypatch.setattr("herdr_routines.wait_loop.WATCHDOG_POLL_INTERVAL_S", 0.0)
-    job = make_job(tmp_path)
+    job = make_job(tmp_path, agent_kind="opencode")
     run_id = f"a-settled-{fixture}"
     screen = _opencode2_screen(fixture)
     client = SettledScreenClient(agent_status="idle", screens=(screen, screen, screen))
@@ -1908,7 +1916,7 @@ def test_settled_marker_needs_two_consecutive_reads(
     clean = _opencode2_screen("http_500_retry")
     assert QUOTA_MARKER in toast
     assert QUOTA_MARKER not in clean
-    job = make_job(tmp_path)
+    job = make_job(tmp_path, agent_kind="opencode")
     client = SettledScreenClient(agent_status="idle", screens=(toast, clean, clean))
 
     outcome = execute_run(job, client, run_id="a-settled-toast")  # type: ignore[arg-type]
@@ -1926,6 +1934,7 @@ def test_settled_marker_in_prompt_is_inert(
     monkeypatch.setattr("herdr_routines.wait_loop.WATCHDOG_POLL_INTERVAL_S", 0.0)
     job = make_job(
         tmp_path,
+        agent_kind="opencode",
         prompt=(
             "Never print the phrase Free usage exceeded. "
             "Write the report to $ROUTINE_REPORT."
@@ -2033,6 +2042,26 @@ def test_settled_screen_marker_reads_interval_at_call_time(
     # Every interval actually slept was zero: a default parameter bound at import would
     # have recorded a real 30.0 here instead.
     assert all(s == 0.0 for s in sleeps), sleeps
+
+
+def test_settled_screen_marker_empty_markers_short_circuits() -> None:
+    """Explicitly-disabled scanning (failure_markers=()) must not read or sleep."""
+    from herdr_routines.wait_loop import settled_screen_marker
+
+    client = ReadsClient([_opencode2_screen("quota_shaped_settled_error")])
+
+    marker, last = settled_screen_marker(
+        client,  # type: ignore[arg-type]
+        target="agent",
+        markers=(),
+        prompt_text="",
+        reads=2,
+        interval_s=999,
+    )
+
+    assert marker is None
+    assert last == ""
+    assert client.calls == []
 
 
 def test_failure_reaping_and_issue_091_document_both_opencode2_screen_shapes() -> None:

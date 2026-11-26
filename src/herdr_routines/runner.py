@@ -84,9 +84,11 @@ READY_POLL_INTERVAL_S = 1.0
 # They are re-exported here under their original names because they are module-level test
 # seams for the routine-job path, which is what every existing test monkeypatches.
 
-# Screen markers scanned once after a failed prompt wait (docs/failure-reaping.md §3.2). The
-# first observed wedge cause: OpenCode's free-tier limit renders a "Free usage exceeded" modal
-# and retries forever instead of settling. A job's `failure_markers` config overrides this
+# Screen markers scanned after a failed prompt wait and, for opencode runs, once more after
+# a settled idle/done agent wrote no usable report (docs/failure-reaping.md §3.2). The first
+# observed wedge cause: OpenCode's free-tier limit renders a "Free usage exceeded" modal and
+# retries forever instead of settling; opencode 2 can also settle into a terminal quota screen
+# that only exists after the wait returns. A job's `failure_markers` config overrides this
 # tuple wholesale (config.py); markers appearing verbatim in the job's own prompt are skipped —
 # the visible screen contains the prompt echo, so scanning would self-match.
 DEFAULT_FAILURE_MARKERS: tuple[str, ...] = (
@@ -929,12 +931,16 @@ def execute_run(
         # Issue 091: opencode 2's terminal quota screen exists only AFTER the wait returns.
         # The run is already failing here (settled success with no usable report), so this is
         # the one place a settle-time scan is allowed; a written report is never scanned.
-        settled_quota_marker, settled_tail = settled_screen_marker(
-            client,
-            target=agent_name,
-            markers=effective_markers,
-            prompt_text=prompt,
-        )
+        if job.agent_kind == OPENCODE_KIND and effective_markers:
+            settled_quota_marker, settled_tail = settled_screen_marker(
+                client,
+                target=agent_name,
+                markers=effective_markers,
+                prompt_text=prompt,
+                interval_s=WATCHDOG_POLL_INTERVAL_S,
+            )
+        else:
+            settled_tail = ""
         if settled_quota_marker is not None and settled_tail:
             try:
                 (report_path.parent / f"{run_id}.tail.txt").write_text(settled_tail)

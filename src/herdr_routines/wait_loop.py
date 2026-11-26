@@ -130,6 +130,8 @@ def settled_screen_marker(
     `interval_s=None` resolves WATCHDOG_POLL_INTERVAL_S at call time: a default parameter
     would bind 30 s at import and defeat the test seam (and add 30 s to every test).
     """
+    if not markers:
+        return None, ""
     if interval_s is None:
         interval_s = WATCHDOG_POLL_INTERVAL_S
     previous_hit: str | None = None

@@ -325,7 +325,10 @@ def test_launcher_forwards_failure_markers_to_pipeline_run(tmp_path: Path) -> No
     word-split, argparse rejects the stray words and the run dies with exit 2."""
     _report_path, call_log = _run_launcher(tmp_path, settle_status="idle")
 
-    assert _pipeline_run_marker_args(call_log) == ["Free usage exceeded"]
+    assert _pipeline_run_marker_args(call_log) == [
+        "Free usage exceeded",
+        "Free usage limit reached",
+    ]
 
 
 def test_launcher_matches_a_custom_failure_marker(tmp_path: Path) -> None:
