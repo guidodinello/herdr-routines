@@ -32,7 +32,7 @@ enforcement in code for v1 — define the workflow, let the orchestrator supervi
        ├─→ stage 3 write the acceptance tests (tests only; a different model family from stage 4)
        ├─→ stage 4 implement (make the named tests pass)
        ├─→ stage 5 bookkeeping + open PR (no agent: sweep, CI check + fix loop, issue flip, PR)
-       ├─→ stage 6 code review (separate session — nemotron, a different family from stage 4)
+       ├─→ stage 6 code review (separate session — laguna fallback / deepseek, a different family from stage 4)
        └─→ stage 7 address comments (resumes stage 4's session, capped 2 iterations)
 ```
 
@@ -81,15 +81,15 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > table** — the column above is the original design. As of 2026-11-22
 > (`muse-spark-1.2-contributor-free` and `x-preview-f-free` were withdrawn on 2026-10-01,
 > `muse-spark-1.3-contributor-free` by 2026-10-18): stages 1–3
-> `opencode/deepseek-v4.1-flash-free` (the stage-3 test author falls back to the
-> OpenRouter nemotron model, never to stage 4's families), stages 4/7 `opencode/big-pickle`,
+> `opencode/deepseek-v4.1-flash-free` (the stage-3 test author falls back to
+> `nvidia/poolside/laguna-xs-2.1`, never to stage 4's families), stages 4/7 `opencode/big-pickle`,
 > stage 6 `opencode/deepseek-v4.1-flash-free` (a different declared family from the
 > implementer, though big-pickle has routed to deepseek; `nemotron-3-ultra-free` was
 > withdrawn by 2026-10-29, `glm-5.3-flash-free` by 2026-11-19).
 > `MODEL_FAMILY` declares each model's family and a test checks the independence rules. `pipeline-prepare`
 > fails the night before claiming an issue if `opencode models` no longer lists one.
-> Each agent stage also has a `fallback_model` off Zen (authors `nvidia/minimaxai/minimax-m3.1-flash`,
-> reviewer `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`): when a stage's session ends
+> Each agent stage also has a `fallback_model` off Zen (stages 1, 2, 4 and 7 `nvidia/minimaxai/minimax-m3.1-flash`,
+> stages 3 and 6 `nvidia/poolside/laguna-xs-2.1`, replacing Nemotron on 2026-11-26; quality unverified): when a stage's session ends
 > in a `provider.*` error (read from `opencode session export`), or the failure-marker watchdog sees Zen's quota text, `pipeline-run`
 > reruns the stage once in a fresh session on the fallback, told to pick up any partial work in
 > the worktree. It never resumes the failed session, because a resumed session keeps the model it

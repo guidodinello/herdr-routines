@@ -39,9 +39,16 @@ class StageSpec:
 # kimi-k3 until NVIDIA withdrew it (gone by 2026-11-10; opencode ran its default
 # big-pickle in its place without an error).
 AUTHOR_FALLBACK_MODEL = "nvidia/minimaxai/minimax-m3.1-flash"
-# Off Zen and outside every author family: independence from the author is about the
-# model family, which a provider switch does not change.
-REVIEWER_FALLBACK_MODEL = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+# Off Zen (the fallback exists for Zen's quota) and outside every author family:
+# independence from the author is about the model family, which a provider switch does
+# not change. Replaced Nemotron on OpenRouter on 2026-11-26 (OpenRouter free was the
+# flakiest provider; Zen withdrew its nemotron-free by 2026-10-29). Chosen after probing
+# the Pi: it answers in 1-2 s and used tools correctly, while nvidia/z-ai/glm-5.3-flash
+# hung 3/3 and the gemma-4-31b-it options were rate-limited or errored. Quality is
+# unverified: no fitted review data for laguna-xs (its sibling laguna-s-2.1 had 2 reviews,
+# 0 findings), so the babysit-prs leaderboard is the check. Known risk: it shares the
+# NVIDIA provider with AUTHOR_FALLBACK_MODEL, so one NVIDIA outage hits both fallbacks.
+REVIEWER_FALLBACK_MODEL = "nvidia/poolside/laguna-xs-2.1"
 
 # Which family each configured model belongs to. Spelled out rather than matched on a
 # substring of the id, so a new model id has to be given a family on purpose, and the
@@ -52,7 +59,7 @@ MODEL_FAMILY: dict[str, str] = {
     "opencode/deepseek-v4.1-flash-free": "deepseek",
     "opencode/big-pickle": "zen-router",
     AUTHOR_FALLBACK_MODEL: "minimax",
-    REVIEWER_FALLBACK_MODEL: "nvidia",
+    REVIEWER_FALLBACK_MODEL: "laguna",
 }
 
 
@@ -106,7 +113,8 @@ STAGES: tuple[StageSpec, ...] = (
         stage=3,
         # The test author: writes the acceptance tests and nothing else. A different
         # family from stage 4's implementer, primary and fallback, so the tests are not
-        # written by the model they are meant to check.
+        # written by the model they are meant to check. The fallback is the reviewer
+        # fallback (laguna), whose quality as a test writer is unmeasured.
         model="opencode/deepseek-v4.1-flash-free",
         prompt_file="stage-3.md",
         timeout_ms=60 * 60 * 1000,
@@ -132,7 +140,8 @@ STAGES: tuple[StageSpec, ...] = (
         stage=6,
         # A different model family from stage 4's implementer, so the review is
         # independent. Zen withdrew nemotron-3-ultra-free by 2026-10-29 and
-        # glm-5.3-flash-free by 2026-11-19. deepseek-v4.1-flash had the best
+        # glm-5.3-flash-free by 2026-11-19. Its fallback is laguna-xs-2.1 on NVIDIA
+        # (family "laguna": not stage 4's, not deepseek; see REVIEWER_FALLBACK_MODEL). deepseek-v4.1-flash had the best
         # accepted-finding rate of the free reviewers left on fitted's babysit-prs
         # leaderboard (96%, only 3 reviews, 2026-11-22). Known risk, accepted: big-pickle
         # (stage 4) has routed to deepseek, so on such a night the review is not

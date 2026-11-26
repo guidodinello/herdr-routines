@@ -1405,7 +1405,7 @@ def test_stage_fallbacks_stay_off_zen_and_keep_the_review_independent() -> None:
     assert all(not s.fallback_model.startswith("opencode/") for s in agent_stages)  # type: ignore[union-attr]
     # Whichever model writes the code, the reviewer's family is a different one.
     assert not stage_families(by_stage[6]) & stage_families(by_stage[4])
-    assert stage_families(by_stage[6]) == {"deepseek", "nvidia"}
+    assert stage_families(by_stage[6]) == {"deepseek", "laguna"}
 
 
 def test_test_author_model_is_independent_of_implementer() -> None:
