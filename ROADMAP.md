@@ -259,6 +259,9 @@ considered met). One-liner index; full detail in the issue file.
 - **opencode 2 jobs end while background subagents run** — the parent goes idle, so the run
   is filed failed. →
   [`094`](docs/process/issues/094-opencode2-background-subagents-early-done.md)
+- **opencode 2 renamed `opencode export`** — a quota-blocked pipeline stage never reaches
+  `fallback_model`. →
+  [`095`](docs/process/issues/095-opencode2-session-export-renamed.md)
 
 ## Later
 
