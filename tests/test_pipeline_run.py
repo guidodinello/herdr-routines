@@ -1063,43 +1063,70 @@ def test_pipeline_run_quota_marker_fails_the_run_when_the_session_is_unreadable(
     assert client.closed_panes
 
 
-def _export(*, error: dict[str, Any] | None) -> str:
-    """An `opencode export` document in the shape the Pi's opencode 1.18.35 produced for
-    run 20261010T050000Z's stage 3 session (trimmed to the keys read here): the last
-    message is the assistant turn the provider rejected, with `info.error` set."""
-    last_info: dict[str, Any] = {
-        "role": "assistant",
-        "modelID": "big-pickle",
-        "providerID": "opencode",
-        "time": {"created": 1791609260233},
-        "tokens": {"input": 0, "output": 0, "reasoning": 0},
+def _export(
+    *,
+    error: dict[str, Any] | None,
+    ends_with: str = "idle",
+    trailing_system: bool = False,
+) -> str:
+    """An `opencode session export` document in the shape the Pi's opencode 2.4.1
+    produced for run 20261126T050000Z's stage 6 session (trimmed to the keys read here):
+    messages are flat events, and a turn that failed carries a flat `error` on the
+    `assistant` message the provider rejected and on the `idle` event that closes it.
+
+    `ends_with` picks which of the two is the turn's last message (an `idle` event
+    normally follows an `assistant` one; an aborted turn has none), and
+    `trailing_system` appends the `system` message opencode 2 adds after an aborted
+    turn."""
+    assistant: dict[str, Any] = {
+        "id": "msg_21660a2fb001DxSv5IO4Djgm8p",
+        "type": "assistant",
+        "agent": "build",
+        "model": {"id": "big-pickle", "providerID": "opencode"},
+        "content": [],
+    }
+    idle: dict[str, Any] = {
+        "id": "msg_21660a486001G5DLjrc3x2FRQC",
+        "type": "idle",
+        "outcome": "succeeded" if error is None else "failed",
     }
     if error is not None:
-        last_info["error"] = error
-    return json.dumps(
-        {
-            "info": {"id": SESSION_IDS[4], "title": "New session"},
-            "messages": [
-                {
-                    "info": {"role": "assistant", "modelID": "big-pickle"},
-                    "parts": [{"type": "tool", "tool": "read"}],
-                },
-                {"info": last_info, "parts": []},
-            ],
-        }
-    )
+        assistant["error"] = error
+        idle["error"] = error
+    messages: list[dict[str, Any]] = [
+        {"id": "msg_216608c03001TM06mKzHoLcUlY", "type": "user", "text": "go"},
+        assistant,
+    ]
+    if ends_with == "idle":
+        messages.append(idle)
+    if trailing_system:
+        messages.append({"id": "msg_2166ffff0001system", "type": "system", "text": "x"})
+    return json.dumps({"info": {"id": SESSION_IDS[4]}, "messages": messages})
 
 
-ZEN_BAD_REQUEST = {
-    "name": "APIError",
-    "data": {
-        "message": 'Bad Request: {"model":"big-pickle"}',
-        "statusCode": 400,
-        "isRetryable": False,
-        "responseBody": '{"model":"big-pickle"}',
-        "metadata": {"url": "https://opencode.ai/zen/v1/chat/completions"},
-    },
+# The messages below are the `error` objects opencode 2.4.1 wrote on the Pi, verbatim
+# (`response` trimmed from the first): Zen's free limit on 2026-11-26 (issue 095), a
+# provider outage with no HTTP status, and a user abort.
+ZEN_FREE_LIMIT = {
+    "type": "provider.free-limit",
+    "message": (
+        "Free usage limit reached. Connect a provider or subscribe to OpenCode Go to "
+        "keep going, or switch models."
+    ),
+    "status": 429,
+    "response": {"body": '{"type":"error","error":{"type":"FreeUsageLimitError"}}'},
+    "retryAfterMs": 66079000,
 }
+ZEN_FREE_LIMIT_SUMMARY = (
+    "429: Free usage limit reached. Connect a provider or subscribe to OpenCode Go to "
+    "keep going, or switch models."
+)
+PROVIDER_OUTAGE = {
+    "type": "provider.error",
+    "message": "Error from provider (Console): Upstream request failed: Endpoint is unavailable.",
+}
+PROVIDER_OUTAGE_SUMMARY = f"provider.error: {PROVIDER_OUTAGE['message']}"
+ABORTED = {"type": "aborted", "message": "Aborted"}
 
 
 class ErrorsOnce:
@@ -1115,7 +1142,7 @@ class ErrorsOnce:
         self.exported.append(session_id)
         first = self.exported.count(session_id) == 1
         failed = session_id == self.session_id and first
-        return _export(error=ZEN_BAD_REQUEST if failed else None)
+        return _export(error=ZEN_FREE_LIMIT if failed else None)
 
 
 def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_provider_error(
@@ -1151,14 +1178,14 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_provider_err
     report_text = prepared.report.read_text()
     assert "## Outcome: ok" in report_text
     assert f"retried in a fresh session on {AUTHOR_FALLBACK_MODEL}" in report_text
-    assert "400: Bad Request" in report_text
+    assert ZEN_FREE_LIMIT_SUMMARY in report_text
 
 
 def test_pipeline_run_does_not_fall_back_on_a_blocked_stage_without_a_provider_error(
     prepared: PipelineFixture,
 ) -> None:
     """`blocked` is also a real permission prompt, which another model would hit just
-    the same. Only an `APIError` in the session record earns the fallback."""
+    the same. Only a provider error in the session record earns the fallback."""
     client = _client(settles={4: ["blocked"]})
 
     outcome, client, _gh = _run(
@@ -1199,7 +1226,7 @@ def test_pipeline_run_keeps_its_never_raises_contract_when_the_session_is_unread
     outcome, _client, _gh = _run(
         prepared,
         client=client,
-        session_export=lambda _id: _export(error=ZEN_BAD_REQUEST),
+        session_export=lambda _id: _export(error=ZEN_FREE_LIMIT),
     )
 
     assert outcome.outcome == "failed"
@@ -1230,19 +1257,91 @@ def test_pipeline_run_reports_the_fallback_when_it_also_fails(
 @pytest.mark.parametrize(
     ("document", "expected"),
     [
-        (_export(error=ZEN_BAD_REQUEST), '400: Bad Request: {"model":"big-pickle"}'),
+        (_export(error=ZEN_FREE_LIMIT), ZEN_FREE_LIMIT_SUMMARY),
+        # The error can sit on the assistant message when no `idle` event follows it.
+        (_export(error=ZEN_FREE_LIMIT, ends_with="assistant"), ZEN_FREE_LIMIT_SUMMARY),
+        (_export(error=PROVIDER_OUTAGE), PROVIDER_OUTAGE_SUMMARY),
+        # A `system` message after the failed turn must not hide the error.
+        (
+            _export(error=ZEN_FREE_LIMIT, trailing_system=True),
+            ZEN_FREE_LIMIT_SUMMARY,
+        ),
         (_export(error=None), None),
         # An aborted turn is not the provider's fault; another model would not help.
-        (_export(error={"name": "MessageAbortedError", "data": {}}), None),
+        (_export(error=ABORTED, ends_with="assistant", trailing_system=True), None),
+        # opencode 1's `info.error` shape is no longer read: no host runs opencode 1.
+        (
+            json.dumps(
+                {
+                    "messages": [
+                        {
+                            "info": {
+                                "role": "assistant",
+                                "error": {
+                                    "name": "APIError",
+                                    "data": {
+                                        "statusCode": 400,
+                                        "message": "Bad Request",
+                                    },
+                                },
+                            },
+                            "parts": [],
+                        }
+                    ]
+                }
+            ),
+            None,
+        ),
         (json.dumps({"info": {}, "messages": []}), None),
         ("not json", None),
     ],
-    ids=["api-error", "no-error", "aborted", "no-messages", "not-json"],
+    ids=[
+        "free-limit",
+        "error-on-assistant-message",
+        "outage-without-status",
+        "trailing-system-message",
+        "no-error",
+        "aborted",
+        "opencode-1-shape",
+        "no-messages",
+        "not-json",
+    ],
 )
-def test_session_api_error_reads_the_last_message_error(
+def test_session_api_error_reads_the_last_turns_error(
     document: str, expected: str | None
 ) -> None:
     assert _session_api_error(document) == expected
+
+
+def test_opencode_export_runs_opencode_2s_session_export(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`opencode export` was removed in opencode 2 (issue 095): it prints the help and
+    exits non-zero, which read as "no session record" and so as "no fallback"."""
+    calls: list[list[str]] = []
+
+    def fake_run(
+        argv: list[str], *, stdout: Any, **_kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        stdout.write('{"messages": []}')
+        return subprocess.CompletedProcess(argv, 0, stderr="")
+
+    monkeypatch.setattr(pipeline_run.subprocess, "run", fake_run)
+
+    assert pipeline_run._opencode_export("ses_x") == '{"messages": []}'
+    assert calls == [["opencode", "session", "export", "ses_x"]]
+
+
+def test_opencode_export_is_none_when_the_command_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, stderr="ERROR")
+
+    monkeypatch.setattr(pipeline_run.subprocess, "run", fake_run)
+
+    assert pipeline_run._opencode_export("ses_x") is None
 
 
 def test_stage_fallbacks_stay_off_zen_and_keep_the_review_independent() -> None:

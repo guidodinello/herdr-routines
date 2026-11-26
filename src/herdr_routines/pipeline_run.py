@@ -126,7 +126,7 @@ _REPORT_OUTCOME: dict[tuple[Outcome, str | None], str] = {
 # branch, short enough that the deadline check still runs on a human timescale.
 GIT_TIMEOUT_S = 300.0
 
-# Bounds a hung `opencode export`, which only runs once a stage has already failed.
+# Bounds a hung `opencode session export`, which only runs once a stage has already failed.
 OPENCODE_EXPORT_TIMEOUT_S = 120.0
 
 # `scripts/ci-check.sh` is what CI runs (`.github/workflows/ci.yml` calls it per job), so a
@@ -1694,31 +1694,50 @@ FALLBACK_PREAMBLE = (
 )
 
 
+# opencode 2 types a provider-side failure `provider.<kind>` (`provider.free-limit`,
+# `provider.quota`, `provider.error`). A user abort is `aborted`: another model would
+# not help, so it is not one.
+PROVIDER_ERROR_TYPE_PREFIX = "provider."
+# The message kinds that end a model turn: the assistant message the provider rejected,
+# and the `idle` event that closes the turn. A `system` or `synthetic` message can trail
+# either, so the last message of the export is not necessarily one of these.
+_TURN_END_TYPES = frozenset({"assistant", "idle"})
+
+
 def _session_api_error(export_json: str) -> str | None:
-    """`"<status>: <message>"` when an `opencode export` document's last message ended
-    in a provider `APIError`, else None.
+    """`"<status>: <message>"` when an `opencode session export` document's last turn
+    ended in a provider error, else None; a provider error without an HTTP status reads
+    `"<type>: <message>"`.
 
     Read from the session record rather than the screen. herdr filed run
     20261010T050000Z's implement stage as `blocked` after Zen answered 400 `Bad Request`, which
     is indistinguishable from a permission prompt by status alone; the export says which
-    it was (`info.error = {"name": "APIError", "data": {"statusCode": 400, ...}}`). A
-    screen marker would not do: this repo's own source carries the error strings, and a
-    stage that reads it would put them on screen."""
+    it was. opencode 2 puts a flat `error` on the turn's last `assistant` or `idle`
+    message: `{"type": "provider.free-limit", "status": 429, "message": ..., ...}` (run
+    20261126T050000Z's stage 6, issue 095). A screen marker would not do: this repo's own
+    source carries the error strings, and a stage that reads it would put them on screen."""
     try:
         doc = json.loads(export_json)
     except json.JSONDecodeError:
         return None
     messages = doc.get("messages") if isinstance(doc, dict) else None
-    if not isinstance(messages, list) or not messages:
+    if not isinstance(messages, list):
         return None
-    last = messages[-1]
-    info = last.get("info") if isinstance(last, dict) else None
-    error = info.get("error") if isinstance(info, dict) else None
-    if not isinstance(error, dict) or error.get("name") != "APIError":
+    last_turn = next(
+        (
+            m
+            for m in reversed(messages)
+            if isinstance(m, dict) and m.get("type") in _TURN_END_TYPES
+        ),
+        None,
+    )
+    error = last_turn.get("error") if last_turn else None
+    if not isinstance(error, dict):
         return None
-    data = error.get("data")
-    data = data if isinstance(data, dict) else {}
-    return f"{data.get('statusCode', '?')}: {data.get('message', 'no message')}"
+    kind = error.get("type")
+    if not isinstance(kind, str) or not kind.startswith(PROVIDER_ERROR_TYPE_PREFIX):
+        return None
+    return f"{error.get('status', kind)}: {error.get('message', 'no message')}"
 
 
 def _fallback_cause(
@@ -1746,16 +1765,21 @@ def _fallback_cause(
 
 
 def _opencode_export(session_id: str) -> str | None:
-    """`opencode export <session_id>`'s output, or None if it could not be read.
+    """`opencode session export <session_id>`'s output, or None if it could not be read.
 
-    Written to a file, never a pipe: piped, opencode 1.18.35 exits before its stdout
-    drains and the JSON comes back cut short — 260954, 293690 and 293690 characters of a
-    1304882-character export on three consecutive runs on the Pi (2026-10-10), so the
-    last message, the one this is read for, is exactly what goes missing."""
+    opencode 2 renamed the command (`opencode export` is gone; issue 095). No
+    `--sanitize`: it redacts transcript data, and the error this is read for is part of it.
+
+    Still written to a file, though the reason is gone: piped, opencode 1.18.35 exited
+    before its stdout drained and the JSON came back cut short (260954, 293690 and 293690
+    characters of a 1304882-character export on three runs on the Pi, 2026-10-10), so the
+    last message, the one this is read for, went missing. opencode 2.4.1 does not do it:
+    a 4246526-byte export piped to `wc -c` gave the file's size on three of three runs
+    (2026-11-26). The file costs nothing, so it stays."""
     with tempfile.TemporaryFile("w+") as out:
         try:
             proc = subprocess.run(
-                ["opencode", "export", session_id],
+                ["opencode", "session", "export", session_id],
                 stdout=out,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1763,11 +1787,11 @@ def _opencode_export(session_id: str) -> str | None:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
-            log.warning("opencode export %s failed: %s", session_id, e)
+            log.warning("opencode session export %s failed: %s", session_id, e)
             return None
         if proc.returncode != 0:
             log.warning(
-                "opencode export %s failed: %s", session_id, proc.stderr.strip()
+                "opencode session export %s failed: %s", session_id, proc.stderr.strip()
             )
             return None
         out.seek(0)

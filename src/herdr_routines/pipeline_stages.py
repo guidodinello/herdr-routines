@@ -18,7 +18,8 @@ class StageSpec:
     - `reuses_stage` is the stage number whose session id is reused, if any (stage 7
       reuses stage 4); every other stage with a model runs in its own session (G-17).
     - `fallback_model` is what `pipeline_run` resumes the stage's session on, once, when
-      `model`'s provider rejects a call mid-stage (an opencode `APIError`). A different
+      `model`'s provider rejects a call mid-stage (a `provider.*` error in the opencode
+      session record, or Zen's quota text on screen). A different
       provider from `model`, so one provider's bad night is not the run's.
     """
 
