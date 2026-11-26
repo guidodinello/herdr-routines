@@ -42,6 +42,7 @@ from herdr_routines.verify import (
 from herdr_routines.wait_loop import (
     PROMPT_RETRY_DELAYS_S,
     WATCHDOG_POLL_INTERVAL_S,
+    drain_opencode_background,
     prompt_with_watchdog,
 )
 from herdr_routines.wait_loop import (
@@ -173,6 +174,7 @@ def _prompt_with_watchdog(
     timeout_ms: int,
     markers: tuple[str, ...],
     prompt_text: str,
+    agent_kind: str,
 ) -> AgentStatus | None:
     """Thin wrapper over `wait_loop.prompt_with_watchdog` (issue 056 §4: the loop moved
     out of this module so `pipeline_run` shares exactly one copy, and `runner`'s
@@ -190,6 +192,7 @@ def _prompt_with_watchdog(
         timeout_ms=timeout_ms,
         markers=markers,
         prompt_text=prompt_text,
+        agent_kind=agent_kind,
         retry_delays_s=PROMPT_RETRY_DELAYS_S,
     )
 
@@ -295,7 +298,7 @@ def _capture_session_id(client: HerdrClient, target: str) -> str | None:
 
 
 def _attempt_report_nudge(
-    client: HerdrClient, *, target: str, report_path: Path
+    client: HerdrClient, *, target: str, report_path: Path, agent_kind: str
 ) -> None:
     """One bounded, non-looping follow-up prompt to the same still-open agent for a settled
     idle/done run that produced no (or an empty) $ROUTINE_REPORT — issue 032. Real Pi history
@@ -305,12 +308,27 @@ def _attempt_report_nudge(
     comment), so this asks only for the missing report and never repeats the job's original
     (possibly side-effecting) instructions. Raises HerdrCliError/OSError on failure or timeout
     exactly like the initial prompt send — the caller never retries this call; any exception
-    here falls straight through to the existing no_report failure path."""
+    here falls straight through to the existing no_report failure path.
+
+    For opencode the nudge's own settle is also not final while background subagents run
+    (issue 094), so it drains them too, within the same NUDGE_TIMEOUT_MS budget and
+    without the marker scan (a bounded one-shot, not the main wait)."""
     prompt = (
         f"You appear to have finished without writing a summary to {report_path}. "
         "Write one now describing what you did."
     )
-    client.agent_prompt_wait(target=target, text=prompt, timeout_ms=NUDGE_TIMEOUT_MS)
+    deadline = time.monotonic() + NUDGE_TIMEOUT_MS / 1000
+    status = client.agent_prompt_wait(
+        target=target, text=prompt, timeout_ms=NUDGE_TIMEOUT_MS
+    )
+    drain_opencode_background(
+        client,
+        job_name=target,
+        target=target,
+        agent_kind=agent_kind,
+        status=status,
+        deadline=deadline,
+    )
 
 
 def default_reports_dir() -> Path:
@@ -792,6 +810,7 @@ def execute_run(
             timeout_ms=job.timeout_ms,
             markers=effective_markers,
             prompt_text=prompt,
+            agent_kind=job.agent_kind,
         )
     except PromptWatchdogKilled as e:
         # Phase-2 fast-fail (failure-reaping §8 / the run's spec): the quota modal sat
@@ -903,7 +922,12 @@ def execute_run(
     if not report_written or report_bytes == 0:
         nudged = True
         try:
-            _attempt_report_nudge(client, target=agent_name, report_path=report_path)
+            _attempt_report_nudge(
+                client,
+                target=agent_name,
+                report_path=report_path,
+                agent_kind=job.agent_kind,
+            )
         except (HerdrCliError, OSError) as e:
             # Never loop: any nudge failure/timeout falls straight through to the existing
             # no_report path below, exactly as if the nudge had never been attempted.

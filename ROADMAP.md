@@ -256,6 +256,9 @@ considered met). One-liner index; full detail in the issue file.
   [`092`](docs/process/issues/092-opencode2-prompt-stalled-after-start.md)
 - **Unknown opencode model ids fail late** — `session.create` accepts them silently. →
   [`093`](docs/process/issues/093-opencode-unknown-model-preflight.md)
+- **opencode 2 jobs end while background subagents run** — the parent goes idle, so the run
+  is filed failed. →
+  [`094`](docs/process/issues/094-opencode2-background-subagents-early-done.md)
 
 ## Later
 

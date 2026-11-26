@@ -379,6 +379,7 @@ def _process_base_target(
             if job.failure_markers is not None
             else ("Free usage exceeded",),
             prompt_text=prompt_text,
+            agent_kind=job.agent_kind,
         )
     except Exception as e:  # noqa: BLE001
         _capture_visible_tail(

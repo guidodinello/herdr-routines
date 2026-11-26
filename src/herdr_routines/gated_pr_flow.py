@@ -650,6 +650,7 @@ def _dispatch_fix_worker(
             timeout_ms=job.timeout_ms,
             markers=job.failure_markers or ("Free usage exceeded",),
             prompt_text=prompt_text,
+            agent_kind=job.agent_kind,
         )
     except Exception as e:  # noqa: BLE001  # noqa: BLE001 — any prompt failure marks the PR failed
         _capture_visible_tail(

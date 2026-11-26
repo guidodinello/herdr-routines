@@ -250,6 +250,11 @@ class HerdrCliError(Exception):
         self.error_body = error_body
 
 
+class OpencodeJobsUnsupported(HerdrCliError):
+    """This opencode has no `experimental.job.list` (issue 094): its background work
+    cannot be read, so callers fall back to trusting the settle."""
+
+
 class PromptWatchdogKilled(HerdrCliError):
     """Raised by agent_prompt_wait_with_watchdog when the failure-marker watchdog confirmed a
     match and the delivered-but-wedged prompt child was terminated early. Carries the matched
@@ -654,6 +659,70 @@ class HerdrClient:
             log.warning(
                 "could not remove orphaned opencode session %s: %s", session_id, e
             )
+
+    def opencode_background_busy(self, session_id: str) -> bool:
+        """True while opencode 2 still has background work for `session_id` (issue 094).
+
+        opencode runs `subagent` calls in the background: the parent session goes `idle`
+        (so herdr reports it settled) while they run, then wakes again on their result.
+        Verified live on the Pi (opencode 2.4.1): during a subagent the session is absent
+        from `session.active` and `experimental.job.list` (sessionID, descendants) shows a
+        `running` job; once the child ends the job disappears as the parent re-enters
+        `session.active`. Busy when either says so.
+
+        A bare `opencode api` starts a stopped service in this process (see
+        `_require_opencode_service`), so the read-only `service status` check comes first,
+        as in `agent_start`. `--server <url>` is no way around it: the service answers it
+        with "requires a password" (checked on the Pi, 2026-11-25), while a bare call
+        authenticates itself. The `service status` check does not cover the reads after it
+        (job.list, session.active), and a drain polls every 15 s, so that millisecond
+        window is hit far more often than in `agent_start`; a service dying inside it
+        already takes the panes' opencode with it. Raises OpencodeJobsUnsupported on an opencode without
+        `experimental.job.list` (2.1.4), HerdrCliError on any other failure."""
+        self._require_opencode_service()
+        jobs = self._opencode_read(
+            ["experimental.job.list", "--param", f"sessionID={session_id}"]
+            + ["--param", "descendants=true"],
+        )
+        data = jobs.get("data")
+        if not isinstance(data, list):
+            raise HerdrCliError(
+                f"unexpected job.list response shape: {jobs!r}", exit_code=0
+            )
+        if any(isinstance(j, dict) and j.get("status") == "running" for j in data):
+            return True
+        active = self._opencode_read(["session.active"]).get("data")
+        if not isinstance(active, dict):
+            raise HerdrCliError(
+                f"unexpected session.active response shape: {active!r}", exit_code=0
+            )
+        return session_id in active
+
+    def _opencode_read(self, args: list[str]) -> dict[str, object]:
+        argv = [opencode_bin(), "api", *args]
+        exit_code, stdout, stderr = self.runner(argv, timeout_s=OPENCODE_API_TIMEOUT_S)
+        if exit_code != 0:
+            # The "Operation not found" line sits after a stack trace; read all of it.
+            if "Operation not found" in stdout + stderr:
+                raise OpencodeJobsUnsupported(
+                    f"opencode api has no {args[0]}", exit_code=exit_code
+                )
+            raise HerdrCliError(
+                f"opencode api {args[0]} failed (exit {exit_code}): "
+                f"{(stdout or stderr).strip()[:300]}",
+                exit_code=exit_code,
+            )
+        body = _try_parse_json(stdout)
+        if body is None:
+            raise HerdrCliError(
+                f"opencode api {args[0]}: not JSON: {stdout[:120]!r}", exit_code=0
+            )
+        return body
+
+    def agent_current_status(self, target: str) -> AgentStatus | None:
+        """A fresh `agent get` read of `target`'s status (None for a value outside herdr's
+        schema). Raises HerdrCliError like the other `agent get` readers."""
+        return _extract_status(self._call(["agent", "get", target]))
 
     def pane_cwd(self, pane_id: str) -> str:
         body = self._call(["pane", "get", pane_id], timeout_s=10)

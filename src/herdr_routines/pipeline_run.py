@@ -68,6 +68,7 @@ from herdr_routines.gates import (
 )
 from herdr_routines.herdr import (
     AGENT_STATUS_BLOCKED,
+    AGENT_STATUS_WORKING,
     AgentStatus,
     HerdrClient,
     HerdrCliError,
@@ -831,6 +832,10 @@ def _settle_outcome(status: _StageStatus) -> tuple[bool, str | None]:
         return False, "stage_blocked"
     if status == QUOTA_KILLED_STATUS:
         return False, "quota_exhausted"
+    if status == AGENT_STATUS_WORKING:
+        # Only `drain_opencode_background` returns this: the stage settled but its
+        # background subagents were still running when the stage's time ran out (issue 094).
+        return False, "subagent_wait_timeout"
     return False, "interrupted_unknown"
 
 
@@ -1658,6 +1663,7 @@ def _start_and_prompt(
             timeout_ms=spec.timeout_ms,
             markers=failure_markers,
             prompt_text=text,
+            agent_kind=STAGE_AGENT_KIND,
             on_poll_hook=_heartbeat_hook(heartbeat, spec.stage, clock),
             # Every stage prompt IS a just-started agent's first prompt, which is exactly
             # the start race this retry exists for: herdr rejects it with

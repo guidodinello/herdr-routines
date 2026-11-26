@@ -40,6 +40,28 @@ NOT_FULL_DIAGNOSIS: dict[str, Any] = {
 
 
 @pytest.fixture(autouse=True)
+def _no_opencode_background_drain(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stub the opencode background-subagent drain (issue 094) for every test but the ones
+    marked `real_opencode_drain`.
+
+    The drain asks the client for the session id, the herdr status and opencode's
+    background state; the many HerdrClient-shaped fakes here answer none of the last two
+    and opencode-kind jobs are common in them. Their subject is not the drain, so it
+    settles instantly; the tests that are about it opt back in. Patched at both import
+    sites (`wait_loop` for the main wait, `runner` for the nudge)."""
+    if request.node.get_closest_marker("real_opencode_drain"):
+        return
+
+    def settle(client: object, *, status: Any, **_: Any) -> Any:
+        return status
+
+    monkeypatch.setattr("herdr_routines.wait_loop.drain_opencode_background", settle)
+    monkeypatch.setattr("herdr_routines.runner.drain_opencode_background", settle)
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_tmp_diagnosis(monkeypatch: pytest.MonkeyPatch) -> None:
     """Pin `execute_run`'s /tmp diagnosis to a not-full host.
 
