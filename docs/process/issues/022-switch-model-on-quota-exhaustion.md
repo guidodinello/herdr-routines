@@ -53,10 +53,11 @@ survive the window instead of dead-ending.
   provider too, reopen for the ordered-list shape this issue originally
   described.
 - **2026-11-26**: replaced the Nemotron/OpenRouter fallback with
-  `nvidia/poolside/laguna-xs-2.1` (pipeline stage-6 `REVIEWER_FALLBACK_MODEL`,
-  `deploy/jobs.d/` examples). Probed on the Pi (opencode 2.4.1): laguna answered
+  `nvidia/poolside/laguna-xs-2.1` (pipeline `REVIEWER_FALLBACK_MODEL`, the fallback
+  of both stage 6, the reviewer, and stage 3, the test author; `deploy/jobs.d/` examples). Probed on the Pi (opencode 2.4.1): laguna answered
   in 1-2 s and used tools correctly; `nvidia/z-ai/glm-5.3-flash` hung 3/3,
   `google/gemma-4-31b-it` was rate-limited, OpenRouter gemma `:free` errored.
   Quality unknown: no fitted review data for laguna-xs (sibling laguna-s-2.1:
-  2 reviews, 0 findings), so the leaderboard is the check. It shares the NVIDIA
+  2 reviews, 0 findings), so the leaderboard is the check for stage 6 only: nothing measures
+  its test-writing for stage 3. It shares the NVIDIA
   provider with the author fallback (minimax): one NVIDIA outage hits both.

@@ -113,7 +113,8 @@ STAGES: tuple[StageSpec, ...] = (
         stage=3,
         # The test author: writes the acceptance tests and nothing else. A different
         # family from stage 4's implementer, primary and fallback, so the tests are not
-        # written by the model they are meant to check.
+        # written by the model they are meant to check. The fallback is the reviewer
+        # fallback (laguna), whose quality as a test writer is unmeasured.
         model="opencode/deepseek-v4.1-flash-free",
         prompt_file="stage-3.md",
         timeout_ms=60 * 60 * 1000,
