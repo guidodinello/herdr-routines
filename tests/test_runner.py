@@ -361,15 +361,18 @@ def test_execute_run_nudge_success_ends_done_and_records_nudged(
     assert outcome.report_written is True
     assert outcome.report_bytes > 0
     assert outcome.nudged is True
-    # Pins the nudge strictly before the visible-tail capture, which is itself before
-    # pane_close (issue 011 spec v2 L33: nudge stays before capture so the tail
-    # reflects the nudge's final screen).
+    # Pins the nudge strictly before the final visible-tail capture, which is itself
+    # before pane_close (issue 011 spec v2 L33: nudge stays before capture so the tail
+    # reflects the nudge's final screen). The two reads before the nudge are issue 091's
+    # settle scan on this no-report path.
     assert client.calls == [
         "settled_agent_pane",
         "worktree_create",
         "agent_start",
         "agent_interactive_ready",
         "agent_prompt_wait",
+        "agent_read_visible",
+        "agent_read_visible",
         "agent_prompt_wait",
         "agent_read_visible",
         "agent_session_id",
