@@ -56,3 +56,11 @@ falling back, which is the failure mode `fallback_model` exists to prevent.
     one pane rendered over another pane's screen (`foreign_session_failed_toast.txt`). The
     two-consecutive-polls gate keeps one sighting from reaping a healthy run (tested); how
     long the toast stays was not measured.
+- **2026-11-26**: first real Zen quota failure on opencode 2 (run `20261126T050000Z`, stage
+  6, `opencode/big-pickle`): HTTP 429 `provider.free-limit`, "Free usage limit reached.
+  Connect a provider or subscribe to OpenCode Go to keep going, or switch models.",
+  `retryAfterMs` 66079000. herdr reported the stage `blocked` and the run ended
+  `failed (stage_blocked)` without trying `fallback_model`. The screen was not captured, so
+  the marker comparison is still open; note the text differs from the default
+  `"Free usage exceeded"`. The session-record path that should have caught it is broken by
+  issue 095.
