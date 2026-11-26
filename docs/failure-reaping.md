@@ -105,8 +105,27 @@ appears verbatim in the job's substituted prompt is skipped for that scan
 (`if marker in prompt_text: continue`). Documented in the schema notes: don't author prompts
 containing marker phrases.
 
-Classification applies to the `agent_prompt_failed` path only. It intentionally does *not*
-inspect screens on healthy runs — no polling, no extra reads on the success path.
+opencode 2's captured corpus (issue 091, fixtures under
+`tests/fixtures/opencode2_screens/`) confirms both shapes use the same verbatim marker:
+
+| Shape | Fixture | Detection path |
+| ----- | ------- | -------------- |
+| retry line while the prompt is in flight (`working`, `⚠ Retrying in 5s · attempt 5 · Free usage exceeded, subscribe to Go`) | `quota_shaped_retry.txt` | the in-flight `wait_loop.prompt_with_watchdog` watchdog scan — same marker on two consecutive polls |
+| terminal line after the wait returns (`idle`, `Error: Free usage exceeded, subscribe to Go`) | `quota_shaped_settled_error.txt` | `wait_loop.settled_screen_marker` called by `runner.execute_run`, only on the settled-success + missing/empty-report path |
+
+`foreign_session_failed_toast.txt` has the marker too, but one sighting is inert: both paths
+require the same marker on two consecutive reads/watches, so a foreign session's toast cannot
+reap a healthy run. `normal_reply.txt`, `model_unavailable.txt`, `http_401_settled_error.txt`
+and `http_500_retry.txt` contain no marker and are never reaped as quota exhaustion — a bad
+key, a 5xx or a missing model must keep their own failure reasons.
+
+Classification's screen reads are confined to runs that are already failing: the
+`agent_prompt_failed` catch above, and the settled-success + missing/empty-report (`no_report`)
+path. On the latter, the settle scan replaces the one-shot nudge when it confirms a marker,
+persists its last read as `{run_id}.tail.txt`, and re-stats the report after its two reads so a
+report written during the scan still wins. Healthy runs — a settled run with a written,
+non-empty report — are never scanned: no polling and no extra reads on the success path, so a
+settle scan can never downgrade a `done` run.
 
 ### 3.3 Visible-screen reader + failure tails (G3)
 

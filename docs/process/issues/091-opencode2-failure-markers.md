@@ -62,5 +62,16 @@ falling back, which is the failure mode `fallback_model` exists to prevent.
   `retryAfterMs` 66079000. herdr reported the stage `blocked` and the run ended
   `failed (stage_blocked)` without trying `fallback_model`. The screen was not captured, so
   the marker comparison is still open; note the text differs from the default
-  `"Free usage exceeded"`. The session-record path that should have caught it is broken by
-  issue 095.
+  `"Free usage exceeded"`. The session-record path that should have caught it was broken by
+  issue 095 (fixed in #304).
+- **2026-11-26**: spec v2 closed the detection gap. The retry shape was already covered by the
+  in-flight watchdog, but the terminal `Error: Free usage exceeded` screen exists only after
+  `agent_prompt_wait` returns; `runner.execute_run` now runs `wait_loop.settled_screen_marker`
+  on the settled-success + missing/empty-report path, skips the 120 s nudge on a stable match,
+  writes that screen as `<run_id>.tail.txt`, and records `quota_exhausted` so `fallback_model`
+  fires. A report written during the scan wins — no `done` run is downgraded. The real-Zen
+  comparison moves to [095](095-zen-quota-wording-and-export-api-error.md); this supersedes
+  the earlier "set `done` once it matches" instruction, which assumed the marker text was the
+  only open question. The reason shift from `no_report` to `quota_exhausted` is deliberate: no
+  deployed job's `retry_on` depends on `no_report` alone. Stage 5 flips this issue to
+  `status: done`.
