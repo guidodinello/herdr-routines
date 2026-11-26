@@ -60,8 +60,11 @@ Findings that shape the fix:
 - This covers every settle-wait: routine runs, the four gated/dispatch flows and pipeline
   stages (all via `wait_loop.prompt_with_watchdog`), and the report nudge.
 - The extra wait is bounded by the job's existing `timeout_ms` (the nudge by
-  `NUDGE_TIMEOUT_MS`) and logged. The failure-marker scan and the pipeline heartbeat keep
-  running during it.
+  `NUDGE_TIMEOUT_MS`) and logged. In the main wait the failure-marker scan and the pipeline
+  heartbeat keep running while work is pending; the nudge's wait has no scan. A wait that
+  ends at the deadline with work still running is a failure (`unsettled_status_working`;
+  `subagent_wait_timeout` for a pipeline stage); a persistently unreadable state (5
+  consecutive errors) falls back to the settle.
 - When the signal is unavailable (service stopped, session id unknown, operation missing),
   behaviour is unchanged and a warning is logged.
 - Claude and codex runs never call the opencode API.
@@ -74,7 +77,7 @@ Findings that shape the fix:
   settle (main wait for routines, the four gated/dispatch flows and pipeline stages, plus the
   report nudge): herdr settled and `HerdrClient.opencode_background_busy` false on two
   consecutive polls, polled every 15 s (2 s to confirm a quiet poll), bounded by the job's
-  `timeout_ms` (the nudge by `NUDGE_TIMEOUT_MS`). The marker scan and pipeline heartbeat run
-  on each poll. An unreadable first poll (stopped service, opencode 2.1.4 without
+  `timeout_ms` (the nudge by `NUDGE_TIMEOUT_MS`). In the main wait the marker scan and pipeline heartbeat run
+  on each poll while work is pending (not in the nudge's wait). An unreadable first poll (stopped service, opencode 2.1.4 without
   `experimental.job.list`, no session id) logs a warning and keeps the old behaviour.
   Not deployed: the Pi's next `fitted-pr-review` run is the live confirmation.

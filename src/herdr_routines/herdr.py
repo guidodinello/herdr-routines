@@ -674,7 +674,10 @@ class HerdrClient:
         `_require_opencode_service`), so the read-only `service status` check comes first,
         as in `agent_start`. `--server <url>` is no way around it: the service answers it
         with "requires a password" (checked on the Pi, 2026-11-25), while a bare call
-        authenticates itself. Raises OpencodeJobsUnsupported on an opencode without
+        authenticates itself. The `service status` check does not cover the reads after it
+        (job.list, session.active), and a drain polls every 15 s, so that millisecond
+        window is hit far more often than in `agent_start`; a service dying inside it
+        already takes the panes' opencode with it. Raises OpencodeJobsUnsupported on an opencode without
         `experimental.job.list` (2.1.4), HerdrCliError on any other failure."""
         self._require_opencode_service()
         jobs = self._opencode_read(
