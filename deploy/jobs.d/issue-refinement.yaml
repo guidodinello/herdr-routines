@@ -38,8 +38,8 @@ agent_kind: opencode
 model: opencode/big-pickle # the author. The reviewer runs as a separate
     # `opencode run -m nvidia/minimaxai/minimax-m3.1-flash` (see prompt) — a different
     # provider AND model family, so the review is independent of the author.
-fallback_model: "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free" # quota_exhausted on Zen → retry on
-    # OpenRouter; deliberately not the reviewer's model, so a fallback run stays independent.
+fallback_model: "nvidia/poolside/laguna-xs-2.1" # quota_exhausted on Zen → retry on
+    # NVIDIA; deliberately not the reviewer's model, so a fallback run stays independent.
 timeout_ms: 3600000 # 1h — a 3-pass author→reviewer loop plus PR creation.
 start_timeout_ms: 120000
 on_missed: log
