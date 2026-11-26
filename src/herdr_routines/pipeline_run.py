@@ -1702,12 +1702,17 @@ PROVIDER_ERROR_TYPE_PREFIX = "provider."
 # and the `idle` event that closes the turn. A `system` or `synthetic` message can trail
 # either, so the last message of the export is not necessarily one of these.
 _TURN_END_TYPES = frozenset({"assistant", "idle"})
+# A `user` message opens the next turn. When one follows the last turn end, the session
+# was resumed and the new prompt has not been answered, so that turn end's error is the
+# previous prompt's, not this stage's.
+_TURN_TYPES = _TURN_END_TYPES | {"user"}
 
 
 def _session_api_error(export_json: str) -> str | None:
     """`"<status>: <message>"` when an `opencode session export` document's last turn
     ended in a provider error, else None; a provider error without an HTTP status reads
-    `"<type>: <message>"`.
+    `"<type>: <message>"`. None too when a `user` message follows that turn: a resumed
+    session whose new prompt is still unanswered.
 
     Read from the session record rather than the screen. herdr filed run
     20261010T050000Z's implement stage as `blocked` after Zen answered 400 `Bad Request`, which
@@ -1727,11 +1732,13 @@ def _session_api_error(export_json: str) -> str | None:
         (
             m
             for m in reversed(messages)
-            if isinstance(m, dict) and m.get("type") in _TURN_END_TYPES
+            if isinstance(m, dict) and m.get("type") in _TURN_TYPES
         ),
         None,
     )
-    error = last_turn.get("error") if last_turn else None
+    if last_turn is None or last_turn.get("type") not in _TURN_END_TYPES:
+        return None
+    error = last_turn.get("error")
     if not isinstance(error, dict):
         return None
     kind = error.get("type")
@@ -1764,8 +1771,31 @@ def _fallback_cause(
     return session_id, _session_api_error(exported) if exported else None
 
 
+def _opencode_service_running() -> bool:
+    """True when opencode's background service is already up (`opencode service status`
+    is read-only and prints the service URL).
+
+    `opencode session export` connects to that service and, like `opencode api`, may
+    start a stopped one in this process, where it would lack the provider keys and die
+    with the unit (`HerdrClient._require_opencode_service`; whether `session export`
+    starts it was not tested, as that means stopping the Pi's service). So this process
+    never calls it unless the service is up. Any failure reads as "not running"."""
+    try:
+        proc = subprocess.run(
+            ["opencode", "service", "status"],
+            capture_output=True,
+            text=True,
+            timeout=OPENCODE_EXPORT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0 and proc.stdout.strip().startswith("http")
+
+
 def _opencode_export(session_id: str) -> str | None:
-    """`opencode session export <session_id>`'s output, or None if it could not be read.
+    """`opencode session export <session_id>`'s output, or None if it could not be read
+    (including when opencode's background service is not running).
 
     opencode 2 renamed the command (`opencode export` is gone; issue 095). No
     `--sanitize`: it redacts transcript data, and the error this is read for is part of it.
@@ -1776,6 +1806,12 @@ def _opencode_export(session_id: str) -> str | None:
     last message, the one this is read for, went missing. opencode 2.4.1 does not do it:
     a 4246526-byte export piped to `wc -c` gave the file's size on three of three runs
     (2026-11-26). The file costs nothing, so it stays."""
+    if not _opencode_service_running():
+        log.warning(
+            "opencode session export %s skipped: background service not running",
+            session_id,
+        )
+        return None
     with tempfile.TemporaryFile("w+") as out:
         try:
             proc = subprocess.run(
