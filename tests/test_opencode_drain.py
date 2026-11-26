@@ -336,7 +336,8 @@ def test_prompt_with_watchdog_waits_out_subagents_and_keeps_the_heartbeat() -> N
     )
     assert status == "idle"
     assert client.calls.count("busy") == 4
-    assert len(beats) == 1 + 3  # the prompt's own poll, then one per sleep in the drain
+    # the prompt's own poll, then one per sleep after a busy poll (not the quiet confirm)
+    assert len(beats) == 1 + 2
 
 
 def test_prompt_with_watchdog_does_not_drain_for_claude() -> None:
@@ -417,3 +418,58 @@ def test_the_nudge_drains_subagents_too(monkeypatch: pytest.MonkeyPatch) -> None
     assert drained[0]["agent_kind"] == "opencode"
     assert drained[0]["status"] == "idle"
     assert "scan" not in drained[0]  # a one-shot nudge has no failure-marker watchdog
+
+
+def test_a_quiet_settle_near_the_deadline_is_not_filed_working(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadline only turns a still-busy wait into `working`; a settle with no
+    background work stands even when the confirm sleep would cross the deadline."""
+    monkeypatch.setattr(wait_loop.time, "monotonic", lambda: 0.0)
+    client = DrainClient([False, False])
+    assert drain(client, seconds=1) == "idle"
+
+
+def test_persistent_read_errors_give_up_and_trust_the_settle(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    errors = [HerdrCliError("down", exit_code=1)] * 10
+    client = DrainClient([True, *errors])
+    with caplog.at_level(logging.WARNING, logger="herdr_routines.wait_loop"):
+        assert drain(client) == "idle"
+    assert client.calls.count("busy") == 1 + wait_loop._DRAIN_MAX_READ_ERRORS
+    assert caplog.text.count("cannot read opencode background state") == (
+        wait_loop._DRAIN_MAX_READ_ERRORS
+    )
+
+
+def test_a_good_poll_resets_the_read_error_count() -> None:
+    blip = HerdrCliError("blip", exit_code=1)
+    polls: list[Any] = [True]
+    for _ in range(wait_loop._DRAIN_MAX_READ_ERRORS - 1):
+        polls.append(blip)
+    polls += [True, blip, False, False]
+    client = DrainClient(polls)
+    assert drain(client) == "idle"
+    assert not client.calls.count("busy") < len(polls)
+
+
+def test_the_marker_scan_is_skipped_once_the_session_is_quiet() -> None:
+    """A stale `previous_hit` from the main wait must not turn the first screen read of an
+    already-quiet session into a kill."""
+    scanned: list[str] = []
+
+    def scan(screen: str) -> str | None:
+        scanned.append(screen)
+        return "Free usage exceeded"
+
+    client = DrainClient([False, False], screen="Free usage exceeded")
+    assert drain(client, scan=scan) == "idle"
+    assert scanned == []
+
+
+def test_pipeline_files_a_subagent_wait_timeout_as_its_own_reason() -> None:
+    from herdr_routines.pipeline_run import _settle_outcome
+
+    assert _settle_outcome("working") == (False, "subagent_wait_timeout")
+    assert _settle_outcome(None) == (False, "interrupted_unknown")

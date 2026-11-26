@@ -4,11 +4,13 @@ loop (issue 056, spec §4).
 `runner.py` and `pipeline_run.py` both need exactly this primitive, and it already
 existed twice: once in `runner._prompt_with_watchdog`, once as the bash
 marker-poll loop inside `scripts/pipeline-launch.sh`. This module is the surviving
-copy, lifted out of `runner.py` unchanged so the routine-job path's behaviour is
-byte-identical — the only addition is `on_poll_hook`, which is what
+copy, lifted out of `runner.py` unchanged at issue 056 so the routine-job path's
+behaviour stayed byte-identical; the one addition then was `on_poll_hook`, which is what
 `pipeline_watchdog.is_stalled` reads: a heartbeat line written from inside the very
 closure that scans the screen for failure markers, so it advances on every poll by
-construction rather than by a model remembering to.
+construction rather than by a model remembering to. Issue 094 has since added
+`drain_opencode_background`: for an opencode agent a settle is only final once its
+background subagents are done.
 
 The `on_poll_hook` name (rather than another `on_poll`) is deliberate: `on_poll` is
 already `HerdrClient.agent_prompt_wait_with_watchdog`'s screen-text-in/marker-out
@@ -46,6 +48,10 @@ WATCHDOG_POLL_INTERVAL_S = 30.0
 OPENCODE_DRAIN_POLL_S = 15.0
 OPENCODE_DRAIN_CONFIRM_S = 2.0
 _DRAIN_QUIET_POLLS = 2
+# Consecutive failed reads of the background state after the first poll before the drain
+# gives up and trusts the settle (a vanished agent or a dead service would otherwise spin
+# until the deadline).
+_DRAIN_MAX_READ_ERRORS = 5
 
 # Retries for the prompt send itself (see prompt_with_watchdog's docstring).
 PROMPT_RETRY_DELAYS_S = (5.0, 15.0)
@@ -137,6 +143,7 @@ def drain_opencode_background(
     started = time.monotonic()
     quiet = 0
     first_poll = True
+    read_errors = 0
     announced = False
     while True:
         try:
@@ -160,7 +167,19 @@ def drain_opencode_background(
                     e,
                 )
                 return status
+            read_errors += 1
+            log.warning(
+                "%s: cannot read opencode background state (%d/%d): %s",
+                job_name,
+                read_errors,
+                _DRAIN_MAX_READ_ERRORS,
+                e,
+            )
+            if read_errors >= _DRAIN_MAX_READ_ERRORS:
+                return status
             busy = True
+        else:
+            read_errors = 0
         first_poll = False
         if not busy:
             quiet += 1
@@ -184,6 +203,8 @@ def drain_opencode_background(
                 )
         wait = OPENCODE_DRAIN_CONFIRM_S if quiet else OPENCODE_DRAIN_POLL_S
         if time.monotonic() + wait >= deadline:
+            if not busy:
+                return current  # one quiet poll in, no work seen: the settle stands
             log.warning(
                 "%s: opencode background work still running at the deadline (%.0fs)",
                 job_name,
@@ -191,7 +212,9 @@ def drain_opencode_background(
             )
             return AGENT_STATUS_WORKING
         time.sleep(wait)
-        if scan is not None:
+        # Only while work is pending: a settled agent's screen is not the wedge the marker
+        # gate looks for, and the closure's `previous_hit` carries over from the main wait.
+        if scan is not None and busy:
             try:
                 screen = client.agent_read_visible(target)
             except (HerdrCliError, OSError):
