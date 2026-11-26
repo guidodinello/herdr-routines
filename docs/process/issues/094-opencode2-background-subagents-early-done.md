@@ -81,3 +81,7 @@ Findings that shape the fix:
   on each poll while work is pending (not in the nudge's wait). An unreadable first poll (stopped service, opencode 2.1.4 without
   `experimental.job.list`, no session id) logs a warning and keeps the old behaviour.
   Not deployed: the Pi's next `fitted-pr-review` run is the live confirmation.
+- **2026-11-26**: confirmed live on the Pi (deployed at 7c5500d). The 12:00 `fitted-pr-review`
+  (`fitted-pr-review-20261126T150000Z`, session `ses_de7a0c7e5ffedEgXK8CUMZuu2M`) logged "has
+  background work" at 12:02:56 and "background work finished after 647s" at 12:13:42, then ended
+  `done` after 806 s with no nudge; both verify gates passed (review posted on fitted#1316).
