@@ -90,7 +90,7 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > fails the night before claiming an issue if `opencode models` no longer lists one.
 > Each agent stage also has a `fallback_model` off Zen (authors `nvidia/minimaxai/minimax-m3.1-flash`,
 > reviewer `openrouter/nvidia/nemotron-3-ultra-550b-a55b:free`): when a stage's session ends
-> in a provider `APIError`, or the failure-marker watchdog sees Zen's quota text, `pipeline-run`
+> in a `provider.*` error (read from `opencode session export`), or the failure-marker watchdog sees Zen's quota text, `pipeline-run`
 > reruns the stage once in a fresh session on the fallback, told to pick up any partial work in
 > the worktree. It never resumes the failed session, because a resumed session keeps the model it
 > was created on and opencode 1 ignored `-m` on resume (see the stage 7 note below). The job's own `fallback_model` is unused for
