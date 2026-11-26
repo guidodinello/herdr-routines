@@ -44,6 +44,7 @@ from herdr_routines.wait_loop import (
     WATCHDOG_POLL_INTERVAL_S,
     drain_opencode_background,
     prompt_with_watchdog,
+    settled_screen_marker,
 )
 from herdr_routines.wait_loop import (
     error_body_code as _error_body_code,
@@ -919,33 +920,71 @@ def execute_run(
     # would no longer be reachable; root-mode jobs never close their pane either way, so the
     # nudge applies identically there.
     nudged = False
+    settled_quota_marker: str | None = None
+    tail_written = False
     if not report_written or report_bytes == 0:
-        nudged = True
-        try:
-            _attempt_report_nudge(
-                client,
-                target=agent_name,
-                report_path=report_path,
-                agent_kind=job.agent_kind,
-            )
-        except (HerdrCliError, OSError) as e:
-            # Never loop: any nudge failure/timeout falls straight through to the existing
-            # no_report path below, exactly as if the nudge had never been attempted.
-            log.warning("%s: no_report nudge failed: %s", job.name, e)
+        # Issue 091: opencode 2's terminal quota screen exists only AFTER the wait returns.
+        # The run is already failing here (settled success with no usable report), so this is
+        # the one place a settle-time scan is allowed; a written report is never scanned.
+        settled_quota_marker, settled_tail = settled_screen_marker(
+            client,
+            target=agent_name,
+            markers=effective_markers,
+            prompt_text=prompt,
+        )
+        if settled_quota_marker is not None and settled_tail:
+            try:
+                (report_path.parent / f"{run_id}.tail.txt").write_text(settled_tail)
+            except OSError:
+                pass
+            # The scan's last read is the tail; do not read a third time.
+            tail_written = True
+
+        # The two reads can be a poll interval apart: a report landing in that window wins.
+        # Re-stat before deciding to nudge or to file quota_exhausted.
         report_written = report_path.exists()
         report_bytes = report_path.stat().st_size if report_written else 0
         common["report_written"] = report_written
         common["report_bytes"] = report_bytes
         common["report_path"] = str(report_path) if report_written else None
-        # The nudge can itself take real wall-clock time (up to NUDGE_TIMEOUT_MS); reflect it
-        # in the recorded duration rather than the pre-nudge snapshot taken above.
+        if report_written and report_bytes > 0:
+            # Never downgrade a run that did write its report.
+            settled_quota_marker = None
+        # The scan (and the nudge below) can take real wall-clock time; reflect it in the
+        # recorded duration rather than the pre-nudge snapshot taken above.
         common["duration_seconds"] = (datetime.now(UTC) - started_at).total_seconds()
 
+        if settled_quota_marker is None and (not report_written or report_bytes == 0):
+            nudged = True
+            try:
+                _attempt_report_nudge(
+                    client,
+                    target=agent_name,
+                    report_path=report_path,
+                    agent_kind=job.agent_kind,
+                )
+            except (HerdrCliError, OSError) as e:
+                # Never loop: any nudge failure/timeout falls straight through to the existing
+                # no_report path below, exactly as if the nudge had never been attempted.
+                log.warning("%s: no_report nudge failed: %s", job.name, e)
+            report_written = report_path.exists()
+            report_bytes = report_path.stat().st_size if report_written else 0
+            common["report_written"] = report_written
+            common["report_bytes"] = report_bytes
+            common["report_path"] = str(report_path) if report_written else None
+            # The nudge can itself take real wall-clock time (up to NUDGE_TIMEOUT_MS); reflect
+            # it in the recorded duration rather than the pre-nudge snapshot taken above.
+            common["duration_seconds"] = (
+                datetime.now(UTC) - started_at
+            ).total_seconds()
+
     # Bounded visible-tail capture (issue 011): placed after the nudge so the tail
-    # reflects the nudge's final screen if the nudge ran, matching spec v2 L33.
-    _capture_visible_tail(
-        client, agent_name, reports_dir=report_path.parent, run_id=run_id
-    )
+    # reflects the nudge's final screen if the nudge ran, matching spec v2 L33. A matched
+    # settle scan already persisted its own last read as the tail, so skip the extra read.
+    if not tail_written:
+        _capture_visible_tail(
+            client, agent_name, reports_dir=report_path.parent, run_id=run_id
+        )
 
     # Pane-lifecycle v2: close our own pane now instead of leaving it for the next run's
     # stale-pane reap (root-mode jobs share the ambient workspace and are never auto-closed,
@@ -973,6 +1012,20 @@ def execute_run(
         # Direct response to the research repo's standing pattern that unattended scheduled
         # runs fail silently and plausibly (docs/plan-v1.md §6): a clean settle with no report,
         # or an empty one, is not "done" — even after the one-shot nudge above.
+        if settled_quota_marker is not None:
+            # The settle-time screen confirmed an exhausted model: classify it so routine_flow's
+            # same-tick fallback can fire instead of asking the dead model for a report.
+            return RunOutcome(
+                state="failed",
+                reason="quota_exhausted",
+                error=(
+                    f"failure marker matched: {settled_quota_marker!r} (settled screen)"
+                ),
+                session_id=session_id,
+                nudged=nudged,
+                resigned_commits=resigned_commits,
+                **common,
+            )
         return RunOutcome(
             state="failed",
             reason="no_report",
