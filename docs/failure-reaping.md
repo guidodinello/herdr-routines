@@ -94,7 +94,8 @@ After the prompt-failed catch (and before reaping), read the screen once via the
 `agent_read_visible` (§3.3) and scan for failure markers:
 
 - New module constant in `runner.py`:
-  `DEFAULT_FAILURE_MARKERS = ("Free usage exceeded",)`
+  `DEFAULT_FAILURE_MARKERS = ("Free usage exceeded", "Free usage limit reached")`
+  (the second is Zen's real opencode 2 wording, issue 096)
 - Effective markers: `job.failure_markers` (config, §3.4) falling back to the default tuple.
 - On match: `reason="quota_exhausted"`, `error=f"failure marker matched: {marker!r}"`.
   Otherwise reason stays `agent_prompt_failed` with the existing error string.
@@ -273,7 +274,7 @@ for tests:
   zombie forever visible to `kill -0`, spinning indefinitely) and polls `herdr agent read
   --source visible` for `--failure-marker` text (same `job.failure_markers` config,
   `pipeline_flow._build_pipeline_launch_argv` passes it through; defaults to `("Free usage
-  exceeded",)`). Same two-consecutive-poll stability gate as §8. On a confirmed match: the
+  exceeded", "Free usage limit reached")`). Same two-consecutive-poll stability gate as §8. On a confirmed match: the
   wait job is killed, and the stub report's `## Outcome:` line reads `failed
   (quota_exhausted)` instead of the generic `failed` — pointing tick at the actual reason
   instead of the `orchestrator_failed` catch-all.

@@ -1689,6 +1689,7 @@ def test_root_mode_never_closes_pane(
 
 
 QUOTA_MARKER = "Free usage exceeded"
+ZEN_FREE_LIMIT_MARKER = "Free usage limit reached"
 
 
 def _opencode2_screen(name: str) -> str:
@@ -1763,6 +1764,7 @@ class ReadsClient:
     [
         ("quota_shaped_retry", True),
         ("quota_shaped_settled_error", True),
+        ("quota_zen_free_limit_settled_error", True),
         ("foreign_session_failed_toast", True),
         ("normal_reply", False),
         ("model_unavailable", False),
@@ -1776,7 +1778,7 @@ def test_opencode2_screen_corpus_classification(fixture: str, matches: bool) -> 
     missing model, a 401 and a 5xx are not quota (issue 091)."""
     screen = _opencode2_screen(fixture)
     marker = matched_failure_marker(screen, DEFAULT_FAILURE_MARKERS, "")
-    assert (marker == QUOTA_MARKER) is matches
+    assert (marker is not None) is matches
 
 
 def test_settled_quota_screen_is_quota_exhausted_without_the_nudge(
@@ -2055,26 +2057,31 @@ def test_failure_reaping_and_issue_091_document_both_opencode2_screen_shapes() -
     issue_091 = (
         root / "docs" / "process" / "issues" / "091-opencode2-failure-markers.md"
     ).read_text()
-    assert "095" in issue_091
+    assert "096" in issue_091
     assert "zen" in issue_091.lower()
     assert "settle" in issue_091.lower()
 
-    issue_095 = (
-        root
-        / "docs"
-        / "process"
-        / "issues"
-        / "095-zen-quota-wording-and-export-api-error.md"
-    )
-    assert issue_095.exists()
-    text_095 = issue_095.read_text()
-    assert "zen" in text_095.lower()
-    assert "APIError" in text_095
-    assert "export" in text_095
-    assert "tail.txt" in text_095
+    issue_096 = root / "docs" / "process" / "issues" / "096-zen-quota-screen-wording.md"
+    assert issue_096.exists()
+    text_096 = issue_096.read_text()
+    assert "zen" in text_096.lower()
+    assert "layout" in text_096
+    assert "tail.txt" in text_096
 
 
 def test_default_failure_markers_unchanged() -> None:
-    """The corpus shows verbatim passthrough, so no marker strings were added or changed:
-    guessing new phrasings would reap 401/5xx/unavailable screens as quota."""
-    assert DEFAULT_FAILURE_MARKERS == (QUOTA_MARKER,)
+    """Only phrasings seen verbatim from a real or captured quota message are markers:
+    guessing new ones would reap 401/5xx/unavailable screens as quota. Zen's real wording
+    (captured 2026-11-26) joined the stub's old one."""
+    assert DEFAULT_FAILURE_MARKERS == (QUOTA_MARKER, ZEN_FREE_LIMIT_MARKER)
+
+
+def test_real_zen_free_limit_wording_matches_its_own_marker() -> None:
+    """Zen's real 429 text (Pi, 2026-11-26) is not the stub's "Free usage exceeded"; the
+    settled screen carrying it must match the marker added for it."""
+    screen = _opencode2_screen("quota_zen_free_limit_settled_error")
+    assert QUOTA_MARKER not in screen
+    assert (
+        matched_failure_marker(screen, DEFAULT_FAILURE_MARKERS, "")
+        == ZEN_FREE_LIMIT_MARKER
+    )

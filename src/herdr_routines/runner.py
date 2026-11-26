@@ -89,7 +89,10 @@ READY_POLL_INTERVAL_S = 1.0
 # and retries forever instead of settling. A job's `failure_markers` config overrides this
 # tuple wholesale (config.py); markers appearing verbatim in the job's own prompt are skipped —
 # the visible screen contains the prompt echo, so scanning would self-match.
-DEFAULT_FAILURE_MARKERS: tuple[str, ...] = ("Free usage exceeded",)
+DEFAULT_FAILURE_MARKERS: tuple[str, ...] = (
+    "Free usage exceeded",  # opencode 1 and the stub upstream behind issue 091's fixtures
+    "Free usage limit reached",  # Zen's real 429 on opencode 2 (captured 2026-11-26, issue 096)
+)
 
 # Bound for the one-shot no_report nudge (issue 032): a settled idle/done agent that wrote no
 # (or an empty) $ROUTINE_REPORT is nudged once, on the same still-open agent, to write it. This

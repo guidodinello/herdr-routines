@@ -70,8 +70,18 @@ falling back, which is the failure mode `fallback_model` exists to prevent.
   on the settled-success + missing/empty-report path, skips the 120 s nudge on a stable match,
   writes that screen as `<run_id>.tail.txt`, and records `quota_exhausted` so `fallback_model`
   fires. A report written during the scan wins — no `done` run is downgraded. The real-Zen
-  comparison moves to [095](095-zen-quota-wording-and-export-api-error.md); this supersedes
+  comparison moves to [096](096-zen-quota-screen-wording.md); this supersedes
   the earlier "set `done` once it matches" instruction, which assumed the marker text was the
   only open question. The reason shift from `no_report` to `quota_exhausted` is deliberate: no
   deployed job's `retry_on` depends on `no_report` alone. Stage 5 flips this issue to
   `status: done`.
+- **2026-11-26**: the real Zen wording (captured on the Pi from session
+  `ses_de9a0ad5fffemFKDFnn5F06wsI`, 429 `provider.free-limit`) is "Free usage limit
+  reached. Connect a provider or subscribe to OpenCode Go to keep going, or switch models.",
+  which the old marker `"Free usage exceeded"` does not match, so on a real Zen 429 the
+  settle-time scan above would have missed. `DEFAULT_FAILURE_MARKERS` now also holds
+  `"Free usage limit reached"` (the old string stays for the stub screens and opencode 1).
+  Fixture `quota_zen_free_limit_settled_error.txt` carries the real text in the stub's
+  settled-screen layout. **Not verified:** how the opencode 2 TUI lays that message out on
+  screen; no real screen was captured (the model was still rate limited and the run's
+  screen was never saved). Tracked in [096](096-zen-quota-screen-wording.md).
