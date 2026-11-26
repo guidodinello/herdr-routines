@@ -43,8 +43,9 @@ Usage: pipeline-launch.sh --run-id ID --repo-parent PATH --report PATH --agent-n
                       verbatim (default: now + --wait-timeout-ms, for a tick that predates
                       this flag)
   --failure-marker   text `pipeline-run` watches each stage's screen for (repeatable;
-                      default: "Free usage exceeded" — same as runner.py's
-                      DEFAULT_FAILURE_MARKERS). Two consecutive sightings of the same
+                      default: runner.py's
+                      DEFAULT_FAILURE_MARKERS, applied by `pipeline-run` when none are
+                      passed). Two consecutive sightings of the same
                       marker resume that stage on its fallback model instead of waiting
                       out the stage's timeout.
   --resume           resume an existing run: skip pipeline-prepare and use the state
@@ -95,10 +96,6 @@ done
 # too rather than leaving it to the orchestrator model.
 if [ -z "$DEADLINE_EPOCH" ]; then
   DEADLINE_EPOCH=$(( $(date +%s) + WAIT_TIMEOUT_MS / 1000 ))
-fi
-
-if [ ${#FAILURE_MARKERS[@]} -eq 0 ]; then
-  FAILURE_MARKERS=("Free usage exceeded")
 fi
 
 for required in RUN_ID REPO_PARENT REPORT AGENT_NAME; do
@@ -178,11 +175,11 @@ echo "=== dispatching pipeline-run: run_id=$RUN_ID state=$STATE_JSON prompts=$PR
 RUN_RC=0
 # The failure markers are the launcher's only remaining opinion about the run: quota
 # exhaustion is detected inside the wait loop (runner.wait_loop), so they are forwarded
-# verbatim rather than scanned for here. Each marker must stay ONE argv entry: the default
-# ("Free usage exceeded") contains spaces, and an unquoted `$(printf ...)` expansion
-# word-split it into three, which argparse rejected with exit 2 every night from
-# 2026-10-02 to 2026-10-07. The array is never empty (it defaults above), so `set -u`
-# cannot bite.
+# verbatim rather than scanned for here. Each marker must stay ONE argv entry: the markers
+# contain spaces, and an unquoted `$(printf ...)` expansion word-split them, which argparse
+# rejected with exit 2 every night from 2026-10-02 to 2026-10-07. With none given the
+# array stays empty and `pipeline-run` applies runner.DEFAULT_FAILURE_MARKERS (one source of
+# truth), so the empty expansion below is guarded against `set -u` on older bash.
 MARKER_ARGS=()
 for marker in "${FAILURE_MARKERS[@]}"; do
   MARKER_ARGS+=(--failure-marker "$marker")
@@ -190,7 +187,7 @@ done
 uv run herdr-routines pipeline-run \
   --run-id "$RUN_ID" --state-json "$STATE_JSON" \
   --report "$REPORT" --prompts-dir "$PROMPTS_DIR" \
-  "${MARKER_ARGS[@]}" || RUN_RC=$?
+  ${MARKER_ARGS[@]+"${MARKER_ARGS[@]}"} || RUN_RC=$?
 echo "=== pipeline-run exited $RUN_RC (run_id=$RUN_ID report=$REPORT) ==="
 
 # Backstop. This used to be conditional on the orchestrator settling somewhere other than

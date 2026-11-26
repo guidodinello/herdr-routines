@@ -94,7 +94,8 @@ After the prompt-failed catch (and before reaping), read the screen once via the
 `agent_read_visible` (§3.3) and scan for failure markers:
 
 - New module constant in `runner.py`:
-  `DEFAULT_FAILURE_MARKERS = ("Free usage exceeded",)`
+  `DEFAULT_FAILURE_MARKERS = ("Free usage exceeded", "Free usage limit reached")`
+  (the second is Zen's real opencode 2 wording, issue 096)
 - Effective markers: `job.failure_markers` (config, §3.4) falling back to the default tuple.
 - On match: `reason="quota_exhausted"`, `error=f"failure marker matched: {marker!r}"`.
   Otherwise reason stays `agent_prompt_failed` with the existing error string.
@@ -105,8 +106,29 @@ appears verbatim in the job's substituted prompt is skipped for that scan
 (`if marker in prompt_text: continue`). Documented in the schema notes: don't author prompts
 containing marker phrases.
 
-Classification applies to the `agent_prompt_failed` path only. It intentionally does *not*
-inspect screens on healthy runs — no polling, no extra reads on the success path.
+opencode 2's captured corpus (issue 091, fixtures under
+`tests/fixtures/opencode2_screens/`) confirms both shapes use the same verbatim marker:
+
+| Shape | Fixture | Detection path |
+| ----- | ------- | -------------- |
+| retry line while the prompt is in flight (`working`, `⚠ Retrying in 5s · attempt 5 · Free usage exceeded, subscribe to Go`) | `quota_shaped_retry.txt` | the in-flight `wait_loop.prompt_with_watchdog` watchdog scan — same marker on two consecutive polls |
+| terminal line after the wait returns (`idle`, `Error: Free usage exceeded, subscribe to Go`) | `quota_shaped_settled_error.txt` | `wait_loop.settled_screen_marker` called by `runner.execute_run`: one read (a settled screen is static, so a second read adds nothing), only for opencode agents, only on the settled-success + missing/empty-report path |
+
+`foreign_session_failed_toast.txt` has the marker too. The in-flight watchdog requires the
+same marker on two consecutive polls, so a foreign session's toast cannot reap a healthy
+run. The settle scan reads once, so a toast on a settled no-report run is classified quota
+(a run that already failed, so only its reason and the skipped nudge change); a run that
+wrote a report is never scanned. `normal_reply.txt`, `model_unavailable.txt`, `http_401_settled_error.txt`
+and `http_500_retry.txt` contain no marker and are never reaped as quota exhaustion — a bad
+key, a 5xx or a missing model must keep their own failure reasons.
+
+Classification's screen reads are confined to runs that are already failing: the
+`agent_prompt_failed` catch above, and the settled-success + missing/empty-report (`no_report`)
+path. On the latter, the settle scan replaces the one-shot nudge when it confirms a marker,
+persists its last read as `{run_id}.tail.txt`, and re-stats the report after its two reads so a
+report written during the scan still wins. Healthy runs — a settled run with a written,
+non-empty report — are never scanned: no polling and no extra reads on the success path, so a
+settle scan can never downgrade a `done` run.
 
 ### 3.3 Visible-screen reader + failure tails (G3)
 
@@ -253,8 +275,7 @@ for tests:
   whichever finishes first — a naive `kill -0`-then-`sleep` loop leaves the prompt job a
   zombie forever visible to `kill -0`, spinning indefinitely) and polls `herdr agent read
   --source visible` for `--failure-marker` text (same `job.failure_markers` config,
-  `pipeline_flow._build_pipeline_launch_argv` passes it through; defaults to `("Free usage
-  exceeded",)`). Same two-consecutive-poll stability gate as §8. On a confirmed match: the
+  `pipeline_flow._build_pipeline_launch_argv` passes it through; defaults to `runner.DEFAULT_FAILURE_MARKERS`). Same two-consecutive-poll stability gate as §8. On a confirmed match: the
   wait job is killed, and the stub report's `## Outcome:` line reads `failed
   (quota_exhausted)` instead of the generic `failed` — pointing tick at the actual reason
   instead of the `orchestrator_failed` catch-all.

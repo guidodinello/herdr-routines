@@ -109,6 +109,34 @@ def matched_failure_marker(
     return None
 
 
+def settled_screen_marker(
+    client: HerdrClient,
+    *,
+    target: str,
+    markers: Sequence[str],
+    prompt_text: str,
+) -> tuple[str | None, str]:
+    """Issue 091: classify a screen that is only visible AFTER the prompt wait has settled.
+
+    Reads `agent_read_visible(target, lines=200)` (tail-equivalent with runner's
+    `_capture_visible_tail`) once and returns the marker that matches, with the marker-in-
+    prompt guard unchanged. One read is enough: a settled screen is static, so a second read
+    would see the same text (the in-flight watchdog's two-poll gate exists for a screen that
+    is still changing, and would add a 30 s sleep to every no-report run here). The screen
+    text comes back with the verdict so the caller can persist it without another read. A
+    read error is inert. Empty `markers` (`failure_markers: []` opts out of scanning) returns
+    without touching the screen.
+    """
+    if not markers:
+        return None, ""
+    try:
+        screen = client.agent_read_visible(target, lines=200)
+    except (HerdrCliError, OSError) as e:
+        log.debug("%s: settled screen read failed: %s", target, e)
+        return None, ""
+    return matched_failure_marker(screen, markers, prompt_text), screen
+
+
 def drain_opencode_background(
     client: HerdrClient,
     *,

@@ -3,7 +3,9 @@ involved). See docs/plan-v1.md §7."""
 
 from __future__ import annotations
 
+import inspect
 import json
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +20,7 @@ from herdr_routines.herdr import (
     PromptWatchdogKilled,
 )
 from herdr_routines.runner import (
+    DEFAULT_FAILURE_MARKERS,
     _is_retryable_prompt_error,
     _is_settle_timeout,
     build_branch_name,
@@ -26,6 +29,7 @@ from herdr_routines.runner import (
     make_run_id,
     substitute_prompt,
 )
+from herdr_routines.wait_loop import matched_failure_marker
 
 
 def make_job(tmp_path: Path, **overrides: Any) -> Job:
@@ -358,9 +362,10 @@ def test_execute_run_nudge_success_ends_done_and_records_nudged(
     assert outcome.report_written is True
     assert outcome.report_bytes > 0
     assert outcome.nudged is True
-    # Pins the nudge strictly before the visible-tail capture, which is itself before
-    # pane_close (issue 011 spec v2 L33: nudge stays before capture so the tail
-    # reflects the nudge's final screen).
+    # Pins the nudge strictly before the final visible-tail capture, which is itself
+    # before pane_close (issue 011 spec v2 L33: nudge stays before capture so the tail
+    # reflects the nudge's final screen). This job is not opencode, so issue 091's
+    # settle scan does not read the screen before the nudge.
     assert client.calls == [
         "settled_agent_pane",
         "worktree_create",
@@ -1673,3 +1678,420 @@ def test_root_mode_never_closes_pane(
     assert "agent_session_id" not in client.calls
     # Tail capture is best-effort — it still fires in root mode.
     assert "agent_read_visible" in client.calls
+
+
+# ---------------------------------------------------------------------------
+# Issue 091 (spec 20261126T050000Z): opencode 2's terminal quota screen exists
+# only AFTER the prompt wait returns, so it is classified by a settle-time scan
+# on the already-failing (settled success + missing/empty report) path.
+# ---------------------------------------------------------------------------
+
+
+QUOTA_MARKER = "Free usage exceeded"
+ZEN_FREE_LIMIT_MARKER = "Free usage limit reached"
+
+
+def _opencode2_screen(name: str) -> str:
+    return (OPENCODE2_SCREENS / f"{name}.txt").read_text()
+
+
+class SettledScreenClient(ScriptedClient):
+    """Settles idle with no watchdog polls and scripts the post-settle visible reads.
+
+    `screens` is consumed one entry per `agent_read_visible`, the last entry repeating once
+    exhausted (a healthy success path still performs its own tail capture). `on_read(n)`
+    fires after read n, so a test can make a report appear *during* the settle scan.
+    """
+
+    def __init__(
+        self,
+        *,
+        screens: Sequence[str] = (),
+        on_read: Callable[[int], None] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.screens = list(screens)
+        self.on_read = on_read
+        self.read_count = 0
+
+    def agent_prompt_wait_with_watchdog(
+        self, *, target, text, timeout_ms, poll_interval_s=30.0, on_poll=None
+    ):
+        # No in-flight polls: the terminal quota shape is only on screen after the settle.
+        # Deliberately does NOT delegate to agent_prompt_wait, so a nudge is the only call
+        # that records "agent_prompt_wait" (see the no-nudge assertions below).
+        self.calls.append("agent_prompt_wait_with_watchdog")
+        if self.write_report_at is not None:
+            self.write_report_at.parent.mkdir(parents=True, exist_ok=True)
+            self.write_report_at.write_text(self.report_content)
+        return self.agent_status
+
+    def agent_read_visible(self, target, *, lines=200):
+        self.calls.append("agent_read_visible")
+        # Tail-equivalent read: the same shape _capture_visible_tail uses.
+        assert lines == 200
+        index = min(self.read_count, len(self.screens) - 1) if self.screens else -1
+        screen = self.screens[index] if index >= 0 else ""
+        self.read_count += 1
+        if self.on_read is not None:
+            self.on_read(self.read_count)
+        return screen
+
+
+class ReadsClient:
+    """A wait_loop-shaped client whose `agent_read_visible` replays scripted values.
+
+    Entries may be strings or exception instances (raised on that read), which is how the
+    helper's inert-read-error contract is exercised without a real herdr binary.
+    """
+
+    def __init__(self, screens: Sequence[str | Exception]) -> None:
+        self._screens = list(screens)
+        self.calls: list[tuple[str, int]] = []
+
+    def agent_read_visible(self, target, *, lines=200):
+        self.calls.append((target, lines))
+        item = self._screens.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+@pytest.mark.parametrize(
+    ("fixture", "matches"),
+    [
+        ("quota_shaped_retry", True),
+        ("quota_shaped_settled_error", True),
+        ("quota_zen_free_limit_settled_error", True),
+        ("foreign_session_failed_toast", True),
+        ("normal_reply", False),
+        ("model_unavailable", False),
+        ("http_401_settled_error", False),
+        ("http_500_retry", False),
+    ],
+)
+def test_opencode2_screen_corpus_classification(fixture: str, matches: bool) -> None:
+    """The captured corpus is a contract: opencode 2 passes the provider message through
+    verbatim, in the retrying line and in the settled `Error:` line, while a normal reply, a
+    missing model, a 401 and a 5xx are not quota (issue 091)."""
+    screen = _opencode2_screen(fixture)
+    marker = matched_failure_marker(screen, DEFAULT_FAILURE_MARKERS, "")
+    assert (marker is not None) is matches
+
+
+def test_settled_quota_screen_is_quota_exhausted_without_the_nudge(
+    tmp_path: Path, _isolated_reports_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run that settles idle with the terminal quota screen and no report is
+    quota_exhausted, not no_report: an exhausted model cannot answer the report nudge, so
+    the scan replaces it, persists the matched screen as the tail, and the run still closes
+    its pane."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    run_id = "a-settled-quota"
+    screen = _opencode2_screen("quota_shaped_settled_error")
+    client = SettledScreenClient(agent_status="idle", screens=(screen, screen))
+
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert "settled screen" in (outcome.error or "")
+    assert outcome.final_agent_status == "idle"
+    # The nudge is the only path that records agent_prompt_wait on this fake; it never ran.
+    assert "agent_prompt_wait" not in client.calls
+    # Exactly the scan's one read: the tail comes from the matched screen, no second read.
+    assert client.read_count == 1
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.exists()
+    assert tail_path.read_text() == screen
+    # The run still goes through the normal post-settle machinery and closes its pane.
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_settled_quota_screen_never_downgrades_a_written_report(
+    tmp_path: Path, _isolated_reports_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A written, non-empty report wins over the same quota screen: the run stays done and
+    the settle scan never reads the screen (zero extra reads beyond the success tail)."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    run_id = "a-settled-quota-done"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    screen = _opencode2_screen("quota_shaped_settled_error")
+    client = SettledScreenClient(
+        agent_status="idle",
+        screens=(screen,),
+        write_report_at=report_path,
+    )
+
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+
+    assert outcome.state == "done"
+    assert outcome.reason is None
+    assert outcome.report_written is True
+    # Only the existing success-path tail capture; the settle scan is skipped entirely.
+    assert client.read_count == 1
+
+
+def test_settled_quota_screen_does_not_downgrade_a_report_written_during_the_scan(
+    tmp_path: Path, _isolated_reports_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-downgrade invariant spans the scan window: a report that lands while the scan reads
+    wins over the marker seen in that same window, so the run ends done. Without the
+    post-scan re-stat a foreign toast could turn a just-completed run into quota_exhausted."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    run_id = "a-settled-quota-race"
+    report_path = _isolated_reports_dir / f"{run_id}.md"
+    screen = _opencode2_screen("quota_shaped_settled_error")
+
+    def write_report_during_scan(read_number: int) -> None:
+        if read_number == 1:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text("# Report\n\nWritten during the settle scan.\n")
+
+    client = SettledScreenClient(
+        agent_status="idle",
+        screens=(screen, screen, screen),
+        on_read=write_report_during_scan,
+    )
+
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+
+    assert outcome.state == "done"
+    assert outcome.reason is None
+    assert outcome.report_written is True
+    assert outcome.report_bytes > 0
+    # The report exists after the scan, so the nudge is skipped as well.
+    assert "agent_prompt_wait" not in client.calls
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["http_401_settled_error", "http_500_retry", "model_unavailable", "normal_reply"],
+)
+def test_settled_non_quota_screens_stay_no_report(
+    tmp_path: Path,
+    _isolated_reports_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture: str,
+) -> None:
+    """A bad key, a 5xx, a missing model or a normal reply must not be reaped as an
+    exhausted quota: no settle marker matches, so today's nudge-then-no_report path is
+    unchanged."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    run_id = f"a-settled-{fixture}"
+    screen = _opencode2_screen(fixture)
+    client = SettledScreenClient(agent_status="idle", screens=(screen, screen, screen))
+
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "no_report"
+    assert outcome.nudged is True
+    # Exactly one nudge (the initial prompt uses the watchdog entry point on this fake).
+    assert client.calls.count("agent_prompt_wait") == 1
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_settled_scan_reads_the_screen_once(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """A settled screen is static, so one read decides: no second read, no sleep (the old
+    two-read gate added 30 s to every no-report run). The trade-off is documented in issue
+    091: a foreign session's toast over a settled no-report run is classified quota."""
+    toast = _opencode2_screen("foreign_session_failed_toast")
+    job = make_job(tmp_path, agent_kind="opencode")
+    client = SettledScreenClient(agent_status="idle", screens=(toast,))
+
+    outcome = execute_run(job, client, run_id="a-settled-once")  # type: ignore[arg-type]
+
+    assert outcome.reason == "quota_exhausted"
+    assert client.read_count == 1
+
+
+def test_settled_scan_is_skipped_when_markers_are_empty(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """`failure_markers: []` opts out of scanning: nothing can match, so the no-report path
+    must not read the screen for the scan and goes straight to the nudge."""
+    quota = _opencode2_screen("quota_shaped_settled_error")
+    job = make_job(tmp_path, agent_kind="opencode", failure_markers=())
+    client = SettledScreenClient(agent_status="idle", screens=(quota,))
+
+    outcome = execute_run(job, client, run_id="a-settled-optout")  # type: ignore[arg-type]
+
+    assert outcome.reason == "no_report"
+    assert outcome.nudged is True
+    # Only the post-nudge tail capture reads the screen, never a scan.
+    assert client.calls.index("agent_prompt_wait") < client.calls.index(
+        "agent_read_visible"
+    )
+
+
+def test_settled_scan_only_runs_for_opencode_agents(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """The screens in the corpus are opencode 2's; another agent's settled no-report run
+    keeps today's nudge-then-no_report path even if its screen holds a marker."""
+    quota = _opencode2_screen("quota_shaped_settled_error")
+    job = make_job(tmp_path, agent_kind="claude")
+    client = SettledScreenClient(agent_status="idle", screens=(quota,))
+
+    outcome = execute_run(job, client, run_id="a-settled-claude")  # type: ignore[arg-type]
+
+    assert outcome.reason == "no_report"
+    assert outcome.nudged is True
+
+
+def test_settled_marker_in_prompt_is_inert(
+    tmp_path: Path, _isolated_reports_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker-in-prompt guard applies on the settle path too: a job whose own prompt
+    contains the phrase cannot self-match, even on two consecutive reads."""
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        prompt=(
+            "Never print the phrase Free usage exceeded. "
+            "Write the report to $ROUTINE_REPORT."
+        ),
+    )
+    screen = _opencode2_screen("quota_shaped_settled_error")
+    client = SettledScreenClient(agent_status="idle", screens=(screen, screen, screen))
+
+    outcome = execute_run(job, client, run_id="a-settled-guard")  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "no_report"
+    assert outcome.nudged is True
+
+
+def test_settled_screen_marker_contract() -> None:
+    """settled_screen_marker's own contract: exactly one agent_read_visible(lines=200), the
+    marker-in-prompt guard, the screen text returned, read errors inert, and empty markers
+    never reading."""
+    from herdr_routines.wait_loop import settled_screen_marker
+
+    quota = _opencode2_screen("quota_shaped_settled_error")
+
+    client = ReadsClient([quota])
+    assert settled_screen_marker(
+        client,  # type: ignore[arg-type]
+        target="agent",
+        markers=DEFAULT_FAILURE_MARKERS,
+        prompt_text="",
+    ) == (QUOTA_MARKER, quota)
+    assert client.calls == [("agent", 200)]
+
+    # No marker on the screen: the text still comes back for the caller.
+    assert settled_screen_marker(
+        ReadsClient(["all clear"]),  # type: ignore[arg-type]
+        target="agent",
+        markers=DEFAULT_FAILURE_MARKERS,
+        prompt_text="",
+    ) == (None, "all clear")
+
+    # Marker-in-prompt guard: unchanged from matched_failure_marker.
+    assert settled_screen_marker(
+        ReadsClient([quota]),  # type: ignore[arg-type]
+        target="agent",
+        markers=DEFAULT_FAILURE_MARKERS,
+        prompt_text=f"never say {QUOTA_MARKER}",
+    ) == (None, quota)
+
+    # A read error is inert and never raised.
+    for error in (OSError("boom"), HerdrCliError("gone", exit_code=1)):
+        assert settled_screen_marker(
+            ReadsClient([error]),  # type: ignore[arg-type]
+            target="agent",
+            markers=DEFAULT_FAILURE_MARKERS,
+            prompt_text="",
+        ) == (None, "")
+
+    # Empty markers: nothing can match, so the screen is not read at all.
+    unread = ReadsClient([quota])
+    assert settled_screen_marker(
+        unread,  # type: ignore[arg-type]
+        target="agent",
+        markers=(),
+        prompt_text="",
+    ) == (None, "")
+    assert unread.calls == []
+
+
+def test_pipeline_launcher_defaults_to_the_runner_failure_markers(
+    tmp_path: Path,
+) -> None:
+    """One source of truth: the tick-launched pipeline watchdog watches for every marker the
+    routine runner does, including Zen's real wording, not a private copy of the old one."""
+    from herdr_routines import pipeline_flow, pipeline_run
+
+    job = replace(
+        make_job(tmp_path, failure_markers=None),
+        kind="pipeline",
+        prompt_file="p.md",
+        deadline_ms=3_600_000,
+    )
+    argv = pipeline_flow._build_pipeline_launch_argv(
+        job,
+        run_id="r",
+        report_path=tmp_path / "r.md",
+        unit_name="u",
+        deadline_epoch=1,
+    )
+    markers = [argv[i + 1] for i, a in enumerate(argv) if a == "--failure-marker"]
+    assert markers == list(DEFAULT_FAILURE_MARKERS)
+    default = inspect.signature(pipeline_run.run_pipeline).parameters["failure_markers"]
+    assert default.default == DEFAULT_FAILURE_MARKERS
+
+
+def test_failure_reaping_and_issue_091_document_both_opencode2_screen_shapes() -> None:
+    """The docs record what was learned: §3.2 names both opencode 2 shapes and their
+    detection paths and limits the settle scan to the already-failing no-report path, the
+    091 log moves the real-Zen comparison to 095, and 095 records that residual."""
+    root = Path(__file__).resolve().parent.parent
+    failure_reaping = (root / "docs" / "failure-reaping.md").read_text()
+    section = failure_reaping.split("### 3.2", 1)[1].split("### 3.3", 1)[0]
+    lower = section.lower()
+
+    assert "quota_shaped_retry" in section
+    assert "quota_shaped_settled_error" in section
+    assert "watchdog" in lower  # the retry shape is caught during the wait
+    assert "settle" in lower  # the terminal shape is caught after the settle
+    assert any(
+        term in lower
+        for term in ("no_report", "no-report", "no report", "missing/empty report")
+    )
+    assert "healthy" in lower
+
+    issue_091 = (
+        root / "docs" / "process" / "issues" / "091-opencode2-failure-markers.md"
+    ).read_text()
+    assert "096" in issue_091
+    assert "zen" in issue_091.lower()
+    assert "settle" in issue_091.lower()
+
+    issue_096 = root / "docs" / "process" / "issues" / "096-zen-quota-screen-wording.md"
+    assert issue_096.exists()
+    text_096 = issue_096.read_text()
+    assert "zen" in text_096.lower()
+    assert "layout" in text_096
+    assert "tail.txt" in text_096
+
+
+def test_default_failure_markers_unchanged() -> None:
+    """Only phrasings seen verbatim from a real or captured quota message are markers:
+    guessing new ones would reap 401/5xx/unavailable screens as quota. Zen's real wording
+    (captured 2026-11-26) joined the stub's old one."""
+    assert DEFAULT_FAILURE_MARKERS == (QUOTA_MARKER, ZEN_FREE_LIMIT_MARKER)
+
+
+def test_real_zen_free_limit_wording_matches_its_own_marker() -> None:
+    """Zen's real 429 text (Pi, 2026-11-26) is not the stub's "Free usage exceeded"; the
+    settled screen carrying it must match the marker added for it."""
+    screen = _opencode2_screen("quota_zen_free_limit_settled_error")
+    assert QUOTA_MARKER not in screen
+    assert (
+        matched_failure_marker(screen, DEFAULT_FAILURE_MARKERS, "")
+        == ZEN_FREE_LIMIT_MARKER
+    )
