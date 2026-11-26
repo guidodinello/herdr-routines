@@ -1,7 +1,7 @@
 ---
 id: "091"
 title: "Check the pipeline's failure markers against opencode 2's screens"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
