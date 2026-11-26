@@ -109,6 +109,47 @@ def matched_failure_marker(
     return None
 
 
+def settled_screen_marker(
+    client: HerdrClient,
+    *,
+    target: str,
+    markers: Sequence[str],
+    prompt_text: str,
+    reads: int = 2,
+    interval_s: float | None = None,
+) -> tuple[str | None, str]:
+    """Issue 091: classify a screen that is only visible AFTER the prompt wait has settled.
+
+    Reads `agent_read_visible(target, lines=200)` (tail-equivalent with runner's
+    `_capture_visible_tail`) `reads` times, `interval_s` apart, and returns a marker only once
+    the same marker appears on two consecutive reads — the same stability gate as the in-flight
+    watchdog, which keeps a one-off foreign-session toast from reaping a run. The marker-in-
+    prompt guard is reused unchanged. The last screen text comes back with the verdict so the
+    caller can persist it without another read. Read errors are inert, as in the poll loop.
+
+    `interval_s=None` resolves WATCHDOG_POLL_INTERVAL_S at call time: a default parameter
+    would bind 30 s at import and defeat the test seam (and add 30 s to every test).
+    """
+    if interval_s is None:
+        interval_s = WATCHDOG_POLL_INTERVAL_S
+    previous_hit: str | None = None
+    confirmed: str | None = None
+    last_screen = ""
+    for index in range(reads):
+        if index:
+            time.sleep(interval_s)
+        try:
+            last_screen = client.agent_read_visible(target, lines=200)
+        except (HerdrCliError, OSError) as e:
+            log.debug("%s: settled screen read failed: %s", target, e)
+            last_screen = ""
+        hit = matched_failure_marker(last_screen, markers, prompt_text)
+        if hit is not None and hit == previous_hit:
+            confirmed = hit
+        previous_hit = hit
+    return confirmed, last_screen
+
+
 def drain_opencode_background(
     client: HerdrClient,
     *,
