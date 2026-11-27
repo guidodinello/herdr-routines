@@ -1,0 +1,13 @@
+[Unit]
+Description=Remove merged run worktrees and pack the job clones
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/herdr-routines
+# Same PATH note as herdr-routines.service: a systemd --user unit does not inherit your
+# login shell's PATH.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# gc only deletes merged auto/* branches past its 14-day age gate, so it never touches a
+# run that is still going. See the script header for what it does per repo.
+ExecStart=%h/projects/herdr-routines/scripts/gc-all-repos.sh
+TimeoutStartSec=900

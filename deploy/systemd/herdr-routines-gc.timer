@@ -1,0 +1,12 @@
+[Unit]
+Description=Clean up the job clones once a week
+
+[Timer]
+# Sunday afternoon: clear of the 02:00 pipeline, the morning reviewers and Monday's
+# 04:00 audit.
+OnCalendar=Sun *-*-* 15:00:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

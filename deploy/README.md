@@ -1,6 +1,6 @@
 # Deploying herdr-routines
 
-Six systemd **user** units (five of them with timers) drive this tool — no daemon of our own, no root required. See
+Seven systemd **user** units (six of them with timers) drive this tool — no daemon of our own, no root required. See
 [`../docs/plan-v1.md`](../docs/plan-v1.md) §3 for the full rationale.
 
 ## Install
@@ -16,6 +16,7 @@ cp systemd/herdr-server.service systemd/opencode-service.service systemd/herdr-r
    systemd/herdr-routines-digest.timer systemd/herdr-routines-digest.service \
    systemd/herdr-routines-update.timer systemd/herdr-routines-update.service \
    systemd/herdr-routines-tmp-sweep.timer systemd/herdr-routines-tmp-sweep.service \
+   systemd/herdr-routines-gc.timer systemd/herdr-routines-gc.service \
    ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
@@ -62,6 +63,19 @@ launch, and agents killed mid-run leave theirs behind; the stock `systemd-tmpfil
 window is far too slow when `/tmp` is a small RAM-backed tmpfs (the Pi's filled on
 2026-10-20). The unit deletes this user's files of exactly that name shape once they are
 two hours old, every hour. Skip it on a host whose `/tmp` is on disk and roomy.
+
+`herdr-routines-gc.{timer,service}` is a second host-hygiene pair. Every Sunday at 15:00 it
+runs `scripts/gc-all-repos.sh`, which goes through each clone under
+`~/.local/state/herdr-routines/repos/`:
+
+- `herdr-routines gc --delete --yes` removes merged `auto/*` branches older than 14 days,
+  with their worktrees under `~/.herdr/worktrees/<repo>`. Unmerged branches and worktrees
+  with uncommitted changes are left alone.
+- `git gc` packs the loose objects that agent commits in worktrees leave behind.
+
+Without it nothing removed finished runs: by 2026-11-27 the Pi held over 5 GB of old
+worktrees. Unmerged runs (a pipeline night that failed before its PR) still need
+`gc --delete --force` by hand.
 
 Note the unit updates a hardcoded path, not its own `WorkingDirectory`: `ExecStart`
 passes no `--path`, so the checkout acted on is the flag's default,
@@ -110,6 +124,7 @@ systemctl --user enable --now herdr-routines-watchdog.timer
 systemctl --user enable --now herdr-routines-digest.timer
 systemctl --user enable --now herdr-routines-update.timer
 systemctl --user enable --now herdr-routines-tmp-sweep.timer  # skip if /tmp is on disk and roomy
+systemctl --user enable --now herdr-routines-gc.timer
 uv run herdr-routines host-check   # must print "ok: no host drift"
 ```
 
