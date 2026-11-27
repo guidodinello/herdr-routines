@@ -130,6 +130,7 @@ def _run_agent_in_worktree(
         _close_run_pane,
         _prompt_with_watchdog,
         _wait_for_agent_ready,
+        effective_failure_markers,
     )
 
     reports_dir = default_reports_dir()
@@ -167,9 +168,7 @@ def _run_agent_in_worktree(
             target=agent_name,
             text=prompt_text,
             timeout_ms=timeout_ms,
-            markers=job.failure_markers
-            if job.failure_markers is not None
-            else ("Free usage exceeded",),
+            markers=effective_failure_markers(job.failure_markers),
             prompt_text=prompt_text,
             agent_kind=job.agent_kind,
         )

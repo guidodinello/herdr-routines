@@ -54,8 +54,8 @@ from herdr_routines.repos import (
     ensure_repo,
 )
 from herdr_routines.runner import (
-    DEFAULT_FAILURE_MARKERS,
     default_reports_dir,
+    effective_failure_markers,
 )
 
 log = get_logger(__name__)
@@ -258,7 +258,7 @@ def _build_pipeline_launch_argv(
         argv += ["--model", job.model]
     # Same default the routine-job watchdog uses (runner.DEFAULT_FAILURE_MARKERS) — the
     # launcher polls the orchestrator's visible screen for this so a quota-exhaustion wedge fails fast instead of burning the full deadline.
-    for marker in job.failure_markers or DEFAULT_FAILURE_MARKERS:
+    for marker in effective_failure_markers(job.failure_markers):
         argv += ["--failure-marker", marker]
     return argv
 

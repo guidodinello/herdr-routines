@@ -95,6 +95,16 @@ DEFAULT_FAILURE_MARKERS: tuple[str, ...] = (
     "Free usage limit reached",  # Zen's real 429 on opencode 2 (captured 2026-11-26, issue 096)
 )
 
+
+def effective_failure_markers(configured: tuple[str, ...] | None) -> tuple[str, ...]:
+    """Resolve a job's markers: None means the defaults, () means scan nothing.
+
+    One definition for every dispatch path (issue 096) — `or` here would silently turn the
+    documented empty-list opt-out back on.
+    """
+    return DEFAULT_FAILURE_MARKERS if configured is None else configured
+
+
 # Bound for the one-shot no_report nudge (issue 032): a settled idle/done agent that wrote no
 # (or an empty) $ROUTINE_REPORT is nudged once, on the same still-open agent, to write it. This
 # is a small top-up prompt, not another full run — job.timeout_ms is already spent by the time
@@ -798,13 +808,8 @@ def execute_run(
             reaped_stale_agent=reaped_stale_agent,
         )
 
-    # `is not None`, not truthiness: an explicit empty failure_markers list is valid config
-    # meaning "scan nothing" — `or` would silently fall back to the defaults (PR #25 review).
-    effective_markers = (
-        job.failure_markers
-        if job.failure_markers is not None
-        else DEFAULT_FAILURE_MARKERS
-    )
+    # `effective_failure_markers` keeps the explicit empty-list opt-out intact (PR #25 review).
+    effective_markers = effective_failure_markers(job.failure_markers)
 
     try:
         settled_status = _prompt_with_watchdog(

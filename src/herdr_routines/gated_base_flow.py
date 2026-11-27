@@ -56,6 +56,7 @@ def _process_base_target(
         _wait_for_agent_ready,
         build_branch_name,
         default_reports_dir,
+        effective_failure_markers,
         substitute_prompt,
     )
 
@@ -375,9 +376,7 @@ def _process_base_target(
             target=agent_name,
             text=prompt_text,
             timeout_ms=job.timeout_ms,
-            markers=job.failure_markers
-            if job.failure_markers is not None
-            else ("Free usage exceeded",),
+            markers=effective_failure_markers(job.failure_markers),
             prompt_text=prompt_text,
             agent_kind=job.agent_kind,
         )

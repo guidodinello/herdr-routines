@@ -512,6 +512,7 @@ def _dispatch_fix_worker(
         _prompt_with_watchdog,
         _wait_for_agent_ready,
         default_reports_dir,
+        effective_failure_markers,
         substitute_prompt,
     )
 
@@ -648,7 +649,7 @@ def _dispatch_fix_worker(
             target=agent_name,
             text=prompt_text,
             timeout_ms=job.timeout_ms,
-            markers=job.failure_markers or ("Free usage exceeded",),
+            markers=effective_failure_markers(job.failure_markers),
             prompt_text=prompt_text,
             agent_kind=job.agent_kind,
         )
