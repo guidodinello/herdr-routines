@@ -1,0 +1,4 @@
+# CODEOWNERS - routes PR reviews to the right people
+# Order matters: last matching pattern wins
+
+* @guidodinello
