@@ -37,3 +37,17 @@ screen.
   The wording half is done (marker added, fixture added); the on-screen layout is unverified.
   An earlier draft also asked whether a quota 429 reaches `opencode export` as an error; 095
   answered that.
+- **2026-11-27**: closed the detection gap provable offline, parked the capture in
+  [097](097-capture-real-zen-quota-screen.md). All six dispatch paths now resolve markers via
+  `runner.effective_failure_markers`, so audit/gated jobs and the pipeline launcher see Zen's
+  wording and honour an explicit `failure_markers: []`. A blocked opencode settle showing the
+  marker is now `quota_exhausted` (session id captured before the owned pane closes; root-mode
+  panes stay open), so `routine_flow`'s same-tick fallback fires on the state the one real Zen
+  429 actually reported. `quota_zen_free_limit_retry.txt` completes the two-shape corpus, and
+  the wrap bound (marker on one line ending by column 36/60) is now an explicit assertion.
+  Not proven: that the real TUI shows the message at all and at that prefix width. Comparison
+  protocol for the first real `<run_id>.tail.txt`: compare the message **text** with both Zen
+  fixtures first. A pure layout difference (chrome, indentation, wrapping above the bound)
+  needs no fixture change, because the test's claim is about the message text; replace a
+  fixture only if the text or the marker's wrap bound differs. A blocking modal with no
+  message text would be a new detection problem, not a fixture swap.

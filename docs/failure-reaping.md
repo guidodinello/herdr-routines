@@ -96,7 +96,8 @@ After the prompt-failed catch (and before reaping), read the screen once via the
 - New module constant in `runner.py`:
   `DEFAULT_FAILURE_MARKERS = ("Free usage exceeded", "Free usage limit reached")`
   (the second is Zen's real opencode 2 wording, issue 096)
-- Effective markers: `job.failure_markers` (config, §3.4) falling back to the default tuple.
+- Effective markers: `runner.effective_failure_markers(job.failure_markers)` (config, §3.4) —
+  `None` uses the default tuple, an explicit `()` opts out of scanning on every dispatch path.
 - On match: `reason="quota_exhausted"`, `error=f"failure marker matched: {marker!r}"`.
   Otherwise reason stays `agent_prompt_failed` with the existing error string.
 
@@ -113,6 +114,17 @@ opencode 2's captured corpus (issue 091, fixtures under
 | ----- | ------- | -------------- |
 | retry line while the prompt is in flight (`working`, `⚠ Retrying in 5s · attempt 5 · Free usage exceeded, subscribe to Go`) | `quota_shaped_retry.txt` | the in-flight `wait_loop.prompt_with_watchdog` watchdog scan — same marker on two consecutive polls |
 | terminal line after the wait returns (`idle`, `Error: Free usage exceeded, subscribe to Go`) | `quota_shaped_settled_error.txt` | `wait_loop.settled_screen_marker` called by `runner.execute_run`: one read (a settled screen is static, so a second read adds nothing), only for opencode agents, only on the settled-success + missing/empty-report path |
+| Zen retry line (`⚠ Retrying in 5s · attempt 5 · Free usage limit reached. …`) | `quota_zen_free_limit_retry.txt` | the same in-flight watchdog scan, with Zen's real wording |
+| Zen terminal line (`Error: Free usage limit reached. …`) | `quota_zen_free_limit_settled_error.txt` | the same one-read settle scan, with Zen's real wording |
+| either Zen line when herdr settles `blocked` | both Zen fixtures | the blocked branch of `runner.execute_run` scans the tail it already captured (one read, opencode only, prompt guard): a match returns `quota_exhausted`, captures the session id and closes the runner-owned pane; root-mode panes stay open, and a non-quota screen stays `failed / blocked` with its pane open |
+
+Both Zen fixtures carry the real wording in the stub's layout, not a captured screen. Matching
+is a plain substring test over the whole visible screen, so chrome and indentation are
+irrelevant; a wrap *inside* the marker is the one layout that could break it. The marker ends
+at column 36 in the settled fixture and column 60 in the retry fixture, so a pane at least
+that wide cannot split it; rewrapping either message at 80 and 120 columns leaves the marker
+intact. This bound is derived from fabricated fixtures — issue 097 records the comparison
+protocol for the first real tail.
 
 `foreign_session_failed_toast.txt` has the marker too. The in-flight watchdog requires the
 same marker on two consecutive polls, so a foreign session's toast cannot reap a healthy
@@ -123,8 +135,9 @@ and `http_500_retry.txt` contain no marker and are never reaped as quota exhaust
 key, a 5xx or a missing model must keep their own failure reasons.
 
 Classification's screen reads are confined to runs that are already failing: the
-`agent_prompt_failed` catch above, and the settled-success + missing/empty-report (`no_report`)
-path. On the latter, the settle scan replaces the one-shot nudge when it confirms a marker,
+`agent_prompt_failed` catch above, the blocked settle, and the settled-success +
+missing/empty-report (`no_report`) path. On the latter, the settle scan replaces the one-shot
+nudge when it confirms a marker,
 persists its last read as `{run_id}.tail.txt`, and re-stats the report after its two reads so a
 report written during the scan still wins. Healthy runs — a settled run with a written,
 non-empty report — are never scanned: no polling and no extra reads on the success path, so a

@@ -265,6 +265,9 @@ considered met). One-liner index; full detail in the issue file.
 - **Real Zen quota screen on opencode 2** — the 091 screens came from a stub upstream;
   confirm what the TUI shows for Zen's real 429 wording. →
   [`096`](docs/process/issues/096-zen-quota-screen-wording.md)
+- **Capture a real Zen quota tail** — compare the first real `<run_id>.tail.txt` with the two
+  Zen fixtures; replace them only if the message text or wrap bound differs. →
+  [`097`](docs/process/issues/097-capture-real-zen-quota-screen.md)
 
 ## Later
 
