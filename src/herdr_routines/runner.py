@@ -885,13 +885,34 @@ def execute_run(
     }
 
     if settled_status == AGENT_STATUS_BLOCKED:
-        # Leave the pane open (no _close_run_pane/_capture_session_id) so a human can
-        # resume and see what it's stuck on — but still capture a diagnostic tail, since
-        # the pane may not survive until then (manual close, host reboot). Uses
-        # agent_read_visible (visible source) which succeeds while unsettled/blocked.
+        # Capture a diagnostic tail, since the pane may not survive until a human looks
+        # (manual close, host reboot). Uses agent_read_visible (visible source), which
+        # succeeds while unsettled/blocked — one read, reused for the scan below.
         tail = _capture_visible_tail(
             client, agent_name, reports_dir=report_path.parent, run_id=run_id
         )
+        # A quota wall is not an approval prompt: the agent cannot be unblocked by a human,
+        # so classify it like the settled no-report path and let routine_flow's same-tick
+        # fallback fire. Only the opencode corpus is known; a marker in our own prompt is
+        # inert (the screen echoes it). Without a marker the pane stays open for inspection.
+        blocked_marker = None
+        if job.agent_kind == OPENCODE_KIND:
+            blocked_marker = _matched_failure_marker(tail, effective_markers, prompt)
+        if blocked_marker is not None:
+            blocked_session_id = None
+            if owns_pane:
+                # Root-mode panes are never auto-closed; for our own pane capture the resume
+                # handle before closing, or the next run's agent_start hits agent_name_taken.
+                blocked_session_id = _capture_session_id(client, agent_name)
+                _close_run_pane(client, job_name=job.name, pane_id=pane_id)
+            return RunOutcome(
+                state="failed",
+                reason="quota_exhausted",
+                error=f"failure marker matched: {blocked_marker!r} (blocked screen)",
+                visible_tail=tail,
+                session_id=blocked_session_id,
+                **common,
+            )
         return RunOutcome(state="failed", reason="blocked", visible_tail=tail, **common)
 
     if settled_status == AGENT_STATUS_UNKNOWN:
