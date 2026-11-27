@@ -1,7 +1,7 @@
 ---
 id: "096"
 title: "Confirm what the opencode 2 TUI shows for Zen's real quota 429"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
