@@ -1,0 +1,39 @@
+
+     Switched agent to Build
+
+  ┃
+  ┃  Run /code-review on guidodinello/fitted#1327. Review exactly that PR, never another one.
+  ┃
+  ┃  Follow the code-review skill's own SKILL.md exactly: it must end by posting a PR review
+  ┃  with inline comments (not a top-level issue comment) and swapping the pending-review
+  ┃  label to reviewed.
+  ┃
+  ┃  Then write a short Markdo                                                            s/fitted-pr-review-5-
+  ┃  20261127T130000Z.md: the    Free limit reached                                 esc
+  ┃  landed, and how many bloc
+  ┃                              You've used today's free messages. Resets at 9:45 PM.
+                                 OpenCode Go gives you reliable access to the best
+     You've used today's free    open-source models for $10/month.
+     Upgrade to OpenCode Go →
+
+     Build · DeepSeek V4.1 Fla                         ▀▀▀▀ ▀▀▀▀
+                                                       ▀ ▀▀ ▀  ▀
+                                                       ▀▀▀▀ ▀▀▀▀
+
+                                                 https://opencode.ai/go
+
+
+  ┃                                don't show again             dismiss     subscribe
+  ┃  Run /code-review on guido                                                            ne.
+  ┃
+  ┃  Follow the code-review skill's own SKILL.md exactly: it must end by posting a PR review
+  ┃  with inline comments (not a top-level issue comment) and swapping the pending-review
+  ┃  label to reviewed.
+  ┃
+  ┃  Then write a short Markdown summary to /home/guido/.local/state/herdr-routines/reports/fitted-pr-review-5-
+  ┃  20261127T130000Z.md: the PR, where the review
+  ┃  landed, and how many blocking and non-blocking findings it has.
+  ┃
+  ┃  Build · DeepSeek V4.1 Flash Free Default / OpenCode
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+  …/auto-fitted-pr-review-5-20261127t130000z:…/fitted-pr-review-5-20261127T130000Z  shift+tab agents  ctrl+p commands

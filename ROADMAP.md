@@ -265,6 +265,9 @@ considered met). One-liner index; full detail in the issue file.
 - **Real Zen quota screen on opencode 2** — the 091 screens came from a stub upstream;
   confirm what the TUI shows for Zen's real 429 wording. →
   [`096`](docs/process/issues/096-zen-quota-screen-wording.md)
+- **Capture a real Zen quota tail** — done: the real screen is a `Free limit reached` modal,
+  now a default marker with its verbatim fixture. →
+  [`097`](docs/process/issues/097-capture-real-zen-quota-screen.md)
 
 ## Later
 
