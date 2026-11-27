@@ -484,6 +484,75 @@ def test_fallback_model_retried_after_settled_quota_screen(
     assert fallback_done.run_id == fallback_running.run_id != primary_run.run_id
 
 
+class BlockedQuotaScreenClient(FakeClient):
+    """The real Zen 429 shape: herdr reports the primary model's run `blocked` (not idle)
+    with Zen's quota screen on the visible screen and no report, while any other model (the
+    fallback) succeeds normally. The blocked-settle scan is what must classify the primary as
+    quota_exhausted so routine_flow retries it on the fallback model."""
+
+    def __init__(self, *, quota_model: str, screen: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.quota_model = quota_model
+        self.screen = screen
+
+    def agent_prompt_wait(self, *, target, text, timeout_ms):
+        self._maybe_raise("agent_prompt_wait")
+        if self._last_model == self.quota_model:
+            return "blocked"  # exhausted: no report, pane left for the blocked path
+        Path(text.rsplit(maxsplit=1)[-1]).write_text("# ok\n")
+        return self.settle_status
+
+    def agent_read_visible(self, target, *, lines=200):
+        if self._last_model == self.quota_model:
+            return self.screen
+        return ""
+
+
+def test_fallback_model_retried_after_blocked_quota_screen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one real Zen 429 on record was reported `blocked`, not idle: the blocked-settle
+    scan records the primary as quota_exhausted and the same tick re-runs the job on
+    fallback_model, instead of leaving it failed/blocked with no recovery."""
+    monkeypatch.setenv("HERDR_PLUGIN_STATE_DIR", str(tmp_path / "state"))
+    history_path = tmp_path / "state" / "history.jsonl"
+    primary_model = "opencode/deepseek-v4.1-flash-free"
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        model=primary_model,
+        fallback_model="openrouter/free",
+    )
+    config = RoutinesConfig(jobs=(job,))
+    screen = (
+        Path(__file__).parent
+        / "fixtures"
+        / "opencode2_screens"
+        / "quota_zen_free_limit_settled_error.txt"
+    ).read_text()
+    client = BlockedQuotaScreenClient(quota_model=primary_model, screen=screen)
+
+    t0 = datetime.now(UTC).replace(microsecond=0)
+    run_tick(config, history_path, client=client, now=t0)  # type: ignore[arg-type] # registers
+    t1 = t0 + timedelta(minutes=1)
+    outcome = run_tick(config, history_path, client=client, now=t1)  # type: ignore[arg-type]
+
+    assert outcome.summaries == ("a: done",)
+    assert outcome.any_job_failed is False
+
+    records = read_job(history_path, job.name)
+    run_records = [r for r in records if r.run_id is not None]
+    # primary "running" + primary "failed" (quota_exhausted) + fallback "running" + fallback "done"
+    assert [r.state for r in run_records] == ["running", "failed", "running", "done"]
+    primary_run, primary_failed, fallback_running, fallback_done = run_records
+    assert primary_failed.extra is not None
+    assert primary_failed.extra["reason"] == "quota_exhausted"
+    assert fallback_running.extra is not None
+    assert fallback_running.extra["reason"] == "fallback_retry"
+    assert fallback_running.extra["primary_run_id"] == primary_run.run_id
+    assert fallback_done.run_id == fallback_running.run_id != primary_run.run_id
+
+
 class NudgeWritesReportClient(FakeClient):
     """The job's own prompt settles idle/done without writing a report; the issue-032
     no_report nudge (the second agent_prompt_wait call) is what actually writes it. Verifies

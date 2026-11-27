@@ -3,8 +3,11 @@ involved). See docs/plan-v1.md §7."""
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
+import re
+import textwrap
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -2095,3 +2098,362 @@ def test_real_zen_free_limit_wording_matches_its_own_marker() -> None:
         matched_failure_marker(screen, DEFAULT_FAILURE_MARKERS, "")
         == ZEN_FREE_LIMIT_MARKER
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue 096 (spec 20261127T050000Z): one source of truth for the effective
+# markers, and a blocked settle that is a quota wall, not an approval prompt.
+# ---------------------------------------------------------------------------
+
+SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "herdr_routines"
+MARKER_LITERALS = frozenset({QUOTA_MARKER, ZEN_FREE_LIMIT_MARKER})
+ZEN_SETTLED_SCREEN = "quota_zen_free_limit_settled_error"
+ZEN_RETRY_SCREEN = "quota_zen_free_limit_retry"
+
+
+def test_effective_failure_markers_contract() -> None:
+    """None means "use the defaults"; an explicit empty tuple means "scan nothing" and must
+    stay empty (the documented opt-out); a custom tuple passes through untouched."""
+    from herdr_routines.runner import effective_failure_markers
+
+    assert effective_failure_markers(None) == DEFAULT_FAILURE_MARKERS
+    assert effective_failure_markers(()) == ()
+    custom = ("Out of credits", "Rate limited")
+    assert effective_failure_markers(custom) == custom
+
+
+def test_failure_markers_have_one_source_of_truth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every dispatch path resolves its markers through runner.effective_failure_markers:
+    no hardcoded marker tuple and no `job.failure_markers or ...` fallback survive in src/,
+    and an explicit empty tuple reaches the call sites unchanged instead of silently
+    re-enabling the defaults."""
+    from herdr_routines import pipeline_flow
+    from herdr_routines.dispatch_common import _run_agent_in_worktree
+    from herdr_routines.runner import effective_failure_markers
+
+    call_sites = (
+        "runner.py",
+        "dispatch_common.py",
+        "gated_base_flow.py",
+        "gated_pr_flow.py",
+        "gated_event_flow.py",
+        "pipeline_flow.py",
+    )
+    helper_call = re.compile(r"effective_failure_markers\(\s*job\.failure_markers\s*\)")
+    for name in call_sites:
+        source = (SRC_ROOT / name).read_text()
+        assert helper_call.search(source), f"{name} does not use the shared helper"
+        assert "job.failure_markers or" not in source, (
+            f"{name} still has an `or` fallback"
+        )
+
+    # The only bare marker literals in src/ are the two in runner.DEFAULT_FAILURE_MARKERS.
+    # cli.py's --failure-marker help prose quotes the old wording inside a longer string,
+    # which the AST scan below deliberately does not treat as a marker literal.
+    for path in sorted(SRC_ROOT.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        bare = sorted(
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in MARKER_LITERALS
+        )
+        if path.name == "runner.py":
+            assert bare == sorted(MARKER_LITERALS)
+        else:
+            assert bare == [], f"hardcoded marker literal(s) in {path.name}: {bare}"
+    assert "'Free usage exceeded'" in (SRC_ROOT / "cli.py").read_text()
+
+    # An empty tuple reaches the launcher unchanged: no marker args at all.
+    assert effective_failure_markers(()) == ()
+    pipeline_job = replace(
+        make_job(tmp_path, failure_markers=()),
+        kind="pipeline",
+        prompt_file="p.md",
+        deadline_ms=3_600_000,
+    )
+    argv = pipeline_flow._build_pipeline_launch_argv(
+        pipeline_job,
+        run_id="r",
+        report_path=tmp_path / "r.md",
+        unit_name="u",
+        deadline_epoch=1,
+    )
+    assert "--failure-marker" not in argv
+
+    # The audit/gated worker path resolves None to the shared defaults, not a private copy.
+    recorded: list[tuple[str, ...]] = []
+
+    def fake_prompt_with_watchdog(*args: Any, **kwargs: Any) -> str:
+        recorded.append(kwargs["markers"])
+        return "idle"
+
+    monkeypatch.setattr(
+        "herdr_routines.runner._prompt_with_watchdog", fake_prompt_with_watchdog
+    )
+    _run_agent_in_worktree(
+        make_job(tmp_path, failure_markers=None),
+        ScriptedClient(),  # type: ignore[arg-type]
+        agent_name="a",
+        wt_path=tmp_path,
+        prompt_text="do the thing",
+        timeout_ms=1_000,
+        tail_id="a-1",
+    )
+    assert recorded == [DEFAULT_FAILURE_MARKERS]
+
+
+def test_blocked_settle_with_zen_screen_is_quota_exhausted(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """A blocked opencode settle showing Zen's real quota screen is a quota wall, not an
+    approval prompt: the already-read tail is persisted, the session id is captured before
+    the owned pane is closed, and the run is classified quota_exhausted."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    run_id = "a-blocked-zen"
+    screen = _opencode2_screen(ZEN_SETTLED_SCREEN)
+    client = ScriptedClient(
+        agent_status="blocked", visible_screen=screen, session_id="ses_blocked"
+    )
+
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert outcome.final_agent_status == "blocked"
+    assert outcome.visible_tail == screen
+    assert f"{ZEN_FREE_LIMIT_MARKER!r}" in (outcome.error or "")
+    assert "(blocked screen)" in (outcome.error or "")
+
+    # One read: the blocked branch scans the tail it already captured.
+    assert client.calls.count("agent_read_visible") == 1
+    tail_path = _isolated_reports_dir / f"{run_id}.tail.txt"
+    assert tail_path.read_text() == screen
+
+    # Session id first, then the owned pane is closed.
+    assert client.calls.count("agent_session_id") == 1
+    assert client.calls.index("agent_session_id") < client.calls.index("pane_close")
+    assert client.closed_panes == ["w1:p1"]
+
+
+@pytest.mark.parametrize("fixture", [ZEN_SETTLED_SCREEN, ZEN_RETRY_SCREEN])
+def test_blocked_settle_matches_both_zen_shapes(
+    tmp_path: Path, _isolated_reports_dir: Path, fixture: str
+) -> None:
+    """The one real Zen 429 on record was reported `blocked`, and the live shape is the
+    retry line: both Zen fixtures must reach quota_exhausted through the blocked settle."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    screen = _opencode2_screen(fixture)
+    client = ScriptedClient(agent_status="blocked", visible_screen=screen)
+
+    outcome = execute_run(job, client, run_id=f"a-blocked-{fixture}")  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert outcome.final_agent_status == "blocked"
+    assert ZEN_FREE_LIMIT_MARKER in (outcome.error or "")
+
+
+def test_blocked_settle_without_a_marker_keeps_the_pane(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """A blocked screen with no marker keeps today's behaviour exactly: failed/blocked, the
+    pane stays open for a human, the tail is still written, and no session id is captured."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    run_id = "a-blocked-plain"
+    screen = "stuck on a y/n prompt"
+    client = ScriptedClient(agent_status="blocked", visible_screen=screen)
+
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "blocked"
+    assert "pane_close" not in client.calls
+    assert "agent_session_id" not in client.calls
+    assert (_isolated_reports_dir / f"{run_id}.tail.txt").read_text() == screen
+
+
+def test_blocked_settle_marker_in_prompt_is_inert(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """The marker-in-prompt guard applies to the blocked scan too: a job whose own prompt
+    contains the phrase cannot self-match, so the run stays blocked with its pane open."""
+    job = make_job(
+        tmp_path,
+        agent_kind="opencode",
+        prompt=(
+            f"Never print the phrase {ZEN_FREE_LIMIT_MARKER}. "
+            "Write the report to $ROUTINE_REPORT."
+        ),
+    )
+    screen = _opencode2_screen(ZEN_SETTLED_SCREEN)
+    client = ScriptedClient(agent_status="blocked", visible_screen=screen)
+
+    outcome = execute_run(job, client, run_id="a-blocked-guard")  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "blocked"
+    assert "pane_close" not in client.calls
+    assert "agent_session_id" not in client.calls
+
+
+def test_blocked_settle_scan_is_opencode_only(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """The corpus is opencode's TUI: a claude agent blocked on the same text keeps today's
+    failed/blocked outcome and its pane."""
+    job = make_job(tmp_path, agent_kind="claude")
+    screen = _opencode2_screen(ZEN_SETTLED_SCREEN)
+    client = ScriptedClient(agent_status="blocked", visible_screen=screen)
+
+    outcome = execute_run(job, client, run_id="a-blocked-claude")  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "blocked"
+    assert "pane_close" not in client.calls
+    assert "agent_session_id" not in client.calls
+
+
+def test_blocked_quota_screen_respects_root_mode_pane_policy(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """A root-mode blocked Zen run is still quota_exhausted, but root-mode panes are never
+    auto-closed: the pane stays open and no session id is captured, matching the settled
+    success path's owns_pane guard."""
+    job = make_job(tmp_path, agent_kind="opencode", workspace="root")
+    run_id = "a-blocked-root-zen"
+    screen = _opencode2_screen(ZEN_SETTLED_SCREEN)
+    client = ScriptedClient(agent_status="blocked", visible_screen=screen)
+
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert outcome.final_agent_status == "blocked"
+    assert "pane_close" not in client.calls
+    assert "agent_session_id" not in client.calls
+    assert (_isolated_reports_dir / f"{run_id}.tail.txt").read_text() == screen
+
+
+@pytest.mark.parametrize("fixture", [ZEN_SETTLED_SCREEN, ZEN_RETRY_SCREEN])
+def test_zen_free_limit_matches_in_both_shapes(fixture: str) -> None:
+    """Zen's real wording matches its own marker and never the stub's old one, whether the
+    TUI renders it in the retry line or the terminal `Error:` line."""
+    screen = _opencode2_screen(fixture)
+
+    assert (
+        matched_failure_marker(screen, (ZEN_FREE_LIMIT_MARKER,), "")
+        == ZEN_FREE_LIMIT_MARKER
+    )
+    assert matched_failure_marker(screen, (QUOTA_MARKER,), "") is None
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["http_401_settled_error", "http_500_retry", "model_unavailable", "normal_reply"],
+)
+def test_non_quota_screens_match_nothing_in_either_shape(fixture: str) -> None:
+    """A bad key, a 5xx, a missing model or a normal reply matches neither Zen's marker nor
+    the stub's: reaping one as quota_exhausted would send it to the fallback for the wrong
+    reason."""
+    screen = _opencode2_screen(fixture)
+
+    for markers in (
+        (QUOTA_MARKER,),
+        (ZEN_FREE_LIMIT_MARKER,),
+        DEFAULT_FAILURE_MARKERS,
+    ):
+        assert matched_failure_marker(screen, markers, "") is None
+
+
+@pytest.mark.parametrize(
+    ("fixture", "max_end_column"),
+    [(ZEN_SETTLED_SCREEN, 36), (ZEN_RETRY_SCREEN, 60)],
+)
+def test_zen_marker_survives_a_wrap_at_realistic_widths(
+    fixture: str, max_end_column: int
+) -> None:
+    """The real claim behind the fixtures: the marker lies on one line and ends at or before
+    column 36 (settled) / 60 (retry), so any pane at least that wide cannot split it. The
+    numeric bound fails a fixture edit that widens the prefix, not just a cosmetic rewrap;
+    re-wrapping the message at 80 and 120 columns is the smoke check on top."""
+    screen = _opencode2_screen(fixture)
+    marker_lines = [
+        line for line in screen.splitlines() if ZEN_FREE_LIMIT_MARKER in line
+    ]
+
+    assert len(marker_lines) == 1, f"{fixture}: marker is not on exactly one line"
+    marker_line = marker_lines[0]
+    end_column = marker_line.index(ZEN_FREE_LIMIT_MARKER) + len(ZEN_FREE_LIMIT_MARKER)
+    assert end_column <= max_end_column, (
+        f"{fixture}: marker ends at column {end_column}, past {max_end_column}"
+    )
+
+    for width in (80, 120):
+        wrapped = textwrap.fill(marker_line.strip(), width=width)
+        assert ZEN_FREE_LIMIT_MARKER in wrapped
+        assert (
+            sum(ZEN_FREE_LIMIT_MARKER in line for line in wrapped.splitlines()) == 1
+        ), f"{fixture}: marker split by a wrap at {width} columns"
+
+
+def test_settled_zen_screen_is_quota_exhausted_without_the_nudge(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """A settled-Zen run (idle, no report) reaches quota_exhausted through execute_run, not
+    just through the matcher: the settle scan replaces the nudge, persists the one read as
+    the tail, and the run still closes its pane."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    run_id = "a-settled-zen"
+    screen = _opencode2_screen(ZEN_SETTLED_SCREEN)
+    client = SettledScreenClient(agent_status="idle", screens=(screen, screen))
+
+    outcome = execute_run(job, client, run_id=run_id)  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert outcome.final_agent_status == "idle"
+    assert ZEN_FREE_LIMIT_MARKER in (outcome.error or "")
+    assert "settled screen" in (outcome.error or "")
+    # The nudge is the only path that records agent_prompt_wait on this fake; it never ran.
+    assert "agent_prompt_wait" not in client.calls
+    # Exactly the scan's one read: the tail comes from the matched screen, no second read.
+    assert client.read_count == 1
+    assert (_isolated_reports_dir / f"{run_id}.tail.txt").read_text() == screen
+    assert client.closed_panes == ["w1:p1"]
+
+
+def test_failure_reaping_documents_the_zen_shapes_and_blocked_path() -> None:
+    """The docs record what is proven and what remains: §3.2 names both Zen shapes, the
+    blocked-settle path and the wrap bound, 096's log points at the capture follow-up, and
+    097 records the comparison protocol for the first real tail."""
+    root = Path(__file__).resolve().parent.parent
+    failure_reaping = (root / "docs" / "failure-reaping.md").read_text()
+    section = failure_reaping.split("### 3.2", 1)[1].split("### 3.3", 1)[0]
+    lower = section.lower()
+
+    assert ZEN_SETTLED_SCREEN in section
+    assert ZEN_RETRY_SCREEN in section
+    assert "blocked" in lower  # the blocked-settle detection path
+    assert "quota_exhausted" in lower
+    assert "60" in section and "36" in section  # the wrap bound
+    assert "column" in lower or "wrap" in lower
+
+    issue_096 = (
+        root / "docs" / "process" / "issues" / "096-zen-quota-screen-wording.md"
+    ).read_text()
+    assert "097" in issue_096
+
+    issue_097 = (
+        root / "docs" / "process" / "issues" / "097-capture-real-zen-quota-screen.md"
+    )
+    assert issue_097.exists()
+    text_097 = issue_097.read_text().lower()
+    assert "zen" in text_097
+    assert "tail.txt" in text_097
+    assert "capture" in text_097
+    assert "compare" in text_097
+    assert "fixture" in text_097
