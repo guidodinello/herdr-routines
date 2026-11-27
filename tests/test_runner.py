@@ -1692,6 +1692,7 @@ def test_root_mode_never_closes_pane(
 
 QUOTA_MARKER = "Free usage exceeded"
 ZEN_FREE_LIMIT_MARKER = "Free usage limit reached"
+ZEN_MODAL_MARKER = "Free limit reached"
 
 
 def _opencode2_screen(name: str) -> str:
@@ -1767,6 +1768,7 @@ class ReadsClient:
         ("quota_shaped_retry", True),
         ("quota_shaped_settled_error", True),
         ("quota_zen_free_limit_settled_error", True),
+        ("quota_zen_free_limit_modal_blocked", True),
         ("foreign_session_failed_toast", True),
         ("normal_reply", False),
         ("model_unavailable", False),
@@ -2085,8 +2087,13 @@ def test_failure_reaping_and_issue_091_document_both_opencode2_screen_shapes() -
 def test_default_failure_markers_unchanged() -> None:
     """Only phrasings seen verbatim from a real or captured quota message are markers:
     guessing new ones would reap 401/5xx/unavailable screens as quota. Zen's real wording
-    (captured 2026-11-26) joined the stub's old one."""
-    assert DEFAULT_FAILURE_MARKERS == (QUOTA_MARKER, ZEN_FREE_LIMIT_MARKER)
+    (captured 2026-11-26) joined the stub's old one, and the TUI's free-limit modal title
+    (real tail, 2026-11-27) joined both."""
+    assert DEFAULT_FAILURE_MARKERS == (
+        QUOTA_MARKER,
+        ZEN_FREE_LIMIT_MARKER,
+        ZEN_MODAL_MARKER,
+    )
 
 
 def test_real_zen_free_limit_wording_matches_its_own_marker() -> None:
@@ -2106,9 +2113,10 @@ def test_real_zen_free_limit_wording_matches_its_own_marker() -> None:
 # ---------------------------------------------------------------------------
 
 SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "herdr_routines"
-MARKER_LITERALS = frozenset({QUOTA_MARKER, ZEN_FREE_LIMIT_MARKER})
+MARKER_LITERALS = frozenset({QUOTA_MARKER, ZEN_FREE_LIMIT_MARKER, ZEN_MODAL_MARKER})
 ZEN_SETTLED_SCREEN = "quota_zen_free_limit_settled_error"
 ZEN_RETRY_SCREEN = "quota_zen_free_limit_retry"
+ZEN_MODAL_SCREEN = "quota_zen_free_limit_modal_blocked"
 
 
 def test_effective_failure_markers_contract() -> None:
@@ -2457,3 +2465,51 @@ def test_failure_reaping_documents_the_zen_shapes_and_blocked_path() -> None:
     assert "capture" in text_097
     assert "compare" in text_097
     assert "fixture" in text_097
+
+
+# ---------------------------------------------------------------------------
+# Issue 097: the first real Zen quota tail (Pi, fitted-pr-review-5-20261127T130000Z,
+# herdr status `blocked`). The TUI covers the prompt with a "Free limit reached" modal and
+# never prints the API's "Free usage limit reached" text, so neither older marker matched.
+# ---------------------------------------------------------------------------
+
+
+def test_real_zen_modal_matches_only_the_modal_marker() -> None:
+    """The real screen carries the modal title, not either API wording: without the modal
+    marker this exact run ended failed/blocked and never reached fallback_model."""
+    screen = _opencode2_screen(ZEN_MODAL_SCREEN)
+
+    assert QUOTA_MARKER not in screen
+    assert ZEN_FREE_LIMIT_MARKER not in screen
+    assert (
+        matched_failure_marker(screen, DEFAULT_FAILURE_MARKERS, "") == ZEN_MODAL_MARKER
+    )
+
+
+def test_blocked_settle_with_the_real_zen_modal_is_quota_exhausted(
+    tmp_path: Path, _isolated_reports_dir: Path
+) -> None:
+    """Replays the real run: an opencode agent settles `blocked` on the modal, and the run is
+    quota_exhausted (so routine_flow retries on fallback_model) instead of failed/blocked."""
+    job = make_job(tmp_path, agent_kind="opencode")
+    screen = _opencode2_screen(ZEN_MODAL_SCREEN)
+    client = ScriptedClient(agent_status="blocked", visible_screen=screen)
+
+    outcome = execute_run(job, client, run_id="a-blocked-real-modal")  # type: ignore[arg-type]
+
+    assert outcome.state == "failed"
+    assert outcome.reason == "quota_exhausted"
+    assert outcome.final_agent_status == "blocked"
+    assert f"{ZEN_MODAL_MARKER!r}" in (outcome.error or "")
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["http_401_settled_error", "http_500_retry", "model_unavailable", "normal_reply"],
+)
+def test_modal_marker_matches_no_non_quota_screen(fixture: str) -> None:
+    """The shorter modal title must not reap a bad key, a 5xx, a missing model or a normal
+    reply as quota."""
+    screen = _opencode2_screen(fixture)
+
+    assert matched_failure_marker(screen, (ZEN_MODAL_MARKER,), "") is None

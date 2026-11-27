@@ -93,6 +93,7 @@ READY_POLL_INTERVAL_S = 1.0
 DEFAULT_FAILURE_MARKERS: tuple[str, ...] = (
     "Free usage exceeded",  # opencode 1 and the stub upstream behind issue 091's fixtures
     "Free usage limit reached",  # Zen's real 429 on opencode 2 (captured 2026-11-26, issue 096)
+    "Free limit reached",  # opencode 2 TUI's free-limit modal (real tail on the Pi 2026-11-27, issue 097)
 )
 
 

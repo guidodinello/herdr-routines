@@ -1,7 +1,7 @@
 ---
 id: "097"
 title: "Capture one real Zen quota tail and compare it with the two Zen screen fixtures"
-status: open
+status: done
 priority: medium
 area: pipeline
 ---
@@ -38,3 +38,14 @@ message or give it a longer prefix.
 - **2026-11-27**: filed from issue 096's residual. Needs a real quota event; deliberately not a
   code task. Until a capture exists, the wrap bound is an explicit assumption rather than
   evidence.
+- **2026-11-27**: first real capture. Run `fitted-pr-review-5-20261127T130000Z` on the Pi
+  (`opencode/deepseek-v4.1-flash-free`), herdr status `blocked` after 43 s, pane 117 columns.
+  The tail is kept verbatim as `tests/fixtures/opencode2_screens/quota_zen_free_limit_modal_blocked.txt`.
+  Compare: the message text differs from both Zen fixtures. The TUI never prints the API's
+  `Free usage limit reached`; it draws a modal over the prompt titled `Free limit reached`,
+  with `You've used today's free messages. Resets at 9:45 PM.` under it. The title is on one
+  line and ends at column 48. So this is the "modal hides the message" case. Instead of
+  filing a new issue, it is fixed here: `Free limit reached` joins `DEFAULT_FAILURE_MARKERS`,
+  and the blocked-settle scan from 096 classifies the run `quota_exhausted`. Without it the
+  run ended `failed / blocked` and never reached `fallback_model`. The two stub-layout Zen
+  fixtures stay, because the retry and `Error:` lines may still appear in other states.
