@@ -80,8 +80,9 @@ Hardcoded stages (mirrors spec §3, stages mirror
 > **Current models live in `src/herdr_routines/pipeline_stages.py` (`STAGES`), not this
 > table** — the column above is the original design. As of 2026-11-22
 > (`muse-spark-1.2-contributor-free` and `x-preview-f-free` were withdrawn on 2026-10-01,
-> `muse-spark-1.3-contributor-free` by 2026-10-18): stages 1–3
-> `opencode/deepseek-v4.1-flash-free` (the stage-3 test author falls back to
+> `muse-spark-1.3-contributor-free` by 2026-10-18; stages 1–2 moved to big-pickle on
+> 2026-11-27 so the pipeline stops using up deepseek's free allowance): stages 1–2
+> `opencode/big-pickle`, stage 3 `opencode/deepseek-v4.1-flash-free` (the stage-3 test author falls back to
 > `nvidia/poolside/laguna-xs-2.1`, never to stage 4's families), stages 4/7 `opencode/big-pickle`,
 > stage 6 `opencode/deepseek-v4.1-flash-free` (a different declared family from the
 > implementer, though big-pickle has routed to deepseek; `nemotron-3-ultra-free` was

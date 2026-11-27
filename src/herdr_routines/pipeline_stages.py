@@ -95,7 +95,13 @@ ADDRESS_COMMENTS_STAGE = 7
 STAGES: tuple[StageSpec, ...] = (
     StageSpec(
         stage=1,
-        model="opencode/deepseek-v4.1-flash-free",
+        # Stages 1-2 run on big-pickle to leave Zen's daily free allowance for deepseek
+        # (stages 3 and 6). With 1-3 and 6 all on deepseek the pipeline used it up by
+        # itself: stage 2 hit the 429 at 02:09 on 2026-11-25, and stage 6 on 11-26 and
+        # 11-27. big-pickle answered on 2026-11-27 while deepseek and mimo were both
+        # limited. No independence rule covers the spec stages. Tradeoff: big-pickle
+        # (stage 4) now implements the spec it wrote.
+        model="opencode/big-pickle",
         prompt_file="stage-1.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,
@@ -103,7 +109,7 @@ STAGES: tuple[StageSpec, ...] = (
     ),
     StageSpec(
         stage=2,
-        model="opencode/deepseek-v4.1-flash-free",
+        model="opencode/big-pickle",
         prompt_file="stage-2.md",
         timeout_ms=60 * 60 * 1000,
         start_timeout_ms=120_000,

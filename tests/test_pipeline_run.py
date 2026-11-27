@@ -1025,8 +1025,9 @@ def test_pipeline_run_resumes_a_stage_on_its_fallback_model_after_a_quota_marker
     assert outcome.outcome == "ok", outcome
     stage2 = [c for c in client.started if c["name"] == f"pl-2-{RUN_ID}".lower()]
     # A fresh session, never `-s` on the failed one: that resume is `blocked` on arrival.
+    stage2_spec = next(s for s in STAGES if s.stage == 2)
     assert [(c["model"], c["session_id"]) for c in stage2] == [
-        ("opencode/deepseek-v4.1-flash-free", None),
+        (stage2_spec.model, None),
         (AUTHOR_FALLBACK_MODEL, None),
     ]
     # The wedged pane is closed before the fallback starts in a new one.
@@ -1544,8 +1545,8 @@ def test_stages_table_matches_the_prompt_files_on_disk() -> None:
 def test_stages_declare_the_documented_models_and_timeouts() -> None:
     by_stage = {s.stage: s for s in STAGES}
 
-    assert by_stage[1].model == "opencode/deepseek-v4.1-flash-free"
-    assert by_stage[2].model == "opencode/deepseek-v4.1-flash-free"
+    assert by_stage[1].model == "opencode/big-pickle"
+    assert by_stage[2].model == "opencode/big-pickle"
     assert by_stage[3].model == "opencode/deepseek-v4.1-flash-free"
     assert by_stage[3].fallback_model == REVIEWER_FALLBACK_MODEL
     assert by_stage[4].model == "opencode/big-pickle"
