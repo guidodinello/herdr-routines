@@ -12,10 +12,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
+from herdr_routines import pipeline_run, wait_loop
+from herdr_routines import runner as runner_module
 from herdr_routines.config import Job
 from herdr_routines.herdr import (
     HerdrClient,
@@ -817,6 +819,50 @@ def test_only_provably_early_rejections_are_retryable() -> None:
     assert not _is_retryable_prompt_error(
         err(exit_code=1, error_body={"error": {"code": "timeout"}})
     )
+
+
+def test_prompt_retry_whitelist_unchanged_for_stalled_and_terminal_shapes() -> None:
+    """Criterion 6 (issue 092): the whitelist keeps its exact contract while the readiness
+    gate removes the cause of the early rejection. Exit 1 with a dict body and a string
+    `error.code` other than "timeout" — including `agent_prompt_stalled` — is retryable;
+    exit 124, exit-0 shape errors, `timeout`, a missing code and a non-dict body are not.
+    Both call sites still share the one wait loop and the one classifier."""
+
+    def err(**kwargs: Any) -> HerdrCliError:
+        return HerdrCliError("boom", **kwargs)
+
+    for code in ("agent_prompt_stalled", "empty_response"):
+        assert _is_retryable_prompt_error(
+            err(
+                exit_code=1,
+                error_body={"error": {"code": code, "message": "no state change"}},
+            )
+        ), code
+
+    # Terminal: delivery happened, is likely, or its state is unknown.
+    assert not _is_retryable_prompt_error(err(exit_code=124))
+    assert not _is_retryable_prompt_error(
+        err(exit_code=0, error_body={"error": {"code": "shape"}})
+    )
+    assert not _is_retryable_prompt_error(
+        err(exit_code=1, error_body={"error": {"code": "timeout"}})
+    )
+    assert not _is_retryable_prompt_error(err(exit_code=1))
+    assert not _is_retryable_prompt_error(err(exit_code=1, error_body={"error": {}}))
+    assert not _is_retryable_prompt_error(
+        err(exit_code=1, error_body={"error": {"code": 7}})
+    )
+    assert not _is_retryable_prompt_error(
+        err(exit_code=1, error_body={"error": "timeout"})
+    )
+    assert not _is_retryable_prompt_error(
+        err(exit_code=1, error_body=cast(dict[str, object], ["error"]))
+    )
+
+    # One classifier and one wait loop, imported by both the routine and pipeline paths.
+    assert _is_retryable_prompt_error is wait_loop.is_retryable_prompt_error
+    assert runner_module.prompt_with_watchdog is wait_loop.prompt_with_watchdog
+    assert pipeline_run.prompt_with_watchdog is wait_loop.prompt_with_watchdog
 
 
 def test_real_herdr_client_satisfies_the_shape_used_by_execute_run() -> None:
