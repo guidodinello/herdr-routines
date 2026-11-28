@@ -28,15 +28,16 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from herdr_routines import pipeline_run, tick
+from herdr_routines import pipeline_run, runner, tick
 from herdr_routines.auto_fix import GhClient, PostedBody, ReviewSearch
 from herdr_routines.gates import GATE_STAGE_CHOICES, PR_GATE_STAGES, gate3_test_names
-from herdr_routines.herdr import HerdrCliError, PromptWatchdogKilled
+from herdr_routines.herdr import HerdrClient, HerdrCliError, PromptWatchdogKilled
 from herdr_routines.pipeline_run import (
     CI_FIX_PROMPT,
     FALLBACK_PREAMBLE,
@@ -207,6 +208,12 @@ class FakeHerdr:
     its last entry, so the two-consecutive-poll stability gate is exercised for real.
     `settles` scripts the settled status per stage, one entry per prompt to that stage
     (a fallback resume is a second prompt), falling back to `settle_status`.
+
+    `ready` is what `agent_interactive_ready` reports by default; `ready_responses`
+    scripts one agent's polls in order, each entry a bool or an exception to raise, then
+    falls back to `ready`. `events` records the interleaving of `start`, `ready` and
+    `prompt` per agent, so a test can prove the readiness gate sits between the start
+    and the first prompt rather than merely having been called.
     """
 
     def __init__(
@@ -217,12 +224,20 @@ class FakeHerdr:
         settles: dict[int, list[str]] | None = None,
         screens: dict[int, list[str]] | None = None,
         polls_per_stage: int = 3,
+        ready: bool = True,
+        ready_responses: dict[str, list[object]] | None = None,
     ) -> None:
         self.session_ids = session_ids
         self.settle_status = settle_status
         self.settles = {stage: list(seq) for stage, seq in (settles or {}).items()}
         self.screens = screens or {}
         self.polls_per_stage = polls_per_stage
+        self.ready = ready
+        self.ready_responses = {
+            target: list(seq) for target, seq in (ready_responses or {}).items()
+        }
+        self.ready_calls: list[str] = []
+        self.events: list[tuple[str, str, object]] = []
         self.started: list[dict[str, Any]] = []
         self.prompts: list[tuple[str, str]] = []
         self.closed_panes: list[str] = []
@@ -259,6 +274,7 @@ class FakeHerdr:
         model: str | None = None,
         session_id: str | None = None,
     ) -> None:
+        self.events.append(("start", name, None))
         self.started.append(
             {
                 "name": name,
@@ -282,6 +298,26 @@ class FakeHerdr:
 
     def agent_session_id(self, target: str) -> str | None:
         return self._session_of(target)
+
+    def agent_interactive_ready(self, target: str) -> bool:
+        """The shared readiness probe, with a scripted seam (issue 092).
+
+        Defaults to ready so every pre-existing test keeps its old call sequence. An
+        exception in `ready_responses` is raised at the probe, exactly as a transient
+        `HerdrCliError`/`OSError` from the real client would be.
+        """
+        self.ready_calls.append(target)
+        scripted = self.ready_responses.get(target)
+        if scripted:
+            item = scripted.pop(0)
+            if isinstance(item, BaseException):
+                self.events.append(("ready_error", target, type(item).__name__))
+                raise item
+            ready = bool(item)
+        else:
+            ready = self.ready
+        self.events.append(("ready", target, ready))
+        return ready
 
     def _session_of(self, target: str) -> str | None:
         # opencode creates its session on the first prompt: a just-started agent reports
@@ -307,6 +343,7 @@ class FakeHerdr:
         poll_interval_s: float = 30.0,
         on_poll: Callable[[str], str | None] | None = None,
     ) -> str:
+        self.events.append(("prompt", target, None))
         self.prompts.append((target, text))
         resumed = self._resumed.get(target)
         self._prompted.add(target)
@@ -2483,3 +2520,433 @@ def test_stage_7_prompt_never_asks_the_agent_to_fetch_feedback() -> None:
     assert "$REVIEW_FEEDBACK" in text
     assert "$PR_NUMBER" in text
     assert "address-pr-comments" not in text
+
+
+# ---------------------------------------------------------------------------
+# Issue 092 — every pipeline stage gates its first prompt on interactive_ready
+# ---------------------------------------------------------------------------
+
+ISSUE_092 = "docs/process/issues/092-opencode2-prompt-stalled-after-start.md"
+ISSUE_098 = "docs/process/issues/098-opencode2-prompt-stall-week-watch.md"
+
+
+def _readiness_before_prompt(
+    client: FakeHerdr, target: str, prompt_index: int
+) -> list[object]:
+    """The successful readiness polls for `target` between its latest start and the
+    prompt at `prompt_index` — the evidence that the gate ran, and how it answered."""
+    events = client.events
+    start = max(
+        index
+        for index, event in enumerate(events[:prompt_index])
+        if event[0] == "start" and event[1] == target
+    )
+    return [
+        event[2]
+        for event in events[start + 1 : prompt_index]
+        if event[0] == "ready" and event[1] == target
+    ]
+
+
+def _first_prompt_index(client: FakeHerdr, target: str) -> int:
+    return next(
+        index
+        for index, event in enumerate(client.events)
+        if event[0] == "prompt" and event[1] == target
+    )
+
+
+def test_pipeline_stage_waits_for_interactive_ready_before_first_prompt(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 1: `_start_and_prompt` polls `agent_interactive_ready(agent_name)`
+    after a successful `agent_start` and before `prompt_with_watchdog`, and sends no
+    prompt while readiness is false. Stage 1 is scripted false, false, true: a prompt
+    that races ahead would show up before the third poll."""
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    stage1 = f"pl-1-{RUN_ID}".lower()
+    client = _client(ready_responses={stage1: [False, False, True]})
+
+    outcome, client, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    stage1_reads = _readiness_before_prompt(
+        client, stage1, _first_prompt_index(client, stage1)
+    )
+    assert stage1_reads == [False, False, True]
+    # The other agent stages were already ready; each is still polled before its prompt.
+    for stage in (2, 3, 4, 6, 7):
+        target = f"pl-{stage}-{RUN_ID}".lower()
+        reads = _readiness_before_prompt(
+            client, target, _first_prompt_index(client, target)
+        )
+        assert reads and reads[-1] is True, f"stage {stage} prompted before readiness"
+
+
+def test_pipeline_stage_readiness_timeout_aborts_without_prompt(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 2: readiness that never becomes true within `spec.start_timeout_ms`
+    sends no prompt, closes the pane, and aborts `stage_agent_not_interactive` with an
+    error naming the agent and the bound. The stage's own spec is shortened so the test
+    does not wait the real two minutes."""
+    start_timeout_ms = 20
+    monkeypatch.setattr(
+        "herdr_routines.pipeline_run.STAGES",
+        tuple(
+            replace(spec, start_timeout_ms=start_timeout_ms)
+            if spec.stage == 1
+            else spec
+            for spec in STAGES
+        ),
+    )
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    client = _client(ready=False)
+
+    outcome, client, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "stage_agent_not_interactive"
+    agent = f"pl-1-{RUN_ID}".lower()
+    assert outcome.error is not None
+    assert agent in outcome.error
+    assert f"{start_timeout_ms}ms" in outcome.error
+    # Nothing was typed into an agent that never reported ready, and its pane was closed.
+    assert [call["name"] for call in client.started] == [agent]
+    assert client.prompts == []
+    assert not [event for event in client.events if event[0] == "prompt"]
+    assert client.started[0]["pane_id"] in client.closed_panes
+    assert "stage_agent_not_interactive" in prepared.report.read_text()
+
+
+def test_pipeline_stage_readiness_poll_errors_are_inert(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 3: one `HerdrCliError` and one `OSError` from individual readiness polls
+    are swallowed and polled again, on the pipeline path and in the shared helper, so a
+    transiently unreachable server never aborts a stage."""
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    stage1 = f"pl-1-{RUN_ID}".lower()
+    client = _client(
+        ready_responses={
+            stage1: [
+                HerdrCliError("herdr server unreachable", exit_code=1),
+                OSError("herdr binary vanished"),
+            ]
+        }
+    )
+
+    outcome, client, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    # Both errors were retried and the stage still prompted.
+    assert client.ready_calls.count(stage1) >= 3
+    assert [
+        event[2]
+        for event in client.events
+        if event[0] == "ready_error" and event[1] == stage1
+    ] == ["HerdrCliError", "OSError"]
+    assert _first_prompt_index(client, stage1) > 0
+    assert len({target for target, _text in client.prompts}) == 6
+
+    class _FlakyProbe:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def agent_interactive_ready(self, target: str) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                raise HerdrCliError("boom", exit_code=1)
+            if self.calls == 2:
+                raise OSError("boom")
+            return True
+
+    probe = _FlakyProbe()
+    assert runner._wait_for_agent_ready(
+        cast(HerdrClient, probe), "rt-a", timeout_s=1
+    ) == (True, None)
+    assert probe.calls == 3
+
+
+def test_pipeline_stage_readiness_uses_shared_client_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Criterion 4: the pipeline reuses `runner._wait_for_agent_ready` and
+    `HerdrClient.agent_interactive_ready` — no second poll loop and no new CLI shape.
+    A response without `interactive_ready` fails open, and a malformed shape raises the
+    client's `HerdrCliError`, which the shared poll retries like any other error."""
+    # The import next to DEFAULT_FAILURE_MARKERS is the reuse, not a copy of the loop.
+    assert pipeline_run._wait_for_agent_ready is runner._wait_for_agent_ready
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+
+    class _CannedRunner:
+        def __init__(self, body: dict[str, object]) -> None:
+            self.body = body
+            self.calls: list[list[str]] = []
+
+        def __call__(
+            self, argv: list[str], *, timeout_s: float | None
+        ) -> tuple[int, str, str]:
+            self.calls.append(argv)
+            return 0, json.dumps(self.body), ""
+
+    # Older herdr builds may omit the flag; absence is ready, not a wedge.
+    fail_open = _CannedRunner({"result": {"agent": {"agent_status": "idle"}}})
+    client = HerdrClient(runner=fail_open)
+    assert runner._wait_for_agent_ready(client, "pl-1", timeout_s=1) == (True, None)
+    assert fail_open.calls[0][1:4] == ["agent", "get", "pl-1"]
+
+    # A malformed shape becomes a HerdrCliError from the shared probe and is retried,
+    # so the eventual timeout reports the last poll error rather than an AttributeError.
+    malformed = _CannedRunner({"result": {"agent": None}})
+    client = HerdrClient(runner=malformed)
+    ready, error = runner._wait_for_agent_ready(client, "pl-1", timeout_s=0.02)
+    assert ready is False
+    assert error is not None and "HerdrCliError" in error
+    assert "unexpected herdr agent response shape" in error
+    assert len(malformed.calls) > 1
+
+
+def test_every_pipeline_stage_including_fallback_gates_on_readiness(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 5: fresh stages, the stage-7 resume and a fallback-model restart are all
+    `agent_start`ed through the same gate. Stage 4 is driven onto its fallback (a
+    provider error on the first settle) so it starts twice; stage 7 starts with a
+    `session_id`, i.e. as a resume."""
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    client = _client(settles={4: ["blocked", "idle"]})
+
+    outcome, client, _gh = _run(
+        prepared, client=client, session_export=ErrorsOnce(SESSION_IDS[4])
+    )
+
+    assert outcome.outcome == "ok", outcome
+    stage4 = f"pl-4-{RUN_ID}".lower()
+    stage4_starts = [
+        event for event in client.events if event[0] == "start" and event[1] == stage4
+    ]
+    stage4_prompts = [
+        index
+        for index, event in enumerate(client.events)
+        if event[0] == "prompt" and event[1] == stage4
+    ]
+    assert len(stage4_starts) == 2  # the failed primary and the fresh fallback
+    assert len(stage4_prompts) == 2
+    for prompt_index in stage4_prompts:
+        reads = _readiness_before_prompt(client, stage4, prompt_index)
+        assert reads and reads[-1] is True
+
+    stage7 = f"pl-7-{RUN_ID}".lower()
+    stage7_start = next(call for call in client.started if call["name"] == stage7)
+    assert (
+        stage7_start["session_id"] is not None
+    )  # the stage-7 resume, not a fresh start
+    reads7 = _readiness_before_prompt(
+        client, stage7, _first_prompt_index(client, stage7)
+    )
+    assert reads7 and reads7[-1] is True
+
+    # No prompt anywhere in the run bypasses the gate.
+    for prompt_index, event in enumerate(client.events):
+        if event[0] != "prompt":
+            continue
+        reads = _readiness_before_prompt(client, event[1], prompt_index)
+        assert reads, f"{event[1]} was prompted without a readiness poll"
+        assert reads[-1] is True, f"{event[1]} was prompted while not ready"
+
+
+class _PromptAlwaysFails(FakeHerdr):
+    """A HerdrClient-shaped fake whose stage prompt raises the given terminal error on
+    every attempt, recording how many deliveries were attempted."""
+
+    def __init__(self, error: HerdrCliError) -> None:
+        super().__init__(SESSION_IDS)
+        self.error = error
+        self.attempts = 0
+
+    def agent_prompt_wait_with_watchdog(self, *, target: str, **kwargs: Any) -> str:
+        self.attempts += 1
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        HerdrCliError(
+            "agent prompt timed out",
+            exit_code=1,
+            error_body={"error": {"code": "timeout", "message": "timed out"}},
+        ),
+        HerdrCliError("wrapper timed out", exit_code=124),
+    ],
+    ids=["settle-timeout", "wrapper-timeout"],
+)
+def test_pipeline_stage_never_retries_unknown_delivery(
+    prepared: PipelineFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    error: HerdrCliError,
+) -> None:
+    """Criterion 7: an ambiguous delivery (`error.code == "timeout"`, or the wrapper's
+    exit 124) aborts `stage_prompt_failed` after exactly one delivery attempt, on the
+    pipeline path and through `runner._prompt_with_watchdog`. Resending could
+    double-prompt an agent that already received the text."""
+    monkeypatch.setattr("herdr_routines.pipeline_run.PROMPT_RETRY_DELAYS_S", (0.0, 0.0))
+    client = _PromptAlwaysFails(error)
+
+    outcome, _client, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "failed"
+    assert outcome.reason == "stage_prompt_failed"
+    assert client.attempts == 1
+    assert client.closed_panes
+
+    # The routine-job seam shares the same whitelist: one attempt, then the error.
+    probe = _PromptAlwaysFails(error)
+    with pytest.raises(HerdrCliError):
+        runner._prompt_with_watchdog(
+            cast(HerdrClient, probe),
+            job_name="routine",
+            target="rt-a",
+            text="do it",
+            timeout_ms=1000,
+            markers=(),
+            prompt_text="do it",
+            agent_kind="opencode",
+        )
+    assert probe.attempts == 1
+
+
+def test_pipeline_run_stage_retry_still_delivers_once_after_readiness(
+    prepared: PipelineFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 8: readiness already true does not remove the existing early-stall
+    retry. A first prompt rejected with `agent_prompt_stalled` is resent once, the run
+    ends `ok`, and every stage still receives exactly one delivered prompt."""
+    monkeypatch.setattr("herdr_routines.pipeline_run.PROMPT_RETRY_DELAYS_S", (0.0,))
+    monkeypatch.setattr("herdr_routines.runner.READY_POLL_INTERVAL_S", 0.0)
+    client = StallingFirstPromptHerdr()
+
+    outcome, _client, _gh = _run(prepared, client=client)
+
+    assert outcome.outcome == "ok", outcome
+    assert client.stalled == [f"pl-{n}-{RUN_ID}".lower() for n in (1, 2, 3, 4, 6, 7)]
+    delivered = [target for target, _text in client.prompts]
+    assert len(delivered) == len(set(delivered)) == 6
+    # The rejected attempt followed a ready poll; the retry then delivered once.
+    for target in delivered:
+        reads = _readiness_before_prompt(
+            client, target, _first_prompt_index(client, target)
+        )
+        assert reads and reads[-1] is True
+
+
+# ---------------------------------------------------------------------------
+# Issue 092 — the docs hand-off and the CI meta-check (non-blocking criteria)
+# ---------------------------------------------------------------------------
+
+
+def _committed(rev: str, rel: str) -> str:
+    proc = _git(REPO_ROOT, "show", f"{rev}:{rel}")
+    assert proc.returncode == 0, f"git show {rev}:{rel} failed: {proc.stderr}"
+    return proc.stdout
+
+
+def _commit_adding(rel: str) -> str:
+    proc = _git(REPO_ROOT, "log", "--diff-filter=A", "--format=%H", "-1", "--", rel)
+    assert proc.returncode == 0, proc.stderr
+    commit = proc.stdout.strip()
+    assert commit, f"{rel} is not committed on this branch"
+    return commit
+
+
+def _docs_commit() -> str:
+    """The newest commit touching the three docs while 092 is still `status: open` —
+    i.e. this change's docs commit, before the pipeline's own bookkeeping flips 092."""
+    log = _git(
+        REPO_ROOT,
+        "log",
+        "--format=%H",
+        "--",
+        ISSUE_092,
+        ISSUE_098,
+        "ROADMAP.md",
+    )
+    for commit in log.stdout.split():
+        if re.search(
+            r"(?m)^status: open$", _frontmatter(_committed(commit, ISSUE_092))
+        ):
+            return commit
+    raise AssertionError("no docs commit leaves issue 092 status: open")
+
+
+def _frontmatter(text: str) -> str:
+    assert text.startswith("---\n"), "document has no frontmatter"
+    return text.split("---", 2)[1]
+
+
+def test_issue_092_log_and_followup_watch_are_recorded() -> None:
+    """Criterion 9: the commit that adds issue 098 also records the offline fix and the
+    hand-off in 092's log, leaves 092's frontmatter `status: open`, and links 098 from
+    `ROADMAP.md`. Checked at the last pre-flip docs commit rather than at the branch
+    tip: the pipeline's own bookkeeping flips 092 to done later, and that is not this
+    change's claim."""
+    _commit_adding(ISSUE_098)  # the follow-up file really is committed
+    commit = _docs_commit()
+
+    issue_098 = _committed(commit, ISSUE_098)
+    assert re.search(r"(?m)^status: open$", _frontmatter(issue_098)), issue_098
+
+    issue_092 = _committed(commit, ISSUE_092)
+    assert re.search(r"(?m)^status: open$", _frontmatter(issue_092)), issue_092
+    log = issue_092.split("## Log", 1)[1]
+    # The entry names the offline fix and hands the week-long confirmation to 098; the
+    # still-open frontmatter is the proof it does not claim that evidence was collected.
+    assert "098" in log
+    assert "interactive_ready" in log or "readiness" in log
+    assert "week" in log.lower()
+
+    roadmap = _committed(commit, "ROADMAP.md")
+    assert ISSUE_098 in roadmap
+    assert ISSUE_092 in roadmap  # 098 is an addition next to 092, not a replacement
+
+
+def test_ci_green_with_opencode_readiness_blocking_tests_run_first() -> None:
+    """Criterion 10 (meta): the stage-5 gate runs lint, strict mypy and the whole suite
+    through `scripts/ci-check.sh`, and the blocking readiness tests are defined before
+    the non-blocking docs/meta ones in this file. The whitelist pin lives in
+    `test_runner.py`, alongside the classification it protects."""
+    ci_text = (REPO_ROOT / "scripts" / "ci-check.sh").read_text()
+    assert "uv run ruff format --check ." in ci_text
+    assert "uv run ruff check ." in ci_text
+    assert "uv run mypy" in ci_text
+    assert "uv run pytest -q" in ci_text
+    assert "all) lint && typecheck && tests" in ci_text
+
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text()
+    assert "disallow_untyped_defs = true" in pyproject  # strict mypy for herdr_routines
+
+    blocking = [
+        "test_pipeline_stage_waits_for_interactive_ready_before_first_prompt",
+        "test_pipeline_stage_readiness_timeout_aborts_without_prompt",
+        "test_pipeline_stage_readiness_poll_errors_are_inert",
+        "test_pipeline_stage_readiness_uses_shared_client_probe",
+        "test_every_pipeline_stage_including_fallback_gates_on_readiness",
+        "test_pipeline_stage_never_retries_unknown_delivery",
+        "test_pipeline_run_stage_retry_still_delivers_once_after_readiness",
+    ]
+    source = Path(__file__).read_text()
+    first_non_blocking = source.index(
+        "def test_issue_092_log_and_followup_watch_are_recorded("
+    )
+    for name in blocking:
+        position = source.index(f"def {name}(")
+        assert position < first_non_blocking, (
+            f"{name} must be defined before the non-blocking tests"
+        )
+
+    runner_source = (REPO_ROOT / "tests" / "test_runner.py").read_text()
+    assert (
+        "def test_prompt_retry_whitelist_unchanged_for_stalled_and_terminal_shapes("
+        in runner_source
+    )

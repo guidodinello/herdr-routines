@@ -1,7 +1,7 @@
 ---
 id: "092"
 title: "Confirm agent_prompt_stalled no longer follows an opencode 2 start"
-status: open
+status: done
 priority: low
 area: infra
 ---
@@ -31,3 +31,11 @@ completed without error (the prompt retry would hide a stall that it absorbed), 
   (`done`, 34 s), two smoke runs (one under the tick unit's environment), and nine
   Telegram `/run` opencode spawns (prompt sent right after start every time). Still too few
   to close; check again after a week of scheduled runs.
+- **2026-11-28**: the offline half of this issue is fixed: every pipeline stage's first
+  prompt now waits for `interactive_ready` (`pipeline_run._start_and_prompt` reuses
+  `runner._wait_for_agent_ready`, bounded by `start_timeout_ms`), so the just-started-agent
+  race observed in run `20261008T003531Z` is gated instead of relying on prompt retry.
+  The retry whitelist is unchanged. This run did **not** inspect a week of production
+  evidence: the time-gated watch and its log moved to
+  [`098`](098-opencode2-prompt-stall-week-watch.md), and this issue stays `status: open`
+  because the pipeline owns the flip to `done`.

@@ -254,6 +254,9 @@ considered met). One-liner index; full detail in the issue file.
   [`091`](docs/process/issues/091-opencode2-failure-markers.md)
 - **`agent_prompt_stalled` after an opencode 2 start** — expected gone; confirm over a week. →
   [`092`](docs/process/issues/092-opencode2-prompt-stalled-after-start.md)
+- **Week-long watch for `agent_prompt_stalled` after an opencode 2 start** — the offline
+  readiness fix is in; production confirmation still pending on the Pi. →
+  [`098`](docs/process/issues/098-opencode2-prompt-stall-week-watch.md)
 - **Unknown opencode model ids fail late** — `session.create` accepts them silently. →
   [`093`](docs/process/issues/093-opencode-unknown-model-preflight.md)
 - **opencode 2 jobs end while background subagents run** — the parent goes idle, so the run
