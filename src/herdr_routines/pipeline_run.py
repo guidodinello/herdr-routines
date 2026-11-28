@@ -89,7 +89,11 @@ from herdr_routines.pipeline_watchdog import (
     heartbeat_log_path,
     validate_stage_sessions,
 )
-from herdr_routines.runner import DEFAULT_FAILURE_MARKERS, SUCCESS_AGENT_STATUSES
+from herdr_routines.runner import (
+    DEFAULT_FAILURE_MARKERS,
+    SUCCESS_AGENT_STATUSES,
+    _wait_for_agent_ready,
+)
 from herdr_routines.runner_seam import BoundedRunner as Runner
 from herdr_routines.signing import (
     ResignError,
@@ -1653,6 +1657,26 @@ def _start_and_prompt(
     except (HerdrCliError, OSError, ValueError) as e:
         _close_pane(client, pane_id)
         raise _Abort("agent_start_failed", detail=str(e)) from e
+
+    # Every stage prompt is a just-started agent's first prompt — the race in issue 092.
+    # Reuse runner.execute_run's bounded poll rather than a second loop: it swallows
+    # transient probe errors and fails open for herdr builds without `interactive_ready`.
+    ready, last_poll_error = _wait_for_agent_ready(
+        client, agent_name, timeout_s=spec.start_timeout_ms / 1000
+    )
+    if not ready:
+        error = (
+            f"agent {agent_name} did not report interactive_ready within "
+            f"{spec.start_timeout_ms}ms of start"
+        )
+        if last_poll_error:
+            error = f"{error}; last poll error: {last_poll_error}"
+        _close_pane(client, pane_id)
+        raise _Abort(
+            "stage_agent_not_interactive",
+            detail=error,
+            lines=["stage_agent_not_interactive"],
+        )
 
     try:
         status = prompt_with_watchdog(
