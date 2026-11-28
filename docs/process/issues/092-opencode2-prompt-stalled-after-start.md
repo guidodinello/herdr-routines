@@ -1,7 +1,7 @@
 ---
 id: "092"
 title: "Confirm agent_prompt_stalled no longer follows an opencode 2 start"
-status: open
+status: done
 priority: low
 area: infra
 ---
